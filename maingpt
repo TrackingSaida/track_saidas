@@ -1,117 +1,40 @@
-# Estrutura mínima (1 endpoint de registro)
+import os
+from datetime import datetime, date
+from typing import Optional
 
-```text
-api-saidas/
-├─ app/
-│  ├─ __init__.py
-│  ├─ main.py
-│  ├─ core/
-│  │  └─ config.py
-│  ├─ db/
-│  │  ├─ __init__.py
-│  │  └─ session.py
-│  ├─ models/
-│  │  └─ saida.py
-│  ├─ schemas/
-│  │  └─ saida.py
-│  └─ routers/
-│     └─ saidas.py
-├─ .env.example
-├─ requirements.txt
-├─ Dockerfile
-├─ docker-compose.yml
-└─ README.md
-```
-
----
-
-## app/__init__.py
-```python
-# vazio de propósito
-```
-
-## app/main.py
-```python
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from app.db.session import Base, engine
-from app.core.config import settings
-from app.routers.saidas import router as saidas_router
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="API Saídas", version="0.1.0")
+from sqlalchemy import create_engine, Column, BigInteger, Text, Boolean, Date, DateTime, func
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-# CORS (ajuste para o domínio do seu site quando souber)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- .env (opcional) ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-@app.get(f"{settings.API_PREFIX}/health")
-async def health_check():
-    return {"status": "ok"}
+# ------------------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")  # ajuste no .env ou variável do Render
+API_PREFIX = os.getenv("API_PREFIX", "/api")
 
-# inclui rotas
-app.include_router(saidas_router, prefix=f"{settings.API_PREFIX}/saidas", tags=["saidas"])
-
-# cria tabelas se não existirem (apenas para SQLite; no PostgreSQL sua tabela já existe)
-@app.on_event("startup")
-async def on_startup():
-    Base.metadata.create_all(bind=engine)
-```
-
-## app/core/config.py
-```python
-from pydantic_settings import BaseSettings
-from pydantic import Field
-
-class Settings(BaseSettings):
-    DATABASE_URL: str = Field(default="sqlite:///./app.db")
-    API_PREFIX: str = Field(default="/api")
-
-    class Config:
-        env_file = ".env"
-
-settings = Settings()
-```
-
-## app/db/__init__.py
-```python
-# vazio
-```
-
-## app/db/session.py
-```python
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from app.core.config import settings
-
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Dependência para FastAPI
-async def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-```
 
-## app/models/saida.py
-```python
-from sqlalchemy import Column, BigInteger, String, Text, Boolean, Date, DateTime, func
-from app.db.session import Base
-
-# Mapeia a tabela existente no seu PostgreSQL
+# ------------------------------------------------------------------------------
+# MODELO (mapeando sua tabela existente)
+# ------------------------------------------------------------------------------
 class Saida(Base):
-    __tablename__ = "saidas"  # ajuste se o nome for outro
+    __tablename__ = "saidas"  # <<< se seu nome for outro, ajuste aqui
 
     id_saida   = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
-    timestamp  = Column(DateTime(timezone=False), server_default=func.now())  # timestamp without time zone
+    timestamp  = Column(DateTime(timezone=False), server_default=func.now())
     data       = Column(Date, server_default=func.current_date())
     entregador = Column(Text, nullable=True)
     codigo     = Column(Text, nullable=True)
@@ -119,20 +42,16 @@ class Saida(Base):
     status     = Column(Text, nullable=True)
     duplicado  = Column(Boolean, nullable=True)
     estacao    = Column(Text, nullable=True)
-```
 
-## app/schemas/saida.py
-```python
-from pydantic import BaseModel, Field
-from typing import Optional
-from datetime import datetime, date
 
+# ------------------------------------------------------------------------------
+# SCHEMAS
+# ------------------------------------------------------------------------------
 class SaidaCreate(BaseModel):
     entregador: str = Field(min_length=1)
     estacao: str = Field(min_length=1)
     codigo: str = Field(min_length=1)
-    # servico/status/duplicado ficam opcionais e podem ser omitidos (nulos)
-    servico: Optional[str] = None
+    servico: Optional[str] = None  # opcional
 
 class SaidaOut(BaseModel):
     id_saida: int
@@ -145,120 +64,54 @@ class SaidaOut(BaseModel):
     duplicado: Optional[bool]
     estacao: Optional[str]
 
-    model_config = {"from_attributes": True}
-```
+    class Config:
+        from_attributes = True
 
-## app/routers/saidas.py
-```python
-from fastapi import APIRouter, Depends, status
-from sqlalchemy.orm import Session
-from app.db.session import get_db
-from app.models.saida import Saida
-from app.schemas.saida import SaidaCreate, SaidaOut
 
-router = APIRouter()
+# ------------------------------------------------------------------------------
+# APP
+# ------------------------------------------------------------------------------
+app = FastAPI(title="API Saídas", version="0.1.0")
 
-@router.post("/registrar", response_model=SaidaOut, status_code=status.HTTP_201_CREATED)
-async def registrar_saida(payload: SaidaCreate, db: Session = Depends(get_db)):
-    # Preenche apenas os campos solicitados; data/timestamp são definidos no servidor
+# CORS (depois podemos travar pro seu domínio)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Dependência da sessão
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.get(f"{API_PREFIX}/health")
+def health():
+    return {"status": "ok"}
+
+
+# Endpoint ÚNICO: registrar
+@app.post(f"{API_PREFIX}/saidas/registrar", response_model=SaidaOut, status_code=status.HTTP_201_CREATED)
+def registrar_saida(payload: SaidaCreate, db: Session = Depends(get_db)):
     obj = Saida(
         entregador=payload.entregador,
         estacao=payload.estacao,
         codigo=payload.codigo,
-        servico=payload.servico,  # pode ser None
-        # status e duplicado ficam nulos por enquanto
+        servico=payload.servico,      # opcional
+        # status e duplicado ficam nulos; timestamp e data vêm do servidor
     )
     db.add(obj)
     db.commit()
     db.refresh(obj)
     return obj
-```
 
----
 
-## .env.example
-```env
-# Ex.: PostgreSQL (Render)
-# DATABASE_URL=postgresql+psycopg://USER:PASS@HOST:5432/DB
-
-# Ou deixe SQLite para testes locais
-DATABASE_URL=sqlite:///./app.db
-API_PREFIX=/api
-```
-
-## requirements.txt
-```txt
-fastapi==0.111.0
-uvicorn[standard]==0.30.0
-SQLAlchemy==2.0.29
-pydantic==2.7.1
-pydantic-settings==2.3.0
-psycopg[binary]==3.1.18
-python-dotenv==1.0.1
-```
-
-## Dockerfile
-```dockerfile
-FROM python:3.11-slim
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-## docker-compose.yml
-```yaml
-version: "3.9"
-services:
-  api:
-    build: .
-    env_file: [.env]
-    ports: ["8000:8000"]
-    volumes: [".:/app"]
-```
-
-## README.md
-```md
-# API Saídas (endpoint único: registrar)
-
-## Rodar
-```bash
-cp .env.example .env
-uvicorn app.main:app --reload
-```
-
-## Endpoint
-POST /api/saidas/registrar
-
-### Body
-```json
-{
-  "entregador": "Andrey",
-  "estacao": "E01",
-  "codigo": "ABC123",
-  "servico": null
-}
-```
-
-### Resposta 201
-```json
-{
-  "id_saida": 42,
-  "timestamp": "2025-09-04T16:10:03",
-  "data": "2025-09-04",
-  "entregador": "Andrey",
-  "codigo": "ABC123",
-  "servico": null,
-  "status": null,
-  "duplicado": null,
-  "estacao": "E01"
-}
-```
-
-> Observação: Para apontar ao seu PostgreSQL, ajuste `DATABASE_URL` no `.env`.
-```
+# OBS: Não chamo Base.metadata.create_all() para não criar tabela errada no seu PostgreSQL.
+# Se quiser usar SQLite local pra teste rápido, descomente a linha abaixo:
+# Base.metadata.create_all(bind=engine)
