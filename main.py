@@ -103,7 +103,7 @@ def registrar_saida(payload: SaidaCreate, db: Session = Depends(get_db)):
         entregador=payload.entregador,
         estacao=payload.estacao,
         codigo=payload.codigo,
-        servico=payload.servico,      # opcional
+        servico=payload.servico or "padrao",  # <- default se não vier
         # status e duplicado ficam nulos; timestamp e data vêm do servidor
     )
     db.add(obj)
