@@ -10,29 +10,17 @@ from main import Base, get_db
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
-# -----------------------------
-# MODELO
-# -----------------------------
 class Entregador(Base):
     __tablename__ = "entregador"
+    id       = Column(Integer, primary_key=True)  # ID gerado pelo banco
+    nome     = Column(Text, nullable=True)
+    telefone = Column(Text, nullable=True)
 
-    id         = Column(Integer, primary_key=True)   # IDENTITY gerado no PostgreSQL
-    email_base = Column(Text, nullable=True)         # não tratado pela API
-    nome       = Column(Text, nullable=True)
-    telefone   = Column(Text, nullable=True)
-
-# -----------------------------
-# SCHEMA
-# -----------------------------
 class EntregadorFields(BaseModel):
     nome: Optional[str] = None
     telefone: Optional[str] = None
-
     model_config = ConfigDict(from_attributes=True)
 
-# -----------------------------
-# ENDPOINT
-# -----------------------------
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_entregador(body: EntregadorFields, db: Session = Depends(get_db)):
     obj = Entregador(
