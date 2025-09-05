@@ -10,32 +10,23 @@ from main import Base, get_db
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
-# -----------------------------
-# MODELO (id gerado pelo banco)
-# -----------------------------
 class User(Base):
     __tablename__ = "users"
-
-    id       = Column(Integer, primary_key=True)   # IDENTITY gerado no PostgreSQL
+    # ID gerado pelo banco (IDENTITY)
+    id       = Column(Integer, primary_key=True)
+    # Somente os campos que a API pode tocar
     email    = Column(Text, nullable=True)
     senha    = Column(Text, nullable=True)
     username = Column(Text, nullable=True)
     contato  = Column(Text, nullable=True)
 
-# -----------------------------
-# SCHEMA
-# -----------------------------
 class UserFields(BaseModel):
     email: Optional[str] = None
     senha: Optional[str] = None
     username: Optional[str] = None
     contato: Optional[str] = None
-
     model_config = ConfigDict(from_attributes=True)
 
-# -----------------------------
-# ENDPOINT
-# -----------------------------
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_user(body: UserFields, db: Session = Depends(get_db)):
     obj = User(
@@ -46,5 +37,5 @@ def create_user(body: UserFields, db: Session = Depends(get_db)):
     )
     db.add(obj)
     db.commit()
-    db.refresh(obj)  # aqui o banco retorna o id gerado
+    db.refresh(obj)
     return {"ok": True, "action": "created", "id": obj.id}
