@@ -75,6 +75,10 @@ class SaidaOut(BaseModel):
 # ------------------------------------------------------------------------------
 app = FastAPI(title="API Saídas", version="0.1.0")
 
+# Importa e registra as rotas de cadastro
+from cadastros import router as cadastros_router
+app.include_router(cadastros_router, prefix=API_PREFIX)
+
 # CORS (depois podemos travar pro seu domínio)
 app.add_middleware(
     CORSMiddleware,
