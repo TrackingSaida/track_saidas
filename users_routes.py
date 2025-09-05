@@ -18,7 +18,6 @@ router = APIRouter(prefix="/users", tags=["Users"])
 class User(Base):
     __tablename__ = "users"
 
-    id       = Column(Integer, primary_key=True, autoincrement=False)  # ID informado
     email    = Column(Text, nullable=True)     # << vermelho
     senha    = Column(Text, nullable=True)     # << vermelho
     username = Column(Text, nullable=True)     # << vermelho
