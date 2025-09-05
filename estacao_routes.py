@@ -18,7 +18,6 @@ router = APIRouter(prefix="/estacoes", tags=["Estacoes"])
 class Estacao(Base):
     __tablename__ = "estacao"
 
-    id         = Column(Integer, primary_key=True, autoincrement=False)  # ID informado
     # Preto (não tratado aqui): email_base
     estacao    = Column(Text, nullable=True)      # << vermelho (se quiser int, troque para Integer)
 
