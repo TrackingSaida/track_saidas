@@ -18,7 +18,6 @@ router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 class Entregador(Base):
     __tablename__ = "entregador"
 
-    id         = Column(Integer, primary_key=True, autoincrement=False)  # ID informado
     # Preto (não tratado aqui): email_base
     nome       = Column(Text, nullable=True)      # << vermelho
     telefone   = Column(Text, nullable=True)      # << vermelho
