@@ -5,6 +5,8 @@ from typing import Optional
 from fastapi import FastAPI, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from cadastros import router as cadastros_router
+
 
 from sqlalchemy import create_engine, Column, BigInteger, Text, Boolean, Date, DateTime, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
