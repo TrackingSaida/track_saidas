@@ -6,7 +6,7 @@ from sqlalchemy import Column, BigInteger, Text, Boolean, Date, DateTime, func, 
 from sqlalchemy.orm import Session, declarative_base
 
 # Reaproveita sessão e Base do main.py (não cria outro engine)
-from ..main import Base, get_db
+from main import Base, get_db
 
 router = APIRouter(tags=["Cadastros"])
 
