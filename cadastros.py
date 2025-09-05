@@ -1,204 +1,194 @@
-# routers/cadastros.py
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
-from sqlalchemy import Column, BigInteger, Text, Boolean, Date, DateTime, func, select, update, delete
-from sqlalchemy.orm import Session, declarative_base
+from __future__ import annotations
 
-# Reaproveita sessão e Base do main.py (não cria outro engine)
+# ----------------------------------------------------------------------
+# Rotas de CADASTROS (somente campos "vermelhos" + id)
+#
+# • users:       senha, valor (R$), mensalidade, creditos
+# • entregador:  nome, telefone
+# • estacao:     estacao
+#
+# A API faz "upsert por ID": se o registro existir, atualiza;
+# se não existir, cria um novo com o ID informado e só os campos permitidos.
+# Os demais campos permanecem intocados (serão ajustados manualmente).
+# ----------------------------------------------------------------------
+
+from datetime import date, datetime
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field, ConfigDict
+
+from sqlalchemy import Column, Integer, Text, Date as SA_Date
+from sqlalchemy.orm import Session
+
+# Importa a Base e a sessão do seu app principal (sem import relativo)
 from main import Base, get_db
 
-router = APIRouter(tags=["Cadastros"])
+router = APIRouter(prefix="/cadastros", tags=["Cadastros"])
 
-# ------------------------------------------------------------------------------
-# ORM MODELS (mapeiam tabelas EXISTENTES no Postgres)
-#  - Não chamamos create_all aqui (seguindo seu padrão)
-#  - Os nomes de coluna precisam bater com o banco.
-#  - Se você tiver uma coluna literalmente chamada R$ em "users",
-#    mapeamos assim: Column('R$', Text, key='valor_rs')
-# ------------------------------------------------------------------------------
+# ======================================================================
+# MODELOS SQLALCHEMY (espelham suas tabelas existentes)
+# IMPORTANTe: colunas NÃO "vermelhas" ficam como nullable=True aqui
+# para não travar quando criarmos linhas só com parte dos campos.
+# ======================================================================
 
 class User(Base):
     __tablename__ = "users"
-    id           = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
-    email        = Column(Text, nullable=False)
-    senha        = Column(Text, nullable=True)
-    username     = Column(Text, nullable=True)
-    contato      = Column(Text, nullable=True)
-    status       = Column(Text, nullable=True)        # ex.: ativo/inativo
-    cobranca     = Column(Text, nullable=True)        # ex.: valor/mensal
-    # se a tabela tiver uma coluna com nome estranho "R$", mapeie assim:
-    valor_rs     = Column('R$', Text, nullable=True, key='valor_rs')  # opcional; remova se não existir
-    mensalidade  = Column(Date, nullable=True)        # data
-    creditos     = Column(Text, nullable=True)        # pode ser money/text, mapeado como text por segurança
+
+    id          = Column(Integer, primary_key=True, autoincrement=False)  # vamos aceitar ID informado
+    email       = Column(Text, nullable=True)
+    senha       = Column(Text, nullable=True)            # << vermelho
+    username    = Column(Text, nullable=True)
+    contato     = Column(Text, nullable=True)
+    status      = Column(Text, nullable=True)
+    cobranca    = Column(Text, nullable=True)
+    valor       = Column(Text, nullable=True)            # << "R$" (vermelho)
+    mensalidade = Column(SA_Date, nullable=True)         # << vermelho (data)
+    creditos    = Column(Text, nullable=True)            # << vermelho
+
 
 class Entregador(Base):
     __tablename__ = "entregador"
-    id         = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+
+    id         = Column(Integer, primary_key=True, autoincrement=False)  # aceitar ID informado
     email_base = Column(Text, nullable=True)
-    nome       = Column(Text, nullable=False)
-    telefone   = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=False), server_default=func.now())
+    nome       = Column(Text, nullable=True)           # << vermelho
+    telefone   = Column(Text, nullable=True)           # << vermelho
+
 
 class Estacao(Base):
     __tablename__ = "estacao"
-    id         = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+
+    id         = Column(Integer, primary_key=True, autoincrement=False)  # aceitar ID informado
     email_base = Column(Text, nullable=True)
-    estacao    = Column(Text, nullable=False)
+    estacao    = Column(Text, nullable=True)           # << vermelho (se quiser como int, mude para Integer)
 
-# ------------------------------------------------------------------------------
-# Pydantic Schemas (entrada/saída)
-# ------------------------------------------------------------------------------
 
-# USERS
-class UserIn(BaseModel):
-    email: str = Field(min_length=3)
+# ======================================================================
+# SCHEMAS (apenas campos "vermelhos")
+# Uso tipos Python. Para data aceito str e converto mais abaixo.
+# ======================================================================
+
+class UserFields(BaseModel):
     senha: Optional[str] = None
-    username: Optional[str] = None
-    contato: Optional[str] = None
-    status: Optional[str] = None
-    cobranca: Optional[str] = None
-    valor_rs: Optional[str] = None     # remova se não existir a coluna "R$"
-    mensalidade: Optional[Date] = None
+    valor: Optional[str] = None                     # coluna "R$"
+    mensalidade: Optional[str] = Field(             # "YYYY-MM-DD" ou "DD/MM/YYYY"
+        default=None,
+        description='Data em "YYYY-MM-DD" ou "DD/MM/YYYY".'
+    )
     creditos: Optional[str] = None
 
-class UserOut(UserIn):
-    id: int
+    model_config = ConfigDict(from_attributes=True)
 
-# ENTREGADORES
-class EntregadorIn(BaseModel):
-    email_base: Optional[str] = None
-    nome: str = Field(min_length=1)
+
+class EntregadorFields(BaseModel):
+    nome: Optional[str] = None
     telefone: Optional[str] = None
 
-class EntregadorOut(EntregadorIn):
-    id: int
+    model_config = ConfigDict(from_attributes=True)
 
-# ESTACOES
-class EstacaoIn(BaseModel):
-    email_base: Optional[str] = None
-    estacao: str = Field(min_length=1)
 
-class EstacaoOut(EstacaoIn):
-    id: int
+class EstacaoFields(BaseModel):
+    estacao: Optional[str] = None                   # se quiser número, troque para Optional[int]
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
+    model_config = ConfigDict(from_attributes=True)
 
-def asdict(obj) -> Dict[str, Any]:
-    """Converte ORM → dict usando os schemas de saída."""
-    d = obj.__dict__.copy()
-    d.pop("_sa_instance_state", None)
-    return d
 
-# ------------------------------------------------------------------------------
-# USERS endpoints
-# ------------------------------------------------------------------------------
+# ======================================================================
+# Utils
+# ======================================================================
 
-@router.get("/cadastros/users", response_model=List[UserOut])
-def list_users(db: Session = Depends(get_db), limit: int = 100):
-    rows = db.execute(select(User).limit(limit)).scalars().all()
-    return [UserOut(**asdict(r)) for r in rows]
+def _parse_date_maybe(value: Optional[str]) -> Optional[date]:
+    """Aceita 'YYYY-MM-DD' ou 'DD/MM/YYYY'. Retorna date ou None."""
+    if not value:
+        return None
+    s = value.strip()
+    # tenta ISO
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+    # tenta BR
+    try:
+        return datetime.strptime(s, "%d/%m/%Y").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Formato de data inválido para mensalidade: '{value}'. Use 'YYYY-MM-DD' ou 'DD/MM/YYYY'.",
+        )
 
-@router.post("/cadastros/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def create_user(payload: UserIn, db: Session = Depends(get_db)):
-    obj = User(**payload.model_dump())
-    db.add(obj)
+
+# ======================================================================
+# ENDPOINTS - apenas upsert por ID (cria/atualiza os campos "vermelhos")
+# URL final (no Render): /api/cadastros/...
+# ======================================================================
+
+@router.post("/users/{id}", status_code=status.HTTP_200_OK)
+def upsert_user(id: int, body: UserFields, db: Session = Depends(get_db)):
+    obj = db.get(User, id)
+    created = False
+    if obj is None:
+        obj = User(id=id)
+        db.add(obj)
+        created = True
+
+    if body.senha is not None:
+        obj.senha = body.senha
+    if body.valor is not None:
+        obj.valor = body.valor
+    if body.mensalidade is not None:
+        obj.mensalidade = _parse_date_maybe(body.mensalidade)
+    if body.creditos is not None:
+        obj.creditos = body.creditos
+
     db.commit()
     db.refresh(obj)
-    return UserOut(**asdict(obj))
+    return {
+        "ok": True,
+        "action": "created" if created else "updated",
+        "id": obj.id,
+    }
 
-@router.put("/cadastros/users/{user_id}", response_model=UserOut)
-def update_user(user_id: int, payload: UserIn, db: Session = Depends(get_db)):
-    obj = db.get(User, user_id)
-    if not obj:
-        raise HTTPException(404, "User não encontrado")
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        setattr(obj, k, v)
+
+@router.post("/entregadores/{id}", status_code=status.HTTP_200_OK)
+def upsert_entregador(id: int, body: EntregadorFields, db: Session = Depends(get_db)):
+    obj = db.get(Entregador, id)
+    created = False
+    if obj is None:
+        obj = Entregador(id=id)
+        db.add(obj)
+        created = True
+
+    if body.nome is not None:
+        obj.nome = body.nome
+    if body.telefone is not None:
+        obj.telefone = body.telefone
+
     db.commit()
     db.refresh(obj)
-    return UserOut(**asdict(obj))
+    return {
+        "ok": True,
+        "action": "created" if created else "updated",
+        "id": obj.id,
+    }
 
-@router.delete("/cadastros/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_user(user_id: int, db: Session = Depends(get_db)):
-    obj = db.get(User, user_id)
-    if not obj:
-        raise HTTPException(404, "User não encontrado")
-    db.delete(obj)
-    db.commit()
-    return
 
-# ------------------------------------------------------------------------------
-# ENTREGADORES endpoints
-# ------------------------------------------------------------------------------
+@router.post("/estacoes/{id}", status_code=status.HTTP_200_OK)
+def upsert_estacao(id: int, body: EstacaoFields, db: Session = Depends(get_db)):
+    obj = db.get(Estacao, id)
+    created = False
+    if obj is None:
+        obj = Estacao(id=id)
+        db.add(obj)
+        created = True
 
-@router.get("/cadastros/entregadores", response_model=List[EntregadorOut])
-def list_entregadores(db: Session = Depends(get_db), limit: int = 200):
-    rows = db.execute(select(Entregador).limit(limit)).scalars().all()
-    return [EntregadorOut(**asdict(r)) for r in rows]
+    if body.estacao is not None:
+        obj.estacao = str(body.estacao)  # guarda como texto; mude para int se a coluna for Integer
 
-@router.post("/cadastros/entregadores", response_model=EntregadorOut, status_code=status.HTTP_201_CREATED)
-def create_entregador(payload: EntregadorIn, db: Session = Depends(get_db)):
-    obj = Entregador(**payload.model_dump())
-    db.add(obj)
     db.commit()
     db.refresh(obj)
-    return EntregadorOut(**asdict(obj))
-
-@router.put("/cadastros/entregadores/{entregador_id}", response_model=EntregadorOut)
-def update_entregador(entregador_id: int, payload: EntregadorIn, db: Session = Depends(get_db)):
-    obj = db.get(Entregador, entregador_id)
-    if not obj:
-        raise HTTPException(404, "Entregador não encontrado")
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        setattr(obj, k, v)
-    db.commit()
-    db.refresh(obj)
-    return EntregadorOut(**asdict(obj))
-
-@router.delete("/cadastros/entregadores/{entregador_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_entregador(entregador_id: int, db: Session = Depends(get_db)):
-    obj = db.get(Entregador, entregador_id)
-    if not obj:
-        raise HTTPException(404, "Entregador não encontrado")
-    db.delete(obj)
-    db.commit()
-    return
-
-# ------------------------------------------------------------------------------
-# ESTACOES endpoints
-# ------------------------------------------------------------------------------
-
-@router.get("/cadastros/estacoes", response_model=List[EstacaoOut])
-def list_estacoes(db: Session = Depends(get_db), limit: int = 200):
-    rows = db.execute(select(Estacao).limit(limit)).scalars().all()
-    return [EstacaoOut(**asdict(r)) for r in rows]
-
-@router.post("/cadastros/estacoes", response_model=EstacaoOut, status_code=status.HTTP_201_CREATED)
-def create_estacao(payload: EstacaoIn, db: Session = Depends(get_db)):
-    obj = Estacao(**payload.model_dump())
-    db.add(obj)
-    db.commit()
-    db.refresh(obj)
-    return EstacaoOut(**asdict(obj))
-
-@router.put("/cadastros/estacoes/{estacao_id}", response_model=EstacaoOut)
-def update_estacao(estacao_id: int, payload: EstacaoIn, db: Session = Depends(get_db)):
-    obj = db.get(Estacao, estacao_id)
-    if not obj:
-        raise HTTPException(404, "Estação não encontrada")
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        setattr(obj, k, v)
-    db.commit()
-    db.refresh(obj)
-    return EstacaoOut(**asdict(obj))
-
-@router.delete("/cadastros/estacoes/{estacao_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_estacao(estacao_id: int, db: Session = Depends(get_db)):
-    obj = db.get(Estacao, estacao_id)
-    if not obj:
-        raise HTTPException(404, "Estação não encontrada")
-    db.delete(obj)
-    db.commit()
-    return
+    return {
+        "ok": True,
+        "action": "created" if created else "updated",
+        "id": obj.id,
+    }
