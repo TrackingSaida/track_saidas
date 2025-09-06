@@ -11,9 +11,6 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
-from db import get_db
-from users_routes_updated import User
-
 # Configurações JWT
 SECRET_KEY = os.getenv("SECRET_KEY", "sua-chave-secreta-super-segura-aqui-mude-em-producao")
 ALGORITHM = "HS256"
