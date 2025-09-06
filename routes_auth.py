@@ -1,8 +1,8 @@
-# auth.py
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import List
 
 from fastapi import APIRouter, Depends, Request, Response, HTTPException, status
 from pydantic import BaseModel, Field
@@ -12,31 +12,25 @@ from sqlalchemy import or_
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 
-# ---------------------------------------------------------------------
-# Ajuste estes imports conforme sua estrutura:
-# from main import get_db              # função que retorna a Session (SQLAlchemy)
-# from models import User              # seu modelo User (SQLAlchemy)
-# ---------------------------------------------------------------------
+from main import get_db                      # sua Session
+from users_routes import User                # seu modelo User
 
-# ===== CONFIG =====
+# ===== Config (use .env / Render Environment) =====
 JWT_ALGORITHM = "HS256"
-JWT_SECRET = "CHANGE_ME_USE_ENV_VAR"   # -> coloque em variável de ambiente
-COOKIE_NAME = "access_token"
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")  # defina em produção
+# Ative cookies Secure automaticamente se ENVIRONMENT=prod/production
+SECURE_COOKIES = os.getenv("ENVIRONMENT", "dev").lower() in ("prod", "production")
 
-# Ative Secure=True em produção/HTTPS
-SECURE_COOKIES = False  # mude para True em produção
+COOKIE_NAME = "access_token"
 COOKIE_SAMESITE = "lax"
 COOKIE_PATH = "/"
-
-# Lembre: 60 minutos ou 30 dias (em segundos)
-EXP_1H   = 60 * 60
-EXP_30D  = 30 * 24 * 60 * 60
+EXP_1H  = 60 * 60
+EXP_30D = 30 * 24 * 60 * 60
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 router = APIRouter()
 
-# ====== Schemas ======
+# ===== Schemas =====
 class LoginIn(BaseModel):
     username: str = Field(..., description="email ou username")
     password: str
@@ -44,8 +38,8 @@ class LoginIn(BaseModel):
 
 class UserPublic(BaseModel):
     id: int
-    username: str
-    email: str
+    username: str | None = None
+    email: str | None = None
 
 class LoginOut(BaseModel):
     ok: bool
@@ -53,24 +47,15 @@ class LoginOut(BaseModel):
 
 class MeOut(BaseModel):
     id: int
-    username: str
-    email: str
+    username: str | None = None
+    email: str | None = None
     roles: List[str] = ["user"]
 
-# ====== Helpers ======
-def create_access_token(*, sub: str | int, expires_in_seconds: int) -> str:
-    now = datetime.now(tz=timezone.utc)
-    exp = now + timedelta(seconds=expires_in_seconds)
-    payload = {
-        "sub": str(sub),
-        "exp": exp,
-        "iat": now,
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return token
-
-def verify_password(plain: str, password_hash: str) -> bool:
-    return pwd_context.verify(plain, password_hash)
+# ===== Helpers =====
+def create_access_token(*, sub: int | str, expires_in_seconds: int) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {"sub": str(sub), "exp": now + timedelta(seconds=expires_in_seconds), "iat": now}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def set_auth_cookie(response: Response, token: str, max_age: int) -> None:
     response.set_cookie(
@@ -79,7 +64,7 @@ def set_auth_cookie(response: Response, token: str, max_age: int) -> None:
         max_age=max_age,
         httponly=True,
         secure=SECURE_COOKIES,
-        samesite=COOKIE_SAMESITE,  # "lax"
+        samesite=COOKIE_SAMESITE,
         path=COOKIE_PATH,
     )
 
@@ -95,72 +80,46 @@ def clear_auth_cookie(response: Response) -> None:
         path=COOKIE_PATH,
     )
 
+def verify_password(plain: str, password_hash: str | None) -> bool:
+    return bool(password_hash) and pwd_context.verify(plain, password_hash)
+
 # ===== Dependência de segurança =====
-def get_current_user(
-    request: Request,
-    db: Session = Depends(get_db),
-):
+def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Não autenticado")
-
+        raise HTTPException(status_code=401, detail="Não autenticado")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         sub = payload.get("sub")
         if not sub:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Não autenticado")
+            raise HTTPException(status_code=401, detail="Não autenticado")
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Não autenticado")
+        raise HTTPException(status_code=401, detail="Não autenticado")
 
-    # Busque seu usuário no DB (ajuste conforme seu ORM)
     user = db.query(User).filter(User.id == int(sub)).first()
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Não autenticado")
-
+        raise HTTPException(status_code=401, detail="Não autenticado")
     return user
 
 # ===== Endpoints =====
-
 @router.post("/api/auth/login", response_model=LoginOut)
 def login(payload: LoginIn, response: Response, db: Session = Depends(get_db)):
-    """
-    Autentica por username OU email, confere senha (bcrypt),
-    gera JWT e seta cookie HttpOnly.
-    """
-    identifier = payload.username.strip()
-
-    user = (
-        db.query(User)
-        .filter(or_(User.username == identifier, User.email == identifier))
-        .first()
-    )
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas")
-
-    if not verify_password(payload.password, user.password_hash):
-        # (Opcional) aqui você pode registrar tentativa p/ anti brute-force
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas")
+    ident = payload.username.strip()
+    user = db.query(User).filter(or_(User.username == ident, User.email == ident)).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Credenciais inválidas")
 
     exp_seconds = EXP_30D if payload.remember else EXP_1H
     token = create_access_token(sub=user.id, expires_in_seconds=exp_seconds)
     set_auth_cookie(response, token, max_age=exp_seconds)
 
-    return LoginOut(
-        ok=True,
-        user=UserPublic(id=user.id, username=user.username, email=user.email)
-    )
+    return {"ok": True, "user": {"id": user.id, "username": user.username, "email": user.email}}
 
 @router.get("/api/auth/me", response_model=MeOut)
-def me(user = Depends(get_current_user)):
-    roles = getattr(user, "roles", None)
-    roles_out = roles if roles else ["user"]
-    return MeOut(id=user.id, username=user.username, email=user.email, roles=roles_out)
+def me(user: User = Depends(get_current_user)):
+    return {"id": user.id, "username": user.username, "email": user.email, "roles": ["user"]}
 
 @router.post("/api/auth/logout")
 def logout(response: Response):
     clear_auth_cookie(response)
     return {"ok": True}
-
-@router.get("/api/health")
-def health():
-    return {"status": "ok"}
