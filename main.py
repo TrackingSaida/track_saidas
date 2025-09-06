@@ -1,118 +1,177 @@
-# auth.py
 from __future__ import annotations
-from datetime import datetime, timedelta, timezone
-from typing import List
 
-from fastapi import APIRouter, Depends, Request, Response, HTTPException, status
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-from jose import jwt, JWTError
-from passlib.context import CryptContext
-from routes_auth import router as auth_router
+import os
+from datetime import datetime, date
+from typing import Optional
+
+from fastapi import FastAPI, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ConfigDict
+from sqlalchemy import (
+    create_engine,
+    Column,
+    BigInteger,
+    Text,
+    Date,
+    DateTime,
+    func,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+
+# ------------------------------------------------------------------------------
+# .env (opcional)
+# ------------------------------------------------------------------------------
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    # dotenv é opcional; se não existir, seguimos com variáveis de ambiente nativas
+    pass
+
+# ------------------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")  # ajuste no .env/Render
+API_PREFIX = os.getenv("API_PREFIX", "/api")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# ------------------------------------------------------------------------------
+# MODELO: tabela saidas
+# ------------------------------------------------------------------------------
+class Saida(Base):
+    __tablename__ = "saidas"
+
+    id_saida = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    # Armazena a data/hora de criação (timezone=False = naive; deixe consistente com o resto do sistema)
+    timestamp = Column(DateTime(timezone=False), server_default=func.now())
+    # Armazena somente a data corrente
+    data = Column(Date, server_default=func.current_date())
+
+    base = Column(Text, nullable=True)
+    entregador = Column(Text, nullable=True)
+    codigo = Column(Text, nullable=True)
+    servico = Column(Text, nullable=True)
+    status = Column(Text, nullable=True)
+    estacao = Column(Text, nullable=True)
 
 
-from main import get_db
-from users_routes import User  # usa seu modelo já existente
+# ------------------------------------------------------------------------------
+# SCHEMAS
+# ------------------------------------------------------------------------------
+class SaidaCreate(BaseModel):
+    base: str = Field(min_length=1)
+    entregador: str = Field(min_length=1)
+    estacao: str = Field(min_length=1)
+    codigo: str = Field(min_length=1)
+    servico: Optional[str] = None
 
-# ===== Config =====
-JWT_ALGORITHM = "HS256"
-JWT_SECRET = "CHANGE_ME_USE_ENV_VAR"  # defina via variável de ambiente em produção
-COOKIE_NAME = "access_token"
-SECURE_COOKIES = False  # True em produção (HTTPS)
-COOKIE_SAMESITE = "lax"
-COOKIE_PATH = "/"
-EXP_1H = 60 * 60
-EXP_30D = 30 * 24 * 60 * 60
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-router = APIRouter()
+class SaidaOut(BaseModel):
+    id_saida: int
+    timestamp: datetime
+    data: date
+    base: Optional[str] = None
+    entregador: Optional[str] = None
+    codigo: Optional[str] = None
+    servico: Optional[str] = None
+    status: Optional[str] = None
+    estacao: Optional[str] = None
 
-# ===== Schemas =====
-from pydantic import BaseModel, Field
-class LoginIn(BaseModel):
-    username: str = Field(..., description="email ou username")
-    password: str
-    remember: bool = False
+    # Pydantic v2: permite criar a partir de objetos ORM (SQLAlchemy)
+    model_config = ConfigDict(from_attributes=True)
 
-class UserPublic(BaseModel):
-    id: int
-    username: str | None = None
-    email: str | None = None
 
-class LoginOut(BaseModel):
-    ok: bool
-    user: UserPublic
+# ------------------------------------------------------------------------------
+# APP
+# ------------------------------------------------------------------------------
+app = FastAPI(title="API Saídas", version="0.2.0")
 
-class MeOut(BaseModel):
-    id: int
-    username: str | None = None
-    email: str | None = None
-    roles: List[str] = ["user"]
+# CORS (ajuste allow_origins em produção)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # ex.: ["https://seu-dominio.com"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ===== Helpers =====
-def create_access_token(*, sub: int | str, expires_in_seconds: int) -> str:
-    now = datetime.now(timezone.utc)
-    payload = {"sub": str(sub), "exp": now + timedelta(seconds=expires_in_seconds), "iat": now}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def set_auth_cookie(response: Response, token: str, max_age: int) -> None:
-    response.set_cookie(
-        key=COOKIE_NAME,
-        value=token,
-        max_age=max_age,
-        httponly=True,
-        secure=SECURE_COOKIES,
-        samesite=COOKIE_SAMESITE,
-        path=COOKIE_PATH,
-    )
-
-def clear_auth_cookie(response: Response) -> None:
-    response.set_cookie(
-        key=COOKIE_NAME, value="", max_age=0, expires=0,
-        httponly=True, secure=SECURE_COOKIES, samesite=COOKIE_SAMESITE, path=COOKIE_PATH
-    )
-
-def verify_password(plain: str, password_hash: str | None) -> bool:
-    return bool(password_hash) and pwd_context.verify(plain, password_hash)
-
-# ===== Dependência de segurança =====
-def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
-    token = request.cookies.get(COOKIE_NAME)
-    if not token:
-        raise HTTPException(status_code=401, detail="Não autenticado")
+# Sessão do banco (exposta para módulos de rota)
+def get_db() -> Session:
+    db = SessionLocal()
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        sub = payload.get("sub")
-        if not sub:
-            raise HTTPException(status_code=401, detail="Não autenticado")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Não autenticado")
+        yield db
+    finally:
+        db.close()
 
-    user = db.query(User).filter(User.id == int(sub)).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Não autenticado")
-    return user
 
-# ===== Endpoints =====
-@router.post("/api/auth/login", response_model=LoginOut)
-def login(payload: LoginIn, response: Response, db: Session = Depends(get_db)):
-    ident = payload.username.strip()
-    user = db.query(User).filter(or_(User.username == ident, User.email == ident)).first()
-    if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Credenciais inválidas")
+# ------------------------------------------------------------------------------
+# ROTAS EXTERNAS (cadastros)
+# ------------------------------------------------------------------------------
+# Importa os módulos de rota separados (devem existir no mesmo projeto)
+from users_routes import router as users_router  # noqa: E402
+from entregador_routes import router as entregadores_router  # noqa: E402
+from estacao_routes import router as estacoes_router  # noqa: E402
 
-    exp = EXP_30D if payload.remember else EXP_1H
-    token = create_access_token(sub=user.id, expires_in_seconds=exp)
-    set_auth_cookie(response, token, max_age=exp)
+# Registra com prefixo comum (ex.: /api/users, /api/entregadores, /api/estacoes)
+app.include_router(users_router, prefix=API_PREFIX)
+app.include_router(entregadores_router, prefix=API_PREFIX)
+app.include_router(estacoes_router, prefix=API_PREFIX)
 
-    return {"ok": True, "user": {"id": user.id, "username": user.username, "email": user.email}}
 
-@router.get("/api/auth/me", response_model=MeOut)
-def me(user: User = Depends(get_current_user)):
-    roles = ["user"]
-    return {"id": user.id, "username": user.username, "email": user.email, "roles": roles}
+# ------------------------------------------------------------------------------
+# Healthcheck
+# ------------------------------------------------------------------------------
+@app.get(f"{API_PREFIX}/health")
+def health():
+    return {"status": "ok"}
 
-@router.post("/api/auth/logout")
-def logout(response: Response):
-    clear_auth_cookie(response)
-    return {"ok": True}
+
+# ------------------------------------------------------------------------------
+# Endpoint: registrar saída
+# ------------------------------------------------------------------------------
+@app.post(
+    f"{API_PREFIX}/saidas/registrar",
+    response_model=SaidaOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def registrar_saida(payload: SaidaCreate, db: Session = Depends(get_db)):
+    obj = Saida(
+        base=payload.base,
+        entregador=payload.entregador,
+        estacao=payload.estacao,
+        codigo=payload.codigo,
+        servico=payload.servico or "padrao",
+        # status="saiu",
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+# ------------------------------------------------------------------------------
+# Observações de migração
+# ------------------------------------------------------------------------------
+# Em produção (PostgreSQL), não crie/altereschemas automaticamente.
+# Deixe a criação/alteração de tabelas para um sistema de migrações (ex.: Alembic).
+#
+# Em DEV/local (SQLite), se quiser criar as tabelas automaticamente, descomente:
+# Base.metadata.create_all(bind=engine)
+
+
+# ------------------------------------------------------------------------------
+# Execução local (opcional)
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
+        reload=os.getenv("RELOAD", "true").lower() == "true",
+    )
