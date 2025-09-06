@@ -74,7 +74,7 @@ from entregador_routes import router as entregadores_router  # noqa: E402
 from estacao_routes import router as estacoes_router  # noqa: E402
 from auth import router as auth_router, get_current_user  # noqa: E402
 
-app.include_router(users_routes_updated, prefix=API_PREFIX)
+app.include_router(users_router, prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(estacoes_router, prefix=API_PREFIX)
 app.include_router(auth_router, prefix=API_PREFIX)
