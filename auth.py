@@ -11,7 +11,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
-from main import get_db
+from db import get_db
 from users_routes import User
 
 # Configurações JWT
