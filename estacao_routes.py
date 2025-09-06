@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Column, Integer, Text
 from sqlalchemy.orm import Session
 
-from main import Base, get_db
+from db import Base, get_db  # <- agora vem daqui
 
 router = APIRouter(prefix="/estacoes", tags=["Estacoes"])
 
