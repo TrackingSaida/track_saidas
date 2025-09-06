@@ -20,7 +20,7 @@ logger = logging.getLogger("routes.users")
 
 class UserFields(BaseModel):
     email: str
-    password: str
+    password_hash: str
     username: str
     contato: str
     status: Optional[str] = "ativo"
