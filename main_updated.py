@@ -60,13 +60,29 @@ class SaidaOut(BaseModel):
 app = FastAPI(title="API Saídas", version="0.2.0")
 
 # CORS
+
+ALLOWED_ORIGINS = [
+    "https://track-saidas-html.onrender.com",
+    "http://localhost:5500", "http://127.0.0.1:5500",
+    "http://localhost:8000", "http://127.0.0.1:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,    # pode ser True aqui
+    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
 )
+
+
+#app.add_middleware(
+#    CORSMiddleware,
+#    allow_origins=["*"],
+#    allow_credentials=True,
+#    allow_methods=["*"],
+#    allow_headers=["*"],
+#)
 
 # Rotas externas
 from users_routes_updated import router as users_router  # noqa: E402
