@@ -9,7 +9,7 @@ from sqlalchemy import Column, Integer, Text, Numeric, Date
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from main import Base, get_db
+from db import Base, get_db  # <- agora vem daqui
 from auth import get_password_hash
 
 
