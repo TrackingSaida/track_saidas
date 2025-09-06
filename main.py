@@ -112,14 +112,16 @@ def get_db() -> Session:
 # ROTAS EXTERNAS (cadastros)
 # ------------------------------------------------------------------------------
 # Importa os módulos de rota separados (devem existir no mesmo projeto)
-from users_routes import router as users_router  # noqa: E402
+from users_routes_updated import router as users_router  # noqa: E402
 from entregador_routes import router as entregadores_router  # noqa: E402
 from estacao_routes import router as estacoes_router  # noqa: E402
+from auth import router as auth_router  # noqa: E402 - NOVA IMPORTAÇÃO
 
-# Registra com prefixo comum (ex.: /api/users, /api/entregadores, /api/estacoes)
+# Registra com prefixo comum (ex.: /api/users, /api/entregadores, /api/estacoes, /api/auth)
 app.include_router(users_router, prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(estacoes_router, prefix=API_PREFIX)
+app.include_router(auth_router, prefix=API_PREFIX)  # NOVA ROTA DE AUTENTICAÇÃO
 
 
 # ------------------------------------------------------------------------------
@@ -131,14 +133,24 @@ def health():
 
 
 # ------------------------------------------------------------------------------
-# Endpoint: registrar saída
+# Endpoint: registrar saída (AGORA PROTEGIDO)
 # ------------------------------------------------------------------------------
+from auth import get_current_user  # noqa: E402
+from users_routes_updated import User  # noqa: E402
+
 @app.post(
     f"{API_PREFIX}/saidas/registrar",
     response_model=SaidaOut,
     status_code=status.HTTP_201_CREATED,
 )
-def registrar_saida(payload: SaidaCreate, db: Session = Depends(get_db)):
+def registrar_saida(
+    payload: SaidaCreate, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # PROTEÇÃO JWT ADICIONADA
+):
+    """
+    Registra uma nova saída. Requer autenticação JWT.
+    """
     obj = Saida(
         base=payload.base,
         entregador=payload.entregador,
@@ -175,3 +187,4 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "8000")),
         reload=os.getenv("RELOAD", "true").lower() == "true",
     )
+
