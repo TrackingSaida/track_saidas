@@ -51,8 +51,11 @@ class UserResponse(BaseModel):
 def create_user(body: UserFields, db: Session = Depends(get_db)):
     # log de entrada (mas sem senha)
     try:
-        payload_log = body.model_dump(exclude_none=False, exclude={"password"})
-        payload_log["password"] = "***"
+        payload_log = body.model_dump(exclude_none=False, exclude={"password_hash"})
+        payload_log["password_hash"] = "***"
+
+        #payload_log = body.model_dump(exclude_none=False, exclude={"password"})
+        #payload_log["password"] = "***"
     except Exception:
         payload_log = "erro ao processar payload"
     logger.info("POST /users payload=%s", payload_log)
@@ -78,7 +81,8 @@ def create_user(body: UserFields, db: Session = Depends(get_db)):
             )
 
     # Obrigatórios
-    if not body.email or not body.password or not body.username or not body.contato:
+    if not body.email or not body.password_hash or not body.username or not body.contato:
+    #if not body.email or not body.password or not body.username or not body.contato:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email, senha, username e contato são obrigatórios",
@@ -97,7 +101,10 @@ def create_user(body: UserFields, db: Session = Depends(get_db)):
             )
 
     # Hash de senha
-    hashed_password = get_password_hash(body.password)
+    # Hash de senha (passo 3)
+    hashed_password = get_password_hash(body.password_hash)  # <-- use password_hash aqui
+
+    #hashed_password = get_password_hash(body.password)
 
     obj = User(
         email=body.email,
