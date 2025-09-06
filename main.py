@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from jose import jwt, JWTError
 from passlib.context import CryptContext
+from routes_auth import router as auth_router
+
 
 from main import get_db
 from users_routes import User  # usa seu modelo já existente
