@@ -7,29 +7,17 @@ from typing import Optional
 from fastapi import FastAPI, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import (
-    Column,
-    BigInteger,
-    Text,
-    Date,
-    DateTime,
-    func,
-)
+from sqlalchemy import Column, BigInteger, Text, Date, DateTime, func
 from sqlalchemy.orm import Session
 
-# ----------------------------------------------------------------------
-# IMPORTAÇÃO DO DB CENTRALIZADO
-# ----------------------------------------------------------------------
-from db import Base, get_db  # <- Base e get_db vêm daqui agora
+# DB centralizado
+from db import Base, get_db
+from models import User  # para o type hint do endpoint protegido
 
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
+# Config
 API_PREFIX = os.getenv("API_PREFIX", "/api")
 
-# ----------------------------------------------------------------------
-# MODELO: tabela saidas
-# ----------------------------------------------------------------------
+# Modelo: tabela saidas
 class Saida(Base):
     __tablename__ = "saidas"
 
@@ -45,9 +33,7 @@ class Saida(Base):
     estacao = Column(Text, nullable=True)
 
 
-# ----------------------------------------------------------------------
-# SCHEMAS
-# ----------------------------------------------------------------------
+# Schemas
 class SaidaCreate(BaseModel):
     base: str = Field(min_length=1)
     entregador: str = Field(min_length=1)
@@ -70,9 +56,7 @@ class SaidaOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# ----------------------------------------------------------------------
-# APP
-# ----------------------------------------------------------------------
+# App
 app = FastAPI(title="API Saídas", version="0.2.0")
 
 # CORS
@@ -84,14 +68,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ----------------------------------------------------------------------
-# ROTAS EXTERNAS
-# ----------------------------------------------------------------------
+# Rotas externas
 from users_routes_updated import router as users_router  # noqa: E402
 from entregador_routes import router as entregadores_router  # noqa: E402
 from estacao_routes import router as estacoes_router  # noqa: E402
-from auth import router as auth_router  # noqa: E402
+from auth import router as auth_router, get_current_user  # noqa: E402
 
 app.include_router(users_router, prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
@@ -99,27 +80,20 @@ app.include_router(estacoes_router, prefix=API_PREFIX)
 app.include_router(auth_router, prefix=API_PREFIX)
 
 
-# ----------------------------------------------------------------------
 # Healthcheck
-# ----------------------------------------------------------------------
 @app.get(f"{API_PREFIX}/health")
 def health():
     return {"status": "ok"}
 
 
-# ----------------------------------------------------------------------
 # Endpoint: registrar saída (protegido por JWT)
-# ----------------------------------------------------------------------
-from auth import get_current_user  # noqa: E402
-from users_routes_updated import User  # noqa: E402
-
 @app.post(
     f"{API_PREFIX}/saidas/registrar",
     response_model=SaidaOut,
     status_code=status.HTTP_201_CREATED,
 )
 def registrar_saida(
-    payload: SaidaCreate, 
+    payload: SaidaCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -139,14 +113,12 @@ def registrar_saida(
     return obj
 
 
-# ----------------------------------------------------------------------
 # Execução local (opcional)
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "main_updated:app",   # <- cuidado aqui: o nome do arquivo!
+        "main_updated:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         reload=os.getenv("RELOAD", "true").lower() == "true",
