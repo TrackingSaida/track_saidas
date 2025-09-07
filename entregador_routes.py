@@ -8,40 +8,28 @@ from sqlalchemy import Column, BigInteger, Text, Date, text, select
 from sqlalchemy.orm import Session
 
 from db import Base, get_db
-
-# 👉 Ajuste este import para onde estiver sua dependência real
-# que extrai o usuário a partir do cookie (mesma usada no /api/auth/me)
-from auth_routes import get_current_user  # <-- troque o caminho se necessário
+from auth import get_current_user          # ✅ usa a sua função pronta do auth.py
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
-
-# ===========================
-# Modelo SQLAlchemy (tabela real)
-# ===========================
+# ------------------ MODELO (tabela real) ------------------
 class Entregador(Base):
     __tablename__ = "entregador"
 
-    # Tabela (PGAdmin) tem: id_entregador (PK), nome, telefone, status (default 'ativo'),
-    # documento, data_cadastro (default CURRENT_DATE), base
     id_entregador = Column(BigInteger, primary_key=True, autoincrement=True)
     nome          = Column(Text, nullable=False)
     telefone      = Column(Text, nullable=True)
     status        = Column(Text, nullable=False, server_default=text("'ativo'::text"))
     documento     = Column(Text, nullable=True)
     data_cadastro = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
-    base          = Column(Text, nullable=True)  # no seu schema atual não está NOT NULL
+    base          = Column(Text, nullable=True)  # pode deixar NOT NULL no banco depois, se quiser
 
-
-# ===========================
-# Schemas Pydantic
-# ===========================
+# ------------------ SCHEMAS ------------------
 class EntregadorIn(BaseModel):
     nome: str
     telefone: Optional[str] = None
     documento: Optional[str] = None
-    # status é opcional — se não vier, banco aplica default 'ativo'
-    status: Optional[str] = None
+    status: Optional[str] = None  # se não vier, o banco aplica 'ativo'
 
 class EntregadorOut(BaseModel):
     id_entregador: int
@@ -49,14 +37,11 @@ class EntregadorOut(BaseModel):
     telefone: Optional[str] = None
     status: str
     documento: Optional[str] = None
-    data_cadastro: Optional[str] = None  # date ISO
+    data_cadastro: Optional[str] = None
     base: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
-
-# ===========================
-# Rotas
-# ===========================
+# ------------------ ROTAS ------------------
 @router.post("/", response_model=EntregadorOut, status_code=status.HTTP_201_CREATED)
 def create_entregador(
     body: EntregadorIn,
@@ -64,30 +49,24 @@ def create_entregador(
     current_user = Depends(get_current_user),
 ):
     """
-    Cria um entregador já vinculado à 'base' do usuário autenticado.
-    - 'status' e 'data_cadastro' ficam por conta dos defaults do banco.
+    Cria um entregador vinculado automaticamente à 'base' do usuário autenticado.
+    'status' e 'data_cadastro' podem ficar a cargo dos defaults do banco.
     """
-    # Obter a base do usuário (tabela users tem coluna 'base' conforme seu print)
     base_do_usuario = getattr(current_user, "base", None)
     if not base_do_usuario:
-        raise HTTPException(
-            status_code=400,
-            detail="Usuário logado não possui 'base' definida."
-        )
+        raise HTTPException(status_code=400, detail="Usuário logado não possui 'base' definida.")
 
     novo = Entregador(
         nome=body.nome,
         telefone=body.telefone,
         documento=body.documento,
         base=base_do_usuario,
-        # Se vier status, usa; senão deixa o banco aplicar o default 'ativo'
-        status=body.status if body.status else None,
+        status=body.status if body.status else None,  # None -> deixa o default 'ativo'
     )
     db.add(novo)
     db.commit()
     db.refresh(novo)
     return novo
-
 
 @router.get("/", response_model=List[EntregadorOut])
 def list_entregadores(
@@ -95,17 +74,18 @@ def list_entregadores(
     current_user = Depends(get_current_user),
 ):
     """
-    Lista entregadores apenas da mesma 'base' do usuário autenticado.
+    Lista somente os entregadores da mesma 'base' do usuário autenticado.
     """
     base_do_usuario = getattr(current_user, "base", None)
     if not base_do_usuario:
         raise HTTPException(status_code=400, detail="Usuário sem 'base' definida.")
 
     rows = db.execute(
-        select(Entregador).where(Entregador.base == base_do_usuario).order_by(Entregador.id_entregador.desc())
+        select(Entregador)
+        .where(Entregador.base == base_do_usuario)
+        .order_by(Entregador.id_entregador.desc())
     ).scalars().all()
     return rows
-
 
 @router.get("/{id_entregador}", response_model=EntregadorOut)
 def get_entregador(
@@ -114,7 +94,7 @@ def get_entregador(
     current_user = Depends(get_current_user),
 ):
     """
-    Busca um entregador por id, validando se pertence à mesma base do usuário.
+    Retorna um entregador por ID se pertencer à mesma base do usuário.
     """
     obj = db.get(Entregador, id_entregador)
     if not obj:
