@@ -177,15 +177,26 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
     token = create_access_token(data={"sub": user.email}, expires_delta=expires)
 
     # Set-Cookie: HTTP-Only
+
     response.set_cookie(
-        key=ACCESS_COOKIE_NAME,
+        key="access_token",
         value=token,
         httponly=True,
-        secure=COOKIE_SECURE,   # True em produção (HTTPS)
-        samesite="Lax",
+        secure=True,       # obrigatório com SameSite=None (e HTTPS)
+        samesite="None",   # necessário para cross-site
         max_age=max_age,
         path="/",
-    )
+)
+
+    #response.set_cookie(
+        #key=ACCESS_COOKIE_NAME,
+        #value=token,
+        #httponly=True,
+        #secure=COOKIE_SECURE,   # True em produção (HTTPS)
+        #samesite="Lax",
+        #max_age=max_age,
+        #path="/",
+    #)
     # Retorno opcional com dados do usuário
     return {
         "ok": True,
