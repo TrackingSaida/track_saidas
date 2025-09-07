@@ -18,3 +18,4 @@ class User(Base):
     valor = Column(Numeric(12, 2), nullable=True)
     mensalidade = Column(Date, nullable=True)
     creditos = Column(Numeric(12, 2), nullable=True, default=0.00)
+    base = Column(Text, nullable=True)   # 👈 ESSENCIAL PARA O /entregadores
