@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Column, BigInteger, Text, Date, text, select
 from sqlalchemy.orm import Session
+from datetime import date  # precisa importar
 
 from db import Base, get_db
 from auth import get_current_user          # ✅ usa a sua função pronta do auth.py
@@ -37,7 +38,7 @@ class EntregadorOut(BaseModel):
     telefone: Optional[str] = None
     status: str
     documento: Optional[str] = None
-    data_cadastro: Optional[str] = None
+    data_cadastro: Optional[date] = None
     base: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
