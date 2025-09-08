@@ -25,12 +25,12 @@ class Saida(Base):
     timestamp = Column(DateTime(timezone=False), server_default=func.now())
     data      = Column(Date, server_default=func.current_date())
 
-    base      = Column(Text, nullable=True)
-    username  = Column(Text, nullable=True)
-    entregador= Column(Text, nullable=True)
-    codigo    = Column(Text, nullable=True)
-    servico   = Column(Text, nullable=True)
-    status    = Column(Text, nullable=True)  # sempre "saiu" neste step
+    base       = Column(Text, nullable=True)
+    username   = Column(Text, nullable=True)
+    entregador = Column(Text, nullable=True)
+    codigo     = Column(Text, nullable=True)
+    servico    = Column(Text, nullable=True)
+    status     = Column(Text, nullable=True)  # sempre "saiu" neste step
 
 # =========================
 # SCHEMAS
@@ -45,7 +45,7 @@ class SaidaCreate(BaseModel):
     @property
     def lista_codigos(self) -> List[str]:
         if self.codigos and len(self.codigos) > 0:
-            return [c for c in self.codigos if c and c.strip()]
+            return [c.strip() for c in self.codigos if c and c.strip()]
         if self.codigo and self.codigo.strip():
             return [self.codigo.strip()]
         return []
@@ -74,6 +74,25 @@ class ResumoBatchOut(BaseModel):
     modo_cobranca: Literal[0, 1]
     saldo_restante: Optional[float] = None  # só informa quando cobranca==0
 
+
+# =========================
+# UTILS
+# =========================
+def _parse_date_any(value) -> Optional[date]:
+    """Tenta interpretar 'value' como date (aceita date, 'YYYY-MM-DD', 'DD/MM/YYYY')."""
+    if isinstance(value, date):
+        return value
+    if value in (None, ""):
+        return None
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    return None
+
+
 # =========================
 # ENDPOINT
 # =========================
@@ -86,9 +105,9 @@ def registrar_saida(
     """
     Step 2: registra 1..N códigos e aplica regras de cobrança.
     - cobranca==0: pré-pago por valor -> debita (valor * qtd) de 'creditos'
-    - cobranca==1: mensalidade -> apenas valida que hoje <= 'mensalidade'
+    - cobranca==1: mensalidade -> valida que hoje <= 'mensalidade'
     - NÃO grava valores na tabela 'saidas'
-    - Tudo atômico (transação)
+    - Retorna a linha única (compat step 1) ou um resumo quando batch
     """
     base_user = getattr(current_user, "base", None)
     username  = getattr(current_user, "username", None)
@@ -99,11 +118,11 @@ def registrar_saida(
     if not codigos:
         raise HTTPException(status_code=422, detail="Informe 'codigo' ou 'codigos'.")
 
-    # Normalizações de campos do usuário (vêm como text no banco)
-    raw_cobranca = getattr(current_user, "cobranca", None)
-    raw_valor = getattr(current_user, "valor", None)
-    raw_creditos = getattr(current_user, "creditos", None)
-    mensalidade = getattr(current_user, "mensalidade", None)
+    # Normalizações vindas do usuário
+    raw_cobranca   = getattr(current_user, "cobranca", None)
+    raw_valor      = getattr(current_user, "valor", None)
+    raw_creditos   = getattr(current_user, "creditos", None)
+    raw_mensalidade= getattr(current_user, "mensalidade", None)
 
     try:
         cobranca = int(str(raw_cobranca)) if raw_cobranca not in (None, "") else 0
@@ -120,27 +139,28 @@ def registrar_saida(
     except Exception:
         creditos = 0.0
 
+    mensalidade = _parse_date_any(raw_mensalidade)
+
     servico = (payload.servico or "padrao").strip()
     entregador = payload.entregador.strip()
-    qtd = len(codigos)
 
-    # ---------- TRANSAÇÃO ----------
-    with db.begin():
-        # 1) cobrança
+    rows: List[Saida] = []
+
+    try:
+        # --- COBRANÇA ---
         if cobranca == 0:
+            qtd = len(codigos)
             custo = round(valor * qtd, 2)
             if creditos < custo:
                 raise HTTPException(
                     status_code=409,
                     detail=f"Créditos insuficientes. Necessário {custo:.2f}, saldo {creditos:.2f}."
                 )
-            # debitar (UPDATE direto na instância atual)
-            # Como current_user é uma instância da ORM, pode atualizar e o flush gravará.
+            # Debita saldo
             current_user.creditos = round(creditos - custo, 2)
-            db.add(current_user)
+            db.add(current_user)  # marca como dirty
 
         elif cobranca == 1:
-            # mensalidade precisa estar válida
             hoje = date.today()
             if not mensalidade or hoje > mensalidade:
                 raise HTTPException(
@@ -148,39 +168,43 @@ def registrar_saida(
                     detail="Mensalidade vencida ou não configurada."
                 )
         else:
-            # fallback: trata como pré-pago sem débito (ou bloqueia)
             raise HTTPException(status_code=422, detail="Valor inválido em 'cobranca' (use 0 ou 1).")
 
-        # 2) inserts em 'saidas'
-        rows = []
+        # --- INSERTS EM 'saidas' ---
         for codigo in codigos:
-            codigo = codigo.strip()
-            if not codigo:
+            c = codigo.strip()
+            if not c:
                 continue
             row = Saida(
                 base=base_user,
                 username=username,
                 entregador=entregador,
-                codigo=codigo,
+                codigo=c,
                 servico=servico,
                 status="saiu",
             )
             db.add(row)
             rows.append(row)
 
-        # Força flush para obter IDs/timestamps (commit será feito ao sair do with)
+        # flush para garantir PKs/timestamps antes do commit (se precisarmos retornar a linha)
         db.flush()
+        db.commit()
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Erro ao registrar saída") from e
 
     # ---------- RESPOSTA ----------
     if len(rows) == 1:
-        # compat com step 1: retorna a linha única
         db.refresh(rows[0])
         return SaidaOut.model_validate(rows[0])
 
-    # batch: retorna resumo
     saldo_restante = None
     if cobranca == 0:
-        saldo_restante = float(current_user.creditos or 0.0)
+        saldo_restante = float(getattr(current_user, "creditos", 0.0) or 0.0)
 
     return ResumoBatchOut(
         base=base_user,
