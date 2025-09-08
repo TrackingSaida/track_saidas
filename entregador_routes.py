@@ -1,15 +1,15 @@
 # entregador_routes.py
 from __future__ import annotations
 from typing import Optional, List
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Column, BigInteger, Text, Date, text, select
+from sqlalchemy import Column, BigInteger, Text, Date, Boolean, text, select
 from sqlalchemy.orm import Session
-from datetime import date  # precisa importar
 
 from db import Base, get_db
-from auth import get_current_user          # ✅ usa a sua função pronta do auth.py
+from auth import get_current_user
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
@@ -20,23 +20,23 @@ class Entregador(Base):
     id_entregador = Column(BigInteger, primary_key=True, autoincrement=True)
     nome          = Column(Text, nullable=False)
     telefone      = Column(Text, nullable=True)
-    status        = Column(Text, nullable=False, server_default=text("'ativo'::text"))
+    ativo         = Column(Boolean, nullable=False, server_default=text("true"))  # 1=ativo, 0=inativo
     documento     = Column(Text, nullable=True)
     data_cadastro = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
-    base          = Column(Text, nullable=True)  # pode deixar NOT NULL no banco depois, se quiser
+    base          = Column(Text, nullable=True)  # pode tornar NOT NULL depois
 
 # ------------------ SCHEMAS ------------------
 class EntregadorIn(BaseModel):
     nome: str
     telefone: Optional[str] = None
     documento: Optional[str] = None
-    status: Optional[str] = None  # se não vier, o banco aplica 'ativo'
+    # não esperamos 'ativo' no POST
 
 class EntregadorOut(BaseModel):
     id_entregador: int
     nome: str
     telefone: Optional[str] = None
-    status: str
+    ativo: bool
     documento: Optional[str] = None
     data_cadastro: Optional[date] = None
     base: Optional[str] = None
@@ -51,7 +51,7 @@ def create_entregador(
 ):
     """
     Cria um entregador vinculado automaticamente à 'base' do usuário autenticado.
-    'status' e 'data_cadastro' podem ficar a cargo dos defaults do banco.
+    'ativo' é sempre True (1) no momento do cadastro.
     """
     base_do_usuario = getattr(current_user, "base", None)
     if not base_do_usuario:
@@ -62,7 +62,7 @@ def create_entregador(
         telefone=body.telefone,
         documento=body.documento,
         base=base_do_usuario,
-        status=body.status if body.status else None,  # None -> deixa o default 'ativo'
+        ativo=True,  # 👈 sempre ativo no cadastro
     )
     db.add(novo)
     db.commit()
