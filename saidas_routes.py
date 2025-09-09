@@ -6,39 +6,14 @@ from datetime import datetime, date
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import Column, BigInteger, Text, Date, DateTime, Numeric, func
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from db import Base, get_db
-from models import User                   # já existente
-from auth import get_current_user         # já existente
+from db import get_db
+from auth import get_current_user
+from models import User, Owner, Saida
 
 router = APIRouter(prefix="/saidas", tags=["Saídas"])
-
-# ---------- MODELOS ORM ----------
-class Owner(Base):
-    __tablename__ = "owner"
-    id_owner    = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
-    email       = Column(Text, nullable=True)
-    username    = Column(Text, nullable=True)
-    cobranca    = Column(Text, nullable=True)           # '0' ou '1'
-    valor       = Column(Numeric(12, 2), nullable=True)
-    mensalidade = Column(Date, nullable=True)
-    creditos    = Column(Numeric(12, 2), nullable=True) # saldo pré-pago
-    base        = Column(Text, nullable=True)
-    contato     = Column(Text, nullable=True)
-
-class Saida(Base):
-    __tablename__ = "saidas"
-    id_saida  = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
-    timestamp = Column(DateTime(timezone=False), server_default=func.now())
-    data      = Column(Date, server_default=func.current_date())
-    base      = Column(Text, nullable=True)
-    username  = Column(Text, nullable=True)
-    entregador= Column(Text, nullable=True)
-    codigo    = Column(Text, nullable=True)
-    servico   = Column(Text, nullable=True)
-    status    = Column(Text, nullable=True)
 
 # ---------- SCHEMAS ----------
 class SaidaCreate(BaseModel):
@@ -49,11 +24,20 @@ class SaidaCreate(BaseModel):
 
     @property
     def lista_codigos(self) -> List[str]:
+        # prioriza lista; senão, usa 'codigo' único
+        raw = []
         if self.codigos:
-            return [c.strip() for c in self.codigos if c and c.strip()]
-        if self.codigo and self.codigo.strip():
-            return [self.codigo.strip()]
-        return []
+            raw.extend(self.codigos)
+        if self.codigo:
+            raw.append(self.codigo)
+        # trim, remove vazios e duplica removendo order-preserving
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in (s.strip() for s in raw if s and isinstance(s, str)):
+            if c and c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
 
 class SaidaOut(BaseModel):
     id_saida: int
@@ -77,6 +61,43 @@ class ResumoBatchOut(BaseModel):
     modo_cobranca: Literal[0, 1]
     saldo_restante: Optional[float] = None
 
+# ---------- HELPERS ----------
+def _resolve_user_base(db: Session, current_user: User) -> str:
+    base_user = getattr(current_user, "base", None)
+    if base_user:
+        return base_user
+
+    # fallback por email/username
+    email = getattr(current_user, "email", None)
+    username = getattr(current_user, "username", None)
+
+    if email:
+        u = db.scalars(select(User).where(User.email == email)).first()
+        if u and u.base:
+            return u.base
+    if username:
+        u = db.scalars(select(User).where(User.username == username)).first()
+        if u and u.base:
+            return u.base
+
+    raise HTTPException(status_code=401, detail="Usuário sem 'base' definida.")
+
+def _get_owner_for_base_or_user(db: Session, base_user: str, email: str | None, username: str | None) -> Owner:
+    # prioriza base
+    owner = db.scalars(select(Owner).where(Owner.base == base_user)).first()
+    if owner:
+        return owner
+    # fallback por email/username
+    if email:
+        owner = db.scalars(select(Owner).where(Owner.email == email)).first()
+        if owner:
+            return owner
+    if username:
+        owner = db.scalars(select(Owner).where(Owner.username == username)).first()
+        if owner:
+            return owner
+    raise HTTPException(status_code=404, detail="Owner não encontrado para esta base/usuário.")
+
 # ---------- ENDPOINT ----------
 @router.post("/registrar", status_code=status.HTTP_201_CREATED)
 def registrar_saida(
@@ -84,66 +105,44 @@ def registrar_saida(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # 1) do token
     username = getattr(current_user, "username", None)
-    email    = getattr(current_user, "email", None)
+    email = getattr(current_user, "email", None)
+    if not username:
+        raise HTTPException(status_code=401, detail="Usuário sem 'username'.")
 
-    # 2) base via users
-    base_user = getattr(current_user, "base", None)
-    if not base_user:
-        # se o modelo User não carrega base via token, faça uma query por id/email e pegue a base
-        u = db.query(User).filter(
-            (User.email == email) | (User.username == username)
-        ).first()
-        base_user = getattr(u, "base", None) if u else None
+    base_user = _resolve_user_base(db, current_user)
+    owner = _get_owner_for_base_or_user(db, base_user, email, username)
 
-    if not base_user or not username:
-        raise HTTPException(status_code=401, detail="Usuário sem 'base' ou 'username'.")
-
-    # 3) parâmetros em owner (prioriza base; fallback por email/username)
-    conta = (
-        db.query(Owner)
-          .filter(Owner.base == base_user)
-          .first()
-    )
-    if not conta:
-        conta = (
-            db.query(Owner)
-              .filter( (Owner.email == email) | (Owner.username == username) )
-              .first()
-        )
-    if not conta:
-        raise HTTPException(status_code=404, detail="Owner não encontrado para esta base/usuário.")
-
-    # normalizações
+    # Normalizações de cobrança
     try:
-        cobranca = int(str(conta.cobranca or "0"))
+        cobranca = int(str(owner.cobranca or "0"))
     except Exception:
         cobranca = 0
 
-    valor       = float(conta.valor or 0)
-    creditos    = float(conta.creditos or 0)
-    mensalidade = conta.mensalidade
+    valor_un = float(owner.valor or 0.0)          # valor unitário na cobrança 0
+    creditos = float(owner.creditos or 0.0)       # saldo pré-pago
+    mensalidade = owner.mensalidade               # date
 
-    codigos    = payload.lista_codigos
+    codigos = payload.lista_codigos
     if not codigos:
         raise HTTPException(status_code=422, detail="Informe 'codigo' ou 'codigos'.")
-    entregador = payload.entregador.strip()
-    servico    = (payload.servico or "padrao").strip()
-    qtd        = len(codigos)
 
-    # 4–5) cobrança + inserts (uma commit no final; sem nested transactions)
-    rows: List[Saida] = []
+    entregador = payload.entregador.strip()
+    servico = (payload.servico or "padrao").strip()
+    qtd = len(codigos)
+
+    rows: list[Saida] = []
     try:
-        # cobrança em OWNER
+        # 1) Cobrança
         if cobranca == 0:
-            custo = round(valor * qtd, 2)
+            custo = round(valor_un * qtd, 2)
             if creditos < custo:
-                raise HTTPException(status_code=409,
-                    detail=f"Créditos insuficientes. Necessário {custo:.2f}, saldo {creditos:.2f}.")
-            # debita
-            conta.creditos = round(creditos - custo, 2)
-            db.add(conta)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Créditos insuficientes. Necessário {custo:.2f}, saldo {creditos:.2f}."
+                )
+            owner.creditos = round(creditos - custo, 2)
+            db.add(owner)
 
         elif cobranca == 1:
             if not mensalidade or date.today() > mensalidade:
@@ -151,17 +150,15 @@ def registrar_saida(
         else:
             raise HTTPException(status_code=422, detail="Valor inválido em 'cobranca' (use 0 ou 1).")
 
-        # inserts em SAIDAS
+        # 2) Inserts em SAIDAS (uma transação)
         for codigo in codigos:
-            if not codigo:
-                continue
             row = Saida(
                 base=base_user,
                 username=username,
                 entregador=entregador,
                 codigo=codigo,
                 servico=servico,
-                status="saiu",
+                status="saiu",  # redundante ao default do DB, mas explícito
             )
             db.add(row)
             rows.append(row)
@@ -175,12 +172,12 @@ def registrar_saida(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erro ao registrar saídas: {e}")
 
-    # 6) resposta
+    # Resposta
     if len(rows) == 1:
         db.refresh(rows[0])
         return SaidaOut.model_validate(rows[0])
 
-    saldo_restante = float(conta.creditos or 0.0) if cobranca == 0 else None
+    saldo_restante = float(owner.creditos or 0.0) if cobranca == 0 else None
     return ResumoBatchOut(
         base=base_user,
         username=username,
