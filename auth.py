@@ -6,10 +6,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from db import get_db
 from models import User
@@ -17,29 +18,33 @@ from models import User
 # ======================
 # Configurações JWT
 # ======================
-SECRET_KEY = os.getenv("SECRET_KEY", "sua-chave-secreta-super-segura-aqui-mude-em-producao")
+SECRET_KEY = os.getenv("SECRET_KEY", "troque-esta-chave-em-producao")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-REMEMBER_ME_EXPIRE_DAYS = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+REMEMBER_ME_EXPIRE_DAYS = int(os.getenv("REMEMBER_ME_EXPIRE_DAYS", "30"))
 
-# Nome do cookie
-ACCESS_COOKIE_NAME = "access_token"
-
-# Em produção (HTTPS), deixe como True
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+# Cookies
+ACCESS_COOKIE_NAME = os.getenv("ACCESS_COOKIE_NAME", "access_token")
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")  # ex.: ".seu-dominio.com" (opcional)
 
 # ======================
 # Hash de senhas
 # ======================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
 # ======================
 # Autenticação Bearer
 # ======================
-security = HTTPBearer(auto_error=False)  # <- NÃO lançar erro automático: vamos tentar cookie antes
+security = HTTPBearer(auto_error=False)  # tenta cookie antes
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
-
 
 # ======================
 # Schemas
@@ -48,34 +53,19 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-
 class TokenData(BaseModel):
-    email: Optional[str] = None
-
+    email: Optional[EmailStr] = None
 
 class UserLogin(BaseModel):
-    email: str
+    email: EmailStr
     password: str
     remember: bool = False
 
-
 class UserResponse(BaseModel):
     id: int
-    email: str
+    email: EmailStr
     username: Optional[str] = None
     contato: Optional[str] = None
-
-
-# ======================
-# Utilitários de senha
-# ======================
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
-
 
 # ======================
 # Utilitários JWT
@@ -86,13 +76,11 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-
 # ======================
 # Acesso a usuário
 # ======================
 def get_user_by_email(db: Session, email: str) -> Optional[User]:
-    return db.query(User).filter(User.email == email).first()
-
+    return db.scalars(select(User).where(User.email == email)).first()
 
 def authenticate_user(db: Session, email: str, password: str) -> Optional[User]:
     user = get_user_by_email(db, email)
@@ -102,7 +90,6 @@ def authenticate_user(db: Session, email: str, password: str) -> Optional[User]:
         return None
     return user
 
-
 # ======================
 # Resolver usuário (Cookie OU Bearer)
 # ======================
@@ -111,12 +98,9 @@ async def get_current_user(
     db: Session = Depends(get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> User:
-    token: Optional[str] = None
+    token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
 
-    # 1) Prioriza COOKIE
-    token = request.cookies.get(ACCESS_COOKIE_NAME)
-
-    # 2) Se não tiver cookie, tenta Bearer
+    # Se não tiver cookie, tenta Bearer
     if not token and credentials and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
 
@@ -129,8 +113,8 @@ async def get_current_user(
 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
+        email: str = payload.get("sub")  # subject = email
+        if not email:
             raise HTTPException(status_code=401, detail="Token inválido")
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
@@ -140,12 +124,10 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
     return user
 
-
 # ======================
 # Rotas
 # ======================
 
-# Login via BEARER (já existia) - útil para clientes programáticos
 @router.post("/token", response_model=Token)
 async def login_for_access_token(user_credentials: UserLogin, db: Session = Depends(get_db)):
     user = authenticate_user(db, user_credentials.email, user_credentials.password)
@@ -159,8 +141,6 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
     access_token = create_access_token(data={"sub": user.email}, expires_delta=expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
-
-# Login que SETA COOKIE (para navegação do browser)
 @router.post("/login")
 async def login_set_cookie(user_credentials: UserLogin, response: Response, db: Session = Depends(get_db)):
     user = authenticate_user(db, user_credentials.email, user_credentials.password)
@@ -169,49 +149,40 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
 
     if user_credentials.remember:
         expires = timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
-        max_age = int(expires.total_seconds())
     else:
         expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        max_age = int(expires.total_seconds())
 
     token = create_access_token(data={"sub": user.email}, expires_delta=expires)
 
-    # Set-Cookie: HTTP-Only
+    # SameSite/Lax vs None conforme ambiente
+    samesite = "None" if COOKIE_SECURE else "Lax"
 
     response.set_cookie(
-        key="access_token",
+        key=ACCESS_COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=True,       # obrigatório com SameSite=None (e HTTPS)
-        samesite="None",   # necessário para cross-site
-        max_age=max_age,
+        secure=COOKIE_SECURE,  # True em produção (HTTPS)
+        samesite=samesite,
+        max_age=int(expires.total_seconds()),
         path="/",
-)
+        domain=COOKIE_DOMAIN,  # None por padrão; configure se precisar subdomínios
+    )
 
-    #response.set_cookie(
-        #key=ACCESS_COOKIE_NAME,
-        #value=token,
-        #httponly=True,
-        #secure=COOKIE_SECURE,   # True em produção (HTTPS)
-        #samesite="Lax",
-        #max_age=max_age,
-        #path="/",
-    #)
-    # Retorno opcional com dados do usuário
     return {
         "ok": True,
         "user": {"id": user.id, "email": user.email, "username": user.username, "contato": user.contato},
     }
 
-
-# Logout: apaga o cookie
 @router.post("/logout")
 async def logout(response: Response):
-    response.delete_cookie(key=ACCESS_COOKIE_NAME, path="/")
+    # usa mesmos parâmetros (path/domain) para garantir remoção
+    response.delete_cookie(
+        key=ACCESS_COOKIE_NAME,
+        path="/",
+        domain=COOKIE_DOMAIN,
+    )
     return {"ok": True}
 
-
-# Quem sou eu (funciona com cookie OU bearer)
 @router.get("/me", response_model=UserResponse)
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return UserResponse(
