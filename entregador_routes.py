@@ -1,3 +1,4 @@
+# entregador_routes.py
 from __future__ import annotations
 from typing import Optional, List
 
@@ -7,29 +8,17 @@ from sqlalchemy import Column, BigInteger, Text, Boolean, Date, select
 from sqlalchemy.orm import Session
 
 from db import Base, get_db
-from auth import get_current_user  # deve ler o cookie e retornar objeto com id/email/username
+from auth import get_current_user          # lê o cookie e retorna objeto com id/email/username
+from models import User                    # <<< IMPORTA o User já existente (NÃO redeclara!)
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
 # =========================
-# MODELOS (SQLAlchemy)
+# MODELO (SQLAlchemy)
 # =========================
-
-class User(Base):
-    """
-    Mapeamento mínimo da tabela users só para consulta da coluna base.
-    """
-    __tablename__ = "users"
-
-    id       = Column(BigInteger, primary_key=True)
-    email    = Column(Text, nullable=True, unique=True)
-    username = Column(Text, nullable=True, unique=True)
-    base     = Column(Text, nullable=True)
-
-
 class Entregador(Base):
     """
-    Estrutura alinhada ao banco:
+    Estrutura alinhada ao banco (conforme suas telas):
       - id_entregador: PK BIGINT
       - ativo: boolean
       - data_cadastro: date
@@ -50,13 +39,11 @@ class Entregador(Base):
 # =========================
 # SCHEMAS (Pydantic)
 # =========================
-
 class EntregadorCreate(BaseModel):
     nome: Optional[str] = None
     telefone: Optional[str] = None
     documento: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
-
 
 class EntregadorOut(BaseModel):
     # Campos exibidos na tabela da página HTML
@@ -70,25 +57,27 @@ class EntregadorOut(BaseModel):
 # =========================
 # HELPERS
 # =========================
-
 def _resolve_user_base(db: Session, current_user) -> str:
     """
-    Passo (2): buscar na tabela `users` a base do usuário.
-    Tenta primeiro por id, depois por email/username.
+    (2) Busca na tabela `users` a base do usuário.
+    Tenta por id (sub), depois por email/username.
     """
-    if getattr(current_user, "id", None) is not None:
-        row = db.get(User, int(current_user.id))
+    # 1) por ID
+    user_id = getattr(current_user, "id", None)
+    if user_id is not None:
+        row = db.get(User, user_id)
         if row and row.base:
             return row.base
 
+    # 2) por email
     email = getattr(current_user, "email", None)
-    uname = getattr(current_user, "username", None)
-
     if email:
         u = db.query(User).filter(User.email == email).first()
         if u and u.base:
             return u.base
 
+    # 3) por username
+    uname = getattr(current_user, "username", None)
     if uname:
         u = db.query(User).filter(User.username == uname).first()
         if u and u.base:
@@ -100,7 +89,6 @@ def _resolve_user_base(db: Session, current_user) -> str:
 # =========================
 # ROTAS
 # =========================
-
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_entregador(
     body: EntregadorCreate,
@@ -143,7 +131,7 @@ def list_entregadores(
         stmt = stmt.where(Entregador.ativo.is_(True))
     elif status == "inativo":
         stmt = stmt.where(Entregador.ativo.is_(False))
-    # se "todos" ou omitido → sem filtro
+    # "todos" (ou qualquer outro) => sem filtro adicional
 
     stmt = stmt.order_by(Entregador.nome)
     rows = db.execute(stmt).scalars().all()
