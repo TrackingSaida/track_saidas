@@ -10,18 +10,18 @@ from db import Base, get_db  # <- agora vem daqui
 
 router = APIRouter(prefix="/estacoes", tags=["Estacoes"])
 
-class Estacao(Base):
-    __tablename__ = "estacao"
+class owner(Base):
+    __tablename__ = "owner"
     id      = Column(Integer, primary_key=True)  # ID gerado pelo banco
-    estacao = Column(Text, nullable=True)
+    owner = Column(Text, nullable=True)
 
-class EstacaoFields(BaseModel):
-    estacao: Optional[str] = None
+class ownerFields(BaseModel):
+    owner: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-def create_estacao(body: EstacaoFields, db: Session = Depends(get_db)):
-    obj = Estacao(estacao=body.estacao)
+def create_owner(body: ownerFields, db: Session = Depends(get_db)):
+    obj = owner(owner=body.owner)
     db.add(obj)
     db.commit()
     db.refresh(obj)
