@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from db import Base, get_db  # <- agora vem daqui
 
-router = APIRouter(prefix="/estacoes", tags=["Estacoes"])
+router = APIRouter(prefix="/owner", tags=["owner"])
 
 class owner(Base):
     __tablename__ = "owner"
