@@ -5,7 +5,7 @@ from __future__ import annotations
 #
 # • users:       senha, valor (R$), mensalidade, creditos
 # • entregador:  nome, telefone
-# • estacao:     estacao
+# • owner:     owner
 #
 # A API faz "upsert por ID": se o registro existir, atualiza;
 # se não existir, cria um novo com o ID informado e só os campos permitidos.
@@ -56,12 +56,12 @@ class Entregador(Base):
     telefone   = Column(Text, nullable=True)           # << vermelho
 
 
-class Estacao(Base):
-    __tablename__ = "estacao"
+class owner(Base):
+    __tablename__ = "owner"
 
     id         = Column(Integer, primary_key=True, autoincrement=False)  # aceitar ID informado
     email_base = Column(Text, nullable=True)
-    estacao    = Column(Text, nullable=True)           # << vermelho (se quiser como int, mude para Integer)
+    owner    = Column(Text, nullable=True)           # << vermelho (se quiser como int, mude para Integer)
 
 
 # ======================================================================
@@ -88,8 +88,8 @@ class EntregadorFields(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class EstacaoFields(BaseModel):
-    estacao: Optional[str] = None                   # se quiser número, troque para Optional[int]
+class ownerFields(BaseModel):
+    owner: Optional[str] = None                   # se quiser número, troque para Optional[int]
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -174,16 +174,16 @@ def upsert_entregador(id: int, body: EntregadorFields, db: Session = Depends(get
 
 
 @router.post("/estacoes/{id}", status_code=status.HTTP_200_OK)
-def upsert_estacao(id: int, body: EstacaoFields, db: Session = Depends(get_db)):
-    obj = db.get(Estacao, id)
+def upsert_owner(id: int, body: ownerFields, db: Session = Depends(get_db)):
+    obj = db.get(owner, id)
     created = False
     if obj is None:
-        obj = Estacao(id=id)
+        obj = owner(id=id)
         db.add(obj)
         created = True
 
-    if body.estacao is not None:
-        obj.estacao = str(body.estacao)  # guarda como texto; mude para int se a coluna for Integer
+    if body.owner is not None:
+        obj.owner = str(body.owner)  # guarda como texto; mude para int se a coluna for Integer
 
     db.commit()
     db.refresh(obj)
