@@ -25,7 +25,7 @@ app.add_middleware(
 # Rotas externas (como já estavam)
 from users_routes_updated import router as users_router          # noqa: E402
 from entregador_routes import router as entregadores_router      # noqa: E402
-from estacao_routes import router as estacoes_router             # noqa: E402
+from owner_routes import router as estacoes_router             # noqa: E402
 from auth import router as auth_router                           # noqa: E402
 
 # NOVO: rota de saídas separada
