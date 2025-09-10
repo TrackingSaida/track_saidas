@@ -49,8 +49,8 @@ class UserOut(BaseModel):
 def create_user(body: UserCreate, db: Session = Depends(get_db)):
     # Log seguro (sem senha)
     try:
-        payload_log = body.model_dump(exclude={"password"})
-        payload_log["password"] = "***"
+        payload_log = body.model_dump(exclude={"password_hash"})
+        payload_log["password_hash"] = "***"
     except Exception:
         payload_log = "erro ao processar payload"
     logger.info("POST /users payload=%s", payload_log)
@@ -76,7 +76,7 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
             )
 
     # Campos obrigatórios (já validados por Pydantic, mas deixo a mensagem clara)
-    if not (body.email and body.password and body.username and body.contato):
+    if not (body.email and body.password_hash and body.username and body.contato):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email, senha, username e contato são obrigatórios",
@@ -84,7 +84,7 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
 
     # Gera hash e persiste
     try:
-        hashed_password = get_password_hash(body.password)
+        hashed_password = get_password_hash(body.password_hash)
 
         obj = User(
             email=body.email,
