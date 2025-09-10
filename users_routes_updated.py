@@ -23,7 +23,7 @@ logger = logging.getLogger("routes.users")
 # =========================
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=4)          # senha em claro; será hasheada
+    password_hash: str = Field(min_length=4)          # senha em claro; será hasheada
     username: str = Field(min_length=3)
     contato: str
     status: Optional[str] = "ativo"
