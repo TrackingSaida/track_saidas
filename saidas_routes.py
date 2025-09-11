@@ -125,6 +125,16 @@ def registrar_saida(
     entregador = payload.entregador.strip()
     servico = _classificar_servico(codigo)
 
+    # 🔎 Checa duplicidade antes de prosseguir
+    existente = db.scalars(
+        select(Saida).where(Saida.base == base_user, Saida.codigo == codigo)
+    ).first()
+    if existente:
+        raise HTTPException(
+            status_code=409,
+            detail=f"O código '{codigo}' já foi registrado anteriormente."
+        )
+
     try:
         # 1) Cobrança
         if cobranca == 0:  # pré-pago
