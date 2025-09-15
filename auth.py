@@ -10,7 +10,7 @@ from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from db import get_db
 from models import User
@@ -57,7 +57,8 @@ class TokenData(BaseModel):
     email: Optional[EmailStr] = None
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    # aceita email, username OU contato no MESMO campo
+    email: str
     password: str
     remember: bool = False
 
@@ -82,8 +83,24 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 def get_user_by_email(db: Session, email: str) -> Optional[User]:
     return db.scalars(select(User).where(User.email == email)).first()
 
-def authenticate_user(db: Session, email: str, password: str) -> Optional[User]:
-    user = get_user_by_email(db, email)
+def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
+    """
+    Busca por email, username OU contato (qualquer um que bater primeiro).
+    """
+    identifier = (identifier or "").strip()
+    if not identifier:
+        return None
+    stmt = select(User).where(
+        or_(
+            User.email == identifier,
+            User.username == identifier,
+            User.contato == identifier,
+        )
+    )
+    return db.scalars(stmt).first()
+
+def authenticate_user(db: Session, identifier: str, password: str) -> Optional[User]:
+    user = get_user_by_identifier(db, identifier)
     if not user:
         return None
     if not verify_password(password, user.password_hash):
@@ -134,10 +151,11 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Email ou senha incorretos",
+            detail="Login ou senha incorretos",
             headers={"WWW-Authenticate": "Bearer"},
         )
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # O 'sub' continua sendo o email real do usuário
     access_token = create_access_token(data={"sub": user.email}, expires_delta=expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -145,7 +163,7 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
 async def login_set_cookie(user_credentials: UserLogin, response: Response, db: Session = Depends(get_db)):
     user = authenticate_user(db, user_credentials.email, user_credentials.password)
     if not user:
-        raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+        raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
     if user_credentials.remember:
         expires = timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
