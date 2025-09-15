@@ -24,7 +24,7 @@ class SaidaOut(BaseModel):
     id_saida: int
     timestamp: datetime
     data: date
-    base: Optional[str]
+    sub_base: Optional[str]
     username: Optional[str]
     entregador: Optional[str]
     codigo: Optional[str]
@@ -115,9 +115,9 @@ def registrar_saida(
     if not username:
         raise HTTPException(status_code=401, detail="Usuário sem 'username'.")
 
-    # Base e owner (usados apenas para fins de cobrança)
-    base_user = _resolve_user_base(db, current_user)
-    owner = _get_owner_for_base_or_user(db, base_user, email, username)
+    # sub_base e owner (usados apenas para fins de cobrança)
+    sub_base_user = _resolve_user_base(db, current_user)
+    owner = _get_owner_for_base_or_user(db, sub_base_user, email, username)
 
     # Regras de cobrança
     try:
@@ -134,9 +134,9 @@ def registrar_saida(
     entregador = payload.entregador.strip()
     servico = _classificar_servico(codigo)
 
-    # 🔎 Checa duplicidade antes de prosseguir
+    # 🔎 Checa duplicidade antes de prosseguir (por sub_base + código)
     existente = db.scalars(
-        select(Saida).where(Saida.base == base_user, Saida.codigo == codigo)
+        select(Saida).where(Saida.sub_base == sub_base_user, Saida.codigo == codigo)
     ).first()
     if existente:
         raise HTTPException(
@@ -164,7 +164,7 @@ def registrar_saida(
 
         # 2) Insert único
         row = Saida(
-            base=base_user,
+            sub_base=sub_base_user,   # <<< grava sub_base
             username=username,
             entregador=entregador,
             codigo=codigo,
