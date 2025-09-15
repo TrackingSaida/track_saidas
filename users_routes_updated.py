@@ -26,8 +26,12 @@ class UserCreate(BaseModel):
     password_hash: str = Field(min_length=4)          # senha em claro; será hasheada
     username: str = Field(min_length=3)
     contato: str
-    status: Optional[str] = "ativo"
-    base: Optional[str] = None                   # opcional, caso já saiba a base
+
+    # Novos campos
+    nome: Optional[str] = None
+    sobrenome: Optional[str] = None
+    status: Optional[bool] = True
+    sub_base: Optional[str] = None                    # substitui "base"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -37,8 +41,14 @@ class UserOut(BaseModel):
     email: EmailStr
     username: str
     contato: str
-    status: Optional[str] = None
-    base: Optional[str] = None
+
+    # Atualizados
+    status: Optional[bool] = None
+    sub_base: Optional[str] = None
+
+    # Novos no output também (úteis no GET)
+    nome: Optional[str] = None
+    sobrenome: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -91,8 +101,11 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
             password_hash=hashed_password,
             username=body.username,
             contato=body.contato,
-            status=body.status or "ativo",
-            base=body.base,
+            # novos campos
+            nome=body.nome,
+            sobrenome=body.sobrenome,
+            status=True if body.status is None else body.status,
+            sub_base=body.sub_base,
         )
         db.add(obj)
         db.commit()
