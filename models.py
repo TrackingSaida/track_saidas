@@ -118,7 +118,8 @@ class Entregador(Base):
     ativo = Column(Boolean, nullable=False, server_default=text("false"))
     documento = Column(Text, nullable=True)
     data_cadastro = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
-    base = Column(Text, nullable=True)
+    sub_base = Column(Text, nullable=True)
+
 
     def __repr__(self) -> str:
         return f"<Entregador id_entregador={self.id_entregador} nome={self.nome!r}>"
