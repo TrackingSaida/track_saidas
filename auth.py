@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, AliasChoices, ConfigDict
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
@@ -57,10 +57,17 @@ class TokenData(BaseModel):
     email: Optional[EmailStr] = None
 
 class UserLogin(BaseModel):
-    # aceita email, username OU contato no MESMO campo
-    email: str
+    # aceita "email" OU "username" OU "contato" no mesmo campo
+    identifier: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("email", "username", "contato"),
+        serialization_alias="email",  # Swagger exibirá como "email"
+        description="Aceita email, username ou contato",
+    )
     password: str
     remember: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
 
 class UserResponse(BaseModel):
     id: int
@@ -85,7 +92,7 @@ def get_user_by_email(db: Session, email: str) -> Optional[User]:
 
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
     """
-    Busca por email, username OU contato (qualquer um que bater primeiro).
+    Busca por email, username OU contato (primeiro que bater).
     """
     identifier = (identifier or "").strip()
     if not identifier:
@@ -147,7 +154,7 @@ async def get_current_user(
 
 @router.post("/token", response_model=Token)
 async def login_for_access_token(user_credentials: UserLogin, db: Session = Depends(get_db)):
-    user = authenticate_user(db, user_credentials.email, user_credentials.password)
+    user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -155,13 +162,12 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
             headers={"WWW-Authenticate": "Bearer"},
         )
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    # O 'sub' continua sendo o email real do usuário
     access_token = create_access_token(data={"sub": user.email}, expires_delta=expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.post("/login")
 async def login_set_cookie(user_credentials: UserLogin, response: Response, db: Session = Depends(get_db)):
-    user = authenticate_user(db, user_credentials.email, user_credentials.password)
+    user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
@@ -193,7 +199,6 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
 
 @router.post("/logout")
 async def logout(response: Response):
-    # usa mesmos parâmetros (path/domain) para garantir remoção
     response.delete_cookie(
         key=ACCESS_COOKIE_NAME,
         path="/",
