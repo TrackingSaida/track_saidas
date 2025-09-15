@@ -55,7 +55,7 @@ class Owner(Base):
     valor = Column(Numeric(12, 2), nullable=True)
     mensalidade = Column(Date, nullable=True)
     creditos = Column(Numeric(12, 2), nullable=True, server_default=text("0.00"))
-    base = Column(Text, nullable=True)
+    sub_base = Column(Text, nullable=True)
     contato = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
@@ -95,7 +95,7 @@ class Saida(Base):
     id_saida = Column(BigInteger, primary_key=True)
     timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
     data = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
-    base = Column(Text, nullable=True)
+    sub_base = Column(Text, nullable=True)
     username = Column(Text, nullable=True)
     entregador = Column(Text, nullable=True)
     codigo = Column(Text, nullable=True)
