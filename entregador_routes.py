@@ -35,31 +35,41 @@ class EntregadorOut(BaseModel):
 # =========================
 def _resolve_user_base(db: Session, current_user) -> str:
     """
-    Busca na tabela `users` a base do usuário.
+    Busca na tabela `users` a sub_base/base do usuário.
     Tenta por id (sub), depois por email/username.
     """
+    def pick_base(u: User) -> Optional[str]:
+        # v2: prioridade para sub_base; fallback para base (se ainda existir)
+        return getattr(u, "sub_base", None) or getattr(u, "base", None)
+
     # 1) por ID
     user_id = getattr(current_user, "id", None)
     if user_id is not None:
         u = db.get(User, user_id)
-        if u and u.base:
-            return u.base
+        if u:
+            b = pick_base(u)
+            if b:
+                return b
 
     # 2) por email
     email = getattr(current_user, "email", None)
     if email:
         u = db.scalars(select(User).where(User.email == email)).first()
-        if u and u.base:
-            return u.base
+        if u:
+            b = pick_base(u)
+            if b:
+                return b
 
     # 3) por username
     uname = getattr(current_user, "username", None)
     if uname:
         u = db.scalars(select(User).where(User.username == uname)).first()
-        if u and u.base:
-            return u.base
+        if u:
+            b = pick_base(u)
+            if b:
+                return b
 
-    raise HTTPException(status_code=400, detail="Base não definida para o usuário em 'users'.")
+    raise HTTPException(status_code=400, detail="Base (sub_base) não definida para o usuário em 'users'.")
 
 # =========================
 # ROTAS
