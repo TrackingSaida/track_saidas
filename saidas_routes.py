@@ -35,39 +35,74 @@ class SaidaOut(BaseModel):
 
 # ---------- HELPERS ----------
 def _resolve_user_base(db: Session, current_user: User) -> str:
-    """Determina a base do usuário (usada para vincular o Owner)."""
-    base_user = getattr(current_user, "base", None)
-    if base_user:
-        return base_user
+    """
+    Determina a sub_base (v2) do usuário, com fallback para base (retrocompat).
+    Tenta por id, depois por email e por username.
+    """
+    def pick_base(u: User) -> str | None:
+        # v2: usa sub_base; se não existir/preenchida, usa base
+        return getattr(u, "sub_base", None) or getattr(u, "base", None)
 
+    # 1) por ID
+    user_id = getattr(current_user, "id", None)
+    if user_id is not None:
+        u = db.get(User, user_id)
+        if u:
+            b = pick_base(u)
+            if b:
+                return b
+
+    # 2) por email
     email = getattr(current_user, "email", None)
-    username = getattr(current_user, "username", None)
-
     if email:
         u = db.scalars(select(User).where(User.email == email)).first()
-        if u and u.base:
-            return u.base
+        if u:
+            b = pick_base(u)
+            if b:
+                return b
+
+    # 3) por username
+    username = getattr(current_user, "username", None)
     if username:
         u = db.scalars(select(User).where(User.username == username)).first()
-        if u and u.base:
-            return u.base
+        if u:
+            b = pick_base(u)
+            if b:
+                return b
 
-    raise HTTPException(status_code=401, detail="Usuário sem 'base' definida.")
+    raise HTTPException(status_code=401, detail="Usuário sem sub_base/base definida em 'users'.")
 
-def _get_owner_for_base_or_user(db: Session, base_user: str, email: str | None, username: str | None) -> Owner:
-    """Retorna o Owner responsável pela base do usuário (usado para cobranças)."""
-    owner = db.scalars(select(Owner).where(Owner.base == base_user)).first()
+def _get_owner_for_base_or_user(
+    db: Session,
+    sub_base_user: str,
+    email: str | None,
+    username: str | None
+) -> Owner:
+    """
+    Retorna o Owner responsável pela sub_base do usuário.
+    Prioriza Owner.sub_base (v2); faz fallback para Owner.base (retrocompat),
+    depois tenta por email e username.
+    """
+    owner = None
+
+    # v2: se o modelo tiver coluna sub_base, tenta primeiro por ela
+    if hasattr(Owner, "sub_base"):
+        owner = db.scalars(select(Owner).where(Owner.sub_base == sub_base_user)).first()
+
+    # Fallback: ainda não migrado? tentar pela coluna base
+    if not owner and hasattr(Owner, "base"):
+        owner = db.scalars(select(Owner).where(Owner.base == sub_base_user)).first()
+
+    # Fallbacks finais por email / username
+    if not owner and email:
+        owner = db.scalars(select(Owner).where(Owner.email == email)).first()
+    if not owner and username:
+        owner = db.scalars(select(Owner).where(Owner.username == username)).first()
+
     if owner:
         return owner
-    if email:
-        owner = db.scalars(select(Owner).where(Owner.email == email)).first()
-        if owner:
-            return owner
-    if username:
-        owner = db.scalars(select(Owner).where(Owner.username == username)).first()
-        if owner:
-            return owner
-    raise HTTPException(status_code=404, detail="Owner não encontrado para esta base/usuário.")
+
+    raise HTTPException(status_code=404, detail="Owner não encontrado para esta sub_base/usuário.")
 
 # ---------- CLASSIFICADOR DE SERVIÇO ----------
 _SHOPEE_RE = re.compile(r"^BR\d{12,14}[A-Z]?$", re.IGNORECASE)
