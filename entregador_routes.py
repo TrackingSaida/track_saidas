@@ -1,4 +1,3 @@
-# entregador_routes.py
 from __future__ import annotations
 from typing import Optional, List
 
@@ -35,41 +34,31 @@ class EntregadorOut(BaseModel):
 # =========================
 def _resolve_user_base(db: Session, current_user) -> str:
     """
-    Busca na tabela `users` a sub_base/base do usuário.
+    Busca na tabela `users` a sub_base do usuário (sem fallback).
     Tenta por id (sub), depois por email/username.
     """
-    def pick_base(u: User) -> Optional[str]:
-        # v2: prioridade para sub_base; fallback para base (se ainda existir)
-        return getattr(u, "sub_base", None) or getattr(u, "base", None)
-
     # 1) por ID
     user_id = getattr(current_user, "id", None)
     if user_id is not None:
         u = db.get(User, user_id)
-        if u:
-            b = pick_base(u)
-            if b:
-                return b
+        if u and getattr(u, "sub_base", None):
+            return u.sub_base
 
     # 2) por email
     email = getattr(current_user, "email", None)
     if email:
         u = db.scalars(select(User).where(User.email == email)).first()
-        if u:
-            b = pick_base(u)
-            if b:
-                return b
+        if u and getattr(u, "sub_base", None):
+            return u.sub_base
 
     # 3) por username
     uname = getattr(current_user, "username", None)
     if uname:
         u = db.scalars(select(User).where(User.username == uname)).first()
-        if u:
-            b = pick_base(u)
-            if b:
-                return b
+        if u and getattr(u, "sub_base", None):
+            return u.sub_base
 
-    raise HTTPException(status_code=400, detail="Base (sub_base) não definida para o usuário em 'users'.")
+    raise HTTPException(status_code=400, detail="sub_base não definida para o usuário em 'users'.")
 
 # =========================
 # ROTAS
@@ -80,10 +69,10 @@ def create_entregador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    base_user = _resolve_user_base(db, current_user)
+    sub_base_user = _resolve_user_base(db, current_user)
 
     obj = Entregador(
-        base=base_user,
+        sub_base=sub_base_user,   # <<< grava na coluna sub_base
         nome=body.nome,
         telefone=body.telefone,
         documento=body.documento,
@@ -103,13 +92,13 @@ def list_entregadores(
 ):
     """
     (1) identifica o usuário via cookie
-    (2) resolve a base na tabela 'users'
-    (3) busca todos os entregadores daquela base
+    (2) resolve a sub_base na tabela 'users'
+    (3) busca todos os entregadores daquela sub_base
     (4) aplica filtro de status se informado
     """
-    base_user = _resolve_user_base(db, current_user)
+    sub_base_user = _resolve_user_base(db, current_user)
 
-    stmt = select(Entregador).where(Entregador.base == base_user)
+    stmt = select(Entregador).where(Entregador.sub_base == sub_base_user)
 
     if status == "ativo":
         stmt = stmt.where(Entregador.ativo.is_(True))
@@ -127,9 +116,9 @@ def get_entregador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    base_user = _resolve_user_base(db, current_user)
+    sub_base_user = _resolve_user_base(db, current_user)
 
     obj = db.get(Entregador, id_entregador)
-    if not obj or obj.base != base_user:
+    if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(status_code=404, detail="Não encontrado")
     return obj
