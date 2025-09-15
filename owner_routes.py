@@ -1,4 +1,3 @@
-# owner_routes.py
 from __future__ import annotations
 from datetime import date
 from typing import Optional
@@ -27,7 +26,7 @@ class OwnerCreate(BaseModel):
     valor: Optional[float] = None                 # valor unitário (cobrança 0)
     mensalidade: Optional[str] = None             # YYYY-MM-DD
     creditos: Optional[float] = None              # saldo inicial pré-pago
-    base: Optional[str] = None
+    sub_base: Optional[str] = None
     contato: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -41,7 +40,7 @@ class OwnerOut(BaseModel):
     valor: Optional[float]
     mensalidade: Optional[date]
     creditos: Optional[float]
-    base: Optional[str]
+    sub_base: Optional[str]
     contato: Optional[str]
     model_config = ConfigDict(from_attributes=True)
 
@@ -73,11 +72,11 @@ def create_owner(
     if not username:
         raise HTTPException(status_code=400, detail="username não encontrado (envie no corpo ou autentique-se).")
 
-    # (Opcional) evitar duplicar Owner por base
-    if body.base:
-        exists = db.scalars(select(Owner).where(Owner.base == body.base)).first()
+    # (Opcional) evitar duplicar Owner por sub_base
+    if body.sub_base:
+        exists = db.scalars(select(Owner).where(Owner.sub_base == body.sub_base)).first()
         if exists:
-            raise HTTPException(status_code=409, detail="Já existe um Owner para essa base.")
+            raise HTTPException(status_code=409, detail="Já existe um Owner para essa sub_base.")
 
     obj = Owner(
         email=email,
@@ -86,7 +85,7 @@ def create_owner(
         valor=body.valor,
         mensalidade=_parse_date_yyyy_mm_dd(body.mensalidade),
         creditos=body.creditos,
-        base=body.base,
+        sub_base=body.sub_base,
         contato=body.contato,
     )
     db.add(obj)
@@ -100,16 +99,16 @@ def get_owner_for_current_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Tenta resolver por base, depois por email/username
-    base_user = getattr(current_user, "base", None)
+    # Tenta resolver por sub_base, depois por email/username
+    sub_base_user = getattr(current_user, "sub_base", None)
     owner = None
-    if base_user:
-        owner = db.scalars(select(Owner).where(Owner.base == base_user)).first()
+    if sub_base_user:
+        owner = db.scalars(select(Owner).where(Owner.sub_base == sub_base_user)).first()
     if not owner and current_user.email:
         owner = db.scalars(select(Owner).where(Owner.email == current_user.email)).first()
     if not owner and current_user.username:
         owner = db.scalars(select(Owner).where(Owner.username == current_user.username)).first()
 
     if not owner:
-        raise HTTPException(status_code=404, detail="Owner não encontrado para esse usuário/base.")
+        raise HTTPException(status_code=404, detail="Owner não encontrado para esse usuário/sub_base.")
     return owner
