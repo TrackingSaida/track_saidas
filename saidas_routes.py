@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Optional
 from datetime import datetime, date
-import re
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, ConfigDict
@@ -19,6 +18,7 @@ router = APIRouter(prefix="/saidas", tags=["Saídas"])
 class SaidaCreate(BaseModel):
     entregador: str = Field(min_length=1)
     codigo: str = Field(min_length=1)
+    servico: str = Field(min_length=1)  # agora vem do front
 
 class SaidaOut(BaseModel):
     id_saida: int
@@ -78,31 +78,6 @@ def _get_owner_for_base_or_user(
 
     raise HTTPException(status_code=404, detail="Owner não encontrado para esta 'sub_base'.")
 
-# ---------- CLASSIFICADOR DE SERVIÇO ----------
-_SHOPEE_RE = re.compile(r"^BR\d{12,14}[A-Z]?$", re.IGNORECASE)
-
-def _classificar_servico(codigo: str) -> str:
-    """
-    Define o serviço a partir do formato do código:
-    - NF-e: 44 dígitos numéricos => 'nfe'
-    - Shopee: BR + 12–14 dígitos + letra opcional => 'shopee'
-    - Mercado Livre: exatamente 10 ou 11 dígitos numéricos => 'mercado_livre'
-    - Caso contrário => 'avulso'
-    """
-    raw = (codigo or "").strip()
-    if not raw:
-        return "avulso"
-
-    digits_only = re.sub(r"\D", "", raw)
-
-    if len(digits_only) == 44:
-        return "nfe"
-    if _SHOPEE_RE.match(raw):
-        return "shopee"
-    if re.fullmatch(r"\d{10,11}", raw):
-        return "mercado_livre"
-    return "avulso"
-
 # ---------- ENDPOINT ----------
 @router.post("/registrar", status_code=status.HTTP_201_CREATED)
 def registrar_saida(
@@ -115,7 +90,7 @@ def registrar_saida(
     if not username:
         raise HTTPException(status_code=401, detail="Usuário sem 'username'.")
 
-    # sub_base e owner (usados apenas para fins de cobrança)
+    # sub_base e owner (usados para fins de cobrança)
     sub_base_user = _resolve_user_base(db, current_user)
     owner = _get_owner_for_base_or_user(db, sub_base_user, email, username)
 
@@ -129,12 +104,12 @@ def registrar_saida(
     creditos = float(owner.creditos or 0.0)
     mensalidade = owner.mensalidade
 
-    # Sempre 1 código por requisição
+    # Dados do payload (agora 'servico' vem do front)
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
-    servico = _classificar_servico(codigo)
+    servico = payload.servico.strip()
 
-    # 🔎 Checa duplicidade antes de prosseguir (por sub_base + código)
+    # 🔎 Checa duplicidade por sub_base + código
     existente = db.scalars(
         select(Saida).where(Saida.sub_base == sub_base_user, Saida.codigo == codigo)
     ).first()
@@ -164,11 +139,11 @@ def registrar_saida(
 
         # 2) Insert único
         row = Saida(
-            sub_base=sub_base_user,   # <<< grava sub_base
+            sub_base=sub_base_user,
             username=username,
             entregador=entregador,
             codigo=codigo,
-            servico=servico,
+            servico=servico,   # <- grava exatamente o que veio do front
             status="saiu",
         )
         db.add(row)
