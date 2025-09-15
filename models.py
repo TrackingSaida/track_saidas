@@ -28,11 +28,17 @@ class User(Base):
     username = Column(Text, nullable=False)
     contato = Column(Text, nullable=False)
 
-    status = Column(Text, nullable=False, server_default=text("'ativo'::text"))
-    base = Column(Text, nullable=True)
+    nome = Column(Text, nullable=True)
+    sobrenome = Column(Text, nullable=True)
+
+    status = Column(Boolean, nullable=False, server_default=text("true"))
+    sub_base = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
-        return f"<User id={self.id} email={self.email!r} username={self.username!r}>"
+        return (
+            f"<User id={self.id} email={self.email!r} username={self.username!r} "
+            f"nome={self.nome!r} sobrenome={self.sobrenome!r} status={self.status}>"
+        )
 
 
 # ==========================
