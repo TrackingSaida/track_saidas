@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, date
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/saidas", tags=["Saídas"])
 class SaidaCreate(BaseModel):
     entregador: str = Field(min_length=1)
     codigo: str = Field(min_length=1)
-    servico: str = Field(min_length=1)  # agora vem do front
+    servico: str = Field(min_length=1)  # vem do front
 
 class SaidaOut(BaseModel):
     id_saida: int
@@ -32,28 +32,35 @@ class SaidaOut(BaseModel):
     status: Optional[str]
     model_config = ConfigDict(from_attributes=True)
 
+# Saídas para a grid (listar)
+class SaidaGridItem(BaseModel):
+    timestamp: datetime   # Data/Hora
+    entregador: Optional[str]
+    codigo: Optional[str]
+    servico: Optional[str]
+    status: Optional[str]
+
+    model_config = ConfigDict(from_attributes=True)
+
 # ---------- HELPERS ----------
 def _resolve_user_base(db: Session, current_user: User) -> str:
     """
-    Determina a sub_base (v2) do usuário, sem fallback.
+    Determina a sub_base (v2) do usuário, sem fallback frouxo.
     Tenta por id, depois por email e por username.
     Exige que 'users.sub_base' esteja preenchido.
     """
-    # 1) por ID
     user_id = getattr(current_user, "id", None)
     if user_id is not None:
         u = db.get(User, user_id)
         if u and getattr(u, "sub_base", None):
             return u.sub_base
 
-    # 2) por email
     email = getattr(current_user, "email", None)
     if email:
         u = db.scalars(select(User).where(User.email == email)).first()
         if u and getattr(u, "sub_base", None):
             return u.sub_base
 
-    # 3) por username
     username = getattr(current_user, "username", None)
     if username:
         u = db.scalars(select(User).where(User.username == username)).first()
@@ -75,10 +82,9 @@ def _get_owner_for_base_or_user(
     owner = db.scalars(select(Owner).where(Owner.sub_base == sub_base_user)).first()
     if owner:
         return owner
-
     raise HTTPException(status_code=404, detail="Owner não encontrado para esta 'sub_base'.")
 
-# ---------- ENDPOINT ----------
+# ---------- POST: REGISTRAR ----------
 @router.post("/registrar", status_code=status.HTTP_201_CREATED)
 def registrar_saida(
     payload: SaidaCreate,
@@ -104,7 +110,7 @@ def registrar_saida(
     creditos = float(owner.creditos or 0.0)
     mensalidade = owner.mensalidade
 
-    # Dados do payload (agora 'servico' vem do front)
+    # Dados do payload (servico vem do front)
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
     servico = payload.servico.strip()
@@ -143,7 +149,7 @@ def registrar_saida(
             username=username,
             entregador=entregador,
             codigo=codigo,
-            servico=servico,   # <- grava exatamente o que veio do front
+            servico=servico,   # grava exatamente o que veio do front
             status="saiu",
         )
         db.add(row)
@@ -158,3 +164,68 @@ def registrar_saida(
         raise HTTPException(status_code=500, detail=f"Erro ao registrar saída: {e}")
 
     return SaidaOut.model_validate(row)
+
+# ---------- GET: LISTAR COM FILTROS ----------
+@router.get("/listar", response_model=List[SaidaGridItem])
+def listar_saidas(
+    # Filtros da UI
+    de: Optional[date] = Query(None, description="Data inicial (yyyy-mm-dd)"),
+    ate: Optional[date] = Query(None, description="Data final (yyyy-mm-dd)"),
+    entregador: Optional[str] = Query(None, description="Filtra por entregador (texto exato)"),
+    status_: Optional[str] = Query(None, alias="status", description="Filtra por status (texto exato)"),
+    codigo: Optional[str] = Query(None, description="Filtro 'contém' no código"),
+    # Paginação simples (opcional)
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Retorna saídas da sub_base do usuário autenticado, aplicando filtros opcionais:
+    - de / ate: filtra por Saida.data (datas inclusivas)
+    - entregador: igualdade exata (ignore se vazio ou '(Todos)')
+    - status: igualdade exata (ignore se vazio ou '(Todos)')
+    - codigo: contém (ILIKE)
+    Ordenado por timestamp desc.
+    """
+    # Descobre a sub_base do usuário
+    sub_base_user = _resolve_user_base(db, current_user)
+
+    # Monta consulta base
+    stmt = select(Saida).where(Saida.sub_base == sub_base_user)
+
+    # Filtro por datas na coluna DATE (inclusivo)
+    if de:
+        stmt = stmt.where(Saida.data >= de)
+    if ate:
+        stmt = stmt.where(Saida.data <= ate)
+
+    # Entregador (ignora campo vazio ou "(Todos)")
+    if entregador and entregador.strip() and entregador.strip().lower() != "(todos)":
+        stmt = stmt.where(Saida.entregador == entregador.strip())
+
+    # Status (ignora campo vazio ou "(Todos)")
+    if status_ and status_.strip() and status_.strip().lower() != "(todos)":
+        stmt = stmt.where(Saida.status == status_.strip())
+
+    # Código contém (ILIKE)
+    if codigo and codigo.strip():
+        like = f"%{codigo.strip()}%"
+        stmt = stmt.where(Saida.codigo.ilike(like))
+
+    # Ordenação + paginação
+    stmt = stmt.order_by(Saida.timestamp.desc()).offset(offset).limit(limit)
+
+    rows = db.execute(stmt).scalars().all()
+
+    # Mapeia apenas as colunas mostradas na grid
+    return [
+        SaidaGridItem(
+            timestamp=r.timestamp,
+            entregador=r.entregador,
+            codigo=r.codigo,
+            servico=r.servico,
+            status=r.status,
+        )
+        for r in rows
+    ]
