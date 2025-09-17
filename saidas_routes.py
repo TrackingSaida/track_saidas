@@ -122,7 +122,7 @@ def registrar_saida(
     if existente:
         raise HTTPException(
             status_code=409,
-            detail=f"O código '{codigo}' já foi registrado anteriormente."
+            detail={"code": "DUPLICATE_SAIDA", "message": f"O código '{codigo}' já foi registrado anteriormente."}
         )
 
     try:
@@ -132,7 +132,7 @@ def registrar_saida(
             if creditos < custo:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Créditos insuficientes. Necessário {custo:.2f}, saldo {creditos:.2f}."
+                    detail={"code": "INSUFFICIENT_CREDITS", "message": f"Créditos insuficientes. Necessário {custo:.2f}, saldo {creditos:.2f}."}
                 )
             owner.creditos = round(creditos - custo, 2)
             db.add(owner)
