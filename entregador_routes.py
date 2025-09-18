@@ -1,3 +1,4 @@
+# entregador_routes.py
 from __future__ import annotations
 from typing import Optional, List
 
@@ -5,10 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from datetime import date
 
 from db import get_db
-from auth import get_current_user          # lê o cookie e retorna objeto com id/email/username
-from models import User, Entregador        # <<< usa os modelos do models.py
+from auth import get_current_user
+from models import User, Entregador
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
@@ -21,6 +23,14 @@ class EntregadorCreate(BaseModel):
     documento: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
+class EntregadorUpdate(BaseModel):
+    # atualização parcial (envie só o que quer alterar)
+    nome: Optional[str] = None
+    telefone: Optional[str] = None
+    documento: Optional[str] = None
+    ativo: Optional[bool] = None
+    model_config = ConfigDict(from_attributes=True)
+
 class EntregadorOut(BaseModel):
     # Campos exibidos na tabela da página HTML
     id_entregador: int
@@ -28,6 +38,7 @@ class EntregadorOut(BaseModel):
     telefone: Optional[str] = None
     documento: Optional[str] = None
     ativo: bool
+    data_cadastro: Optional[date] = None
     model_config = ConfigDict(from_attributes=True)
 
 # =========================
@@ -35,8 +46,8 @@ class EntregadorOut(BaseModel):
 # =========================
 def _resolve_user_base(db: Session, current_user) -> str:
     """
-    Busca na tabela `users` a sub_base do usuário (sem fallback).
-    Tenta por id (sub), depois por email/username.
+    Busca na tabela `users` a sub_base do usuário.
+    Tenta por id, depois por email/username.
     """
     # 1) por ID
     user_id = getattr(current_user, "id", None)
@@ -61,6 +72,15 @@ def _resolve_user_base(db: Session, current_user) -> str:
 
     raise HTTPException(status_code=400, detail="sub_base não definida para o usuário em 'users'.")
 
+def _get_owned_entregador(db: Session, sub_base_user: str, id_entregador: int) -> Entregador:
+    """
+    Passo 2: valida se o entregador existe e pertence à mesma sub_base do solicitante.
+    """
+    obj = db.get(Entregador, id_entregador)
+    if not obj or obj.sub_base != sub_base_user:
+        raise HTTPException(status_code=404, detail="Não encontrado")
+    return obj
+
 # =========================
 # ROTAS
 # =========================
@@ -73,12 +93,12 @@ def create_entregador(
     sub_base_user = _resolve_user_base(db, current_user)
 
     obj = Entregador(
-        sub_base=sub_base_user,   # <<< grava na coluna sub_base
-        nome=body.nome,
-        telefone=body.telefone,
-        documento=body.documento,
-        ativo=True,  # novo cadastro começa ativo (override do default do DB)
-        # data_cadastro fica a cargo do DEFAULT CURRENT_DATE do banco
+        sub_base=sub_base_user,      # grava na coluna sub_base
+        nome=(body.nome or "").strip() or None,
+        telefone=(body.telefone or "").strip() or None,
+        documento=(body.documento or "").strip() or None,
+        ativo=True,                  # novo cadastro começa ativo
+        # data_cadastro: DEFAULT CURRENT_DATE no banco
     )
     db.add(obj)
     db.commit()
@@ -118,8 +138,50 @@ def get_entregador(
     current_user = Depends(get_current_user),
 ):
     sub_base_user = _resolve_user_base(db, current_user)
-
-    obj = db.get(Entregador, id_entregador)
-    if not obj or obj.sub_base != sub_base_user:
-        raise HTTPException(status_code=404, detail="Não encontrado")
+    obj = _get_owned_entregador(db, sub_base_user, id_entregador)
     return obj
+
+@router.patch("/{id_entregador}", response_model=EntregadorOut)
+def patch_entregador(
+    id_entregador: int,
+    body: EntregadorUpdate,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Edição parcial: altera qualquer combinação de nome/telefone/documento/ativo.
+    Passo 1: pega sub_base do solicitante.
+    Passo 2: valida se o entregador pertence à mesma sub_base.
+    """
+    sub_base_user = _resolve_user_base(db, current_user)
+    obj = _get_owned_entregador(db, sub_base_user, id_entregador)
+
+    # aplica somente o que veio no body
+    if body.nome is not None:
+        obj.nome = body.nome.strip()
+    if body.telefone is not None:
+        obj.telefone = body.telefone.strip()
+    if body.documento is not None:
+        obj.documento = body.documento.strip()
+    if body.ativo is not None:
+        obj.ativo = body.ativo
+
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+@router.delete("/{id_entregador}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_entregador(
+    id_entregador: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Passo 3: aplica a mesma validação de base e remove.
+    """
+    sub_base_user = _resolve_user_base(db, current_user)
+    obj = _get_owned_entregador(db, sub_base_user, id_entregador)
+
+    db.delete(obj)
+    db.commit()
+    return
