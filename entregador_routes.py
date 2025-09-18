@@ -23,7 +23,7 @@ class EntregadorCreate(BaseModel):
 
 class EntregadorOut(BaseModel):
     # Campos exibidos na tabela da página HTML
-    ide_entregador: Optional[str] = None
+    id_entregador: Optional[str] = None
     nome: Optional[str] = None
     telefone: Optional[str] = None
     documento: Optional[str] = None
