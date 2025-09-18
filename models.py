@@ -22,7 +22,7 @@ from db import Base
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(BigInteger, primary_key=True)
+    id_user = Column(BigInteger, primary_key=True)
     email = Column(Text, nullable=False)
     password_hash = Column(Text, nullable=False)
     username = Column(Text, nullable=False)
@@ -36,7 +36,7 @@ class User(Base):
 
     def __repr__(self) -> str:
         return (
-            f"<User id={self.id} email={self.email!r} username={self.username!r} "
+            f"<User id={self.id_user} email={self.email!r} username={self.username!r} "
             f"nome={self.nome!r} sobrenome={self.sobrenome!r} status={self.status}>"
         )
 
