@@ -40,7 +40,16 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+        "Accept",
+        "Accept-Language",
+        "Cache-Control", "Pragma",
+    ],
+    max_age=86400,                           # (opcional) cache do preflight
+    # expose_headers=["Set-Cookie"],         # opcional, só p/ depurar
 )
 
 # ──────────────────────────────────────────────────────────────────
