@@ -15,7 +15,7 @@ if _env_origins:
     ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
 else:
     ALLOWED_ORIGINS = [
-        "admirable-sprinkles-d10196.netlify.app",
+        "https://admirable-sprinkles-d10196.netlify.app",
         "https://tracking-saidas.com.br",
         "https://www.tracking-saidas.com.br",
         "https://track-saidas-html.onrender.com",
