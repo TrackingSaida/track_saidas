@@ -15,8 +15,8 @@ if _env_origins:
     ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
 else:
     ALLOWED_ORIGINS = [
-        "https://tracking-saidas.com.br"
-        "https://www.tracking-saidas.com.br"
+        "https://tracking-saidas.com.br",
+        "https://www.tracking-saidas.com.br",
         "https://track-saidas-html.onrender.com",
         "http://localhost:5500", "http://127.0.0.1:5500",
         "http://localhost:8000", "http://127.0.0.1:8000",
