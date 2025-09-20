@@ -61,30 +61,31 @@ class Owner(Base):
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r}>"
 
-
 # ==========================
-# Tabela: servico_padroes
+# Tabela: coletas
 # ==========================
-class ServicoPadrao(Base):
-    __tablename__ = "servico_padroes"
+class Coleta(Base):
+    __tablename__ = "coletas"
 
-    id_servico = Column(BigInteger, primary_key=True, autoincrement=True)
-    servico = Column(Text, nullable=False)
-    regex = Column(Text, nullable=False)
-    normalizar = Column(Boolean, nullable=False, server_default=text("false"))
-    prioridade = Column(Integer, nullable=False, server_default=text("100"))
-    ativo = Column(Boolean, nullable=False, server_default=text("true"))
-    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
-    atualizado_em = Column(
-        DateTime(timezone=False),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
+    id_coleta = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # mesmo nome da coluna na planilha, mas em snake_case
+    timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    sub_base  = Column(Text, nullable=True)
+    base      = Column(Text, nullable=True)
+    username_entregador = Column(Text, nullable=True)
+
+    # contadores por tipo (vêm como inteiros)
+    shopee         = Column(Integer, nullable=False, server_default=text("0"))
+    mercado_livre  = Column(Integer, nullable=False, server_default=text("0"))
+    avulso         = Column(Integer, nullable=False, server_default=text("0"))
+    nfe            = Column(Integer, nullable=False, server_default=text("0"))
+
+    # total monetário
+    valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
 
     def __repr__(self) -> str:
-        return f"<ServicoPadrao id_servico={self.id_servico} servico={self.servico!r}>"
-
+        return f"<Coleta id_coleta={self.id_coleta} sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
 
 # ==========================
 # Tabela: saidas
