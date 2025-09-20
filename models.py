@@ -88,6 +88,28 @@ class Coleta(Base):
         return f"<Coleta id_coleta={self.id_coleta} sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
 
 # ==========================
+# Tabela: base  (preços por base/sub_base)
+# ==========================
+class BasePreco(Base):
+    __tablename__ = "base"
+
+    id_base   = Column(BigInteger, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    base      = Column(Text, nullable=True)
+    sub_base  = Column(Text, nullable=True)           # col "sub-base" da planilha → sub_base
+    username  = Column(Text, nullable=True)
+
+    # preços unitários por serviço
+    shopee        = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ml            = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))  # "ML"
+    avulso        = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    nfe           = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+
+    def __repr__(self) -> str:
+        return f"<BasePreco id_base={self.id_base} sub_base={self.sub_base!r} username={self.username!r}>"
+
+# ==========================
 # Tabela: saidas
 # ==========================
 class Saida(Base):
