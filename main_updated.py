@@ -54,20 +54,20 @@ app.add_middleware(
 )
 
 # ──────────────────────────────────────────────────────────────────
-# Routers em uso (sem owner por enquanto)
+# Routers em uso
 from users_routes_updated import router as users_router          # noqa: E402
 from entregador_routes import router as entregadores_router      # noqa: E402
 from auth import router as auth_router                           # noqa: E402
 from saidas_routes import router as saidas_router                # noqa: E402
 from owner_routes import router as owners_router
-
-
+from base import router as base_router
 
 app.include_router(users_router,        prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
+app.include_router(base_router, prefix=API_PREFIX)
 
 # ──────────────────────────────────────────────────────────────────
 # Healthcheck
