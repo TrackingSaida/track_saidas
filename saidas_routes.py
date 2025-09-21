@@ -39,7 +39,6 @@ class SaidaGridItem(BaseModel):
     codigo: Optional[str]
     servico: Optional[str]
     status: Optional[str]
-
     model_config = ConfigDict(from_attributes=True)
 
 # ---------- HELPERS ----------
@@ -115,14 +114,15 @@ def registrar_saida(
     entregador = payload.entregador.strip()
     servico = payload.servico.strip()
 
-    # 🔎 Checa duplicidade por sub_base + código
+    # 🔎 Checa duplicidade por sub_base + código (409 estruturado)
     existente = db.scalars(
         select(Saida).where(Saida.sub_base == sub_base_user, Saida.codigo == codigo)
     ).first()
     if existente:
         raise HTTPException(
-            status_code=409,
-            detail={"code": "DUPLICATE_SAIDA", "message": f"O código '{codigo}' já foi registrado anteriormente."}
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "DUPLICATE_SAIDA",
+                    "message": f"O código '{codigo}' já foi registrado anteriormente."}
         )
 
     try:
@@ -131,8 +131,9 @@ def registrar_saida(
             custo = round(valor_un * 1, 2)
             if creditos < custo:
                 raise HTTPException(
-                    status_code=409,
-                    detail={"code": "INSUFFICIENT_CREDITS", "message": f"Créditos insuficientes. Necessário {custo:.2f}, saldo {creditos:.2f}."}
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"code": "INSUFFICIENT_CREDITS",
+                            "message": f"Créditos insuficientes. Necessário {custo:.2f}, saldo {creditos:.2f}."}
                 )
             owner.creditos = round(creditos - custo, 2)
             db.add(owner)
@@ -229,3 +230,36 @@ def listar_saidas(
         )
         for r in rows
     ]
+
+# ---------- DELETE: REMOVER UMA SAÍDA ----------
+@router.delete(
+    "/{id_saida}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        204: {"description": "Removido com sucesso"},
+        401: {"description": "Não autenticado"},
+        404: {"description": "Saída não encontrada",
+              "content": {"application/json": {"example": {
+                  "detail": {"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."}
+              }}}},
+    },
+)
+def deletar_saida(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),  # mantemos auth
+):
+    """
+    Remove uma saída pelo ID.
+    (A visibilidade no front já restringe por sub_base, então não revalidamos aqui.)
+    """
+    obj = db.get(Saida, id_saida)
+    if not obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."}
+        )
+
+    db.delete(obj)
+    db.commit()
+    return
