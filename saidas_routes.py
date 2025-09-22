@@ -45,6 +45,7 @@ class SaidaGridItem(BaseModel):
 class SaidaUpdate(BaseModel):
     entregador: Optional[str] = Field(None, description="Novo entregador")
     status: Optional[str] = Field(None, description="Novo status")
+    codigo: Optional[str] = Field(None, description="Novo código")
 
 # ---------- HELPERS ----------
 def _resolve_user_base(db: Session, current_user: User) -> str:
@@ -245,7 +246,7 @@ def listar_saidas(
         for r in rows
     ]
 
-# ---------- PATCH: ATUALIZAR CAMPOS (status / entregador) ----------
+# ---------- PATCH: ATUALIZAR CAMPOS (status / entregador / codigo) ----------
 @router.patch(
     "/{id_saida}",
     response_model=SaidaOut,
@@ -253,7 +254,8 @@ def listar_saidas(
         200: {"description": "Atualizado com sucesso"},
         401: {"description": "Não autenticado"},
         404: {"description": "Saída não encontrada"},
-        422: {"description": "Nenhum campo para atualizar"},
+        409: {"description": "Conflito (código duplicado)"},
+        422: {"description": "Nenhum campo para atualizar ou dados inválidos"},
         500: {"description": "Erro interno"},
     },
 )
@@ -271,13 +273,36 @@ def atualizar_saida(
         )
 
     # Pelo menos um campo deve ser enviado
-    if payload.entregador is None and payload.status is None:
+    if payload.entregador is None and payload.status is None and payload.codigo is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "NO_FIELDS_TO_UPDATE", "message": "Informe ao menos um campo para atualizar (status ou entregador)."}
+            detail={"code": "NO_FIELDS_TO_UPDATE", "message": "Informe ao menos um campo para atualizar (status, entregador ou codigo)."}
         )
 
     try:
+        # Atualização de código: validar vazio e duplicidade dentro da mesma sub_base
+        if payload.codigo is not None:
+            novo_codigo = payload.codigo.strip()
+            if not novo_codigo:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"code": "INVALID_CODIGO", "message": "Código não pode ser vazio."}
+                )
+            if novo_codigo != obj.codigo:
+                dup = db.scalars(
+                    select(Saida).where(
+                        Saida.sub_base == obj.sub_base,
+                        Saida.codigo == novo_codigo,
+                        Saida.id_saida != obj.id_saida
+                    )
+                ).first()
+                if dup:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={"code": "DUPLICATE_SAIDA", "message": f"O código '{novo_codigo}' já foi registrado anteriormente."}
+                    )
+                obj.codigo = novo_codigo
+
         if payload.entregador is not None:
             obj.entregador = payload.entregador.strip()
         if payload.status is not None:
@@ -286,7 +311,10 @@ def atualizar_saida(
         db.add(obj)
         db.commit()
         db.refresh(obj)
-    except Exception as e:
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail={"code": "UPDATE_FAILED", "message": "Erro ao atualizar a saída."})
 
@@ -322,15 +350,12 @@ def deletar_saida(
 
     # Verifica janela de 1 dia
     if obj.timestamp is None:
-        # Sem timestamp não conseguimos garantir janela; bloquear por segurança
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "DELETE_WINDOW_EXPIRED", "message": "Exclusão não permitida: janela de 1 dia expirada."}
         )
 
     agora = datetime.utcnow()
-    # Se seu timestamp já está em timezone-aware/UTC, esse cálculo funciona;
-    # caso contrário, ajuste para o mesmo timezone que grava no banco.
     if agora - obj.timestamp > timedelta(days=1):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -359,7 +384,7 @@ def deletar_saida(
     except HTTPException:
         db.rollback()
         raise
-    except Exception as e:
+    except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail={"code": "DELETE_FAILED", "message": "Erro ao deletar a saída."})
 
