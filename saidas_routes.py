@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, List
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field, ConfigDict
@@ -40,6 +40,11 @@ class SaidaGridItem(BaseModel):
     servico: Optional[str]
     status: Optional[str]
     model_config = ConfigDict(from_attributes=True)
+
+# Atualização parcial
+class SaidaUpdate(BaseModel):
+    entregador: Optional[str] = Field(None, description="Novo entregador")
+    status: Optional[str] = Field(None, description="Novo status")
 
 # ---------- HELPERS ----------
 def _resolve_user_base(db: Session, current_user: User) -> str:
@@ -84,7 +89,16 @@ def _get_owner_for_base_or_user(
     raise HTTPException(status_code=404, detail="Owner não encontrado para esta 'sub_base'.")
 
 # ---------- POST: REGISTRAR ----------
-@router.post("/registrar", status_code=status.HTTP_201_CREATED)
+@router.post("/registrar", status_code=status.HTTP_201_CREATED,
+    responses={
+        409: {"description": "Conflitos (duplicidade / créditos)"},
+        402: {"description": "Mensalidade vencida"},
+        404: {"description": "Owner não encontrado"},
+        401: {"description": "Não autenticado"},
+        422: {"description": "Validação"},
+        500: {"description": "Erro interno"},
+    }
+)
 def registrar_saida(
     payload: SaidaCreate,
     db: Session = Depends(get_db),
@@ -231,27 +245,73 @@ def listar_saidas(
         for r in rows
     ]
 
-# ---------- DELETE: REMOVER UMA SAÍDA ----------
+# ---------- PATCH: ATUALIZAR CAMPOS (status / entregador) ----------
+@router.patch(
+    "/{id_saida}",
+    response_model=SaidaOut,
+    responses={
+        200: {"description": "Atualizado com sucesso"},
+        401: {"description": "Não autenticado"},
+        404: {"description": "Saída não encontrada"},
+        422: {"description": "Nenhum campo para atualizar"},
+        500: {"description": "Erro interno"},
+    },
+)
+def atualizar_saida(
+    id_saida: int,
+    payload: SaidaUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    obj = db.get(Saida, id_saida)
+    if not obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."}
+        )
+
+    # Pelo menos um campo deve ser enviado
+    if payload.entregador is None and payload.status is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "NO_FIELDS_TO_UPDATE", "message": "Informe ao menos um campo para atualizar (status ou entregador)."}
+        )
+
+    try:
+        if payload.entregador is not None:
+            obj.entregador = payload.entregador.strip()
+        if payload.status is not None:
+            obj.status = payload.status.strip()
+
+        db.add(obj)
+        db.commit()
+        db.refresh(obj)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail={"code": "UPDATE_FAILED", "message": "Erro ao atualizar a saída."})
+
+    return SaidaOut.model_validate(obj)
+
+# ---------- DELETE: REMOVER (com janela de 1 dia + estorno) ----------
 @router.delete(
     "/{id_saida}",
     status_code=status.HTTP_204_NO_CONTENT,
     responses={
         204: {"description": "Removido com sucesso"},
         401: {"description": "Não autenticado"},
-        404: {"description": "Saída não encontrada",
-              "content": {"application/json": {"example": {
-                  "detail": {"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."}
-              }}}},
+        404: {"description": "Saída não encontrada"},
+        409: {"description": "Janela de exclusão expirada"},
+        500: {"description": "Erro interno"},
     },
 )
 def deletar_saida(
     id_saida: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # mantemos auth
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Remove uma saída pelo ID.
-    (A visibilidade no front já restringe por sub_base, então não revalidamos aqui.)
+    Remove uma saída pelo ID **apenas se criada há <= 1 dia**.
+    Se o plano do Owner for pré-pago (cobranca=0), estorna os créditos no valor unitário vigente.
     """
     obj = db.get(Saida, id_saida)
     if not obj:
@@ -260,6 +320,47 @@ def deletar_saida(
             detail={"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."}
         )
 
-    db.delete(obj)
-    db.commit()
+    # Verifica janela de 1 dia
+    if obj.timestamp is None:
+        # Sem timestamp não conseguimos garantir janela; bloquear por segurança
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "DELETE_WINDOW_EXPIRED", "message": "Exclusão não permitida: janela de 1 dia expirada."}
+        )
+
+    agora = datetime.utcnow()
+    # Se seu timestamp já está em timezone-aware/UTC, esse cálculo funciona;
+    # caso contrário, ajuste para o mesmo timezone que grava no banco.
+    if agora - obj.timestamp > timedelta(days=1):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "DELETE_WINDOW_EXPIRED", "message": "Exclusão não permitida: janela de 1 dia expirada."}
+        )
+
+    # Recupera Owner pela sub_base do usuário atual (para estorno)
+    sub_base_user = _resolve_user_base(db, current_user)
+    owner = _get_owner_for_base_or_user(db, sub_base_user, getattr(current_user, "email", None), getattr(current_user, "username", None))
+
+    try:
+        # Se pré-pago, estorna o mesmo valor debitado no POST (valor_un * 1)
+        try:
+            cobranca = int(str(owner.cobranca or "0"))
+        except Exception:
+            cobranca = 0
+
+        if cobranca == 0:
+            valor_un = float(owner.valor or 0.0)
+            owner.creditos = round(float(owner.creditos or 0.0) + round(valor_un * 1, 2), 2)
+            db.add(owner)
+
+        # Exclui a saída
+        db.delete(obj)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail={"code": "DELETE_FAILED", "message": "Erro ao deletar a saída."})
+
     return
