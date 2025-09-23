@@ -25,9 +25,9 @@ class EntregadorCreate(BaseModel):
 
 class EntregadorUpdate(BaseModel):
     # atualização parcial (envie só o que quer alterar)
-    nome: Optional[str] = None
-    telefone: Optional[str] = None
-    documento: Optional[str] = None
+    nome: str
+    telefone: str
+    documento: str
     ativo: Optional[bool] = None
     model_config = ConfigDict(from_attributes=True)
 
