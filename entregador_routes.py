@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from datetime import date
@@ -18,9 +18,9 @@ router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 # SCHEMAS (Pydantic)
 # =========================
 class EntregadorCreate(BaseModel):
-    nome: str
-    telefone: str
-    documento: str
+    nome: str = Field(min_length=1)
+    telefone: str = Field(min_length=1)
+    documento: str = Field(min_length=1)  # <- obrigatório (não aceita vazio)
     model_config = ConfigDict(from_attributes=True)
 
 class EntregadorUpdate(BaseModel):
@@ -32,7 +32,6 @@ class EntregadorUpdate(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 class EntregadorOut(BaseModel):
-    # Campos exibidos na tabela da página HTML
     id_entregador: int
     nome: Optional[str] = None
     telefone: Optional[str] = None
@@ -45,37 +44,27 @@ class EntregadorOut(BaseModel):
 # HELPERS
 # =========================
 def _resolve_user_base(db: Session, current_user) -> str:
-    """
-    Busca na tabela `users` a sub_base do usuário.
-    Tenta por id, depois por email/username.
-    """
     # 1) por ID
     user_id = getattr(current_user, "id", None)
     if user_id is not None:
         u = db.get(User, user_id)
         if u and getattr(u, "sub_base", None):
             return u.sub_base
-
     # 2) por email
     email = getattr(current_user, "email", None)
     if email:
         u = db.scalars(select(User).where(User.email == email)).first()
         if u and getattr(u, "sub_base", None):
             return u.sub_base
-
     # 3) por username
     uname = getattr(current_user, "username", None)
     if uname:
         u = db.scalars(select(User).where(User.username == uname)).first()
         if u and getattr(u, "sub_base", None):
             return u.sub_base
-
     raise HTTPException(status_code=400, detail="sub_base não definida para o usuário em 'users'.")
 
 def _get_owned_entregador(db: Session, sub_base_user: str, id_entregador: int) -> Entregador:
-    """
-    Passo 2: valida se o entregador existe e pertence à mesma sub_base do solicitante.
-    """
     obj = db.get(Entregador, id_entregador)
     if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(status_code=404, detail="Não encontrado")
@@ -92,12 +81,29 @@ def create_entregador(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
+    nome = (body.nome or "").strip()
+    telefone = (body.telefone or "").strip()
+    documento = (body.documento or "").strip()
+
+    if not documento:
+        raise HTTPException(status_code=400, detail="O campo 'documento' é obrigatório.")
+
+    # Unicidade de documento dentro da sub_base
+    exists = db.scalars(
+        select(Entregador).where(
+            Entregador.sub_base == sub_base_user,
+            Entregador.documento == documento,
+        )
+    ).first()
+    if exists:
+        raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
+
     obj = Entregador(
-        sub_base=sub_base_user,      # grava na coluna sub_base
-        nome=(body.nome or "").strip() or None,
-        telefone=(body.telefone or "").strip() or None,
-        documento=(body.documento or "").strip() or None,
-        ativo=True,                  # novo cadastro começa ativo
+        sub_base=sub_base_user,
+        nome=nome,
+        telefone=telefone,
+        documento=documento,
+        ativo=True,  # novo cadastro começa ativo
         # data_cadastro: DEFAULT CURRENT_DATE no banco
     )
     db.add(obj)
@@ -111,12 +117,6 @@ def list_entregadores(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """
-    (1) identifica o usuário via cookie
-    (2) resolve a sub_base na tabela 'users'
-    (3) busca todos os entregadores daquela sub_base
-    (4) aplica filtro de status se informado
-    """
     sub_base_user = _resolve_user_base(db, current_user)
 
     stmt = select(Entregador).where(Entregador.sub_base == sub_base_user)
@@ -125,7 +125,6 @@ def list_entregadores(
         stmt = stmt.where(Entregador.ativo.is_(True))
     elif status == "inativo":
         stmt = stmt.where(Entregador.ativo.is_(False))
-    # "todos" => sem filtro adicional
 
     stmt = stmt.order_by(Entregador.nome)
     rows = db.scalars(stmt).all()
@@ -148,21 +147,29 @@ def patch_entregador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """
-    Edição parcial: altera qualquer combinação de nome/telefone/documento/ativo.
-    Passo 1: pega sub_base do solicitante.
-    Passo 2: valida se o entregador pertence à mesma sub_base.
-    """
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
 
-    # aplica somente o que veio no body
     if body.nome is not None:
         obj.nome = body.nome.strip()
     if body.telefone is not None:
         obj.telefone = body.telefone.strip()
     if body.documento is not None:
-        obj.documento = body.documento.strip()
+        novo_doc = body.documento.strip()
+        if not novo_doc:
+            raise HTTPException(status_code=400, detail="O campo 'documento' não pode ficar vazio.")
+        # se mudou, checa duplicidade na mesma sub_base
+        if novo_doc != obj.documento:
+            exists = db.scalars(
+                select(Entregador).where(
+                    Entregador.sub_base == sub_base_user,
+                    Entregador.documento == novo_doc,
+                    Entregador.id_entregador != obj.id_entregador,
+                )
+            ).first()
+            if exists:
+                raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
+        obj.documento = novo_doc
     if body.ativo is not None:
         obj.ativo = body.ativo
 
@@ -176,12 +183,8 @@ def delete_entregador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """
-    Passo 3: aplica a mesma validação de base e remove.
-    """
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
-
     db.delete(obj)
     db.commit()
     return
