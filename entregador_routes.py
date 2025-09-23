@@ -18,16 +18,16 @@ router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 # SCHEMAS (Pydantic)
 # =========================
 class EntregadorCreate(BaseModel):
-    nome: Optional[str] = None
-    telefone: Optional[str] = None
-    documento: Optional[str] = None
+    nome: str
+    telefone: str
+    documento: str
     model_config = ConfigDict(from_attributes=True)
 
 class EntregadorUpdate(BaseModel):
     # atualização parcial (envie só o que quer alterar)
-    nome: str
-    telefone: str
-    documento: str
+    nome: Optional[str] = None
+    telefone: Optional[str] = None
+    documento: Optional[str] = None
     ativo: Optional[bool] = None
     model_config = ConfigDict(from_attributes=True)
 
