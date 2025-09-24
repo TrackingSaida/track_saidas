@@ -142,7 +142,15 @@ class Entregador(Base):
     documento = Column(Text, nullable=True)
     data_cadastro = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
     sub_base = Column(Text, nullable=True)
+    rua = Column(Text, nullable=False)
+    numero = Column(Text, nullable=False)
+    complemento = Column(Text, nullable=False)
+    cep = Column(Text, nullable=False)
+    cidade = Column(Text, nullable=False)
+    bairro = Column(Text, nullable=False)
 
 
+
+    
     def __repr__(self) -> str:
         return f"<Entregador id_entregador={self.id_entregador} nome={self.nome!r}>"
