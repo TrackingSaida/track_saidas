@@ -22,13 +22,25 @@ class EntregadorCreate(BaseModel):
     telefone: str = Field(min_length=1)
     documento: str = Field(min_length=1)  # <- obrigatório (não aceita vazio)
     model_config = ConfigDict(from_attributes=True)
+    rua: str = Field(min_length=1)
+    numero: str = Field(min_length=1)
+    complemento: str = Field(min_length=1)
+    cep: str = Field(min_length=1)
+    cidade: str = Field(min_length=1)
+    bairro: str = Field(min_length=1)
+
 
 class EntregadorUpdate(BaseModel):
     # atualização parcial (envie só o que quer alterar)
     nome: Optional[str] = None
     telefone: Optional[str] = None
     documento: Optional[str] = None
-    ativo: Optional[bool] = None
+    rua: Optional[bool] = None
+    numero: Optional[bool] = None
+    complemento: Optional[bool] = None
+    cep: Optional[bool] = None
+    cidade: Optional[bool] = None
+    bairro: Optional[bool] = None
     model_config = ConfigDict(from_attributes=True)
 
 class EntregadorOut(BaseModel):
@@ -38,6 +50,12 @@ class EntregadorOut(BaseModel):
     documento: Optional[str] = None
     ativo: bool
     data_cadastro: Optional[date] = None
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    cep: Optional[str] = None
+    cidade: Optional[str] = None
+    bairro: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 # =========================
