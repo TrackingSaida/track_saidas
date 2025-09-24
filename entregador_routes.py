@@ -35,12 +35,12 @@ class EntregadorUpdate(BaseModel):
     nome: Optional[str] = None
     telefone: Optional[str] = None
     documento: Optional[str] = None
-    rua: Optional[bool] = None
-    numero: Optional[bool] = None
-    complemento: Optional[bool] = None
-    cep: Optional[bool] = None
-    cidade: Optional[bool] = None
-    bairro: Optional[bool] = None
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    cep: Optional[str] = None
+    cidade: Optional[str] = None
+    bairro: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class EntregadorOut(BaseModel):
