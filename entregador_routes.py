@@ -170,7 +170,6 @@ def get_entregador(
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
     return obj
-
 @router.patch("/{id_entregador}", response_model=EntregadorOut)
 def patch_entregador(
     id_entregador: int,
@@ -189,7 +188,6 @@ def patch_entregador(
         novo_doc = body.documento.strip()
         if not novo_doc:
             raise HTTPException(status_code=400, detail="O campo 'documento' não pode ficar vazio.")
-        # se mudou, checa duplicidade na mesma sub_base
         if novo_doc != obj.documento:
             exists = db.scalars(
                 select(Entregador).where(
@@ -201,8 +199,20 @@ def patch_entregador(
             if exists:
                 raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
         obj.documento = novo_doc
-    if body.ativo is not None:
-        obj.ativo = body.ativo
+
+    # NOVOS CAMPOS
+    if body.rua is not None:
+        obj.rua = body.rua.strip()
+    if body.numero is not None:
+        obj.numero = body.numero.strip()
+    if body.complemento is not None:
+        obj.complemento = body.complemento.strip()
+    if body.cep is not None:
+        obj.cep = body.cep.strip()
+    if body.cidade is not None:
+        obj.cidade = body.cidade.strip()
+    if body.bairro is not None:
+        obj.bairro = body.bairro.strip()
 
     db.commit()
     db.refresh(obj)
