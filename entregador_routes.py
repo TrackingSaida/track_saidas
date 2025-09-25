@@ -99,14 +99,21 @@ def create_entregador(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-    nome = (body.nome or "").strip()
-    telefone = (body.telefone or "").strip()
-    documento = (body.documento or "").strip()
+    # normaliza/valida
+    nome        = (body.nome or "").strip()
+    telefone    = (body.telefone or "").strip()
+    documento   = (body.documento or "").strip()
+    rua         = (body.rua or "").strip()
+    numero      = (body.numero or "").strip()
+    complemento = (body.complemento or "").strip()
+    cep         = (body.cep or "").strip()
+    cidade      = (body.cidade or "").strip()
+    bairro      = (body.bairro or "").strip()
 
     if not documento:
         raise HTTPException(status_code=400, detail="O campo 'documento' é obrigatório.")
 
-    # Unicidade de documento dentro da sub_base
+    # (opcional) checar duplicidade de documento por sub_base
     exists = db.scalars(
         select(Entregador).where(
             Entregador.sub_base == sub_base_user,
@@ -121,7 +128,13 @@ def create_entregador(
         nome=nome,
         telefone=telefone,
         documento=documento,
-        ativo=True,  # novo cadastro começa ativo
+        ativo=True,
+        rua=rua,
+        numero=numero,
+        complemento=complemento,
+        cep=cep,
+        cidade=cidade,
+        bairro=bairro,
         # data_cadastro: DEFAULT CURRENT_DATE no banco
     )
     db.add(obj)
