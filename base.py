@@ -1,4 +1,7 @@
-# --- IMPORTS ADICIONAIS (no topo do base.py) ---
+from __future__ import annotations
+from db import get_db
+from auth import get_current_user
+from models import User, BasePreco
 from typing import Optional, List
 from fastapi import Query
 from sqlalchemy import select
