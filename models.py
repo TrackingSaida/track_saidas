@@ -29,22 +29,28 @@ class User(Base):
     username = Column(Text, nullable=False)
     contato = Column(Text, nullable=False)
 
+    # perfil
     nome = Column(Text, nullable=True)
     sobrenome = Column(Text, nullable=True)
 
     status = Column(Boolean, nullable=False, server_default=text("true"))
     sub_base = Column(Text, nullable=True)
 
+    # >>> novos/ajustados para coleta
+    coletador = Column(Boolean, nullable=False, server_default=text("false"))
+    username_entregador = Column(Text, nullable=True)
+    senha_coletador = Column(Text, nullable=True)           # hash (bcrypt)
+    tipo_de_cadastro = Column(Integer, nullable=True)       # será setado para 3
+
     def __repr__(self) -> str:
         return (
             f"<User id={self.id} email={self.email!r} username={self.username!r} "
-            f"nome={self.nome!r} sobrenome={self.sobrenome!r} status={self.status}>"
+            f"nome={self.nome!r} status={self.status} coletador={self.coletador}>"
         )
 
 
 # ==========================
 # Tabela: owner
-# (campos de cobrança/planos)
 # ==========================
 class Owner(Base):
     __tablename__ = "owner"
@@ -88,7 +94,7 @@ class Coleta(Base):
 
 
 # ==========================
-# Tabela: base  (preços por base/sub_base)
+# Tabela: base (preços)
 # ==========================
 class BasePreco(Base):
     __tablename__ = "base"
@@ -100,10 +106,10 @@ class BasePreco(Base):
     sub_base  = Column(Text, nullable=True)
     username  = Column(Text, nullable=True)
 
-    shopee        = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    ml            = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    avulso        = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    nfe           = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    shopee = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ml     = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    avulso = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    nfe    = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
 
     def __repr__(self) -> str:
         return f"<BasePreco id_base={self.id_base} sub_base={self.sub_base!r} username={self.username!r}>"
@@ -135,7 +141,6 @@ class Saida(Base):
 class Entregador(Base):
     __tablename__ = "entregador"
     __table_args__ = (
-        # cada sub_base não pode ter dois entregadores com o mesmo username
         UniqueConstraint("sub_base", "username_entregador", name="uq_entregador_subbase_username"),
     )
 
@@ -155,11 +160,9 @@ class Entregador(Base):
     cidade = Column(Text, nullable=False)
     bairro = Column(Text, nullable=False)
 
-    # novos campos
+    # mantém APENAS estes dois aqui
     coletador = Column(Boolean, nullable=False, server_default=text("false"))
     username_entregador = Column(Text, nullable=True)
-    # guarda o HASH da senha (bcrypt/passlib) — nunca a senha em texto puro
-    senha_entregador = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<Entregador id_entregador={self.id_entregador} nome={self.nome!r}>"
