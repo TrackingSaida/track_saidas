@@ -1,4 +1,3 @@
-# entregador_routes.py
 from __future__ import annotations
 from typing import Optional, List
 
@@ -18,7 +17,7 @@ router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 # SCHEMAS (Pydantic)
 # =========================
 class EntregadorCreate(BaseModel):
-    # obrigatórios básicos
+    # obrigatórios para o entregador
     nome: str = Field(min_length=1)
     telefone: str = Field(min_length=1)
     documento: str = Field(min_length=1)
@@ -31,21 +30,20 @@ class EntregadorCreate(BaseModel):
     cidade: str = Field(min_length=1)
     bairro: str = Field(min_length=1)
 
-    # novos campos
-    coletador: bool = False
+    # coleta
+    coletador: Optional[bool] = False
     username_entregador: Optional[str] = None
-    senha_entregador: Optional[str] = None
+    senha_coletador: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class EntregadorUpdate(BaseModel):
-    # atualização parcial (envie só o que quer alterar)
+    # atualização parcial
     nome: Optional[str] = None
     telefone: Optional[str] = None
     documento: Optional[str] = None
 
-    # endereço
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -53,10 +51,11 @@ class EntregadorUpdate(BaseModel):
     cidade: Optional[str] = None
     bairro: Optional[str] = None
 
-    # novos campos
     coletador: Optional[bool] = None
     username_entregador: Optional[str] = None
-    senha_entregador: Optional[str] = None
+    senha_coletador: Optional[str] = None  # se vier, re-hash
+
+    ativo: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -69,7 +68,6 @@ class EntregadorOut(BaseModel):
     ativo: bool
     data_cadastro: Optional[date] = None
 
-    # endereço
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -77,11 +75,11 @@ class EntregadorOut(BaseModel):
     cidade: Optional[str] = None
     bairro: Optional[str] = None
 
-    # novos campos (não expõe senha)
     coletador: bool
     username_entregador: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
 
 # =========================
 # HELPERS
@@ -107,25 +105,13 @@ def _resolve_user_base(db: Session, current_user) -> str:
             return u.sub_base
     raise HTTPException(status_code=400, detail="sub_base não definida para o usuário em 'users'.")
 
+
 def _get_owned_entregador(db: Session, sub_base_user: str, id_entregador: int) -> Entregador:
     obj = db.get(Entregador, id_entregador)
     if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(status_code=404, detail="Não encontrado")
     return obj
 
-def _check_username_duplicado(
-    db: Session, sub_base_user: str, username: str, ignorar_id: Optional[int] = None
-) -> None:
-    if not username:
-        return
-    stmt = select(Entregador).where(
-        Entregador.sub_base == sub_base_user,
-        Entregador.username_entregador == username
-    )
-    if ignorar_id is not None:
-        stmt = stmt.where(Entregador.id_entregador != ignorar_id)
-    if db.scalars(stmt).first():
-        raise HTTPException(status_code=409, detail="Já existe um entregador com este username nesta sub_base.")
 
 # =========================
 # ROTAS
@@ -138,10 +124,11 @@ def create_entregador(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-    # normaliza/valida
+    # normaliza/valida mínimos
     nome        = (body.nome or "").strip()
     telefone    = (body.telefone or "").strip()
     documento   = (body.documento or "").strip()
+
     rua         = (body.rua or "").strip()
     numero      = (body.numero or "").strip()
     complemento = (body.complemento or "").strip()
@@ -149,14 +136,21 @@ def create_entregador(
     cidade      = (body.cidade or "").strip()
     bairro      = (body.bairro or "").strip()
 
-    coletador   = bool(body.coletador)
-    username    = (body.username_entregador or "").strip() or None
-    senha_plain = (body.senha_entregador or "").strip() or None
-
     if not documento:
         raise HTTPException(status_code=400, detail="O campo 'documento' é obrigatório.")
 
-    # duplicidade de documento por sub_base
+    # se coletador = true, exige credenciais de coleta
+    coletador_flag = bool(body.coletador)
+    username_ent = (body.username_entregador or "").strip() if coletador_flag else None
+    senha_col_raw = (body.senha_coletador or "").strip() if coletador_flag else None
+
+    if coletador_flag:
+        if not username_ent:
+            raise HTTPException(status_code=400, detail="Informe 'username_entregador' para coletador.")
+        if not senha_col_raw:
+            raise HTTPException(status_code=400, detail="Informe 'senha_coletador' para coletador.")
+
+    # (opcional) checar duplicidade de documento por sub_base
     exists = db.scalars(
         select(Entregador).where(
             Entregador.sub_base == sub_base_user,
@@ -166,39 +160,52 @@ def create_entregador(
     if exists:
         raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
 
-    # regra: se for coletador, exige username e senha
-    if coletador:
-        if not username or not senha_plain:
-            raise HTTPException(
-                status_code=400,
-                detail="Para coletador=true é obrigatório informar 'username_entregador' e 'senha_entregador'."
-            )
-        _check_username_duplicado(db, sub_base_user, username)
+    try:
+        # ------------ cria entregador ------------
+        ent = Entregador(
+            sub_base=sub_base_user,
+            nome=nome,
+            telefone=telefone,
+            documento=documento,
+            ativo=True,
+            rua=rua,
+            numero=numero,
+            complemento=complemento,
+            cep=cep,
+            cidade=cidade,
+            bairro=bairro,
+            coletador=coletador_flag,
+            username_entregador=username_ent,
+        )
+        db.add(ent)
 
-    senha_hash = get_password_hash(senha_plain) if (coletador and senha_plain) else None
+        # ------------ atualiza o usuário ------------
+        u = db.get(User, getattr(current_user, "id"))
+        if not u:
+            raise HTTPException(status_code=401, detail="Usuário não encontrado.")
 
-    obj = Entregador(
-        sub_base=sub_base_user,
-        nome=nome,
-        telefone=telefone,
-        documento=documento,
-        ativo=True,
-        rua=rua,
-        numero=numero,
-        complemento=complemento,
-        cep=cep,
-        cidade=cidade,
-        bairro=bairro,
-        # novos campos
-        coletador=coletador,
-        username_entregador=username,
-        senha_entregador=senha_hash,
-        # data_cadastro: DEFAULT CURRENT_DATE no banco
-    )
-    db.add(obj)
-    db.commit()
-    db.refresh(obj)
-    return {"ok": True, "action": "created", "id": obj.id_entregador}
+        # espelha nome/telefone
+        u.nome = nome or u.nome
+        u.contato = telefone or u.contato
+
+        # atributos de coleta
+        u.coletador = coletador_flag
+        u.username_entregador = username_ent if coletador_flag else u.username_entregador
+
+        # senha coletador (hash)
+        if coletador_flag:
+            u.senha_coletador = get_password_hash(senha_col_raw)
+
+        # classifica o tipo de cadastro
+        u.tipo_de_cadastro = 3
+
+        db.commit()
+        db.refresh(ent)
+        return {"ok": True, "action": "created", "id": ent.id_entregador}
+    except Exception:
+        db.rollback()
+        raise
+
 
 @router.get("/", response_model=List[EntregadorOut])
 def list_entregadores(
@@ -219,6 +226,7 @@ def list_entregadores(
     rows = db.scalars(stmt).all()
     return rows
 
+
 @router.get("/{id_entregador}", response_model=EntregadorOut)
 def get_entregador(
     id_entregador: int,
@@ -228,6 +236,7 @@ def get_entregador(
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
     return obj
+
 
 @router.patch("/{id_entregador}", response_model=EntregadorOut)
 def patch_entregador(
@@ -239,70 +248,78 @@ def patch_entregador(
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
 
-    # básicos
-    if body.nome is not None:
-        obj.nome = (body.nome or "").strip()
-    if body.telefone is not None:
-        obj.telefone = (body.telefone or "").strip()
-    if body.documento is not None:
-        novo_doc = (body.documento or "").strip()
-        if not novo_doc:
-            raise HTTPException(status_code=400, detail="O campo 'documento' não pode ficar vazio.")
-        if novo_doc != obj.documento:
-            exists = db.scalars(
-                select(Entregador).where(
-                    Entregador.sub_base == sub_base_user,
-                    Entregador.documento == novo_doc,
-                    Entregador.id_entregador != obj.id_entregador,
-                )
-            ).first()
-            if exists:
-                raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
-        obj.documento = novo_doc
+    try:
+        # entregador
+        if body.nome is not None:
+            obj.nome = body.nome.strip()
+        if body.telefone is not None:
+            obj.telefone = body.telefone.strip()
+        if body.documento is not None:
+            novo_doc = body.documento.strip()
+            if not novo_doc:
+                raise HTTPException(status_code=400, detail="O campo 'documento' não pode ficar vazio.")
+            if novo_doc != obj.documento:
+                exists = db.scalars(
+                    select(Entregador).where(
+                        Entregador.sub_base == sub_base_user,
+                        Entregador.documento == novo_doc,
+                        Entregador.id_entregador != obj.id_entregador,
+                    )
+                ).first()
+                if exists:
+                    raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
+            obj.documento = novo_doc
 
-    # endereço
-    if body.rua is not None:
-        obj.rua = (body.rua or "").strip()
-    if body.numero is not None:
-        obj.numero = (body.numero or "").strip()
-    if body.complemento is not None:
-        obj.complemento = (body.complemento or "").strip()
-    if body.cep is not None:
-        obj.cep = (body.cep or "").strip()
-    if body.cidade is not None:
-        obj.cidade = (body.cidade or "").strip()
-    if body.bairro is not None:
-        obj.bairro = (body.bairro or "").strip()
+        # endereço
+        if body.rua is not None:         obj.rua = body.rua.strip()
+        if body.numero is not None:      obj.numero = body.numero.strip()
+        if body.complemento is not None: obj.complemento = body.complemento.strip()
+        if body.cep is not None:         obj.cep = body.cep.strip()
+        if body.cidade is not None:      obj.cidade = body.cidade.strip()
+        if body.bairro is not None:      obj.bairro = body.bairro.strip()
 
-    # novos campos
-    username = (body.username_entregador or "").strip() if body.username_entregador is not None else None
-    if username is not None:
-        if username == "":
-            obj.username_entregador = None
-        else:
-            _check_username_duplicado(db, sub_base_user, username, ignorar_id=obj.id_entregador)
-            obj.username_entregador = username
+        # flags de coleta e credenciais (espelhar no users também)
+        u = db.get(User, getattr(current_user, "id"))
+        if not u:
+            raise HTTPException(status_code=401, detail="Usuário não encontrado.")
 
-    if body.senha_entregador is not None:
-        senha_plain = (body.senha_entregador or "").strip()
-        if senha_plain == "":
-            obj.senha_entregador = None
-        else:
-            obj.senha_entregador = get_password_hash(senha_plain)
+        changed_user = False
 
-    if body.coletador is not None:
-        will_be_coletador = bool(body.coletador)
-        if will_be_coletador and not (obj.username_entregador or username):
-            # se vai virar coletador e ainda não tem username definido
-            raise HTTPException(
-                status_code=400,
-                detail="Para definir coletador=true, informe 'username_entregador' (e opcionalmente uma nova senha)."
-            )
-        obj.coletador = will_be_coletador
+        if body.coletador is not None:
+            obj.coletador = bool(body.coletador)
+            u.coletador = bool(body.coletador)
+            changed_user = True
 
-    db.commit()
-    db.refresh(obj)
-    return obj
+        if body.username_entregador is not None:
+            obj.username_entregador = (body.username_entregador or "").strip() or None
+            u.username_entregador = obj.username_entregador
+            changed_user = True
+
+        if body.senha_coletador is not None:
+            raw = body.senha_coletador.strip()
+            if not raw:
+                raise HTTPException(status_code=400, detail="A nova 'senha_coletador' não pode ser vazia.")
+            u.senha_coletador = get_password_hash(raw)
+            changed_user = True
+
+        if body.ativo is not None:
+            obj.ativo = bool(body.ativo)
+
+        # se mexeu no user, garante tipo_de_cadastro = 3 e espelha nome/telefone
+        if changed_user or (body.nome is not None or body.telefone is not None):
+            if body.nome is not None and body.nome.strip():
+                u.nome = body.nome.strip()
+            if body.telefone is not None and body.telefone.strip():
+                u.contato = body.telefone.strip()
+            u.tipo_de_cadastro = 3
+
+        db.commit()
+        db.refresh(obj)
+        return obj
+    except Exception:
+        db.rollback()
+        raise
+
 
 @router.delete("/{id_entregador}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_entregador(
@@ -313,5 +330,8 @@ def delete_entregador(
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
     db.delete(obj)
+
+    # OBS: regra de negócio para users ao deletar entregador não foi especificada.
+    # Se precisar "limpar" campos do user ao excluir, me diga a regra.
     db.commit()
     return
