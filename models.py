@@ -89,7 +89,6 @@ class Coleta(Base):
     shopee         = Column(Integer, nullable=False, server_default=text("0"))
     mercado_livre  = Column(Integer, nullable=False, server_default=text("0"))
     avulso         = Column(Integer, nullable=False, server_default=text("0"))
-    nfe            = Column(Integer, nullable=False, server_default=text("0"))
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
 
@@ -110,10 +109,9 @@ class BasePreco(Base):
     sub_base  = Column(Text, nullable=True)
     username  = Column(Text, nullable=True)
 
-    shopee        = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    ml            = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    avulso        = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    nfe           = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    shopee = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ml     = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    avulso = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
 
     def __repr__(self) -> str:
         return f"<BasePreco id_base={self.id_base} sub_base={self.sub_base!r} username={self.username!r}>"
@@ -130,6 +128,7 @@ class Saida(Base):
     data = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
 
     sub_base = Column(Text, nullable=True)
+    base = Column(Text, nullable=True)              # NOVA COLUNA (de onde veio a mercadoria)
     username = Column(Text, nullable=True)
     entregador = Column(Text, nullable=True)
 
@@ -147,7 +146,6 @@ class Saida(Base):
 class Entregador(Base):
     __tablename__ = "entregador"
     __table_args__ = (
-        # garante unicidade do par (sub_base, username_entregador)
         UniqueConstraint("sub_base", "username_entregador", name="uq_entregador_subbase_username"),
     )
 
@@ -170,7 +168,7 @@ class Entregador(Base):
     cidade = Column(Text, nullable=False)
     bairro = Column(Text, nullable=False)
 
-    # perfil coletador (ATENÇÃO: sem senha aqui!)
+    # perfil coletador
     coletador = Column(Boolean, nullable=False, server_default=text("false"))
     username_entregador = Column(Text, nullable=True)
 
