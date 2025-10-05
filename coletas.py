@@ -10,8 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from db import get_db
-from auth import get_current_user  # mantém autenticação por cookie/bearer
-from models import Coleta, Entregador, BasePreco, User  # nomes conforme seus models
+from auth import get_current_user
+from models import Coleta, Entregador, BasePreco, User
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
 
@@ -26,7 +26,6 @@ class ColetaCreate(BaseModel):
     shopee: int = Field(ge=0, default=0)
     ml: int = Field(ge=0, default=0)                    # vai para coluna "mercado_livre"
     avulso: int = Field(ge=0, default=0)
-    nfe: int = Field(ge=0, default=0)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -39,7 +38,6 @@ class ColetaOut(BaseModel):
     shopee: int
     mercado_livre: int
     avulso: int
-    nfe: int
     valor_total: Decimal
 
     model_config = ConfigDict(from_attributes=True)
@@ -78,7 +76,7 @@ def _get_owned_coleta(db: Session, sub_base_user: str, id_coleta: int) -> Coleta
     return obj
 
 # =========================
-# POST /coletas  (já existia)
+# POST /coletas
 # =========================
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=ColetaOut)
 def criar_coleta(
@@ -92,7 +90,7 @@ def criar_coleta(
       2) Encontra o ENTREGADOR por username_entregador e lê sua sub_base
       3) Busca a tabela de preços da BASE (BasePreco) por (sub_base, base)
       4) Calcula valor_total = soma(qtd * preço)
-      5) Persiste em COLETAS mapeando 'ml' -> coluna 'mercado_livre'
+      5) Persiste em COLETAS mapeando 'ml' -> 'mercado_livre'
     """
 
     # (2) Resolver entregador -> sub_base
@@ -106,18 +104,11 @@ def criar_coleta(
             detail=f"Entregador com username '{body.username_entregador}' não encontrado."
         )
 
-    if hasattr(Entregador, "sub_base"):
-        sub_base = ent.sub_base
-    else:
-        sub_base = getattr(ent, "base", None)
-
+    sub_base = getattr(ent, "sub_base", None) or getattr(ent, "base", None)
     if not sub_base:
-        raise HTTPException(
-            status_code=422,
-            detail="Entregador sem 'sub_base' definida."
-        )
+        raise HTTPException(status_code=422, detail="Entregador sem 'sub_base' definida.")
 
-    # (3) Buscar preços na tabela Base (BasePreco) por (sub_base, base)
+    # (3) Buscar preços na tabela BasePreco por (sub_base, base)
     precos = db.scalars(
         select(BasePreco).where(
             BasePreco.sub_base == sub_base,
@@ -131,17 +122,15 @@ def criar_coleta(
             detail=f"Tabela de preços não encontrada para sub_base='{sub_base}' e base='{body.base}'."
         )
 
-    # (4) Calcular total com Decimal (2 casas)
+    # (4) Calcular total (2 casas)
     p_shopee = _decimal(precos.shopee)
     p_ml     = _decimal(precos.ml)
     p_avulso = _decimal(precos.avulso)
-    p_nfe    = _decimal(precos.nfe)
 
     total = (
         _decimal(body.shopee) * p_shopee +
         _decimal(body.ml)     * p_ml +
-        _decimal(body.avulso) * p_avulso +
-        _decimal(body.nfe)    * p_nfe
+        _decimal(body.avulso) * p_avulso
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     # (5) Inserir na tabela COLETAS (ml -> mercado_livre)
@@ -152,7 +141,6 @@ def criar_coleta(
         shopee=body.shopee,
         mercado_livre=body.ml,
         avulso=body.avulso,
-        nfe=body.nfe,
         valor_total=total,
     )
 
@@ -167,7 +155,7 @@ def criar_coleta(
     return row
 
 # =========================
-# (NOVO) UPDATE SCHEMA (parcial) para PATCH
+# UPDATE SCHEMA (parcial) para PATCH
 # =========================
 class ColetaUpdate(BaseModel):
     base: Optional[str] = None
@@ -175,11 +163,10 @@ class ColetaUpdate(BaseModel):
     shopee: Optional[int] = Field(default=None, ge=0)
     ml: Optional[int]     = Field(default=None, ge=0)  # mapeado para 'mercado_livre'
     avulso: Optional[int] = Field(default=None, ge=0)
-    nfe: Optional[int]    = Field(default=None, ge=0)
     model_config = ConfigDict(from_attributes=True)
 
 # =========================
-# (NOVO) GET /coletas/  -> listar (escopo por sub_base do usuário)
+# GET /coletas/  -> listar (escopo por sub_base do usuário)
 # =========================
 @router.get("/", response_model=List[ColetaOut])
 def list_coletas(
@@ -201,7 +188,7 @@ def list_coletas(
     return rows
 
 # =========================
-# (NOVO) GET /coletas/{id_coleta}  -> detalhe
+# GET /coletas/{id_coleta}  -> detalhe
 # =========================
 @router.get("/{id_coleta}", response_model=ColetaOut)
 def get_coleta(
@@ -214,7 +201,7 @@ def get_coleta(
     return obj
 
 # =========================
-# (NOVO) PATCH /coletas/{id_coleta}  -> atualização parcial + recálculo
+# PATCH /coletas/{id_coleta}  -> atualização parcial + recálculo
 # =========================
 @router.patch("/{id_coleta}", response_model=ColetaOut)
 def patch_coleta(
@@ -264,7 +251,6 @@ def patch_coleta(
     q_shopee = obj.shopee if body.shopee is None else int(body.shopee)
     q_ml     = obj.mercado_livre if body.ml is None else int(body.ml)
     q_avulso = obj.avulso if body.avulso is None else int(body.avulso)
-    q_nfe    = obj.nfe if body.nfe is None else int(body.nfe)
 
     # Buscar preços BasePreco para (new_sub_base, new_base)
     precos = db.scalars(
@@ -282,13 +268,11 @@ def patch_coleta(
     p_shopee = _decimal(precos.shopee)
     p_ml     = _decimal(precos.ml)
     p_avulso = _decimal(precos.avulso)
-    p_nfe    = _decimal(precos.nfe)
 
     new_total = (
         _decimal(q_shopee) * p_shopee +
         _decimal(q_ml)     * p_ml +
-        _decimal(q_avulso) * p_avulso +
-        _decimal(q_nfe)    * p_nfe
+        _decimal(q_avulso) * p_avulso
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     # Persistir mudanças
@@ -298,7 +282,6 @@ def patch_coleta(
     obj.shopee = q_shopee
     obj.mercado_livre = q_ml
     obj.avulso = q_avulso
-    obj.nfe = q_nfe
     obj.valor_total = new_total
 
     db.commit()
@@ -306,7 +289,7 @@ def patch_coleta(
     return obj
 
 # =========================
-# (NOVO) DELETE /coletas/{id_coleta}
+# DELETE /coletas/{id_coleta}
 # =========================
 @router.delete("/{id_coleta}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_coleta(
