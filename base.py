@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, BasePreco  # << classe do models.py com __tablename__ = "base"
+from models import User, BasePreco  # classe do models.py com __tablename__ = "base"
 
 router = APIRouter(prefix="/base", tags=["Base"])
 
@@ -21,7 +21,6 @@ class BaseCreate(BaseModel):
     shopee: float = Field(ge=0)
     ml: float = Field(ge=0)
     avulso: float = Field(ge=0)
-    nfe: float = Field(ge=0)
     model_config = ConfigDict(from_attributes=True)
 
 class BaseOut(BaseModel):
@@ -32,51 +31,38 @@ class BaseOut(BaseModel):
     shopee: float
     ml: float
     avulso: float
-    nfe: float
     model_config = ConfigDict(from_attributes=True)
 
-# (NOVO) atualização parcial
 class BaseUpdate(BaseModel):
-    # Se não quiser permitir renomear "base", remova este campo.
     base: Optional[str] = None
-
     shopee: Optional[float] = Field(default=None, ge=0)
     ml: Optional[float]     = Field(default=None, ge=0)
     avulso: Optional[float] = Field(default=None, ge=0)
-    nfe: Optional[float]    = Field(default=None, ge=0)
     model_config = ConfigDict(from_attributes=True)
 
 # =========================
-# Helper (igual ao das saídas, mas focado em sub_base)
+# Helper
 # =========================
 def _resolve_user_sub_base(db: Session, current_user: User) -> str:
-    """
-    Determina a sub_base do usuário autenticado (sem fallback frouxo).
-    Tenta por id, depois email e username.
-    Exige 'users.sub_base' preenchido.
-    """
     user_id = getattr(current_user, "id", None)
     if user_id is not None:
         u = db.get(User, user_id)
         if u and getattr(u, "sub_base", None):
             return u.sub_base
-
     email = getattr(current_user, "email", None)
     if email:
         u = db.scalars(select(User).where(User.email == email)).first()
         if u and getattr(u, "sub_base", None):
             return u.sub_base
-
     username = getattr(current_user, "username", None)
     if username:
         u = db.scalars(select(User).where(User.username == username)).first()
         if u and getattr(u, "sub_base", None):
             return u.sub_base
-
     raise HTTPException(status_code=401, detail="Usuário sem 'sub_base' definida em 'users'.")
 
 # =========================
-# POST /base  -> cria um registro de preços para a sub_base do usuário
+# POST /base
 # =========================
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def criar_precos_base(
@@ -93,7 +79,6 @@ def criar_precos_base(
         shopee=payload.shopee,
         ml=payload.ml,
         avulso=payload.avulso,
-        nfe=payload.nfe,
     )
     db.add(obj)
     db.commit()
@@ -101,7 +86,7 @@ def criar_precos_base(
     return {"ok": True, "action": "created", "id_base": obj.id_base}
 
 # =========================
-# GET /base/  -> lista preços da sub_base do usuário (NOVO)
+# GET /base/
 # =========================
 @router.get("/", response_model=List[BaseOut])
 def list_bases(
@@ -113,7 +98,6 @@ def list_bases(
 
     stmt = select(BasePreco).where(BasePreco.sub_base == sub_base_user)
     if q:
-        # Para Postgres, .ilike faz case-insensitive
         stmt = stmt.where(BasePreco.base.ilike(f"%{q.strip()}%"))
 
     stmt = stmt.order_by(BasePreco.base)
@@ -121,7 +105,7 @@ def list_bases(
     return rows
 
 # =========================
-# GET /base/{id_base}  -> detalhe (NOVO)
+# GET /base/{id_base}
 # =========================
 @router.get("/{id_base}", response_model=BaseOut)
 def get_base(
@@ -136,7 +120,7 @@ def get_base(
     return obj
 
 # =========================
-# PATCH /base/{id_base}  -> atualização parcial (NOVO)
+# PATCH /base/{id_base}
 # =========================
 @router.patch("/{id_base}", response_model=BaseOut)
 def patch_base(
@@ -177,15 +161,13 @@ def patch_base(
         obj.ml = float(body.ml)
     if body.avulso is not None:
         obj.avulso = float(body.avulso)
-    if body.nfe is not None:
-        obj.nfe = float(body.nfe)
 
     db.commit()
     db.refresh(obj)
     return obj
 
 # =========================
-# DELETE /base/{id_base} (NOVO)
+# DELETE /base/{id_base}
 # =========================
 @router.delete("/{id_base}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_base(
