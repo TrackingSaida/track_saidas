@@ -2,33 +2,37 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, List
+from typing import Optional, List, Literal, Dict, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, BasePreco, User
+from models import Coleta, Entregador, BasePreco, User, Saida
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
 
 # =========================
 # Schemas
 # =========================
-class ColetaCreate(BaseModel):
-    base: str = Field(min_length=1)                     # ex.: "3AS"
-    username_entregador: str = Field(min_length=1)      # ex.: "entregador_cristian"
+class ItemLote(BaseModel):
+    codigo: str = Field(min_length=1)
+    servico: str = Field(min_length=1, description="shopee | ml | mercado_livre | mercado livre | avulso")
 
-    # quantidades coletadas (não negativas)
-    shopee: int = Field(ge=0, default=0)
-    ml: int = Field(ge=0, default=0)                    # vai para coluna "mercado_livre"
-    avulso: int = Field(ge=0, default=0)
+class ColetaLoteIn(BaseModel):
+    base: str = Field(min_length=1)
+    itens: List[ItemLote] = Field(min_length=1)
 
-    model_config = ConfigDict(from_attributes=True)
-
+class ResumoLote(BaseModel):
+    inseridos: int
+    duplicados: int
+    codigos_duplicados: List[str]
+    contagem: Dict[str, int]
+    precos: Dict[str, str]
+    total: str
 
 class ColetaOut(BaseModel):
     id_coleta: int
@@ -39,8 +43,11 @@ class ColetaOut(BaseModel):
     mercado_livre: int
     avulso: int
     valor_total: Decimal
-
     model_config = ConfigDict(from_attributes=True)
+
+class LoteResponse(BaseModel):
+    coleta: ColetaOut
+    resumo: ResumoLote
 
 # =========================
 # Helpers
@@ -51,122 +58,170 @@ def _decimal(v) -> Decimal:
     except Exception:
         return Decimal("0")
 
-def _resolve_user_sub_base(db: Session, current_user: User) -> str:
-    user_id = getattr(current_user, "id", None)
-    if user_id is not None:
-        u = db.get(User, user_id)
-        if u and getattr(u, "sub_base", None):
-            return u.sub_base
-    email = getattr(current_user, "email", None)
-    if email:
-        u = db.scalars(select(User).where(User.email == email)).first()
-        if u and getattr(u, "sub_base", None):
-            return u.sub_base
-    uname = getattr(current_user, "username", None)
-    if uname:
-        u = db.scalars(select(User).where(User.username == uname)).first()
-        if u and getattr(u, "sub_base", None):
-            return u.sub_base
-    raise HTTPException(status_code=400, detail="sub_base não definida para o usuário em 'users'.")
+def _fmt_money(d: Decimal) -> str:
+    return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
 
-def _get_owned_coleta(db: Session, sub_base_user: str, id_coleta: int) -> Coleta:
-    obj = db.get(Coleta, id_coleta)
-    if not obj or obj.sub_base != sub_base_user:
-        raise HTTPException(status_code=404, detail="Não encontrado")
-    return obj
+def _normalize_servico(raw: str) -> Literal["shopee", "mercado_livre", "avulso"]:
+    s = (raw or "").strip().lower()
+    if s in {"shopee"}:
+        return "shopee"
+    if s in {"ml", "mercado_livre", "mercado livre"}:
+        return "mercado_livre"
+    if s in {"avulso"}:
+        return "avulso"
+    raise HTTPException(status_code=422, detail=f"Serviço inválido: {raw!r}")
+
+def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) -> str:
+    # etiqueta que ficará em `saidas.servico`
+    return "Mercado Livre" if s == "mercado_livre" else s
+
+def _find_entregador_for_user(db: Session, user: User) -> Entregador:
+    """
+    Resolve o entregador do usuário autenticado.
+    1) tenta por User.username_entregador
+    2) cai para User.username
+    Exige que o entregador exista e esteja ativo.
+    """
+    candidates = []
+    ue = getattr(user, "username_entregador", None)
+    if ue:
+        candidates.append(ue)
+    un = getattr(user, "username", None)
+    if un and un not in candidates:
+        candidates.append(un)
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Usuário sem 'username' compatível para localizar o entregador.")
+
+    ent = db.scalars(
+        select(Entregador)
+        .where(Entregador.username_entregador.in_(candidates))
+    ).first()
+
+    if not ent:
+        raise HTTPException(status_code=404, detail="Entregador não encontrado para o usuário autenticado.")
+    if hasattr(ent, "ativo") and ent.ativo is False:
+        raise HTTPException(status_code=403, detail="Entregador inativo.")
+
+    if not getattr(ent, "sub_base", None):
+        raise HTTPException(status_code=422, detail="Entregador encontrado, porém sem 'sub_base' definida.")
+
+    return ent
+
+def _get_precos(db: Session, sub_base: str, base: str) -> Tuple[Decimal, Decimal, Decimal]:
+    precos = db.scalars(
+        select(BasePreco).where(BasePreco.sub_base == sub_base, BasePreco.base == base)
+    ).first()
+    if not precos:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tabela de preços não encontrada para sub_base={sub_base!r} e base={base!r}."
+        )
+    return _decimal(precos.shopee), _decimal(precos.ml), _decimal(precos.avulso)
 
 # =========================
-# POST /coletas
+# POST /coletas/lote  (novo fluxo)
 # =========================
-@router.post("/", status_code=status.HTTP_201_CREATED, response_model=ColetaOut)
-def criar_coleta(
-    body: ColetaCreate,
+@router.post("/lote", status_code=status.HTTP_201_CREATED, response_model=LoteResponse)
+def registrar_coleta_em_lote(
+    payload: ColetaLoteIn,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Fluxo:
-      1) Recebe quantidades + base + username_entregador
-      2) Encontra o ENTREGADOR por username_entregador e lê sua sub_base
-      3) Busca a tabela de preços da BASE (BasePreco) por (sub_base, base)
-      4) Calcula valor_total = soma(qtd * preço)
-      5) Persiste em COLETAS mapeando 'ml' -> 'mercado_livre'
+    Recebe vários códigos, grava cada um em `saidas` (status='coletado', com a base do payload),
+    e grava o consolidado em `coletas` calculando o valor_total a partir da tabela `base`
+    (preços por sub_base e base). Não existe 'nfe' neste fluxo.
     """
 
-    # (2) Resolver entregador -> sub_base
-    ent = db.scalars(
-        select(Entregador).where(Entregador.username_entregador == body.username_entregador)
-    ).first()
+    # 1) Usuário autenticado -> entregueador + sub_base
+    entregador = _find_entregador_for_user(db, current_user)
+    sub_base = entregador.sub_base
+    entregador_nome = entregador.nome or entregador.username_entregador
+    username_entregador = entregador.username_entregador
 
-    if not ent:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Entregador com username '{body.username_entregador}' não encontrado."
-        )
+    # 2) preços da base
+    p_shopee, p_ml, p_avulso = _get_precos(db, sub_base=sub_base, base=payload.base)
 
-    sub_base = getattr(ent, "sub_base", None) or getattr(ent, "base", None)
-    if not sub_base:
-        raise HTTPException(status_code=422, detail="Entregador sem 'sub_base' definida.")
-
-    # (3) Buscar preços na tabela BasePreco por (sub_base, base)
-    precos = db.scalars(
-        select(BasePreco).where(
-            BasePreco.sub_base == sub_base,
-            BasePreco.base == body.base,
-        )
-    ).first()
-
-    if not precos:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Tabela de preços não encontrada para sub_base='{sub_base}' e base='{body.base}'."
-        )
-
-    # (4) Calcular total (2 casas)
-    p_shopee = _decimal(precos.shopee)
-    p_ml     = _decimal(precos.ml)
-    p_avulso = _decimal(precos.avulso)
-
-    total = (
-        _decimal(body.shopee) * p_shopee +
-        _decimal(body.ml)     * p_ml +
-        _decimal(body.avulso) * p_avulso
-    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-    # (5) Inserir na tabela COLETAS (ml -> mercado_livre)
-    row = Coleta(
-        sub_base=sub_base,
-        base=body.base,
-        username_entregador=body.username_entregador,
-        shopee=body.shopee,
-        mercado_livre=body.ml,
-        avulso=body.avulso,
-        valor_total=total,
-    )
+    # 3) percorrer itens, inserir em `saidas` e contar por serviço
+    count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
+    duplicates: List[str] = []
+    created = 0
 
     try:
-        db.add(row)
+        for item in payload.itens:
+            serv = _normalize_servico(item.servico)
+            codigo = (item.codigo or "").strip()
+            if not codigo:
+                raise HTTPException(status_code=422, detail="Código vazio no payload.")
+
+            # de-dup por (sub_base, codigo)
+            exists = db.scalars(
+                select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
+            ).first()
+            if exists:
+                duplicates.append(codigo)
+                continue
+
+            saida = Saida(
+                sub_base=sub_base,
+                base=payload.base,                       # nova coluna na tabela `saidas`
+                username=getattr(current_user, "username", None),
+                entregador=entregador_nome,
+                codigo=codigo,
+                servico=_servico_label_for_saida(serv),  # "Mercado Livre" | "shopee" | "avulso"
+                status="coletado",
+            )
+            db.add(saida)
+            created += 1
+            count[serv] += 1
+
+        # 4) consolidado em `coletas`
+        total = (
+            _decimal(count["shopee"])        * p_shopee +
+            _decimal(count["mercado_livre"]) * p_ml +
+            _decimal(count["avulso"])        * p_avulso
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        coleta = Coleta(
+            sub_base=sub_base,
+            base=payload.base,
+            username_entregador=username_entregador,
+            shopee=count["shopee"],
+            mercado_livre=count["mercado_livre"],
+            avulso=count["avulso"],
+            valor_total=total,
+        )
+        db.add(coleta)
+
         db.commit()
-        db.refresh(row)
+        db.refresh(coleta)
+
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Falha ao gravar coleta: {e}")
+        raise HTTPException(status_code=500, detail=f"Falha ao registrar lote: {e}")
 
-    return row
+    return LoteResponse(
+        coleta=ColetaOut.model_validate(coleta),
+        resumo=ResumoLote(
+            inseridos=created,
+            duplicados=len(duplicates),
+            codigos_duplicados=duplicates,
+            contagem=dict(count),
+            precos={
+                "shopee": _fmt_money(p_shopee),
+                "ml": _fmt_money(p_ml),
+                "avulso": _fmt_money(p_avulso),
+            },
+            total=_fmt_money(coleta.valor_total),
+        ),
+    )
 
 # =========================
-# UPDATE SCHEMA (parcial) para PATCH
-# =========================
-class ColetaUpdate(BaseModel):
-    base: Optional[str] = None
-    username_entregador: Optional[str] = None
-    shopee: Optional[int] = Field(default=None, ge=0)
-    ml: Optional[int]     = Field(default=None, ge=0)  # mapeado para 'mercado_livre'
-    avulso: Optional[int] = Field(default=None, ge=0)
-    model_config = ConfigDict(from_attributes=True)
-
-# =========================
-# GET /coletas/  -> listar (escopo por sub_base do usuário)
+# GETs simples (escopo por sub_base do user) – mantidos
 # =========================
 @router.get("/", response_model=List[ColetaOut])
 def list_coletas(
@@ -175,7 +230,20 @@ def list_coletas(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base_user = _resolve_user_sub_base(db, current_user)
+    # sub_base do usuário autenticado (via tabela users)
+    user_id = getattr(current_user, "id", None)
+    sub_base_user: Optional[str] = None
+    if user_id is not None:
+        u = db.get(User, user_id)
+        sub_base_user = getattr(u, "sub_base", None)
+    if not sub_base_user and getattr(current_user, "email", None):
+        u = db.scalars(select(User).where(User.email == current_user.email)).first()
+        sub_base_user = getattr(u, "sub_base", None)
+    if not sub_base_user and getattr(current_user, "username", None):
+        u = db.scalars(select(User).where(User.username == current_user.username)).first()
+        sub_base_user = getattr(u, "sub_base", None)
+    if not sub_base_user:
+        raise HTTPException(status_code=400, detail="sub_base não definida no usuário.")
 
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
     if base:
@@ -186,119 +254,3 @@ def list_coletas(
     stmt = stmt.order_by(Coleta.id_coleta.desc())
     rows = db.scalars(stmt).all()
     return rows
-
-# =========================
-# GET /coletas/{id_coleta}  -> detalhe
-# =========================
-@router.get("/{id_coleta}", response_model=ColetaOut)
-def get_coleta(
-    id_coleta: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    sub_base_user = _resolve_user_sub_base(db, current_user)
-    obj = _get_owned_coleta(db, sub_base_user, id_coleta)
-    return obj
-
-# =========================
-# PATCH /coletas/{id_coleta}  -> atualização parcial + recálculo
-# =========================
-@router.patch("/{id_coleta}", response_model=ColetaOut)
-def patch_coleta(
-    id_coleta: int,
-    body: ColetaUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Regras:
-      - Permite atualizar base, username_entregador e quantidades.
-      - Sempre recalcula 'valor_total' com a tabela de preços vigente (BasePreco) para (sub_base, base).
-      - sub_base é a do entregador (se alterado) ou a atual da coleta (se entregador não mudar).
-    """
-    sub_base_user = _resolve_user_sub_base(db, current_user)
-    obj = _get_owned_coleta(db, sub_base_user, id_coleta)
-
-    # Determinar novos campos (sem gravar ainda)
-    new_base = obj.base
-    new_username = obj.username_entregador
-
-    if body.base is not None:
-        nb = (body.base or "").strip()
-        if not nb:
-            raise HTTPException(status_code=400, detail="O campo 'base' não pode ficar vazio.")
-        new_base = nb
-
-    if body.username_entregador is not None:
-        nu = (body.username_entregador or "").strip()
-        if not nu:
-            raise HTTPException(status_code=400, detail="O campo 'username_entregador' não pode ficar vazio.")
-        new_username = nu
-
-    # Resolver sub_base (se username_entregador mudar, pega a sub_base do novo entregador)
-    new_sub_base = obj.sub_base
-    if new_username != obj.username_entregador:
-        ent = db.scalars(
-            select(Entregador).where(Entregador.username_entregador == new_username)
-        ).first()
-        if not ent:
-            raise HTTPException(status_code=404, detail=f"Entregador com username '{new_username}' não encontrado.")
-        new_sub_base = getattr(ent, "sub_base", None) or getattr(ent, "base", None)
-        if not new_sub_base:
-            raise HTTPException(status_code=422, detail="Entregador sem 'sub_base' definida.")
-
-    # Quantidades (se não enviadas, mantém as atuais)
-    q_shopee = obj.shopee if body.shopee is None else int(body.shopee)
-    q_ml     = obj.mercado_livre if body.ml is None else int(body.ml)
-    q_avulso = obj.avulso if body.avulso is None else int(body.avulso)
-
-    # Buscar preços BasePreco para (new_sub_base, new_base)
-    precos = db.scalars(
-        select(BasePreco).where(
-            BasePreco.sub_base == new_sub_base,
-            BasePreco.base == new_base,
-        )
-    ).first()
-    if not precos:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Tabela de preços não encontrada para sub_base='{new_sub_base}' e base='{new_base}'."
-        )
-
-    p_shopee = _decimal(precos.shopee)
-    p_ml     = _decimal(precos.ml)
-    p_avulso = _decimal(precos.avulso)
-
-    new_total = (
-        _decimal(q_shopee) * p_shopee +
-        _decimal(q_ml)     * p_ml +
-        _decimal(q_avulso) * p_avulso
-    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-    # Persistir mudanças
-    obj.base = new_base
-    obj.username_entregador = new_username
-    obj.sub_base = new_sub_base
-    obj.shopee = q_shopee
-    obj.mercado_livre = q_ml
-    obj.avulso = q_avulso
-    obj.valor_total = new_total
-
-    db.commit()
-    db.refresh(obj)
-    return obj
-
-# =========================
-# DELETE /coletas/{id_coleta}
-# =========================
-@router.delete("/{id_coleta}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_coleta(
-    id_coleta: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    sub_base_user = _resolve_user_sub_base(db, current_user)
-    obj = _get_owned_coleta(db, sub_base_user, id_coleta)
-    db.delete(obj)
-    db.commit()
-    return
