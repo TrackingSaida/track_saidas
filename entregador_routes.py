@@ -83,6 +83,7 @@ class EntregadorOut(BaseModel):
 # HELPERS
 # =========================================================
 def _resolve_user_base(db: Session, current_user) -> str:
+    """Resolve a sub_base do usuário autenticado"""
     user_id = getattr(current_user, "id", None)
     if user_id is not None:
         u = db.get(User, user_id)
@@ -99,6 +100,7 @@ def _resolve_user_base(db: Session, current_user) -> str:
 
 
 def _get_owned_entregador(db: Session, sub_base_user: str, id_entregador: int) -> Entregador:
+    """Busca o entregador e valida se pertence à mesma sub_base"""
     obj = db.get(Entregador, id_entregador)
     if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(status_code=404, detail="Não encontrado")
@@ -106,6 +108,7 @@ def _get_owned_entregador(db: Session, sub_base_user: str, id_entregador: int) -
 
 
 def _find_matching_user(db: Session, sub_base: str, username_ent: Optional[str]) -> Optional[User]:
+    """Localiza um user vinculado ao entregador"""
     if not username_ent:
         return None
     stmt = select(User).where(
@@ -127,16 +130,15 @@ def create_entregador(
     current_user = Depends(get_current_user),
 ):
     """
-    Cria um entregador e, se 'coletador=true', também cria um NOVO usuário em 'users':
-      - password_hash recebe o hash de 'senha'
+    Cria um entregador e, se 'coletador=True', também cria um novo usuário em 'users':
+      - password_hash recebe o hash da senha
       - username = username_entregador
       - contato = telefone
       - nome = nome
-      - coletador = true
-      - username_entregador = username_entregador
+      - coletador = True
       - tipo_de_cadastro = 3
       - sub_base = do solicitante
-      - status = true
+      - status = True
     """
     sub_base_user = _resolve_user_base(db, current_user)
 
@@ -164,7 +166,7 @@ def create_entregador(
         if not senha_raw:
             raise HTTPException(status_code=400, detail="Informe 'senha' para coletador.")
 
-        # unicidade do novo user
+        # unicidade do username
         if db.scalars(select(User).where(User.username == username_ent)).first():
             raise HTTPException(status_code=409, detail="Já existe um usuário com este username.")
 
@@ -179,7 +181,7 @@ def create_entregador(
         raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
 
     try:
-        # 1) cria ENTREGADOR
+        # 1️⃣ Cria ENTREGADOR
         ent = Entregador(
             sub_base=sub_base_user,
             nome=nome,
@@ -197,7 +199,7 @@ def create_entregador(
         )
         db.add(ent)
 
-        # 2) se coletador => cria USER
+        # 2️⃣ Se coletador → cria USER
         if coletador_flag:
             new_user = User(
                 password_hash=get_password_hash(senha_raw),
@@ -220,6 +222,36 @@ def create_entregador(
         raise
 
 
+@router.get("/", response_model=List[EntregadorOut])
+def list_entregadores(
+    status: Optional[str] = Query("todos", description="Filtrar por status: ativo, inativo ou todos"),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Lista entregadores da sub_base do solicitante, filtrando por status"""
+    sub_base_user = _resolve_user_base(db, current_user)
+
+    stmt = select(Entregador).where(Entregador.sub_base == sub_base_user)
+    if status == "ativo":
+        stmt = stmt.where(Entregador.ativo.is_(True))
+    elif status == "inativo":
+        stmt = stmt.where(Entregador.ativo.is_(False))
+    stmt = stmt.order_by(Entregador.nome)
+
+    return db.scalars(stmt).all()
+
+
+@router.get("/{id_entregador}", response_model=EntregadorOut)
+def get_entregador(
+    id_entregador: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Retorna um entregador específico"""
+    sub_base_user = _resolve_user_base(db, current_user)
+    return _get_owned_entregador(db, sub_base_user, id_entregador)
+
+
 @router.patch("/{id_entregador}", response_model=EntregadorOut)
 def patch_entregador(
     id_entregador: int,
@@ -227,15 +259,20 @@ def patch_entregador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
+    """
+    Atualiza parcialmente:
+      - Sincroniza 'coletador' entre entregador e users
+      - Atualiza senha (password_hash)
+      - Atualiza nome/telefone em ambos
+      - username_entregador reflete em users.username
+    """
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
 
     try:
-        # dados básicos
-        if body.nome is not None:
-            obj.nome = body.nome.strip()
-        if body.telefone is not None:
-            obj.telefone = body.telefone.strip()
+        # Atualiza campos locais
+        if body.nome is not None: obj.nome = body.nome.strip()
+        if body.telefone is not None: obj.telefone = body.telefone.strip()
         if body.documento is not None:
             novo_doc = body.documento.strip()
             if not novo_doc:
@@ -252,7 +289,6 @@ def patch_entregador(
                     raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
             obj.documento = novo_doc
 
-        # endereço
         if body.rua is not None:         obj.rua = body.rua.strip()
         if body.numero is not None:      obj.numero = body.numero.strip()
         if body.complemento is not None: obj.complemento = body.complemento.strip()
@@ -260,20 +296,28 @@ def patch_entregador(
         if body.cidade is not None:      obj.cidade = body.cidade.strip()
         if body.bairro is not None:      obj.bairro = body.bairro.strip()
 
-        # localizar user correspondente
+        # Localiza user correspondente
         user = _find_matching_user(db, sub_base_user, obj.username_entregador)
 
-        # sincronização de nome e telefone
-        if user and body.nome is not None: user.nome = body.nome.strip()
-        if user and body.telefone is not None: user.contato = body.telefone.strip()
+        # Sincroniza nome/telefone
+        if user and body.nome: user.nome = body.nome.strip()
+        if user and body.telefone: user.contato = body.telefone.strip()
 
-        # sincronização de coletador
+        # Atualiza username_entregador
+        if body.username_entregador is not None:
+            novo_user = body.username_entregador.strip()
+            obj.username_entregador = novo_user
+            if user:
+                user.username = novo_user
+                user.username_entregador = novo_user
+
+        # Sincroniza coletador (em ambas)
         if body.coletador is not None:
             obj.coletador = bool(body.coletador)
             if user:
                 user.coletador = bool(body.coletador)
 
-        # senha nova
+        # Atualiza senha (user.password_hash)
         if body.senha is not None:
             if not user:
                 raise HTTPException(status_code=404, detail="Usuário não encontrado para atualização de senha.")
@@ -283,9 +327,27 @@ def patch_entregador(
             user.password_hash = get_password_hash(raw)
             user.tipo_de_cadastro = 3
 
+        # Atualiza ativo apenas no entregador
+        if body.ativo is not None:
+            obj.ativo = bool(body.ativo)
+
         db.commit()
         db.refresh(obj)
         return obj
     except Exception:
         db.rollback()
         raise
+
+
+@router.delete("/{id_entregador}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_entregador(
+    id_entregador: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Remove o entregador, sem deletar o user"""
+    sub_base_user = _resolve_user_base(db, current_user)
+    obj = _get_owned_entregador(db, sub_base_user, id_entregador)
+    db.delete(obj)
+    db.commit()
+    return
