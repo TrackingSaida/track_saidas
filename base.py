@@ -21,6 +21,8 @@ class BaseCreate(BaseModel):
     shopee: float = Field(ge=0)
     ml: float = Field(ge=0)
     avulso: float = Field(ge=0)
+    # novo: toggle opcional; se não vier, usamos False (segue server_default)
+    ativo: Optional[bool] = None
     model_config = ConfigDict(from_attributes=True)
 
 class BaseOut(BaseModel):
@@ -31,6 +33,8 @@ class BaseOut(BaseModel):
     shopee: float
     ml: float
     avulso: float
+    # novo: expor status
+    ativo: bool
     model_config = ConfigDict(from_attributes=True)
 
 class BaseUpdate(BaseModel):
@@ -38,6 +42,8 @@ class BaseUpdate(BaseModel):
     shopee: Optional[float] = Field(default=None, ge=0)
     ml: Optional[float]     = Field(default=None, ge=0)
     avulso: Optional[float] = Field(default=None, ge=0)
+    # novo: permitir alterar status
+    ativo: Optional[bool]   = None
     model_config = ConfigDict(from_attributes=True)
 
 # =========================
@@ -79,6 +85,8 @@ def criar_precos_base(
         shopee=payload.shopee,
         ml=payload.ml,
         avulso=payload.avulso,
+        # novo: se não vier no payload, fica False (alinha com server_default "false")
+        ativo=bool(payload.ativo) if payload.ativo is not None else False,
     )
     db.add(obj)
     db.commit()
@@ -91,14 +99,27 @@ def criar_precos_base(
 @router.get("/", response_model=List[BaseOut])
 def list_bases(
     q: Optional[str] = Query(None, description="Filtro por texto em 'base' (contém)"),
+    status_flag: Optional[str] = Query(
+        "todos",
+        alias="status",
+        description="Filtrar por status: ativo, inativo ou todos"
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     sub_base_user = _resolve_user_sub_base(db, current_user)
 
     stmt = select(BasePreco).where(BasePreco.sub_base == sub_base_user)
+
     if q:
         stmt = stmt.where(BasePreco.base.ilike(f"%{q.strip()}%"))
+
+    # novo: filtro por ativo/inativo (opcional)
+    if status_flag == "ativo":
+        stmt = stmt.where(BasePreco.ativo.is_(True))
+    elif status_flag in ("inativo", "inativos"):
+        stmt = stmt.where(BasePreco.ativo.is_(False))
+    # "todos" mantém sem filtro
 
     stmt = stmt.order_by(BasePreco.base)
     rows = db.scalars(stmt).all()
@@ -161,6 +182,10 @@ def patch_base(
         obj.ml = float(body.ml)
     if body.avulso is not None:
         obj.avulso = float(body.avulso)
+
+    # novo: toggle de status
+    if body.ativo is not None:
+        obj.ativo = bool(body.ativo)
 
     db.commit()
     db.refresh(obj)
