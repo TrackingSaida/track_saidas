@@ -91,8 +91,6 @@ class Coleta(Base):
     avulso         = Column(Integer, nullable=False, server_default=text("0"))
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    ativo = Column(Boolean, nullable=False, server_default=text("false"))
-
 
     def __repr__(self) -> str:
         return f"<Coleta id_coleta={self.id_coleta} sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
@@ -114,6 +112,7 @@ class BasePreco(Base):
     shopee = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     ml     = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     avulso = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ativo = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
         return f"<BasePreco id_base={self.id_base} sub_base={self.sub_base!r} username={self.username!r}>"
