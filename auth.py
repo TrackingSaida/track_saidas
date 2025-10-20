@@ -84,6 +84,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+
 # ======================
 # Acesso a usuário
 # ======================
@@ -161,10 +162,15 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
             detail="Login ou senha incorretos",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(data={"sub": user.email}, expires_delta=expires)
-    return {"access_token": access_token, "token_type": "bearer"}
 
+    # ✅ Novo: usa email ou username ou contato como identificador principal
+    subject = user.email or user.username or user.contato
+    if not subject:
+        raise HTTPException(status_code=422, detail="Usuário sem identificador válido (email/username/contato).")
+
+    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": subject}, expires_delta=expires)
+    return {"access_token": access_token, "token_type": "bearer"}
 @router.post("/login")
 async def login_set_cookie(user_credentials: UserLogin, response: Response, db: Session = Depends(get_db)):
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
