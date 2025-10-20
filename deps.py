@@ -1,39 +1,74 @@
 # deps.py
-import os, jwt
+from __future__ import annotations
+
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer
-from sqlalchemy.orm import Session
-from db import SessionLocal
+from typing import Callable
+
 from models import User
+from auth import get_current_user as auth_get_current_user  # reutiliza seu auth.get_current_user
 
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
-JWT_ALG = "HS256"
-auth_scheme = HTTPBearer(auto_error=True)
 
-def get_db():
-    db = SessionLocal()
+def _coerce_role_from_user(user: User) -> int:
+    """
+    Extrai o 'role' a partir de user.tipo_de_cadastro.
+    Defaults seguro: 3 (mais restrito) se vier None/0/inválido.
+    """
     try:
-        yield db
-    finally:
-        db.close()
+        value = int(getattr(user, "tipo_de_cadastro", 3) or 3)
+        # garante faixa conhecida (1,2,3); se sair disso, cai para 3
+        if value not in (1, 2, 3):
+            return 3
+        return value
+    except Exception:
+        return 3
 
-def get_current_user(credentials=Depends(auth_scheme), db: Session = Depends(get_db)) -> User:
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expirado")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Token inválido")
 
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Token sem sub")
-
-    user = db.query(User).get(user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuário não encontrado")
-
-    # papel = tipo_de_cadastro (1,2,3); default seguro = 3
-    user.role = int(getattr(user, "tipo_de_cadastro", 3) or 3)
+def current_user_with_role(user: User = Depends(auth_get_current_user)) -> User:
+    """
+    Wrap no current_user do auth.py:
+    - mantém autenticação (cookie/Bearer) e busca no DB
+    - anexa 'user.role' com base em 'tipo_de_cadastro'
+    """
+    user.role = _coerce_role_from_user(user)
     return user
+
+
+def allow(*tipos_permitidos: int) -> Callable:
+    """
+    Guard (RBAC) para usar nas rotas.
+    Ex.: Operação -> Depends(allow(1,2,3))
+         Config   -> Depends(allow(1,2))
+         Dash     -> Depends(allow(1))
+    """
+    # normaliza lista e filtra valores válidos
+    permitidos = tuple(x for x in tipos_permitidos if x in (1, 2, 3))
+    if not permitidos:
+        # fallback seguro: ninguém acessa, caso alguém use allow() sem argumentos
+        permitidos = (0,)
+
+    def guard(user: User = Depends(current_user_with_role)) -> User:
+        if int(user.role) not in permitidos:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Acesso negado",
+            )
+        return user
+
+    return guard
+
+
+# --------- EXEMPLOS DE USO (para referência) ----------
+# from fastapi import APIRouter, Depends
+# router = APIRouter()
+#
+# @router.get("/operacao/registros")        # 1,2,3
+# def listar_registros(user = Depends(allow(1,2,3))):
+#     ...
+#
+# @router.get("/config/entregadores")       # 1,2
+# def cfg_entregadores(user = Depends(allow(1,2))):
+#     ...
+#
+# @router.get("/dashboards/tracking")       # 1
+# def dash_tracking(user = Depends(allow(1))):
+#     ...
