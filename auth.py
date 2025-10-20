@@ -71,7 +71,7 @@ class UserLogin(BaseModel):
 
 class UserResponse(BaseModel):
     id: int
-    email: EmailStr
+    email: Optional[EmailStr] = None
     username: Optional[str] = None
     contato: Optional[str] = None
 
@@ -84,13 +84,9 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-
 # ======================
 # Acesso a usuário
 # ======================
-def get_user_by_email(db: Session, email: str) -> Optional[User]:
-    return db.scalars(select(User).where(User.email == email)).first()
-
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
     """
     Busca por email, username OU contato (primeiro que bater).
@@ -110,6 +106,8 @@ def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
 def authenticate_user(db: Session, identifier: str, password: str) -> Optional[User]:
     user = get_user_by_identifier(db, identifier)
     if not user:
+        return None
+    if not getattr(user, "password_hash", None):
         return None
     if not verify_password(password, user.password_hash):
         return None
@@ -138,13 +136,14 @@ async def get_current_user(
 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")  # subject = email
-        if not email:
-            raise HTTPException(status_code=401, detail="Token inválido")
+        sub_value: str = payload.get("sub")  # agora pode ser email OU username OU contato
+        if not sub_value:
+            raise HTTPException(status_code=401, detail="Token inválido: sem identificador 'sub'")
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
-    user = get_user_by_email(db, email=email)
+    # Busca o usuário por qualquer um dos identificadores
+    user = get_user_by_identifier(db, sub_value)
     if user is None:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
     return user
@@ -152,7 +151,6 @@ async def get_current_user(
 # ======================
 # Rotas
 # ======================
-
 @router.post("/token", response_model=Token)
 async def login_for_access_token(user_credentials: UserLogin, db: Session = Depends(get_db)):
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
@@ -163,7 +161,7 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # ✅ Novo: usa email ou username ou contato como identificador principal
+    # Usa o primeiro identificador disponível
     subject = user.email or user.username or user.contato
     if not subject:
         raise HTTPException(status_code=422, detail="Usuário sem identificador válido (email/username/contato).")
@@ -171,18 +169,24 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(data={"sub": subject}, expires_delta=expires)
     return {"access_token": access_token, "token_type": "bearer"}
+
 @router.post("/login")
 async def login_set_cookie(user_credentials: UserLogin, response: Response, db: Session = Depends(get_db)):
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
+    subject = user.email or user.username or user.contato
+    if not subject:
+        raise HTTPException(status_code=422, detail="Usuário sem identificador válido (email/username/contato).")
+
     if user_credentials.remember:
         expires = timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
     else:
-        expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_M
+INUTES)
 
-    token = create_access_token(data={"sub": user.email}, expires_delta=expires)
+    token = create_access_token(data={"sub": subject}, expires_delta=expires)
 
     # SameSite/Lax vs None conforme ambiente
     samesite = "None" if COOKIE_SECURE else "Lax"
@@ -200,7 +204,12 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
 
     return {
         "ok": True,
-        "user": {"id": user.id, "email": user.email, "username": user.username, "contato": user.contato},
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+            "contato": user.contato,
+        },
     }
 
 @router.post("/logout")
