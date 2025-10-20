@@ -62,8 +62,10 @@ from saidas_routes import router as saidas_router                # noqa: E402
 from owner_routes import router as owners_router
 from base import router as base_router
 from coletas import router as coletas_router
+from routes_ui import router as ui_router
 
 
+app.include_router(ui_router)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(users_router,        prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
