@@ -54,7 +54,7 @@ class Token(BaseModel):
     token_type: str
 
 class TokenData(BaseModel):
-    email: Optional[EmailStr] = None
+    email: Optional[EmailStr] = None  # opcional; mantido por compatibilidade
 
 class UserLogin(BaseModel):
     # aceita "email" OU "username" OU "contato" no mesmo campo
@@ -183,8 +183,8 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
     if user_credentials.remember:
         expires = timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
     else:
-        expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_M
-INUTES)
+        # >>> linha corrigida: sem quebra no nome da constante <<<
+        expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
     token = create_access_token(data={"sub": subject}, expires_delta=expires)
 
