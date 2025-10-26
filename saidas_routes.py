@@ -226,7 +226,7 @@ def listar_saidas(
     entregador: Optional[str] = Query(None, description="Filtra por entregador (texto exato)"),
     status_: Optional[str] = Query(None, alias="status", description="Filtra por status (texto exato)"),
     codigo: Optional[str] = Query(None, description="Filtro 'contém' no código"),
-    limit: int = Query(200, ge=1, le=1000),
+    limit: int = Query(200, ge=1, le=6000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
