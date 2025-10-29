@@ -19,6 +19,7 @@ class SaidaCreate(BaseModel):
     entregador: str = Field(min_length=1)
     codigo: str = Field(min_length=1)
     servico: str = Field(min_length=1)  # vem do front
+    status: Optional[str] = None        # <- NOVO: aceitar status no POST (opcional)
 
 class SaidaOut(BaseModel):
     id_saida: int
@@ -167,6 +168,12 @@ def registrar_saida(
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
     servico = payload.servico.strip()
+    # NOVO: status opcional no payload; se ausente ou vazio, usar "saiu"
+    status_val = "saiu"
+    if payload.status is not None:
+        s = payload.status.strip()
+        if s:
+            status_val = s
 
     # 🔎 Duplicidade por sub_base + código
     existente = db.scalars(
@@ -203,7 +210,7 @@ def registrar_saida(
             entregador=entregador,
             codigo=codigo,
             servico=servico,   # grava exatamente o que veio do front
-            status="saiu",
+            status=status_val, # <- ALTERADO: usa o status do payload (ou 'saiu' por padrão)
         )
         db.add(row)
         db.commit()
