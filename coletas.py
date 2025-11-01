@@ -6,7 +6,7 @@ from typing import Optional, List, Literal, Dict, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, or_
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -22,9 +22,11 @@ class ItemLote(BaseModel):
     codigo: str = Field(min_length=1)
     servico: str = Field(min_length=1, description="shopee | ml | mercado_livre | mercado livre | avulso")
 
+
 class ColetaLoteIn(BaseModel):
     base: str = Field(min_length=1)
     itens: List[ItemLote] = Field(min_length=1)
+
 
 class ResumoLote(BaseModel):
     inseridos: int
@@ -33,6 +35,7 @@ class ResumoLote(BaseModel):
     contagem: Dict[str, int]
     precos: Dict[str, str]
     total: str
+
 
 class ColetaOut(BaseModel):
     id_coleta: int
@@ -45,9 +48,11 @@ class ColetaOut(BaseModel):
     valor_total: Decimal
     model_config = ConfigDict(from_attributes=True)
 
+
 class LoteResponse(BaseModel):
     coleta: ColetaOut
     resumo: ResumoLote
+
 
 # =========================
 # Helpers
@@ -58,8 +63,10 @@ def _decimal(v) -> Decimal:
     except Exception:
         return Decimal("0")
 
+
 def _fmt_money(d: Decimal) -> str:
     return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
+
 
 def _normalize_servico(raw: str) -> Literal["shopee", "mercado_livre", "avulso"]:
     s = (raw or "").strip().lower()
@@ -71,9 +78,11 @@ def _normalize_servico(raw: str) -> Literal["shopee", "mercado_livre", "avulso"]
         return "avulso"
     raise HTTPException(status_code=422, detail=f"Serviço inválido: {raw!r}")
 
+
 def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) -> str:
     # etiqueta que ficará em `saidas.servico`
     return "Mercado Livre" if s == "mercado_livre" else s
+
 
 def _find_entregador_for_user(db: Session, user: User) -> Entregador:
     """
@@ -93,34 +102,76 @@ def _find_entregador_for_user(db: Session, user: User) -> Entregador:
     if not candidates:
         raise HTTPException(status_code=404, detail="Usuário sem 'username' compatível para localizar o entregador.")
 
-    ent = db.scalars(
-        select(Entregador)
-        .where(Entregador.username_entregador.in_(candidates))
-    ).first()
+    ent = db.scalar(select(Entregador).where(Entregador.username_entregador.in_(candidates)))
 
     if not ent:
         raise HTTPException(status_code=404, detail="Entregador não encontrado para o usuário autenticado.")
     if hasattr(ent, "ativo") and ent.ativo is False:
         raise HTTPException(status_code=403, detail="Entregador inativo.")
-
     if not getattr(ent, "sub_base", None):
         raise HTTPException(status_code=422, detail="Entregador encontrado, porém sem 'sub_base' definida.")
 
     return ent
 
+
+def _resolve_entregador_ou_user_base(db: Session, user: User) -> Tuple[str, str, str]:
+    """
+    Resolve (sub_base, nome_exibicao, username_entregador) do usuário autenticado.
+    1) Se tiver entregador ativo vinculado, usa ele.
+    2) Caso contrário, usa sub_base do próprio usuário (usuário de sistema / owner).
+    """
+    # tenta localizar entregador vinculado
+    candidates = []
+    ue = getattr(user, "username_entregador", None)
+    if ue:
+        candidates.append(ue)
+    un = getattr(user, "username", None)
+    if un and un not in candidates:
+        candidates.append(un)
+
+    ent = None
+    if candidates:
+        ent = db.scalar(select(Entregador).where(Entregador.username_entregador.in_(candidates)))
+
+    if ent:
+        if hasattr(ent, "ativo") and not ent.ativo:
+            raise HTTPException(status_code=403, detail="Entregador inativo.")
+        if not getattr(ent, "sub_base", None):
+            raise HTTPException(status_code=422, detail="Entregador sem 'sub_base' definida.")
+        return ent.sub_base, (ent.nome or ent.username_entregador), ent.username_entregador
+
+    # se não tiver entregador, tenta pegar sub_base direto do user (usuário de sistema)
+    user_id = getattr(user, "id", None)
+    u = db.get(User, user_id) if user_id else None
+    sub_base = getattr(u, "sub_base", None)
+    if not sub_base and getattr(user, "email", None):
+        u = db.scalar(select(User).where(User.email == user.email))
+        sub_base = getattr(u, "sub_base", None)
+    if not sub_base and getattr(user, "username", None):
+        u = db.scalar(select(User).where(User.username == user.username))
+        sub_base = getattr(u, "sub_base", None)
+
+    if not sub_base:
+        raise HTTPException(status_code=422, detail="Usuário sem 'sub_base' definida em 'users'.")
+
+    username_entregador = getattr(user, "username", "sistema")
+    nome_exibicao = getattr(user, "username", "Sistema")
+
+    return sub_base, nome_exibicao, username_entregador
+
+
 def _get_precos(db: Session, sub_base: str, base: str) -> Tuple[Decimal, Decimal, Decimal]:
-    precos = db.scalars(
-        select(BasePreco).where(BasePreco.sub_base == sub_base, BasePreco.base == base)
-    ).first()
+    precos = db.scalar(select(BasePreco).where(BasePreco.sub_base == sub_base, BasePreco.base == base))
     if not precos:
         raise HTTPException(
             status_code=404,
-            detail=f"Tabela de preços não encontrada para sub_base={sub_base!r} e base={base!r}."
+            detail=f"Tabela de preços não encontrada para sub_base={sub_base!r} e base={base!r}.",
         )
     return _decimal(precos.shopee), _decimal(precos.ml), _decimal(precos.avulso)
 
+
 # =========================
-# POST /coletas/lote  (novo fluxo)
+# POST /coletas/lote (novo fluxo)
 # =========================
 @router.post("/lote", status_code=status.HTTP_201_CREATED, response_model=LoteResponse)
 def registrar_coleta_em_lote(
@@ -131,14 +182,13 @@ def registrar_coleta_em_lote(
     """
     Recebe vários códigos, grava cada um em `saidas` (status='coletado', com a base do payload),
     e grava o consolidado em `coletas` calculando o valor_total a partir da tabela `base`
-    (preços por sub_base e base). Não existe 'nfe' neste fluxo.
-    """
+    (preços por sub_base e base).
 
-    # 1) Usuário autenticado -> entregueador + sub_base
-    entregador = _find_entregador_for_user(db, current_user)
-    sub_base = entregador.sub_base
-    entregador_nome = entregador.nome or entregador.username_entregador
-    username_entregador = entregador.username_entregador
+    ✅ Agora permite também usuários do sistema (sem entregador vinculado),
+    desde que possuam 'sub_base' definida em 'users'.
+    """
+    # 1) Resolve entregador OU sub_base do usuário (flexível)
+    sub_base, entregador_nome, username_entregador = _resolve_entregador_ou_user_base(db, current_user)
 
     # 2) preços da base
     p_shopee, p_ml, p_avulso = _get_precos(db, sub_base=sub_base, base=payload.base)
@@ -156,20 +206,18 @@ def registrar_coleta_em_lote(
                 raise HTTPException(status_code=422, detail="Código vazio no payload.")
 
             # de-dup por (sub_base, codigo)
-            exists = db.scalars(
-                select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
-            ).first()
+            exists = db.scalar(select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo))
             if exists:
                 duplicates.append(codigo)
                 continue
 
             saida = Saida(
                 sub_base=sub_base,
-                base=payload.base,                       # nova coluna na tabela `saidas`
+                base=payload.base,
                 username=getattr(current_user, "username", None),
                 entregador=entregador_nome,
                 codigo=codigo,
-                servico=_servico_label_for_saida(serv),  # "Mercado Livre" | "shopee" | "avulso"
+                servico=_servico_label_for_saida(serv),
                 status="coletado",
             )
             db.add(saida)
@@ -178,9 +226,9 @@ def registrar_coleta_em_lote(
 
         # 4) consolidado em `coletas`
         total = (
-            _decimal(count["shopee"])        * p_shopee +
-            _decimal(count["mercado_livre"]) * p_ml +
-            _decimal(count["avulso"])        * p_avulso
+            _decimal(count["shopee"]) * p_shopee
+            + _decimal(count["mercado_livre"]) * p_ml
+            + _decimal(count["avulso"]) * p_avulso
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         coleta = Coleta(
@@ -204,6 +252,7 @@ def registrar_coleta_em_lote(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Falha ao registrar lote: {e}")
 
+    # 5) retorno
     return LoteResponse(
         coleta=ColetaOut.model_validate(coleta),
         resumo=ResumoLote(
@@ -220,8 +269,9 @@ def registrar_coleta_em_lote(
         ),
     )
 
+
 # =========================
-# GETs simples (escopo por sub_base do user) – mantidos
+# GET /coletas
 # =========================
 @router.get("/", response_model=List[ColetaOut])
 def list_coletas(
@@ -230,6 +280,9 @@ def list_coletas(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    Lista coletas visíveis para a sub_base do usuário autenticado.
+    """
     # sub_base do usuário autenticado (via tabela users)
     user_id = getattr(current_user, "id", None)
     sub_base_user: Optional[str] = None
@@ -237,10 +290,10 @@ def list_coletas(
         u = db.get(User, user_id)
         sub_base_user = getattr(u, "sub_base", None)
     if not sub_base_user and getattr(current_user, "email", None):
-        u = db.scalars(select(User).where(User.email == current_user.email)).first()
+        u = db.scalar(select(User).where(User.email == current_user.email))
         sub_base_user = getattr(u, "sub_base", None)
     if not sub_base_user and getattr(current_user, "username", None):
-        u = db.scalars(select(User).where(User.username == current_user.username)).first()
+        u = db.scalar(select(User).where(User.username == current_user.username))
         sub_base_user = getattr(u, "sub_base", None)
     if not sub_base_user:
         raise HTTPException(status_code=400, detail="sub_base não definida no usuário.")
