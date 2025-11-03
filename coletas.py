@@ -274,17 +274,21 @@ def registrar_coleta_em_lote(
 # =========================
 # GET /coletas
 # =========================
+from datetime import date
+
 @router.get("/", response_model=List[ColetaOut])
 def list_coletas(
     base: Optional[str] = Query(None, description="Filtra por base ex.: '3AS'"),
     username_entregador: Optional[str] = Query(None, description="Filtra por username do entregador"),
+    data_inicio: Optional[date] = Query(None, description="Filtra coletas a partir desta data (YYYY-MM-DD)"),
+    data_fim: Optional[date] = Query(None, description="Filtra coletas até esta data (YYYY-MM-DD)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Lista coletas visíveis para a sub_base do usuário autenticado.
     """
-    # sub_base do usuário autenticado (via tabela users)
+    # sub_base do usuário autenticado
     user_id = getattr(current_user, "id", None)
     sub_base_user: Optional[str] = None
     if user_id is not None:
@@ -299,12 +303,18 @@ def list_coletas(
     if not sub_base_user:
         raise HTTPException(status_code=400, detail="sub_base não definida no usuário.")
 
+    # ====== Filtros ======
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
+
     if base:
         stmt = stmt.where(Coleta.base == base.strip())
     if username_entregador:
         stmt = stmt.where(Coleta.username_entregador == username_entregador.strip())
+    if data_inicio:
+        stmt = stmt.where(Coleta.timestamp >= data_inicio)
+    if data_fim:
+        stmt = stmt.where(Coleta.timestamp <= data_fim)
 
-    stmt = stmt.order_by(Coleta.id_coleta.desc())
+    stmt = stmt.order_by(Coleta.timestamp.desc())
     rows = db.scalars(stmt).all()
     return rows
