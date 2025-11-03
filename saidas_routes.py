@@ -233,6 +233,7 @@ def registrar_saida(
 def listar_saidas(
     de: Optional[date] = Query(None, description="Data inicial (yyyy-mm-dd)"),
     ate: Optional[date] = Query(None, description="Data final (yyyy-mm-dd)"),
+    base: Optional[str] = Query(None, description="Filtra por base (texto exato)"),
     entregador: Optional[str] = Query(None, description="Filtra por entregador (texto exato)"),
     status_: Optional[str] = Query(None, alias="status", description="Filtra por status (texto exato)"),
     codigo: Optional[str] = Query(None, description="Filtro 'contém' no código"),
