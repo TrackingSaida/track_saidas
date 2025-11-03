@@ -38,14 +38,20 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://.*(localhost|127\.0\.0\.1|tracking-saidas|track-saidas|netlify)\.?(app|com|br)?(:\d+)?$",
-    allow_credentials=True,  # necessário para cookies
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Set-Cookie"],  # opcional, útil para debug
-    max_age=86400,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+        "Accept",
+        "Accept-Language",
+        "Cache-Control", "Pragma",
+    ],
+    max_age=86400,                           # (opcional) cache do preflight
+    # expose_headers=["Set-Cookie"],         # opcional, só p/ depurar
 )
-
 
 # ──────────────────────────────────────────────────────────────────
 # Routers em uso
