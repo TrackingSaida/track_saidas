@@ -39,6 +39,7 @@ class ResumoLote(BaseModel):
 
 class ColetaOut(BaseModel):
     id_coleta: int
+    timestamp: str
     base: str
     sub_base: str
     username_entregador: str
