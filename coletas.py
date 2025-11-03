@@ -274,23 +274,26 @@ def list_coletas(
         raise HTTPException(status_code=400, detail="sub_base não definida no usuário.")
 
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
-    if base:
-        stmt = stmt.where(Coleta.base == base.strip())
-    if username_entregador:
-        stmt = stmt.where(Coleta.username_entregador == username_entregador.strip())
-    if data_inicio:
-        stmt = stmt.where(Coleta.timestamp >= data_inicio)
-    if data_fim:
-        stmt = stmt.where(Coleta.timestamp <= data_fim)
-        
-     stmt = stmt.where(
+
+if base:
+    stmt = stmt.where(Coleta.base == base.strip())
+if username_entregador:
+    stmt = stmt.where(Coleta.username_entregador == username_entregador.strip())
+if data_inicio:
+    stmt = stmt.where(Coleta.timestamp >= data_inicio)
+if data_fim:
+    stmt = stmt.where(Coleta.timestamp <= data_fim)
+
+# 🔹 filtro para excluir coletas com tudo zero
+stmt = stmt.where(
     (Coleta.shopee > 0)
     | (Coleta.mercado_livre > 0)
     | (Coleta.avulso > 0)
     | (Coleta.valor_total > 0)
 )
 
-    stmt = stmt.order_by(Coleta.timestamp.desc())
-    
-    rows = db.scalars(stmt).all()
+stmt = stmt.order_by(Coleta.timestamp.desc())
+
+rows = db.scalars(stmt).all()
+
     return rows
