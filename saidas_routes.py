@@ -170,8 +170,8 @@ def registrar_saida(
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
     servico = payload.servico.strip()
-    # NOVO: status opcional no payload; se ausente ou vazio, usar "saiu"
-    status_val = "saiu"
+    # NOVO: status opcional no payload; se ausente ou vazio, usar "Saiu para entrega"
+    status_val = "Saiu para entrega"
     if payload.status is not None:
         s = payload.status.strip()
         if s:
