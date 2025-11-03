@@ -31,6 +31,7 @@ class SaidaOut(BaseModel):
     codigo: Optional[str]
     servico: Optional[str]
     status: Optional[str]
+    base: Optional[str] = None          # <- NOVO: base
     model_config = ConfigDict(from_attributes=True)
 
 # Saídas para a grid (listar)
@@ -41,6 +42,7 @@ class SaidaGridItem(BaseModel):
     codigo: Optional[str]
     servico: Optional[str]
     status: Optional[str]
+    base: Optional[str] = None    # <- NOVO: base
     model_config = ConfigDict(from_attributes=True)
 
 # Atualização parcial
@@ -211,6 +213,7 @@ def registrar_saida(
             codigo=codigo,
             servico=servico,   # grava exatamente o que veio do front
             status=status_val, # <- ALTERADO: usa o status do payload (ou 'saiu' por padrão)
+            # base -> permanece como está no seu modelo (se houver default/trigger), não alteramos aqui
         )
         db.add(row)
         db.commit()
@@ -268,6 +271,7 @@ def listar_saidas(
             codigo=r.codigo,
             servico=r.servico,
             status=r.status,
+            base=getattr(r, "base", None),  # <- NOVO: base
         )
         for r in rows
     ]
