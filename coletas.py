@@ -50,9 +50,14 @@ class ColetaOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+
+ColetaOut.model_rebuild()
+
+
 class LoteResponse(BaseModel):
     coleta: ColetaOut
     resumo: ResumoLote
+
 
 
 # =========================
