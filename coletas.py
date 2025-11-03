@@ -273,7 +273,8 @@ def list_coletas(
     if not sub_base_user:
         raise HTTPException(status_code=400, detail="sub_base não definida no usuário.")
 
-        stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
+    # 🔹 Aqui estava o erro: o stmt precisa estar FORA do if acima
+    stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
 
     if base:
         stmt = stmt.where(Coleta.base == base.strip())
@@ -293,7 +294,6 @@ def list_coletas(
     )
 
     stmt = stmt.order_by(Coleta.timestamp.desc())
-
     rows = db.scalars(stmt).all()
     return rows
 
