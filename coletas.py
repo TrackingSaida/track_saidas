@@ -282,7 +282,15 @@ def list_coletas(
         stmt = stmt.where(Coleta.timestamp >= data_inicio)
     if data_fim:
         stmt = stmt.where(Coleta.timestamp <= data_fim)
+        
+     stmt = stmt.where(
+    (Coleta.shopee > 0)
+    | (Coleta.mercado_livre > 0)
+    | (Coleta.avulso > 0)
+    | (Coleta.valor_total > 0)
+)
 
     stmt = stmt.order_by(Coleta.timestamp.desc())
+    
     rows = db.scalars(stmt).all()
     return rows
