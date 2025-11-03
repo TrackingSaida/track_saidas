@@ -1,6 +1,7 @@
 # coletas.py
 from __future__ import annotations
 
+import datetime  
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple
 
@@ -39,7 +40,7 @@ class ResumoLote(BaseModel):
 
 class ColetaOut(BaseModel):
     id_coleta: int
-    timestamp: datetime
+    timestamp: datetime.datetime  # ✅ usa o módulo completo
     base: str
     sub_base: str
     username_entregador: str
@@ -50,14 +51,13 @@ class ColetaOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-
+# ✅ Corrige erro Pydantic 2.x (TypeAdapter not fully defined)
 ColetaOut.model_rebuild()
 
 
 class LoteResponse(BaseModel):
     coleta: ColetaOut
     resumo: ResumoLote
-
 
 
 # =========================
@@ -86,17 +86,10 @@ def _normalize_servico(raw: str) -> Literal["shopee", "mercado_livre", "avulso"]
 
 
 def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) -> str:
-    # etiqueta que ficará em `saidas.servico`
     return "Mercado Livre" if s == "mercado_livre" else s
 
 
 def _find_entregador_for_user(db: Session, user: User) -> Entregador:
-    """
-    Resolve o entregador do usuário autenticado.
-    1) tenta por User.username_entregador
-    2) cai para User.username
-    Exige que o entregador exista e esteja ativo.
-    """
     candidates = []
     ue = getattr(user, "username_entregador", None)
     if ue:
@@ -121,12 +114,6 @@ def _find_entregador_for_user(db: Session, user: User) -> Entregador:
 
 
 def _resolve_entregador_ou_user_base(db: Session, user: User) -> Tuple[str, str, str]:
-    """
-    Resolve (sub_base, nome_exibicao, username_entregador) do usuário autenticado.
-    1) Se tiver entregador ativo vinculado, usa ele.
-    2) Caso contrário, usa sub_base do próprio usuário (usuário de sistema / owner).
-    """
-    # tenta localizar entregador vinculado
     candidates = []
     ue = getattr(user, "username_entregador", None)
     if ue:
@@ -146,7 +133,6 @@ def _resolve_entregador_ou_user_base(db: Session, user: User) -> Tuple[str, str,
             raise HTTPException(status_code=422, detail="Entregador sem 'sub_base' definida.")
         return ent.sub_base, (ent.nome or ent.username_entregador), ent.username_entregador
 
-    # se não tiver entregador, tenta pegar sub_base direto do user (usuário de sistema)
     user_id = getattr(user, "id", None)
     u = db.get(User, user_id) if user_id else None
     sub_base = getattr(u, "sub_base", None)
@@ -177,7 +163,7 @@ def _get_precos(db: Session, sub_base: str, base: str) -> Tuple[Decimal, Decimal
 
 
 # =========================
-# POST /coletas/lote (novo fluxo)
+# POST /coletas/lote
 # =========================
 @router.post("/lote", status_code=status.HTTP_201_CREATED, response_model=LoteResponse)
 def registrar_coleta_em_lote(
@@ -185,21 +171,9 @@ def registrar_coleta_em_lote(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Recebe vários códigos, grava cada um em `saidas` (status='coletado', com a base do payload),
-    e grava o consolidado em `coletas` calculando o valor_total a partir da tabela `base`
-    (preços por sub_base e base).
-
-    ✅ Agora permite também usuários do sistema (sem entregador vinculado),
-    desde que possuam 'sub_base' definida em 'users'.
-    """
-    # 1) Resolve entregador OU sub_base do usuário (flexível)
     sub_base, entregador_nome, username_entregador = _resolve_entregador_ou_user_base(db, current_user)
-
-    # 2) preços da base
     p_shopee, p_ml, p_avulso = _get_precos(db, sub_base=sub_base, base=payload.base)
 
-    # 3) percorrer itens, inserir em `saidas` e contar por serviço
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
     duplicates: List[str] = []
     created = 0
@@ -211,7 +185,6 @@ def registrar_coleta_em_lote(
             if not codigo:
                 raise HTTPException(status_code=422, detail="Código vazio no payload.")
 
-            # de-dup por (sub_base, codigo)
             exists = db.scalar(select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo))
             if exists:
                 duplicates.append(codigo)
@@ -230,7 +203,6 @@ def registrar_coleta_em_lote(
             created += 1
             count[serv] += 1
 
-        # 4) consolidado em `coletas`
         total = (
             _decimal(count["shopee"]) * p_shopee
             + _decimal(count["mercado_livre"]) * p_ml
@@ -247,7 +219,6 @@ def registrar_coleta_em_lote(
             valor_total=total,
         )
         db.add(coleta)
-
         db.commit()
         db.refresh(coleta)
 
@@ -258,7 +229,6 @@ def registrar_coleta_em_lote(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Falha ao registrar lote: {e}")
 
-    # 5) retorno
     return LoteResponse(
         coleta=ColetaOut.model_validate(coleta),
         resumo=ResumoLote(
@@ -279,24 +249,19 @@ def registrar_coleta_em_lote(
 # =========================
 # GET /coletas
 # =========================
-from datetime import date
-
 @router.get("/", response_model=List[ColetaOut])
 def list_coletas(
-    base: Optional[str] = Query(None, description="Filtra por base ex.: '3AS'"),
-    username_entregador: Optional[str] = Query(None, description="Filtra por username do entregador"),
-    data_inicio: Optional[date] = Query(None, description="Filtra coletas a partir desta data (YYYY-MM-DD)"),
-    data_fim: Optional[date] = Query(None, description="Filtra coletas até esta data (YYYY-MM-DD)"),
+    base: Optional[str] = Query(None),
+    username_entregador: Optional[str] = Query(None),
+    data_inicio: Optional[datetime.date] = Query(None),
+    data_fim: Optional[datetime.date] = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Lista coletas visíveis para a sub_base do usuário autenticado.
-    """
-    # sub_base do usuário autenticado
     user_id = getattr(current_user, "id", None)
     sub_base_user: Optional[str] = None
-    if user_id is not None:
+
+    if user_id:
         u = db.get(User, user_id)
         sub_base_user = getattr(u, "sub_base", None)
     if not sub_base_user and getattr(current_user, "email", None):
@@ -308,9 +273,7 @@ def list_coletas(
     if not sub_base_user:
         raise HTTPException(status_code=400, detail="sub_base não definida no usuário.")
 
-    # ====== Filtros ======
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
-
     if base:
         stmt = stmt.where(Coleta.base == base.strip())
     if username_entregador:
