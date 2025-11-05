@@ -36,7 +36,7 @@ def ml_connect():
         raise HTTPException(500, "ML_CLIENT_ID ou ML_REDIRECT_URI não configurados.")
 
     auth_url = (
-        "https://auth.mercadolibre.com.br/authorization"
+        "https://auth.mercadolivre.com.br/authorization"
         f"?response_type=code&client_id={ML_CLIENT_ID}&redirect_uri={ML_REDIRECT_URI}"
     )
     return {"auth_url": auth_url}
