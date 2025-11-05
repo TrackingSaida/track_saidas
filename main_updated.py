@@ -66,7 +66,6 @@ from routes_ui import router as ui_router
 from ml_routes import router as ml_routerfrom ml_routes import router as ml_router
 
 app.include_router(ml_router, prefix=API_PREFIX)
-app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(ui_router)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(users_router,        prefix=API_PREFIX)
