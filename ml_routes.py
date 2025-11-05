@@ -4,9 +4,11 @@ from __future__ import annotations
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from db import get_db
-from ml_token_service import get_valid_ml_access_token
+from ml_token_service import get_valid_ml_access_token  # continua sendo usado no outro endpoint
+from models import MercadoLivreToken  # <<< importa o model da tabela mercado_livre_tokens
 
 router = APIRouter(prefix="/ml", tags=["Mercado Livre"])
 
@@ -14,21 +16,47 @@ router = APIRouter(prefix="/ml", tags=["Mercado Livre"])
 @router.get("/me")
 def ml_me(db: Session = Depends(get_db)):
     """
-    Testa a integração com o Mercado Livre.
-    Busca os dados da conta autenticada.
+    Faz uma varredura em TODAS as contas do Mercado Livre que temos salvas
+    na tabela `mercado_livre_tokens` e tenta chamar /users/me para cada uma.
+    Retorna uma lista com o status de cada conta.
     """
-    try:
-        access_token = get_valid_ml_access_token(db)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # 1. buscar todos os tokens salvos
+    tokens = db.execute(select(MercadoLivreToken)).scalars().all()
 
-    headers = {"Authorization": f"Bearer {access_token}"}
-    resp = requests.get("https://api.mercadolibre.com/users/me", headers=headers)
+    if not tokens:
+        raise HTTPException(status_code=404, detail="Nenhum token do Mercado Livre encontrado na tabela.")
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+    resultados = []
 
-    return resp.json()
+    for tk in tokens:
+        headers = {"Authorization": f"Bearer {tk.access_token}"}
+        resp = requests.get("https://api.mercadolibre.com/users/me", headers=headers)
+
+        if resp.status_code == 200:
+            resultados.append(
+                {
+                    "id": tk.id,                  # id da sua tabela
+                    "user_id_ml": tk.user_id_ml,  # id do usuário no ML que você já está guardando
+                    "status": "ok",
+                    "data": resp.json(),
+                }
+            )
+        else:
+            # não derruba o endpoint inteiro, só marca o erro daquele token
+            resultados.append(
+                {
+                    "id": tk.id,
+                    "user_id_ml": tk.user_id_ml,
+                    "status": "erro",
+                    "http_status": resp.status_code,
+                    "detail": resp.json(),
+                }
+            )
+
+    return {
+        "total_tokens": len(tokens),
+        "resultados": resultados,
+    }
 
 
 @router.get("/shipment-by-tracking")
@@ -41,7 +69,7 @@ def ml_shipment_by_tracking(
     Usa o endpoint: GET https://api.mercadolibre.com/shipments/search?tracking_number=...
     Se encontrar, devolve o endereço do destinatário (receiver_address).
     """
-    # 1. pega token válido (renova se precisar)
+    # 1. pega token válido (renova se precisar) -- aqui continua do jeito que já estava
     try:
         access_token = get_valid_ml_access_token(db)
     except Exception as e:
