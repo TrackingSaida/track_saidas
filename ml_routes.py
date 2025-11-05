@@ -3,58 +3,71 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from db import get_db
-from ml_token_service import get_valid_ml_access_token  # usado no shipment
-from models import MercadoLivreToken  # tabela mercado_livre_tokens
+from ml_token_service import get_valid_ml_access_token
+from models import MercadoLivreToken
 
 router = APIRouter(prefix="/ml", tags=["Mercado Livre"])
 
-# configs do ML (vir do .env)
+# -------------------------------------------------------------------
+# Configurações via env
+# -------------------------------------------------------------------
+# exemplo:
+# ML_CLIENT_ID=2453516154609797
+# ML_CLIENT_SECRET=xxx
+# ML_REDIRECT_URI=https://track-saidas-api.onrender.com/api/ml/callback
+# ML_AFTER_CALLBACK=https://tracking-saidas.com.br/
 ML_CLIENT_ID = os.getenv("ML_CLIENT_ID")
 ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET")
 ML_REDIRECT_URI = os.getenv("ML_REDIRECT_URI")
+FRONTEND_AFTER_CALLBACK = os.getenv("ML_AFTER_CALLBACK", "https://tracking-saidas.com.br/")
 
+ML_AUTH_BASE = "https://auth.mercadolivre.com.br/authorization"
 ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 ML_ME_URL = "https://api.mercadolibre.com/users/me"
 
 
-# =========================
-# 1) gera o link pra mandar pro cliente
-# =========================
+# ============================================================
+# 1) Gera o link para o cliente autorizar
+# ============================================================
 @router.get("/connect")
 def ml_connect():
     """
     Devolve a URL de autorização do Mercado Livre.
-    Você manda isso para o cliente. Depois do aceite, o ML vai chamar /ml/callback.
+    Você manda isso para o cliente.
     """
     if not ML_CLIENT_ID or not ML_REDIRECT_URI:
         raise HTTPException(500, "ML_CLIENT_ID ou ML_REDIRECT_URI não configurados.")
 
     auth_url = (
-        "https://auth.mercadolivre.com.br/authorization"
-        f"?response_type=code&client_id={ML_CLIENT_ID}&redirect_uri={ML_REDIRECT_URI}"
+        f"{ML_AUTH_BASE}"
+        f"?response_type=code"
+        f"&client_id={ML_CLIENT_ID}"
+        f"&redirect_uri={ML_REDIRECT_URI}"
     )
     return {"auth_url": auth_url}
 
 
-# =========================
-# 2) callback que salva no banco
-# =========================
+# ============================================================
+# 2) Callback que o Mercado Livre chama após o aceite
+#    - recebe ?code=...
+#    - troca por tokens
+#    - salva na tabela mercado_livre_tokens
+#    - redireciona o usuário para o seu site
+# ============================================================
 @router.get("/callback")
 def ml_callback(code: str, db: Session = Depends(get_db)):
-    """
-    Endpoint que o Mercado Livre chama depois que o cliente autoriza.
-    Aqui trocamos o code por tokens e salvamos na tabela mercado_livre_tokens.
-    """
     if not ML_CLIENT_ID or not ML_CLIENT_SECRET or not ML_REDIRECT_URI:
         raise HTTPException(500, "Variáveis do Mercado Livre não configuradas.")
 
-    # troca code por tokens
+    # 1. trocar code por tokens
     data = {
         "grant_type": "authorization_code",
         "client_id": ML_CLIENT_ID,
@@ -73,7 +86,7 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
     refresh_token = token_data.get("refresh_token")
     expires_in = token_data.get("expires_in", 3600)
 
-    # pega o id do usuário no ML pra salvar junto
+    # 2. pegar dados do usuário no ML
     me_resp = requests.get(
         ML_ME_URL,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -85,6 +98,7 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
 
+    # 3. salvar no banco
     novo = MercadoLivreToken(
         user_id_ml=user_id_ml,
         access_token=access_token,
@@ -93,18 +107,16 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
     )
     db.add(novo)
     db.commit()
-    db.refresh(novo)
 
-    return {
-        "detail": "Conta do Mercado Livre conectada e salva.",
-        "user_id_ml": user_id_ml,
-        "expires_at": expires_at.isoformat(),
-    }
+    # 4. redirecionar usuário para o seu site
+    # você pode colocar ?ml=ok só pra saber que deu certo
+    final_url = f"{FRONTEND_AFTER_CALLBACK}?ml=ok"
+    return RedirectResponse(url=final_url, status_code=302)
 
 
-# =========================
-# 3) varredura em TODAS as contas salvas
-# =========================
+# ============================================================
+# 3) Varredura: obter /users/me de TODAS as contas salvas
+# ============================================================
 @router.get("/me")
 def ml_me(db: Session = Depends(get_db)):
     """
@@ -121,7 +133,7 @@ def ml_me(db: Session = Depends(get_db)):
 
     for tk in tokens:
         headers = {"Authorization": f"Bearer {tk.access_token}"}
-        resp = requests.get("https://api.mercadolibre.com/users/me", headers=headers)
+        resp = requests.get(ML_ME_URL, headers=headers)
 
         if resp.status_code == 200:
             resultados.append(
@@ -149,9 +161,9 @@ def ml_me(db: Session = Depends(get_db)):
     }
 
 
-# =========================
-# 4) consulta envio por código de rastreio (mantido)
-# =========================
+# ============================================================
+# 4) Consulta envio por tracking (mantido)
+# ============================================================
 @router.get("/shipment-by-tracking")
 def ml_shipment_by_tracking(
     tracking_number: str = Query(..., description="Código de rastreio da encomenda"),
@@ -162,6 +174,7 @@ def ml_shipment_by_tracking(
     Usa o endpoint: GET https://api.mercadolibre.com/shipments/search?tracking_number=...
     Se encontrar, devolve o endereço do destinatário (receiver_address).
     """
+    # pega token válido (o mais recente da tabela)
     try:
         access_token = get_valid_ml_access_token(db)
     except Exception as e:
