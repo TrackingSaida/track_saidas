@@ -175,3 +175,19 @@ class Entregador(Base):
 
     def __repr__(self) -> str:
         return f"<Entregador id_entregador={self.id_entregador} nome={self.nome!r} coletador={self.coletador}>"
+
+# ==========================
+# Tabela: mercado_livre_tokens
+# ==========================
+class MercadoLivreToken(Base):
+    __tablename__ = "mercado_livre_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id_ml = Column(BigInteger, nullable=False)
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=False)
+    expires_at = Column(DateTime(timezone=False), nullable=False)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<MercadoLivreToken id={self.id} user_id_ml={self.user_id_ml}>"
