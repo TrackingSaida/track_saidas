@@ -62,5 +62,5 @@ def init_db():
     para criar as tabelas conforme os Models.
     """
     # Import adiado para evitar import circular
-    from models import User, Owner, ServicoPadrao, Saida, Entregador  # noqa: F401
+    from models import User, Owner, ServicoPadrao, Saida, Entregador, MercadoLivreToken  # noqa: F401
     Base.metadata.create_all(bind=engine)
