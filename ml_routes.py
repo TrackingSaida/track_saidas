@@ -19,11 +19,6 @@ router = APIRouter(prefix="/ml", tags=["Mercado Livre"])
 # -------------------------------------------------------------------
 # Configurações via env
 # -------------------------------------------------------------------
-# exemplo:
-# ML_CLIENT_ID=2453516154609797
-# ML_CLIENT_SECRET=xxx
-# ML_REDIRECT_URI=https://track-saidas-api.onrender.com/api/ml/callback
-# ML_AFTER_CALLBACK=https://tracking-saidas.com.br/
 ML_CLIENT_ID = os.getenv("ML_CLIENT_ID")
 ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET")
 ML_REDIRECT_URI = os.getenv("ML_REDIRECT_URI")
@@ -56,10 +51,10 @@ def ml_connect():
 
 
 # ============================================================
-# 2) Callback que o Mercado Livre chama após o aceite
+# 2) Callback chamado pelo Mercado Livre após o aceite
 #    - recebe ?code=...
 #    - troca por tokens
-#    - SALVA/ATUALIZA na tabela mercado_livre_tokens
+#    - salva SOMENTE SE for um novo user_id_ml
 #    - redireciona o usuário para o seu site
 # ============================================================
 @router.get("/callback")
@@ -67,7 +62,7 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
     if not ML_CLIENT_ID or not ML_CLIENT_SECRET or not ML_REDIRECT_URI:
         raise HTTPException(500, "Variáveis do Mercado Livre não configuradas.")
 
-    # 1. trocar code por tokens
+    # 1. troca code por tokens
     data = {
         "grant_type": "authorization_code",
         "client_id": ML_CLIENT_ID,
@@ -76,7 +71,6 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
         "redirect_uri": ML_REDIRECT_URI,
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
     resp = requests.post(ML_TOKEN_URL, data=data, headers=headers)
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, f"Erro ao obter token no ML: {resp.text}")
@@ -86,7 +80,7 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
     refresh_token = token_data.get("refresh_token")
     expires_in = token_data.get("expires_in", 3600)
 
-    # 2. pegar dados do usuário no ML
+    # 2. pega dados do usuário no ML
     me_resp = requests.get(
         ML_ME_URL,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -96,32 +90,30 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
     me_data = me_resp.json()
     user_id_ml = me_data["id"]
 
-    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
-
-    # 3. se já existir esse user_id_ml, ATUALIZA; senão, cria
+    # 3. verifica se já existe esse user_id_ml
     existente = (
         db.query(MercadoLivreToken)
         .filter(MercadoLivreToken.user_id_ml == user_id_ml)
         .first()
     )
 
+    # se já existir, não faz nada — apenas ignora e redireciona
     if existente:
-        existente.access_token = access_token
-        existente.refresh_token = refresh_token
-        existente.expires_at = expires_at
-        db.add(existente)
-        db.commit()
-    else:
-        novo = MercadoLivreToken(
-            user_id_ml=user_id_ml,
-            access_token=access_token,
-            refresh_token=refresh_token,
-            expires_at=expires_at,
-        )
-        db.add(novo)
-        db.commit()
+        final_url = f"{FRONTEND_AFTER_CALLBACK}?ml=ja_existe"
+        return RedirectResponse(url=final_url, status_code=302)
 
-    # 4. redirecionar usuário para o seu site
+    # 4. se não existir, salva novo registro
+    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    novo = MercadoLivreToken(
+        user_id_ml=user_id_ml,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=expires_at,
+    )
+    db.add(novo)
+    db.commit()
+
+    # 5. redireciona o usuário para o site
     final_url = f"{FRONTEND_AFTER_CALLBACK}?ml=ok"
     return RedirectResponse(url=final_url, status_code=302)
 
