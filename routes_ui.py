@@ -8,7 +8,7 @@ MENU_DEFS = [
         "roles": [1, 2, 3],
         "items": [
             {"label": "Leitura de Coletas",  "href": "tracking-coleta-leitura.html", "roles": [1, 2, 3]},
-            {"label": "Resumo de Coletas",   "href": "tracking-coletas-resumo.html", "roles": [1, 2, 3]}, 
+            {"label": "Resumo de Coletas",   "href": "tracking-coletas-resumo.html", "roles": [1, 2]}, 
             {"label": "Leitura de Saídas",   "href": "tracking-leitura.html", "roles": [1, 2, 3]},
             {"label": "Registros de Saídas", "href": "tracking-registros.html", "roles": [1, 2, 3]},      
         ]
@@ -47,7 +47,9 @@ def menu_for_role(role: int):
 
 router = APIRouter(prefix="/ui", tags=["UI"])
 
+from fastapi import Request
+
 @router.get("/menu")
-def get_menu(user=Depends(current_user_with_role)):
-    role = int(user.role)
-    return {"role": role, "menu": menu_for_role(role)}
+def get_menu(request: Request, user=Depends(current_user_with_role)):
+    return {"role": int(user.role), "menu": menu_for_role(int(user.role))}
+
