@@ -59,7 +59,7 @@ def ml_connect():
 # 2) Callback que o Mercado Livre chama após o aceite
 #    - recebe ?code=...
 #    - troca por tokens
-#    - salva na tabela mercado_livre_tokens
+#    - SALVA/ATUALIZA na tabela mercado_livre_tokens
 #    - redireciona o usuário para o seu site
 # ============================================================
 @router.get("/callback")
@@ -98,18 +98,30 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
 
-    # 3. salvar no banco
-    novo = MercadoLivreToken(
-        user_id_ml=user_id_ml,
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_at=expires_at,
+    # 3. se já existir esse user_id_ml, ATUALIZA; senão, cria
+    existente = (
+        db.query(MercadoLivreToken)
+        .filter(MercadoLivreToken.user_id_ml == user_id_ml)
+        .first()
     )
-    db.add(novo)
-    db.commit()
+
+    if existente:
+        existente.access_token = access_token
+        existente.refresh_token = refresh_token
+        existente.expires_at = expires_at
+        db.add(existente)
+        db.commit()
+    else:
+        novo = MercadoLivreToken(
+            user_id_ml=user_id_ml,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=expires_at,
+        )
+        db.add(novo)
+        db.commit()
 
     # 4. redirecionar usuário para o seu site
-    # você pode colocar ?ml=ok só pra saber que deu certo
     final_url = f"{FRONTEND_AFTER_CALLBACK}?ml=ok"
     return RedirectResponse(url=final_url, status_code=302)
 
