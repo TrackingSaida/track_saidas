@@ -27,6 +27,7 @@ FRONTEND_AFTER_CALLBACK = os.getenv("ML_AFTER_CALLBACK", "https://tracking-saida
 ML_AUTH_BASE = "https://auth.mercadolivre.com.br/authorization"
 ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 ML_ME_URL = "https://api.mercadolibre.com/users/me"
+ML_ORDERS_SEARCH_URL = "https://api.mercadolibre.com/orders/search"
 
 
 # ============================================================
@@ -156,6 +157,108 @@ def ml_me(db: Session = Depends(get_db)):
                     "status": "erro",
                     "http_status": resp.status_code,
                     "detail": resp.json(),
+                }
+            )
+
+    return {
+        "total_tokens": len(tokens),
+        "resultados": resultados,
+    }
+
+
+# ============================================================
+# 3.1) Varredura de pedidos (/orders/search?seller=...)
+#      usando TODOS os tokens salvos
+# ============================================================
+@router.get("/orders-scan")
+def ml_orders_scan(db: Session = Depends(get_db)):
+    """
+    Para cada conta Mercado Livre salva na tabela, tenta listar TODAS as orders
+    usando o endpoint:
+        GET https://api.mercadolibre.com/orders/search?seller={USER_ID_ML}
+    Faz paginação até acabar.
+    Os tokens que não tiverem user_id_ml ou que não retornarem pedidos são ignorados,
+    mas o resultado vem marcado.
+    """
+    tokens = db.execute(select(MercadoLivreToken)).scalars().all()
+    if not tokens:
+        raise HTTPException(status_code=404, detail="Nenhum token do Mercado Livre encontrado na tabela.")
+
+    resultados = []
+
+    for tk in tokens:
+        # se por algum motivo o token não tiver user_id_ml salvo, só pula
+        if not tk.user_id_ml:
+            resultados.append(
+                {
+                    "token_id": tk.id,
+                    "user_id_ml": None,
+                    "status": "sem_user_id_ml",
+                    "total_orders": 0,
+                    "orders": [],
+                }
+            )
+            continue
+
+        headers = {"Authorization": f"Bearer {tk.access_token}"}
+
+        all_orders = []
+        offset = 0
+        limit = 50  # limite padrão do ML
+        erro = None
+
+        while True:
+            params = {
+                "seller": tk.user_id_ml,
+                "offset": offset,
+                "limit": limit,
+            }
+
+            resp = requests.get(ML_ORDERS_SEARCH_URL, headers=headers, params=params)
+
+            # se deu erro (token expirado, 401, 403, etc.), para esse usuário e registra
+            if resp.status_code != 200:
+                erro = {
+                    "http_status": resp.status_code,
+                    "detail": resp.json() if resp.content else {},
+                }
+                break
+
+            data = resp.json()
+            batch_orders = data.get("results") or []
+            paging = data.get("paging") or {}
+
+            all_orders.extend(batch_orders)
+
+            total = paging.get("total", 0)
+            # se já chegamos no total ou o que voltou foi menor que o limite, paramos
+            if len(all_orders) >= total or len(batch_orders) < limit:
+                break
+
+            # senão segue para próxima página
+            offset += limit
+
+        if erro:
+            resultados.append(
+                {
+                    "token_id": tk.id,
+                    "user_id_ml": tk.user_id_ml,
+                    "status": "erro",
+                    "erro": erro,
+                    "total_orders": len(all_orders),
+                    "orders": all_orders,
+                }
+            )
+        else:
+            resultados.append(
+                {
+                    "token_id": tk.id,
+                    "user_id_ml": tk.user_id_ml,
+                    "status": "ok",
+                    "total_orders": len(all_orders),
+                    # IMPORTANTE: aqui já vem o campo shipping.id em cada order
+                    # que vamos usar no próximo passo para consultar o endereço.
+                    "orders": all_orders,
                 }
             )
 
