@@ -184,3 +184,62 @@ def ml_shipment_by_tracking(
         "status": shipment.get("status"),
         "substatus": shipment.get("substatus"),
     }
+# ============================================================
+# 6) Consulta detalhes de envio por SHIPPING_ID
+# ============================================================
+@router.get("/shipment-details")
+def ml_shipment_details(
+    user_id_ml: int = Query(..., description="ID do usuário dono do token"),
+    shipping_id: int = Query(..., description="ID do envio (shipping_id)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Consulta os DETALHES COMPLETOS de um envio específico no Mercado Livre.
+
+    Endpoint oficial:
+        GET https://api.mercadolibre.com/marketplace/shipments/{SHIPMENT_ID}
+    Headers:
+        Authorization: Bearer {ACCESS_TOKEN}
+        x-format-new: true
+
+    Retorna: status, substatus, tracking, origem, destino, endereço, etc.
+    """
+
+    # Busca o token correspondente a esse user_id_ml
+    tk = (
+        db.query(MercadoLivreToken)
+        .filter(MercadoLivreToken.user_id_ml == user_id_ml)
+        .first()
+    )
+    if not tk:
+        raise HTTPException(404, f"Token não encontrado para user_id_ml={user_id_ml}")
+
+    headers = {
+        "Authorization": f"Bearer {tk.access_token}",
+        "x-format-new": "true",
+    }
+
+    url = f"https://api.mercadolibre.com/marketplace/shipments/{shipping_id}"
+    resp = requests.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = {"raw": resp.text}
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+
+    data = resp.json()
+
+    # Retorna os dados principais (ou tudo, se preferir)
+    return {
+        "shipping_id": shipping_id,
+        "status": data.get("status"),
+        "substatus": data.get("substatus"),
+        "tracking_number": data.get("tracking_number"),
+        "origin": data.get("origin"),
+        "destination": data.get("destination"),
+        "dimensions": data.get("dimensions"),
+        "lead_time": data.get("lead_time"),
+        "raw": data,  # mantém o JSON completo para debug
+    }
