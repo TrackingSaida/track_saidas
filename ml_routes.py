@@ -150,8 +150,6 @@ def ml_me(db: Session = Depends(get_db)):
                 }
             )
         else:
-            # mesmo se der erro, registra
-            detail = {}
             try:
                 detail = resp.json()
             except Exception:
@@ -173,19 +171,15 @@ def ml_me(db: Session = Depends(get_db)):
 
 
 # ============================================================
-# 3.1) Varredura de pedidos (/orders/search?seller=...)
-#      usando TODOS os tokens salvos
-#      (mantido, mas agora temos também o /orders-by-seller)
+# 3.1) Varredura de pedidos como SELLER (mantido)
 # ============================================================
 @router.get("/orders-scan")
 def ml_orders_scan(db: Session = Depends(get_db)):
     """
     Para cada conta Mercado Livre salva na tabela, tenta listar TODAS as orders
-    usando o endpoint:
+    como SELLER:
         GET https://api.mercadolibre.com/orders/search?seller={USER_ID_ML}
     Faz paginação até acabar.
-    Os tokens que não tiverem user_id_ml ou que não retornarem pedidos são ignorados,
-    mas o resultado vem marcado.
     """
     tokens = db.execute(select(MercadoLivreToken)).scalars().all()
     if not tokens:
@@ -223,7 +217,6 @@ def ml_orders_scan(db: Session = Depends(get_db)):
             resp = requests.get(ML_ORDERS_SEARCH_URL, headers=headers, params=params)
 
             if resp.status_code != 200:
-                # para esse token, registramos o erro e saímos do loop
                 try:
                     detail = resp.json()
                 except Exception:
@@ -275,21 +268,18 @@ def ml_orders_scan(db: Session = Depends(get_db)):
 
 
 # ============================================================
-# 3.2) Consulta direta por seller_id (sem varredura)
-#      aqui você informa o seller_id e opcionalmente from/to
+# 3.2) Consulta direta por SELLER (já tínhamos)
 # ============================================================
 @router.get("/orders-by-seller")
 def ml_orders_by_seller(
     seller_id: int = Query(..., description="ID do vendedor no Mercado Livre"),
-    from_date: str = Query(None, description="Data inicial ISO8601, ex: 2025-01-01T00:00:00.000-00:00"),
-    to_date: str = Query(None, description="Data final ISO8601, ex: 2025-01-31T23:59:59.000-00:00"),
+    from_date: str = Query(None, description="Data inicial ISO8601"),
+    to_date: str = Query(None, description="Data final ISO8601"),
     db: Session = Depends(get_db),
 ):
     """
     Consulta as orders de UM vendedor específico, usando o token mais recente da tabela.
-    Isso elimina o fator 'varredura'.
     """
-    # pega um token válido (o mais recente) para autenticar
     try:
         access_token = get_valid_ml_access_token(db)
     except Exception as e:
@@ -311,7 +301,6 @@ def ml_orders_by_seller(
     resp = requests.get(ML_ORDERS_SEARCH_URL, headers=headers, params=params)
 
     if resp.status_code != 200:
-        # devolve o erro cru do ML pra gente ver o que está rolando
         try:
             detail = resp.json()
         except Exception:
@@ -322,8 +311,53 @@ def ml_orders_by_seller(
 
 
 # ============================================================
-# 3.3) Ver permissões / "o que o token deixa"
-#      aqui olhamos o token específico que está salvo no seu banco
+# 3.3) NOVO: Consulta direta por BUYER (compras do próprio usuário)
+# ============================================================
+@router.get("/orders-by-buyer")
+def ml_orders_by_buyer(
+    buyer_id: int = Query(..., description="ID do comprador (geralmente o mesmo /users/me.id)"),
+    from_date: str = Query(None, description="Data inicial ISO8601"),
+    to_date: str = Query(None, description="Data final ISO8601"),
+    db: Session = Depends(get_db),
+):
+    """
+    Consulta as ORDERS onde esse usuário atuou como COMPRADOR.
+    Útil quando a conta não é vendedora.
+    Endpoint do ML:
+        GET https://api.mercadolibre.com/orders/search?buyer={buyer_id}
+    """
+    try:
+        access_token = get_valid_ml_access_token(db)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    params = {
+        "buyer": buyer_id,
+        "offset": 0,
+        "limit": 50,
+    }
+
+    if from_date:
+        params["order.date_created.from"] = from_date
+    if to_date:
+        params["order.date_created.to"] = to_date
+
+    resp = requests.get(ML_ORDERS_SEARCH_URL, headers=headers, params=params)
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = {"raw": resp.text}
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+
+    return resp.json()
+
+
+# ============================================================
+# 3.4) Ver permissões / quem é esse token
 # ============================================================
 @router.get("/token-permissions/{token_id}")
 def ml_token_permissions(token_id: int, db: Session = Depends(get_db)):
@@ -331,8 +365,7 @@ def ml_token_permissions(token_id: int, db: Session = Depends(get_db)):
     Consulta quais dados o token consegue acessar AGORA.
     Faz:
       1) /users/me com esse token
-      2) tenta /applications/{ML_CLIENT_ID} pra ver dados do app (se o ML permitir)
-    Isso ajuda a saber se o token ainda está vivo e se pertence ao seller certo.
+      2) tenta /applications/{ML_CLIENT_ID}
     """
     tk = db.get(MercadoLivreToken, token_id)
     if not tk:
@@ -342,7 +375,6 @@ def ml_token_permissions(token_id: int, db: Session = Depends(get_db)):
 
     # 1) quem sou eu com esse token?
     me_resp = requests.get(ML_ME_URL, headers=headers)
-    me_data = None
     if me_resp.status_code == 200:
         me_data = me_resp.json()
     else:
@@ -351,7 +383,7 @@ def ml_token_permissions(token_id: int, db: Session = Depends(get_db)):
         except Exception:
             me_data = {"raw": me_resp.text}
 
-    # 2) tenta ver info da aplicação (não é exatamente "escopos do token", mas ajuda)
+    # 2) info da aplicação (ajuda a depurar)
     app_data = None
     if ML_CLIENT_ID:
         app_resp = requests.get(f"https://api.mercadolibre.com/applications/{ML_CLIENT_ID}")
@@ -384,7 +416,6 @@ def ml_shipment_by_tracking(
     Usa o endpoint: GET https://api.mercadolibre.com/shipments/search?tracking_number=...
     Se encontrar, devolve o endereço do destinatário (receiver_address).
     """
-    # pega token válido (o mais recente da tabela)
     try:
         access_token = get_valid_ml_access_token(db)
     except Exception as e:
