@@ -249,14 +249,26 @@ def listar_saidas(
     sub_base_user = _resolve_user_base(db, current_user)
 
     stmt = select(Saida).where(Saida.sub_base == sub_base_user)
+
+    # 🔹 Filtro de base (FALTAVA)
+    if base and base.strip() and base.strip().lower() != "(todas)":
+        stmt = stmt.where(Saida.base == base.strip())
+
+    # 🔹 Filtro de data
     if de:
         stmt = stmt.where(Saida.data >= de)
     if ate:
         stmt = stmt.where(Saida.data <= ate)
+
+    # 🔹 Filtro de entregador
     if entregador and entregador.strip() and entregador.strip().lower() != "(todos)":
         stmt = stmt.where(Saida.entregador == entregador.strip())
+
+    # 🔹 Filtro de status
     if status_ and status_.strip() and status_.strip().lower() != "(todos)":
         stmt = stmt.where(Saida.status == status_.strip())
+
+    # 🔹 Filtro de código
     if codigo and codigo.strip():
         like = f"%{codigo.strip()}%"
         stmt = stmt.where(Saida.codigo.ilike(like))
@@ -272,7 +284,7 @@ def listar_saidas(
             codigo=r.codigo,
             servico=r.servico,
             status=r.status,
-            base=getattr(r, "base", None),  # <- NOVO: base
+            base=getattr(r, "base", None),
         )
         for r in rows
     ]
