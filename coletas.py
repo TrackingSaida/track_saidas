@@ -165,6 +165,7 @@ def _get_precos(db: Session, sub_base: str, base: str) -> Tuple[Decimal, Decimal
 # =========================
 # POST /coletas/lote
 # =========================
+
 @router.post("/lote", status_code=status.HTTP_201_CREATED, response_model=LoteResponse)
 def registrar_coleta_em_lote(
     payload: ColetaLoteIn,
@@ -175,7 +176,6 @@ def registrar_coleta_em_lote(
     p_shopee, p_ml, p_avulso = _get_precos(db, sub_base=sub_base, base=payload.base)
 
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
-    duplicates: List[str] = []
     created = 0
 
     try:
@@ -185,10 +185,15 @@ def registrar_coleta_em_lote(
             if not codigo:
                 raise HTTPException(status_code=422, detail="Código vazio no payload.")
 
-            exists = db.scalar(select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo))
+            exists = db.scalar(
+                select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
+            )
             if exists:
-                duplicates.append(codigo)
-                continue
+                # 🚫 Interrompe imediatamente e cancela o lote
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"O código '{codigo}' já foi coletado anteriormente."
+                )
 
             saida = Saida(
                 sub_base=sub_base,
@@ -222,9 +227,9 @@ def registrar_coleta_em_lote(
         db.commit()
         db.refresh(coleta)
 
-    except HTTPException:
+    except HTTPException as e:
         db.rollback()
-        raise
+        raise e
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Falha ao registrar lote: {e}")
@@ -233,8 +238,8 @@ def registrar_coleta_em_lote(
         coleta=ColetaOut.model_validate(coleta),
         resumo=ResumoLote(
             inseridos=created,
-            duplicados=len(duplicates),
-            codigos_duplicados=duplicates,
+            duplicados=0,
+            codigos_duplicados=[],
             contagem=dict(count),
             precos={
                 "shopee": _fmt_money(p_shopee),
@@ -244,7 +249,6 @@ def registrar_coleta_em_lote(
             total=_fmt_money(coleta.valor_total),
         ),
     )
-
 
 # =========================
 # GET /coletas
@@ -296,4 +300,3 @@ def list_coletas(
     stmt = stmt.order_by(Coleta.timestamp.desc())
     rows = db.scalars(stmt).all()
     return rows
-
