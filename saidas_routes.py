@@ -237,43 +237,44 @@ def listar_saidas(
     entregador: Optional[str] = Query(None, description="Filtra por entregador (texto exato)"),
     status_: Optional[str] = Query(None, alias="status", description="Filtra por status (texto exato)"),
     codigo: Optional[str] = Query(None, description="Filtro 'contém' no código"),
-    limit: int = Query(200, ge=1, le=6000),
+    limit: Optional[int] = Query(None),   
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Retorna saídas da sub_base do usuário autenticado, aplicando filtros opcionais.
-    Agora inclui `id_saida` para a grid usar em PATCH/DELETE.
-    """
     sub_base_user = _resolve_user_base(db, current_user)
 
     stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
-    # 🔹 Filtro de base (FALTAVA)
     if base and base.strip() and base.strip().lower() != "(todas)":
         stmt = stmt.where(Saida.base == base.strip())
 
-    # 🔹 Filtro de data
     if de:
         stmt = stmt.where(Saida.data >= de)
+
     if ate:
         stmt = stmt.where(Saida.data <= ate)
 
-    # 🔹 Filtro de entregador
     if entregador and entregador.strip() and entregador.strip().lower() != "(todos)":
         stmt = stmt.where(Saida.entregador == entregador.strip())
 
-    # 🔹 Filtro de status
     if status_ and status_.strip() and status_.strip().lower() != "(todos)":
         stmt = stmt.where(Saida.status == status_.strip())
 
-    # 🔹 Filtro de código
     if codigo and codigo.strip():
-        like = f"%{codigo.strip()}%"
-        stmt = stmt.where(Saida.codigo.ilike(like))
+        stmt = stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
 
-    stmt = stmt.order_by(Saida.timestamp.desc()).offset(offset).limit(limit)
+    # ==================================================================
+    # ORDEM SEMPRE
+    stmt = stmt.order_by(Saida.timestamp.desc())
+
+    # LIMIT só se fornecido (sem filtros, retorna tudo)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+
+    if offset:
+        stmt = stmt.offset(offset)
+
     rows = db.execute(stmt).scalars().all()
 
     return [
@@ -288,6 +289,7 @@ def listar_saidas(
         )
         for r in rows
     ]
+
 
 # ---------- PATCH: ATUALIZAR (por ID) ----------
 @router.patch(
