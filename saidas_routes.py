@@ -246,15 +246,14 @@ def listar_saidas(
 
     stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
-    if base and base.strip() and base.strip().lower() != "(todas)":
+       if base and base.strip() and base.strip().lower() != "(todas)":
         stmt = stmt.where(Saida.base == base.strip())
 
-if de:
-    stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
+    if de:
+        stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
 
-if ate:
-    stmt = stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
-
+    if ate:
+        stmt = stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
 
     if entregador and entregador.strip() and entregador.strip().lower() != "(todos)":
         stmt = stmt.where(Saida.entregador == entregador.strip())
@@ -264,6 +263,7 @@ if ate:
 
     if codigo and codigo.strip():
         stmt = stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
+
 
     # ==================================================================
     # ORDEM SEMPRE
