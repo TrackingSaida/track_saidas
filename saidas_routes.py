@@ -246,7 +246,7 @@ def listar_saidas(
 
     stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
-       if base and base.strip() and base.strip().lower() != "(todas)":
+    if base and base.strip() and base.strip().lower() != "(todas)":
         stmt = stmt.where(Saida.base == base.strip())
 
     if de:
