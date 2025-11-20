@@ -63,8 +63,10 @@ from owner_routes import router as owners_router
 from base import router as base_router
 from coletas import router as coletas_router
 from routes_ui import router as ui_router
+from ml_routes import router as ml_router
 
 
+app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(ui_router)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(users_router,        prefix=API_PREFIX)
@@ -74,8 +76,21 @@ app.include_router(saidas_router,       prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
 
+# ──────────────────────────────────────────────────────────────────
+# Rotina de startup — renova tokens ML ao inicializar a API
+from db import SessionLocal
+from ml_token_service import refresh_all_ml_tokens
 
-
+@app.on_event("startup")
+def startup_event():
+    """Executa ao subir a API: renova tokens vencidos do Mercado Livre."""
+    db = SessionLocal()
+    try:
+        refresh_all_ml_tokens(db)
+    except Exception as e:
+        print(f"[ML] Erro durante renovação inicial: {e}")
+    finally:
+        db.close()
 # ──────────────────────────────────────────────────────────────────
 # Healthcheck
 @app.get(f"{API_PREFIX}/health", tags=["Health"])
