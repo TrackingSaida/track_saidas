@@ -249,11 +249,12 @@ def listar_saidas(
     if base and base.strip() and base.strip().lower() != "(todas)":
         stmt = stmt.where(Saida.base == base.strip())
 
-    if de:
-        stmt = stmt.where(Saida.data >= de)
+if de:
+    stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
 
-    if ate:
-        stmt = stmt.where(Saida.data <= ate)
+if ate:
+    stmt = stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
+
 
     if entregador and entregador.strip() and entregador.strip().lower() != "(todos)":
         stmt = stmt.where(Saida.entregador == entregador.strip())
