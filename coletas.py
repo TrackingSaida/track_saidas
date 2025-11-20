@@ -299,4 +299,160 @@ def list_coletas(
 
     stmt = stmt.order_by(Coleta.timestamp.desc())
     rows = db.scalars(stmt).all()
+
+    # ====== Ajuste: contabilizar cancelamentos ======
+    # Se houver registros de saídas com status "cancelado" dentro do período/base
+    # estes devem ser descontados do resumo de coletas (por data/base/serviço)
+    # A lógica a seguir consolida cancelamentos por data e base, e subtrai das
+    # contagens de coletas correspondentes antes de retornar ao front.
+    try:
+        # agrupa cancelamentos por (data, base)
+        cancelamentos: Dict[Tuple[datetime.date, Optional[str]], Dict[str, Decimal]] = {}
+
+        # Constrói filtro para Saida cancelada na mesma sub_base
+        cancel_stmt = select(Saida).where(
+            Saida.sub_base == sub_base_user,
+            # status pode ser 'Cancelado' (case-insensitive)
+            Saida.status.ilike("%cancelado%"),
+        )
+        # Aplica mesmo filtro de base, se fornecido
+        if base:
+            cancel_stmt = cancel_stmt.where(Saida.base == base.strip())
+        # Aplica filtros de data caso definidos (mesma lógica do list_coletas)
+        if data_inicio:
+            # início do dia para timestamp
+            dt_ini = datetime.datetime.combine(data_inicio, datetime.time.min)
+            cancel_stmt = cancel_stmt.where(Saida.timestamp >= dt_ini)
+        if data_fim:
+            # final do dia para timestamp
+            dt_fim = datetime.datetime.combine(data_fim, datetime.time.max)
+            cancel_stmt = cancel_stmt.where(Saida.timestamp <= dt_fim)
+
+        cancel_rows = db.scalars(cancel_stmt).all()
+
+        # Define função local para classificar o serviço do cancelamento
+        def _class_servico(raw: Optional[str]) -> Optional[str]:
+            s = (raw or "").strip().lower()
+            if not s:
+                return None
+            # As saídas gravadas via lote usam rótulos 'shopee', 'Mercado Livre', 'avulso'
+            # normalizamos para as mesmas chaves usadas em Coleta.shopee/mercado_livre/avulso
+            if s == "shopee":
+                return "shopee"
+            # lidar com "mercado livre" ou variantes
+            if s.replace("_", " ").replace("  ", " ") in {"mercado livre", "mercado_livre", "mercado livre"}:
+                return "mercado_livre"
+            # 'ml' também representa Mercado Livre
+            if s == "ml":
+                return "mercado_livre"
+            if s == "mercadolivre":
+                return "mercado_livre"
+            if s == "avulso":
+                return "avulso"
+            # fallback: tenta com espaços normalizados
+            if s.replace(" ", "").startswith("mercadolivre"):
+                return "mercado_livre"
+            return None
+
+        # Agrupa cancelamentos por data/base e serviço
+        for c in cancel_rows:
+            key = (c.timestamp.date(), getattr(c, "base", None))
+            # ignora cancelamento sem base associada
+            if not key[1]:
+                continue
+            # classifica serviço
+            sv = _class_servico(getattr(c, "servico", None))
+            if not sv:
+                continue
+            if key not in cancelamentos:
+                cancelamentos[key] = {
+                    "shopee": Decimal(0),
+                    "mercado_livre": Decimal(0),
+                    "avulso": Decimal(0),
+                    "valor_total": Decimal(0),
+                }
+            cancelamentos[key][sv] += Decimal(1)
+
+        # calcula valor_total a ser descontado por base utilizando preços por serviço
+        # (utiliza _get_precos para buscar preço da base somente uma vez)
+        precos_cache: Dict[Optional[str], Tuple[Decimal, Decimal, Decimal]] = {}
+        for (d, b), vals in list(cancelamentos.items()):
+            # obtém preços
+            if b not in precos_cache:
+                try:
+                    precos_cache[b] = _get_precos(db, sub_base=sub_base_user, base=b)
+                except Exception:
+                    # se não encontrar preços, define zero para evitar erro
+                    precos_cache[b] = (Decimal(0), Decimal(0), Decimal(0))
+            p_sh, p_ml, p_av = precos_cache[b]
+            # calcula total por cancelamento
+            total_cancel = (
+                (vals.get("shopee", 0) * p_sh)
+                + (vals.get("mercado_livre", 0) * p_ml)
+                + (vals.get("avulso", 0) * p_av)
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            cancelamentos[(d, b)]["valor_total"] = total_cancel
+
+        # Realiza o desconto nas contagens/valores dos objetos retornados
+        if cancelamentos:
+            # percorre rows na ordem original (já ordenados por timestamp desc)
+            for r in rows:
+                key = (r.timestamp.date(), getattr(r, "base", None))
+                if key in cancelamentos:
+                    canc = cancelamentos[key]
+                    # obtém preços para este base
+                    p_sh, p_ml, p_av = precos_cache.get(key[1], (Decimal(0), Decimal(0), Decimal(0)))
+                    # desconta shopee
+                    sub_sh = 0
+                    if getattr(r, "shopee", 0) > 0 and canc.get("shopee", 0) > 0:
+                        sub_sh = min(int(r.shopee), int(canc["shopee"]))
+                        r.shopee -= sub_sh
+                        canc["shopee"] -= Decimal(sub_sh)
+                    # desconta mercado_livre
+                    sub_ml = 0
+                    if getattr(r, "mercado_livre", 0) > 0 and canc.get("mercado_livre", 0) > 0:
+                        sub_ml = min(int(r.mercado_livre), int(canc["mercado_livre"]))
+                        r.mercado_livre -= sub_ml
+                        canc["mercado_livre"] -= Decimal(sub_ml)
+                    # desconta avulso
+                    sub_av = 0
+                    if getattr(r, "avulso", 0) > 0 and canc.get("avulso", 0) > 0:
+                        sub_av = min(int(r.avulso), int(canc["avulso"]))
+                        r.avulso -= sub_av
+                        canc["avulso"] -= Decimal(sub_av)
+                    # calcula valor total a descontar baseado nas quantidades removidas
+                    sub_val = (
+                        (Decimal(sub_sh) * p_sh)
+                        + (Decimal(sub_ml) * p_ml)
+                        + (Decimal(sub_av) * p_av)
+                    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    if sub_val > 0 and getattr(r, "valor_total", None) is not None:
+                        # valor_total em Coleta é um Decimal
+                        r.valor_total = (Decimal(r.valor_total) - sub_val).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        canc["valor_total"] -= sub_val
+                    # se todos cancelamentos deste dia/base foram aplicados, remove da lista
+                    if (
+                        canc.get("shopee", 0) <= 0
+                        and canc.get("mercado_livre", 0) <= 0
+                        and canc.get("avulso", 0) <= 0
+                        and canc.get("valor_total", 0) <= 0
+                    ):
+                        del cancelamentos[key]
+
+        # após ajuste, remove linhas que ficaram zeradas
+        adjusted_rows = []
+        for r in rows:
+            try:
+                has_counts = (r.shopee or 0) > 0 or (r.mercado_livre or 0) > 0 or (r.avulso or 0) > 0
+                has_valor = (r.valor_total or Decimal(0)) > Decimal(0)
+            except Exception:
+                has_counts = True
+                has_valor = True
+            if has_counts or has_valor:
+                adjusted_rows.append(r)
+        rows = adjusted_rows
+    except Exception:
+        # em caso de erro ao aplicar descontos, apenas retorna os dados originais
+        pass
+
     return rows
