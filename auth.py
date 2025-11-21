@@ -40,10 +40,9 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 # ======================
-# HTTP Bearer (fallback caso cookie falhe)
+# HTTP Bearer (fallback)
 # ======================
 security = HTTPBearer(auto_error=False)
-
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 # ======================
@@ -52,9 +51,6 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 class Token(BaseModel):
     access_token: str
     token_type: str
-
-class TokenData(BaseModel):
-    email: Optional[EmailStr] = None
 
 class UserLogin(BaseModel):
     identifier: str = Field(
@@ -75,7 +71,7 @@ class UserResponse(BaseModel):
     role: Optional[int]
 
 # ======================
-# JWT Utilitários
+# JWT Util
 # ======================
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
@@ -84,7 +80,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # ======================
-# Obter usuário
+# Buscar usuário
 # ======================
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
     identifier = (identifier or "").strip()
@@ -104,14 +100,12 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
     user = get_user_by_identifier(db, identifier)
     if not user:
         return None
-    if not getattr(user, "password_hash", None):
-        return None
     if not verify_password(password, user.password_hash):
         return None
     return user
 
 # ======================
-# Resolver usuário autenticado
+# Usuário logado
 # ======================
 async def get_current_user(
     request: Request,
@@ -119,10 +113,8 @@ async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> User:
 
-    # Tenta via cookie
     token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
 
-    # Se não tiver cookie, tenta via Bearer token
     if not token and credentials and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
 
@@ -133,7 +125,7 @@ async def get_current_user(
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         sub_value: str = payload.get("sub")
         if not sub_value:
-            raise HTTPException(status_code=401, detail="Token inválido: sem 'sub'")
+            raise HTTPException(status_code=401, detail="Token inválido (sem sub)")
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
@@ -144,7 +136,7 @@ async def get_current_user(
     return user
 
 # ======================
-# Rotas de Autenticação
+# Rotas de autenticação
 # ======================
 @router.post("/token", response_model=Token)
 async def login_for_access_token(user_credentials: UserLogin, db: Session = Depends(get_db)):
@@ -153,8 +145,8 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
         raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
     subject = user.email or user.username or user.contato
-
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
     access_token = create_access_token({"sub": subject}, expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -165,8 +157,6 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
         raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
     subject = user.email or user.username or user.contato
-    if not subject:
-        raise HTTPException(422, "Usuário sem identificador válido")
 
     expires = (
         timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
@@ -219,7 +209,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
     )
 
 # ======================
-# RESET DE SENHA
+# RESET PASSWORD
 # ======================
 class ResetPasswordPayload(BaseModel):
     identifier: str = Field(..., description="email, username ou contato")
