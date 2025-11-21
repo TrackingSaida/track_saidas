@@ -16,9 +16,9 @@ MENU_DEFS = [
     {
         "section": "Dashboards",
         "icon": "ri-dashboard-2-line",
-        "roles": [1, 2],
+        "roles": [1],
         "items": [
-            {"label": "Tracking", "href": "dashboard-tracking-saidas.html"},
+            {"label": "Tracking", "href": "dashboard-tracking-overview.html"},
         ]
     },
     {
