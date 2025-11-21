@@ -26,10 +26,10 @@ REMEMBER_ME_EXPIRE_DAYS = int(os.getenv("REMEMBER_ME_EXPIRE_DAYS", "30"))
 # Cookies
 ACCESS_COOKIE_NAME = os.getenv("ACCESS_COOKIE_NAME", "access_token")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
-COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")  # ex.: ".seu-dominio.com" (opcional)
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")  # ex.: ".seu-dominio.com"
 
 # ======================
-# Hash de senhas
+# Hash de Senhas
 # ======================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -40,9 +40,9 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 # ======================
-# Autenticação Bearer
+# HTTP Bearer (fallback caso cookie falhe)
 # ======================
-security = HTTPBearer(auto_error=False)  # tenta cookie antes
+security = HTTPBearer(auto_error=False)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -54,30 +54,28 @@ class Token(BaseModel):
     token_type: str
 
 class TokenData(BaseModel):
-    email: Optional[EmailStr] = None  # opcional; mantido por compatibilidade
+    email: Optional[EmailStr] = None
 
 class UserLogin(BaseModel):
-    # aceita "email" OU "username" OU "contato" no mesmo campo
     identifier: str = Field(
         min_length=1,
         validation_alias=AliasChoices("email", "username", "contato"),
-        serialization_alias="email",  # Swagger exibirá como "email"
+        serialization_alias="email",
         description="Aceita email, username ou contato",
     )
     password: str
     remember: bool = False
-
     model_config = ConfigDict(from_attributes=True)
 
 class UserResponse(BaseModel):
     id: int
-    email: Optional[EmailStr] = None
-    username: Optional[str] = None
-    contato: Optional[str] = None
-    role: Optional[int] = None
+    email: Optional[EmailStr]
+    username: Optional[str]
+    contato: Optional[str]
+    role: Optional[int]
 
 # ======================
-# Utilitários JWT
+# JWT Utilitários
 # ======================
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
@@ -86,15 +84,13 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # ======================
-# Acesso a usuário
+# Obter usuário
 # ======================
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
-    """
-    Busca por email, username OU contato (primeiro que bater).
-    """
     identifier = (identifier or "").strip()
     if not identifier:
         return None
+
     stmt = select(User).where(
         or_(
             User.email == identifier,
@@ -115,60 +111,51 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
     return user
 
 # ======================
-# Resolver usuário (Cookie OU Bearer)
+# Resolver usuário autenticado
 # ======================
 async def get_current_user(
     request: Request,
     db: Session = Depends(get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> User:
+
+    # Tenta via cookie
     token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
 
-    # Se não tiver cookie, tenta Bearer
+    # Se não tiver cookie, tenta via Bearer token
     if not token and credentials and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
 
     if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Não autenticado",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=401, detail="Não autenticado")
 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        sub_value: str = payload.get("sub")  # agora pode ser email OU username OU contato
+        sub_value: str = payload.get("sub")
         if not sub_value:
-            raise HTTPException(status_code=401, detail="Token inválido: sem identificador 'sub'")
+            raise HTTPException(status_code=401, detail="Token inválido: sem 'sub'")
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
-    # Busca o usuário por qualquer um dos identificadores
     user = get_user_by_identifier(db, sub_value)
-    if user is None:
+    if not user:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
+
     return user
 
 # ======================
-# Rotas
+# Rotas de Autenticação
 # ======================
 @router.post("/token", response_model=Token)
 async def login_for_access_token(user_credentials: UserLogin, db: Session = Depends(get_db)):
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Login ou senha incorretos",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
-    # Usa o primeiro identificador disponível
     subject = user.email or user.username or user.contato
-    if not subject:
-        raise HTTPException(status_code=422, detail="Usuário sem identificador válido (email/username/contato).")
 
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(data={"sub": subject}, expires_delta=expires)
+    access_token = create_access_token({"sub": subject}, expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.post("/login")
@@ -179,28 +166,27 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
 
     subject = user.email or user.username or user.contato
     if not subject:
-        raise HTTPException(status_code=422, detail="Usuário sem identificador válido (email/username/contato).")
+        raise HTTPException(422, "Usuário sem identificador válido")
 
-    if user_credentials.remember:
-        expires = timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
-    else:
-        # >>> linha corrigida: sem quebra no nome da constante <<<
-        expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expires = (
+        timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
+        if user_credentials.remember
+        else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
 
-    token = create_access_token(data={"sub": subject}, expires_delta=expires)
+    token = create_access_token({"sub": subject}, expires)
 
-    # SameSite/Lax vs None conforme ambiente
     samesite = "None" if COOKIE_SECURE else "Lax"
 
     response.set_cookie(
         key=ACCESS_COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=COOKIE_SECURE,  # True em produção (HTTPS)
+        secure=COOKIE_SECURE,
         samesite=samesite,
         max_age=int(expires.total_seconds()),
         path="/",
-        domain=COOKIE_DOMAIN,  # None por padrão; configure se precisar subdomínios
+        domain=COOKIE_DOMAIN,
     )
 
     return {
@@ -210,7 +196,7 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
             "email": user.email,
             "username": user.username,
             "contato": user.contato,
-        },
+        }
     }
 
 @router.post("/logout")
@@ -229,16 +215,15 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
         email=current_user.email,
         username=current_user.username,
         contato=current_user.contato,
-        role=current_user.role 
+        role=current_user.role
     )
 
-    class ResetPasswordPayload(BaseModel):
+# ======================
+# RESET DE SENHA
+# ======================
+class ResetPasswordPayload(BaseModel):
     identifier: str = Field(..., description="email, username ou contato")
-    new_password: str = Field(
-        min_length=8,
-        description="Nova senha"
-    )
-
+    new_password: str = Field(min_length=8, description="Nova senha")
 
 @router.post("/reset-password")
 async def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db)):
@@ -250,4 +235,3 @@ async def reset_password(payload: ResetPasswordPayload, db: Session = Depends(ge
     db.commit()
 
     return {"ok": True, "message": "Senha redefinida com sucesso"}
-
