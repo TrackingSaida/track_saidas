@@ -156,6 +156,13 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
         logger.exception("Erro inesperado ao criar user: %s", e)
         raise
 
+# =========================
+# GET /users/me
+# =========================
+@router.get("/me", response_model=UserFull)
+def read_current_user(current_user: User = Depends(get_current_user)) -> UserFull:
+    """Retorna os dados completos do usuário logado."""
+    return current_user
 
 # =========================
 # GET /users/{user_id}
@@ -170,15 +177,6 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
             detail="Usuário não encontrado",
         )
     return user
-
-
-# =========================
-# GET /users/me
-# =========================
-@router.get("/me", response_model=UserFull)
-def read_current_user(current_user: User = Depends(get_current_user)) -> UserFull:
-    """Retorna os dados completos do usuário logado."""
-    return current_user
 
 
 # =========================
