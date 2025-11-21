@@ -16,9 +16,10 @@ MENU_DEFS = [
     {
         "section": "Dashboards",
         "icon": "ri-dashboard-2-line",
-        "roles": [1],
+        "roles": [1,2,3],
         "items": [
-            {"label": "Visão geral", "href": "dashboard-tracking-overview.html"},
+            {"label": "Visão geral", "href": "dashboard-tracking-overview.html", "roles": [1]},
+            {"label": "Ranking", "href": "dashboard-tracking-saidas.html", "roles": [1,2,3]},
         ]
     },
     {
