@@ -63,7 +63,7 @@ class UserFull(BaseModel):
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
     sub_base: Optional[str] = None
-    status: bool
+    status: Optional[bool] = None
     model_config = ConfigDict(from_attributes=True)
 
 
