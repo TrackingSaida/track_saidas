@@ -231,3 +231,23 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
         contato=current_user.contato,
         role=current_user.role 
     )
+
+    class ResetPasswordPayload(BaseModel):
+    identifier: str = Field(..., description="email, username ou contato")
+    new_password: str = Field(
+        min_length=8,
+        description="Nova senha"
+    )
+
+
+@router.post("/reset-password")
+async def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db)):
+    user = get_user_by_identifier(db, payload.identifier)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    user.password_hash = get_password_hash(payload.new_password)
+    db.commit()
+
+    return {"ok": True, "message": "Senha redefinida com sucesso"}
+
