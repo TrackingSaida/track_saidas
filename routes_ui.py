@@ -18,7 +18,7 @@ MENU_DEFS = [
         "icon": "ri-dashboard-2-line",
         "roles": [1],
         "items": [
-            {"label": "Tracking", "href": "dashboard-tracking-overview.html"},
+            {"label": "Visão geral", "href": "dashboard-tracking-overview.html"},
         ]
     },
     {
