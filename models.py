@@ -44,7 +44,7 @@ class User(Base):
     # PERFIL DE COLETADOR (NOVO)
     coletador = Column(Boolean, nullable=False, server_default=text("false"))
     username_entregador = Column(Text, nullable=True)  # espelha o username do entregador quando aplicável
-    tipo_de_cadastro = Column(Integer, nullable=True)  # marcado como 3 quando vier do fluxo de entregador
+    role = Column(Integer, nullable=False, server_default="2") 
 
     def __repr__(self) -> str:
         return (

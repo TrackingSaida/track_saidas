@@ -136,7 +136,7 @@ def create_entregador(
       - contato = telefone
       - nome = nome
       - coletador = True
-      - tipo_de_cadastro = 3
+      - role = 3
       - sub_base = do solicitante
       - status = True
     """
@@ -210,7 +210,7 @@ def create_entregador(
                 sub_base=sub_base_user,
                 coletador=True,
                 username_entregador=username_ent,
-                tipo_de_cadastro=3,
+                role=3,
             )
             db.add(new_user)
 
@@ -267,8 +267,8 @@ def patch_entregador(
     - Procura/corrige o User correspondente. Se *não* existir e:
         (a) coletador está sendo marcado como True (no body) OU o entregador já é coletador,
         (b) e existir username_alvo e senha no PATCH,
-      então CRIA o User com password_hash, username, sub_base, nome/contato, coletador e tipo_de_cadastro=3.
-    - Se o User existir, sincroniza: username, coletador, senha (hash), nome, contato, tipo_de_cadastro.
+      então CRIA o User com password_hash, username, sub_base, nome/contato, coletador e role=3.
+    - Se o User existir, sincroniza: username, coletador, senha (hash), nome, contato, role.
     - 'ativo' só altera na tabela entregador (não mexe no status do user).
     """
     sub_base_user = _resolve_user_base(db, current_user)
@@ -347,7 +347,7 @@ def patch_entregador(
                 nome=(body.nome or obj.nome) or None,
                 contato=(body.telefone or obj.telefone) or "",
                 coletador=True,
-                tipo_de_cadastro=3,
+                role=3,
                 status=True,
             )
             db.add(user)
@@ -392,9 +392,9 @@ def patch_entregador(
                 user.password_hash = get_password_hash(raw)
                 houve_alteracao_user = True
 
-            # Marca tipo_de_cadastro=3 quando houver alterações relevantes
+            # Marca role=3 quando houver alterações relevantes
             if houve_alteracao_user:
-                user.tipo_de_cadastro = 3
+                user.role = 3
 
         # Por fim, espelha o coletador no ENTREGADOR (depois de criar/sincronizar user)
         if body.coletador is not None:

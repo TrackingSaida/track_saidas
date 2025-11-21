@@ -10,11 +10,11 @@ from auth import get_current_user as auth_get_current_user  # reutiliza seu auth
 
 def _coerce_role_from_user(user: User) -> int:
     """
-    Extrai o 'role' a partir de user.tipo_de_cadastro.
+    Extrai o 'role' a partir de user.role.
     Defaults seguro: 3 (mais restrito) se vier None/0/inválido.
     """
     try:
-        value = int(getattr(user, "tipo_de_cadastro", 3) or 3)
+        value = int(getattr(user, "role", 3) or 3)
         # garante faixa conhecida (1,2,3); se sair disso, cai para 3
         if value not in (1, 2, 3):
             return 3
@@ -27,7 +27,7 @@ def current_user_with_role(user: User = Depends(auth_get_current_user)) -> User:
     """
     Wrap no current_user do auth.py:
     - mantém autenticação (cookie/Bearer) e busca no DB
-    - anexa 'user.role' com base em 'tipo_de_cadastro'
+    - anexa 'user.role' com base em 'role'
     """
     user.role = _coerce_role_from_user(user)
     return user
