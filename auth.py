@@ -74,6 +74,7 @@ class UserResponse(BaseModel):
     email: Optional[EmailStr] = None
     username: Optional[str] = None
     contato: Optional[str] = None
+    role: Optional[int] = None
 
 # ======================
 # Utilitários JWT
@@ -228,4 +229,5 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
         email=current_user.email,
         username=current_user.username,
         contato=current_user.contato,
+        role=current_user.role 
     )
