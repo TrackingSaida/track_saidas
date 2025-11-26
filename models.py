@@ -52,25 +52,25 @@ class User(Base):
             f"coletador={self.coletador} sub_base={self.sub_base!r}>"
         )
 
+# ==========================
+# Tabela: owner
+# ==========================
 
-# ==========================
-# Tabela: owner (cobrança/planos)
-# ==========================
 class Owner(Base):
     __tablename__ = "owner"
 
     id_owner = Column(BigInteger, primary_key=True)
     email = Column(Text, nullable=False, server_default=text("''::text"))
     username = Column(Text, nullable=False)
-    cobranca = Column(Text, nullable=True)
-    valor = Column(Numeric(12, 2), nullable=True)
-    mensalidade = Column(Date, nullable=True)
-    creditos = Column(Numeric(12, 2), nullable=True, server_default=text("0.00"))
+    valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     sub_base = Column(Text, nullable=True)
     contato = Column(Text, nullable=True)
 
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+
     def __repr__(self) -> str:
-        return f"<Owner id_owner={self.id_owner} username={self.username!r}>"
+        return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
+
 
 
 # ==========================
@@ -191,3 +191,21 @@ class MercadoLivreToken(Base):
 
     def __repr__(self) -> str:
         return f"<MercadoLivreToken id={self.id} user_id_ml={self.user_id_ml}>"
+
+
+# ==========================
+# Tabela: owner_cobranca_itens
+# ==========================
+class OwnerCobrancaItem(Base):
+    __tablename__ = "owner_cobranca_itens"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    id_coleta = Column(BigInteger, nullable=False)
+    valor = Column(Numeric(12, 2), nullable=False)
+    timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+    periodo_inicio = Column(Date, nullable=True)
+    periodo_fim = Column(Date, nullable=True)
+    fechado = Column(Boolean, nullable=False, server_default=text("false"))
+

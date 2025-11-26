@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, or_
 
 from db import get_db
-from models import User
+from models import User, Owner   # <- apenas 1 import correto aqui
 
 # ======================
 # Configurações JWT
@@ -116,12 +116,14 @@ async def get_current_user(
 
     token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
 
+    # fallback para header Authorization: Bearer
     if not token and credentials and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
 
     if not token:
         raise HTTPException(status_code=401, detail="Não autenticado")
 
+    # valida token
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         sub_value: str = payload.get("sub")
@@ -130,9 +132,22 @@ async def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
+    # pega usuário pelo token
     user = get_user_by_identifier(db, sub_value)
     if not user:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
+
+    # ================================================================
+    # 🔒 BLOQUEIO POR OWNER — NOVO!
+    # ================================================================
+    if user.sub_base:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
+        if owner and owner.ativo is False:
+            raise HTTPException(
+                status_code=403,
+                detail="Operação bloqueada pelo administrador."
+            )
+    # ================================================================
 
     return user
 
@@ -147,8 +162,8 @@ async def login_for_access_token(user_credentials: UserLogin, db: Session = Depe
 
     subject = user.email or user.username or user.contato
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-
     access_token = create_access_token({"sub": subject}, expires)
+
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.post("/login")
@@ -156,6 +171,18 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(status_code=401, detail="Login ou senha incorretos")
+
+    # ================================================================
+    # 🔒 BLOQUEIO POR OWNER — ANTES DE GERAR TOKEN
+    # ================================================================
+    if user.sub_base:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
+        if owner and owner.ativo is False:
+            raise HTTPException(
+                status_code=403,
+                detail="owner_blocked"
+            )
+    # ================================================================
 
     subject = user.email or user.username or user.contato
 
@@ -187,8 +214,11 @@ async def login_set_cookie(user_credentials: UserLogin, response: Response, db: 
             "email": user.email,
             "username": user.username,
             "contato": user.contato,
+            "role": user.role,
+            "sub_base": user.sub_base
         }
     }
+
 
 @router.post("/logout")
 async def logout(response: Response):

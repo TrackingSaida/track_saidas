@@ -14,6 +14,10 @@ from db import get_db
 from auth import get_current_user
 from models import Coleta, Entregador, BasePreco, User, Saida
 
+from models import Owner, OwnerCobrancaItem
+
+
+
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
 
 # =========================
@@ -173,15 +177,26 @@ def registrar_coleta_em_lote(
     current_user: User = Depends(get_current_user),
 ):
     sub_base, entregador_nome, username_entregador = _resolve_entregador_ou_user_base(db, current_user)
+
+    # === BUSCAR OWNER DA SUB_BASE ===
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+    valor_unit = Decimal(str(owner.valor or 0))
+
     p_shopee, p_ml, p_avulso = _get_precos(db, sub_base=sub_base, base=payload.base)
 
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
     created = 0
 
     try:
+        # =====================================
+        # REGISTRAR SAÍDAS DO LOTE
+        # =====================================
         for item in payload.itens:
             serv = _normalize_servico(item.servico)
             codigo = (item.codigo or "").strip()
+
             if not codigo:
                 raise HTTPException(status_code=422, detail="Código vazio no payload.")
 
@@ -189,7 +204,6 @@ def registrar_coleta_em_lote(
                 select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
             )
             if exists:
-                # 🚫 Interrompe imediatamente e cancela o lote
                 raise HTTPException(
                     status_code=409,
                     detail=f"O código '{codigo}' já foi coletado anteriormente."
@@ -209,9 +223,9 @@ def registrar_coleta_em_lote(
             count[serv] += 1
 
         total = (
-            _decimal(count["shopee"]) * p_shopee
-            + _decimal(count["mercado_livre"]) * p_ml
-            + _decimal(count["avulso"]) * p_avulso
+            _decimal(count["shopee"]) * p_shopee +
+            _decimal(count["mercado_livre"]) * p_ml +
+            _decimal(count["avulso"]) * p_avulso
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         coleta = Coleta(
@@ -227,13 +241,30 @@ def registrar_coleta_em_lote(
         db.commit()
         db.refresh(coleta)
 
+        # =====================================
+        # REGISTRAR COBRANÇA (NOVO)
+        # =====================================
+        for _ in range(created):
+            item = OwnerCobrancaItem(
+                sub_base=sub_base,
+                id_coleta=coleta.id_coleta,
+                valor=valor_unit
+            )
+            db.add(item)
+
+        db.commit()
+
     except HTTPException as e:
         db.rollback()
         raise e
+
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Falha ao registrar lote: {e}")
 
+    # =====================================
+    # RESPOSTA FINAL
+    # =====================================
     return LoteResponse(
         coleta=ColetaOut.model_validate(coleta),
         resumo=ResumoLote(
@@ -246,8 +277,8 @@ def registrar_coleta_em_lote(
                 "ml": _fmt_money(p_ml),
                 "avulso": _fmt_money(p_avulso),
             },
-            total=_fmt_money(coleta.valor_total),
-        ),
+            total=_fmt_money(coleta.valor_total)
+        )
     )
 
 # =========================
