@@ -78,19 +78,40 @@ def criar_precos_base(
 ):
     sub_base_user = _resolve_user_sub_base(db, current_user)
 
+    # Normaliza nome (trim)
+    nome = (payload.base or "").strip()
+    if not nome:
+        raise HTTPException(status_code=400, detail="O campo 'base' não pode ficar vazio.")
+
+    # Verificar duplicidade: mesma base dentro da mesma sub_base
+    dup = db.scalars(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base_user,
+            BasePreco.base == nome
+        )
+    ).first()
+
+    if dup:
+        raise HTTPException(
+            status_code=409,
+            detail="Já existe um registro de preços para essa 'base' nesta sub_base."
+        )
+
+    # Criar objeto se não houver duplicidade
     obj = BasePreco(
-        base=(payload.base or "").strip(),
+        base=nome,
         sub_base=sub_base_user,
         username=getattr(current_user, "username", None),
         shopee=payload.shopee,
         ml=payload.ml,
         avulso=payload.avulso,
-        # novo: se não vier no payload, fica False (alinha com server_default "false")
         ativo=bool(payload.ativo) if payload.ativo is not None else False,
     )
+
     db.add(obj)
     db.commit()
     db.refresh(obj)
+
     return {"ok": True, "action": "created", "id_base": obj.id_base}
 
 # =========================
