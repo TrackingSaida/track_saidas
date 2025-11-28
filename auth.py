@@ -16,6 +16,15 @@ from db import get_db
 from models import User, Owner   # <- apenas 1 import correto aqui
 
 # ======================
+# OAuth2 para fluxo do ENTREGADOR
+# ======================
+from fastapi.security import OAuth2PasswordBearer
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+
+# ======================
 # Configurações JWT
 # ======================
 SECRET_KEY = os.getenv("SECRET_KEY", "troque-esta-chave-em-producao")
