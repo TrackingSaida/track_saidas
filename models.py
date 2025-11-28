@@ -209,3 +209,44 @@ class OwnerCobrancaItem(Base):
     periodo_fim = Column(Date, nullable=True)
     fechado = Column(Boolean, nullable=False, server_default=text("false"))
 
+
+ # ==========================
+ # Tabela: saidas_detail
+ # ==========================       
+    class SaidaDetail(Base):
+    __tablename__ = "saidas_detail"
+
+    id_detail = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    id_saida = Column(BigInteger, nullable=False)
+
+    entregador = Column(Text, nullable=False)  # entregador responsável pela entrega
+
+    status = Column(Text, nullable=False, server_default=text("'Em Rota'"))
+    tentativa = Column(Integer, nullable=False, server_default=text("1"))
+
+    motivo_ocorrencia = Column(Text, nullable=True)
+    observacao_ocorrencia = Column(Text, nullable=True)
+
+    tipo_recebedor = Column(Text, nullable=True)
+    nome_recebedor = Column(Text, nullable=True)
+    tipo_documento = Column(Text, nullable=True)
+    numero_documento = Column(Text, nullable=True)
+    observacao_entrega = Column(Text, nullable=True)
+
+    foto_url = Column(Text, nullable=True)
+
+    dest_nome = Column(Text, nullable=True)
+    dest_rua = Column(Text, nullable=True)
+    dest_numero = Column(Text, nullable=True)
+    dest_complemento = Column(Text, nullable=True)
+    dest_bairro = Column(Text, nullable=True)
+    dest_cidade = Column(Text, nullable=True)
+    dest_estado = Column(Text, nullable=True)
+    dest_cep = Column(Text, nullable=True)
+    dest_contato = Column(Text, nullable=True)
+
+    timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<SaidaDetail id_detail={self.id_detail} id_saida={self.id_saida}>"
