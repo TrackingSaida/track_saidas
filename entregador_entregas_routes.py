@@ -47,6 +47,53 @@ def _get_detail(db: Session, id_saida: int) -> Optional[SaidaDetail]:
         select(SaidaDetail).where(SaidaDetail.id_saida == id_saida)
     ).first()
 
+    
+# ============================================================
+# 0) LOGIN SIMPLES DO ENTREGADOR (sem senha)
+# ============================================================
+@router.post("/login-simples")
+def login_simples(payload: dict,
+                  db: Session = Depends(get_db)):
+
+    telefone = (payload.get("telefone") or "").strip()
+
+    if not telefone:
+        raise HTTPException(422, "Telefone é obrigatório.")
+
+    # buscar entregador pelo telefone
+    entregador = db.scalars(
+        select(Entregador).where(Entregador.telefone == telefone)
+    ).first()
+
+    if not entregador:
+        raise HTTPException(404, "Entregador não encontrado.")
+
+    if not entregador.ativo:
+        raise HTTPException(403, "Entregador inativo.")
+
+    # buscar usuário vinculado
+    user = db.scalars(
+        select(User).where(User.username_entregador == entregador.username_entregador)
+    ).first()
+
+    if not user:
+        raise HTTPException(404, "Usuário vinculado ao entregador não encontrado.")
+
+    # gerar token
+    from auth import create_access_token
+    token = create_access_token({"sub": user.username})
+
+    return {
+        "ok": True,
+        "token": token,
+        "entregador": {
+            "id": entregador.id_entregador,
+            "nome": entregador.nome,
+            "telefone": entregador.telefone,
+            "sub_base": entregador.sub_base
+        }
+    }
+
 
 # ============================================================
 # 1) SCAN
