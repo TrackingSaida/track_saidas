@@ -1,66 +1,48 @@
-# entregador_entregas_routes.py
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
-from typing import Optional, List
+from sqlalchemy.orm import Session
+from typing import Optional
 
-from db import get_db
-from auth import get_current_user
-from models import Saida, Entregador, SaidaDetail, User
+from deps import get_db
+from db import SessionLocal
+from models import Saida, SaidaDetail, Entregador
 
-router = APIRouter(prefix="/entregador/entregas", tags=["Entregador - Entregas"])
+# Funções utilitárias do token
+from auth import create_access_token
+from auth import oauth2_scheme
+from jose import jwt
+from auth import SECRET_KEY, ALGORITHM
+
+
+router = APIRouter(
+    prefix="/entregador/entregas",
+    tags=["Entregador - Entregas"]
+)
 
 
 # ============================================================
-# HELPERS
+# Aux: obter entregador_id do token
 # ============================================================
-
-def _get_entregador_logado(db: Session, current_user: User) -> Entregador:
-    """Retorna o entregador vinculado ao user logado."""
-    # tenta por username_entregador
-    ue = getattr(current_user, "username_entregador", None)
-    if ue:
-        ent = db.scalars(select(Entregador).where(Entregador.username_entregador == ue)).first()
-        if ent:
-            return ent
-
-    # tenta por username normal
-    un = getattr(current_user, "username", None)
-    if un:
-        ent = db.scalars(select(Entregador).where(Entregador.username_entregador == un)).first()
-        if ent:
-            return ent
-
-    raise HTTPException(401, "Usuário logado não é um entregador válido.")
+def get_entregador_id_from_token(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("sub") != "entregador":
+            raise HTTPException(403, "Token não é de entregador")
+        return payload["entregador_id"]
+    except:
+        raise HTTPException(401, "Token inválido")
 
 
-def _get_saida_by_codigo(db: Session, codigo: str, sub_base: str) -> Optional[Saida]:
-    return db.scalars(
-        select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
-    ).first()
-
-
-def _get_detail(db: Session, id_saida: int) -> Optional[SaidaDetail]:
-    return db.scalars(
-        select(SaidaDetail).where(SaidaDetail.id_saida == id_saida)
-    ).first()
-
-    
 # ============================================================
-# 0) LOGIN SIMPLES DO ENTREGADOR (sem senha)
+# LOGIN SIMPLES DO ENTREGADOR (SEM SENHA)
 # ============================================================
 @router.post("/login-simples")
-def login_simples(payload: dict,
-                  db: Session = Depends(get_db)):
+def login_simples(payload: dict, db: Session = Depends(get_db)):
 
     telefone = (payload.get("telefone") or "").strip()
-
     if not telefone:
         raise HTTPException(422, "Telefone é obrigatório.")
 
-    # buscar entregador pelo telefone
     entregador = db.scalars(
         select(Entregador).where(Entregador.telefone == telefone)
     ).first()
@@ -71,17 +53,11 @@ def login_simples(payload: dict,
     if not entregador.ativo:
         raise HTTPException(403, "Entregador inativo.")
 
-    # buscar usuário vinculado
-    user = db.scalars(
-        select(User).where(User.username_entregador == entregador.username_entregador)
-    ).first()
-
-    if not user:
-        raise HTTPException(404, "Usuário vinculado ao entregador não encontrado.")
-
-    # gerar token
-    from auth import create_access_token
-    token = create_access_token({"sub": user.username})
+    # Gerar token independente
+    token = create_access_token({
+        "sub": "entregador",
+        "entregador_id": entregador.id_entregador
+    })
 
     return {
         "ok": True,
@@ -96,324 +72,247 @@ def login_simples(payload: dict,
 
 
 # ============================================================
-# 1) SCAN
+# SCAN DE CÓDIGO (bipa o pacote)
 # ============================================================
-class ScanPayload:
-    codigo: str
-
-
 @router.post("/scan")
-def scan_codigo(payload: dict, 
-                db: Session = Depends(get_db),
-                current_user: User = Depends(get_current_user)):
-    """
-    Entregador bipou um código.
-    Regras:
+def scan_codigo(payload: dict,
+                entregador_id: int = Depends(get_entregador_id_from_token),
+                db: Session = Depends(get_db)):
 
-    - Se não existe → erro.
-    - Se existe e está sem entregador/Coletado → atribui ao entregador logado.
-    - Se está com ele → OK (já é dele).
-    - Se está com outro → retorna info para confirmar "assumir".
-    """
     codigo = (payload.get("codigo") or "").strip()
+
     if not codigo:
-        raise HTTPException(422, "Código inválido.")
+        raise HTTPException(422, "Código é obrigatório.")
 
-    ent = _get_entregador_logado(db, current_user)
-    sub_base = ent.sub_base
+    saida = db.scalars(
+        select(Saida).where(Saida.codigo == codigo)
+    ).first()
 
-    saida = _get_saida_by_codigo(db, codigo, sub_base)
     if not saida:
-        raise HTTPException(404, "Código não encontrado na sua sub_base.")
+        raise HTTPException(404, "Pacote não encontrado em SAIDAS.")
 
-    # Caso 1 — saída sem entregador ou coletado
-    if not saida.entregador or saida.status.lower() in ("coletado", "coletada"):
-        saida.entregador = ent.username_entregador
-        saida.status = "Saiu para entrega"
-        db.commit()
+    # Se já está atribuído a outro entregador
+    if saida.entregador_id and saida.entregador_id != entregador_id:
+        raise HTTPException(403, f"Pacote já está com outro entregador (ID {saida.entregador_id}).")
 
-        # cria detail se não existir
-        detail = _get_detail(db, saida.id_saida)
-        if not detail:
-            detail = SaidaDetail(
-                id_saida=saida.id_saida,
-                entregador=ent.username_entregador,
-                status="Em Rota",
-                tentativa=1
-            )
-            db.add(detail)
-            db.commit()
+    # Registra a atribuição
+    saida.entregador_id = entregador_id
 
-        return {
-            "ok": True,
-            "action": "atribuido",
-            "id_saida": saida.id_saida,
-            "mensagem": "Entrega atribuída a você."
-        }
+    # Mantém o campo histórico texto para painéis antigos
+    entregador = db.scalars(
+        select(Entregador).where(Entregador.id_entregador == entregador_id)
+    ).first()
+    saida.entregador = entregador.nome
 
-    # Caso 2 — já está com ele
-    if saida.entregador == ent.username_entregador:
-        return {
-            "ok": True,
-            "action": "ja_eh_seu",
-            "id_saida": saida.id_saida
-        }
+    db.commit()
 
-    # Caso 3 — está com outro entregador
+    return {"ok": True, "msg": "Pacote assumido via scan", "id_saida": saida.id_saida}
+
+
+# ============================================================
+# ASSUMIR PACOTE (quando já existe e está com outro EXCEÇÃO)
+# ============================================================
+@router.post("/assumir")
+def assumir_codigo(payload: dict,
+                   entregador_id: int = Depends(get_entregador_id_from_token),
+                   db: Session = Depends(get_db)):
+
+    codigo = (payload.get("codigo") or "").strip()
+
+    if not codigo:
+        raise HTTPException(422, "Código é obrigatório.")
+
+    saida = db.scalars(
+        select(Saida).where(Saida.codigo == codigo)
+    ).first()
+
+    if not saida:
+        raise HTTPException(404, "Pacote não encontrado.")
+
+    # Atribuir sempre ao entregador logado
+    saida.entregador_id = entregador_id
+
+    entregador = db.scalars(
+        select(Entregador).where(Entregador.id_entregador == entregador_id)
+    ).first()
+    saida.entregador = entregador.nome
+
+    db.commit()
+
+    return {"ok": True, "msg": "Pacote assumido", "id_saida": saida.id_saida}
+
+
+# ============================================================
+# LISTAR PENDENTES DO ENTREGADOR
+# ============================================================
+@router.get("/pendentes")
+def listar_pendentes(entregador_id: int = Depends(get_entregador_id_from_token),
+                     db: Session = Depends(get_db)):
+
+    pendentes = db.scalars(
+        select(Saida).where(
+            Saida.entregador_id == entregador_id,
+            Saida.status == "saiu"
+        )
+    ).all()
+
+    return [{"id_saida": s.id_saida, "codigo": s.codigo} for s in pendentes]
+
+
+# ============================================================
+# DETALHES DO PACOTE
+# ============================================================
+@router.get("/detalhe/{id_saida}")
+def detalhe(id_saida: int,
+            entregador_id: int = Depends(get_entregador_id_from_token),
+            db: Session = Depends(get_db)):
+
+    saida = db.get(Saida, id_saida)
+    if not saida:
+        raise HTTPException(404, "Pacote não encontrado.")
+
+    if saida.entregador_id != entregador_id:
+        raise HTTPException(403, "Este pacote não pertence a você.")
+
     return {
-        "ok": False,
-        "action": "outro_entregador",
-        "atual": saida.entregador,
         "id_saida": saida.id_saida,
-        "mensagem": f"Pedido está com {saida.entregador}. Deseja assumir?"
+        "codigo": saida.codigo,
+        "status": saida.status
     }
 
 
 # ============================================================
-# 2) ASSUMIR ENTREGA DE OUTRO ENTREGADOR
-# ============================================================
-@router.post("/assumir")
-def assumir_entrega(payload: dict,
-                    db: Session = Depends(get_db),
-                    current_user: User = Depends(get_current_user)):
-    id_saida = payload.get("id_saida")
-    if not id_saida:
-        raise HTTPException(422, "id_saida é obrigatório.")
-
-    ent = _get_entregador_logado(db, current_user)
-    saida = db.get(Saida, id_saida)
-
-    if not saida or saida.sub_base != ent.sub_base:
-        raise HTTPException(404, "Saída não encontrada.")
-
-    # reatribuindo
-    saida.entregador = ent.username_entregador
-    saida.status = "Saiu para entrega"
-    db.commit()
-
-    # atualiza detail
-    detail = _get_detail(db, saida.id_saida)
-    if not detail:
-        detail = SaidaDetail(
-            id_saida=saida.id_saida,
-            entregador=ent.username_entregador,
-            status="Em Rota",
-            tentativa=1
-        )
-        db.add(detail)
-    else:
-        detail.entregador = ent.username_entregador
-        detail.status = "Em Rota"
-
-    db.commit()
-
-    return {"ok": True, "mensagem": "Pedido assumido com sucesso.", "id_saida": id_saida}
-
-
-# ============================================================
-# 3) LISTAR PENDENTES
-# ============================================================
-@router.get("/pendentes")
-def listar_pendentes(db: Session = Depends(get_db),
-                     current_user: User = Depends(get_current_user)):
-    ent = _get_entregador_logado(db, current_user)
-
-    rows = db.scalars(
-        select(Saida)
-        .where(
-            Saida.sub_base == ent.sub_base,
-            Saida.entregador == ent.username_entregador,
-            Saida.status == "Saiu para entrega"
-        )
-        .order_by(Saida.timestamp.desc())
-    ).all()
-
-    return [{"id_saida": r.id_saida, "codigo": r.codigo, "status": r.status} for r in rows]
-
-
-# ============================================================
-# 4) LISTAR OCORRÊNCIAS
-# ============================================================
-@router.get("/ocorrencias")
-def listar_ocorrencias(db: Session = Depends(get_db),
-                       current_user: User = Depends(get_current_user)):
-    ent = _get_entregador_logado(db, current_user)
-
-    rows = db.scalars(
-        select(SaidaDetail)
-        .where(
-            SaidaDetail.entregador == ent.username_entregador,
-            SaidaDetail.status == "Ocorrência"
-        )
-        .order_by(SaidaDetail.timestamp.desc())
-    ).all()
-
-    return rows
-
-
-# ============================================================
-# 5) LISTAR FINALIZADAS
-# ============================================================
-@router.get("/finalizadas")
-def listar_finalizadas(db: Session = Depends(get_db),
-                       current_user: User = Depends(get_current_user)):
-    ent = _get_entregador_logado(db, current_user)
-
-    rows = db.scalars(
-        select(SaidaDetail)
-        .where(
-            SaidaDetail.entregador == ent.username_entregador,
-            SaidaDetail.status.in_(["Entregue", "Cancelado"])
-        )
-        .order_by(SaidaDetail.timestamp.desc())
-    ).all()
-
-    return rows
-
-
-# ============================================================
-# 6) REGISTRAR ENTREGA
+# ENTREGAR PACOTE
 # ============================================================
 @router.post("/entregar")
-def registrar_entrega(payload: dict,
-                      db: Session = Depends(get_db),
-                      current_user: User = Depends(get_current_user)):
-    id_saida = payload.get("id_saida")
-    if not id_saida:
-        raise HTTPException(422, "id_saida é obrigatório.")
+def entregar_pacote(payload: dict,
+                    entregador_id: int = Depends(get_entregador_id_from_token),
+                    db: Session = Depends(get_db)):
 
-    ent = _get_entregador_logado(db, current_user)
+    id_saida = payload.get("id_saida")
 
     saida = db.get(Saida, id_saida)
-    if not saida or saida.sub_base != ent.sub_base:
+    if not saida:
         raise HTTPException(404, "Saída não encontrada.")
 
-    # Atualiza Saida
-    saida.status = "Entregue"
+    if saida.entregador_id != entregador_id:
+        raise HTTPException(403, "Este pacote não pertence a você.")
 
-    # Atualiza detalhe
-    detail = _get_detail(db, id_saida)
-    if not detail:
-        detail = SaidaDetail(id_saida=id_saida, entregador=ent.username_entregador)
+    detail = SaidaDetail(
+        id_saida=id_saida,
+        id_entregador=entregador_id,
+        status="entregue",
+        tipo_recebedor=payload.get("tipo_recebedor"),
+        nome_recebedor=payload.get("nome_recebedor"),
+        tipo_documento=payload.get("tipo_documento"),
+        numero_documento=payload.get("numero_documento"),
+        observacao_entrega=payload.get("observacao_entrega"),
+        foto_url=payload.get("foto_url")
+    )
 
-    detail.status = "Entregue"
-    detail.tipo_recebedor = payload.get("tipo_recebedor")
-    detail.nome_recebedor = payload.get("nome_recebedor")
-    detail.tipo_documento = payload.get("tipo_documento")
-    detail.numero_documento = payload.get("numero_documento")
-    detail.observacao_entrega = payload.get("observacao")
-    detail.foto_url = payload.get("foto_url")
+    saida.status = "entregue"
 
     db.add(detail)
     db.commit()
 
-    return {"ok": True, "mensagem": "Entrega registrada."}
+    return {"ok": True, "msg": "Pacote entregue"}
 
 
 # ============================================================
-# 7) REGISTRAR OCORRÊNCIA
+# REGISTRAR OCORRÊNCIA
 # ============================================================
 @router.post("/ocorrencia")
 def registrar_ocorrencia(payload: dict,
-                         db: Session = Depends(get_db),
-                         current_user: User = Depends(get_current_user)):
+                         entregador_id: int = Depends(get_entregador_id_from_token),
+                         db: Session = Depends(get_db)):
+
     id_saida = payload.get("id_saida")
-    motivo = payload.get("motivo")
-    foto_url = payload.get("foto_url")
-    obs = payload.get("observacao")
 
-    if not id_saida or not motivo:
-        raise HTTPException(422, "Campos obrigatórios: id_saida, motivo")
-
-    ent = _get_entregador_logado(db, current_user)
     saida = db.get(Saida, id_saida)
-
-    if not saida or saida.sub_base != ent.sub_base:
+    if not saida:
         raise HTTPException(404, "Saída não encontrada.")
 
-    # atualizar STATUS geral
-    saida.status = "Ocorrência"
+    if saida.entregador_id != entregador_id:
+        raise HTTPException(403, "Este pacote não pertence a você.")
 
-    detail = _get_detail(db, id_saida)
-    if not detail:
-        detail = SaidaDetail(id_saida=id_saida, entregador=ent.username_entregador)
+    detail = SaidaDetail(
+        id_saida=id_saida,
+        id_entregador=entregador_id,
+        status="ocorrencia",
+        motivo_ocorrencia=payload.get("motivo"),
+        observacao_ocorrencia=payload.get("observacao"),
+        foto_url=payload.get("foto_url")
+    )
 
-    # incrementa tentativa
-    detail.tentativa = (detail.tentativa or 1) + 1
-    detail.status = "Ocorrência"
-    detail.motivo_ocorrencia = motivo
-    detail.observacao_ocorrencia = obs
-    detail.foto_url = foto_url
-
-    # Cancelamento automático
-    if detail.tentativa >= 3 or motivo.lower() == "recusado":
-        detail.status = "Cancelado"
-        saida.status = "Cancelado"
+    saida.status = "ocorrencia"
 
     db.add(detail)
     db.commit()
 
-    return {"ok": True, "mensagem": "Ocorrência registrada."}
+    return {"ok": True, "msg": "Ocorrência registrada"}
 
 
 # ============================================================
-# 8) NOVA TENTATIVA
+# NOVA TENTATIVA
 # ============================================================
 @router.post("/tentativa")
-def registrar_tentativa(payload: dict,
-                        db: Session = Depends(get_db),
-                        current_user: User = Depends(get_current_user)):
+def nova_tentativa(payload: dict,
+                   entregador_id: int = Depends(get_entregador_id_from_token),
+                   db: Session = Depends(get_db)):
+
     id_saida = payload.get("id_saida")
-    if not id_saida:
-        raise HTTPException(422, "id_saida é obrigatório.")
 
-    ent = _get_entregador_logado(db, current_user)
     saida = db.get(Saida, id_saida)
-
-    if not saida or saida.sub_base != ent.sub_base:
+    if not saida:
         raise HTTPException(404, "Saída não encontrada.")
 
-    saida.status = "Em Tentativa"
+    if saida.entregador_id != entregador_id:
+        raise HTTPException(403, "Este pacote não pertence a você.")
 
-    detail = _get_detail(db, id_saida)
-    if not detail:
-        detail = SaidaDetail(
-            id_saida=id_saida,
-            entregador=ent.username_entregador,
-            status="Em Rota",
-            tentativa=1
-        )
-    else:
-        detail.tentativa = (detail.tentativa or 1) + 1
-        detail.status = "Em Rota"
+    # marcar status voltou para pendente
+    saida.status = "saiu"
+
+    detail = SaidaDetail(
+        id_saida=id_saida,
+        id_entregador=entregador_id,
+        status="tentativa"
+    )
 
     db.add(detail)
     db.commit()
 
-    return {"ok": True, "mensagem": "Nova tentativa registrada."}
+    return {"ok": True, "msg": "Nova tentativa registrada"}
 
 
 # ============================================================
-# 9) DETALHE DA ENTREGA
+# FINALIZADAS
 # ============================================================
-@router.get("/detalhe/{id_saida}")
-def detalhe_entrega(id_saida: int,
-                    db: Session = Depends(get_db),
-                    current_user: User = Depends(get_current_user)):
-    ent = _get_entregador_logado(db, current_user)
+@router.get("/finalizadas")
+def finalizadas(entregador_id: int = Depends(get_entregador_id_from_token),
+                db: Session = Depends(get_db)):
 
-    saida = db.get(Saida, id_saida)
-    if not saida or saida.sub_base != ent.sub_base:
-        raise HTTPException(404, "Saída não encontrada.")
+    final = db.scalars(
+        select(Saida).where(
+            Saida.entregador_id == entregador_id,
+            Saida.status == "entregue"
+        )
+    ).all()
 
-    detail = _get_detail(db, id_saida)
+    return [{"id_saida": s.id_saida, "codigo": s.codigo} for s in final]
 
-    return {
-        "saida": {
-            "id_saida": saida.id_saida,
-            "codigo": saida.codigo,
-            "status": saida.status,
-            "entregador": saida.entregador,
-        },
-        "detail": detail
-    }
+
+# ============================================================
+# OCORRÊNCIAS
+# ============================================================
+@router.get("/ocorrencias")
+def ocorrencias(entregador_id: int = Depends(get_entregador_id_from_token),
+                db: Session = Depends(get_db)):
+
+    occ = db.scalars(
+        select(Saida).where(
+            Saida.entregador_id == entregador_id,
+            Saida.status == "ocorrencia"
+        )
+    ).all()
+
+    return [{"id_saida": s.id_saida, "codigo": s.codigo} for s in occ]

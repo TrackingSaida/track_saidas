@@ -131,6 +131,7 @@ class Saida(Base):
     sub_base = Column(Text, nullable=True)
     base = Column(Text, nullable=True)              # NOVA COLUNA (de onde veio a mercadoria)
     username = Column(Text, nullable=True)
+    entregador_id = Column(BigInteger, nullable=True)
     entregador = Column(Text, nullable=True)
 
     codigo = Column(Text, nullable=True)
@@ -220,7 +221,8 @@ class SaidaDetail(Base):
 
     id_saida = Column(BigInteger, nullable=False)
 
-    entregador = Column(Text, nullable=False)  # entregador responsável pela entrega
+    id_entregador = Column(BigInteger, nullable=False)
+ # entregador responsável pela entrega
 
     status = Column(Text, nullable=False, server_default=text("'Em Rota'"))
     tentativa = Column(Integer, nullable=False, server_default=text("1"))

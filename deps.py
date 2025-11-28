@@ -57,6 +57,17 @@ def allow(*tipos_permitidos: int) -> Callable:
     return guard
 
 
+def get_entregador_id_from_token(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("sub") != "entregador":
+            raise HTTPException(403, "Token não é de entregador")
+        return payload["entregador_id"]
+    except:
+        raise HTTPException(401, "Token inválido")
+
+
+
 # --------- EXEMPLOS DE USO (para referência) ----------
 # from fastapi import APIRouter, Depends
 # router = APIRouter()
