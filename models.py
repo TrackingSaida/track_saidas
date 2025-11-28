@@ -213,7 +213,7 @@ class OwnerCobrancaItem(Base):
  # ==========================
  # Tabela: saidas_detail
  # ==========================       
-    class SaidaDetail(Base):
+class SaidaDetail(Base):
     __tablename__ = "saidas_detail"
 
     id_detail = Column(BigInteger, primary_key=True, autoincrement=True)
