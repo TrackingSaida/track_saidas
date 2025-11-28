@@ -3,7 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from typing import Optional
 
-from deps import get_db
+from db import get_db
 from db import SessionLocal
 from models import Saida, SaidaDetail, Entregador
 
