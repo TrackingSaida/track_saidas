@@ -84,6 +84,8 @@ class UserResponse(BaseModel):
     contato: Optional[str]
     role: Optional[int]
     sub_base: Optional[str]
+    ignorar_coleta: Optional[bool] = False
+
 
 
 # ======================================================
