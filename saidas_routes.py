@@ -119,14 +119,29 @@ def registrar_saida(
     if not username:
         raise HTTPException(401, "Usuário sem username.")
 
+    # sub_base do usuário logado
     sub_base_user = _resolve_user_base(db, current_user)
 
+    # normalizar payload
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
     servico = payload.servico.strip()
     status_val = payload.status.strip() if payload.status else "Saiu para entrega"
 
-    # duplicidade
+    # -----------------------------------------
+    # Buscar OWNER (para ignorar_coleta E valor)
+    # -----------------------------------------
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_user))
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+
+    ignorar = bool(owner.ignorar_coleta)
+    # Debug opcional
+    print(f"[DEBUG] ignorar_coleta={ignorar} sub_base={sub_base_user}")
+
+    # -----------------------------------------
+    # DUPLICIDADE
+    # -----------------------------------------
     existente = db.scalars(
         select(Saida).where(
             Saida.sub_base == sub_base_user,
@@ -139,9 +154,9 @@ def registrar_saida(
             {"code": "DUPLICATE_SAIDA", "message": f"Código '{codigo}' já registrado."}
         )
 
-    # validação coleta obrigatória (quando ignorar_coleta = false)
-    ignorar = getattr(request.state, "ignorar_coleta", False)
-
+    # -----------------------------------------
+    # SE NÃO IGNORAR → coleta obrigatória
+    # -----------------------------------------
     if not ignorar:
         from models import Coleta
         coleta_exists = db.scalar(
@@ -159,6 +174,9 @@ def registrar_saida(
                 }
             )
 
+    # -----------------------------------------
+    # CRIAR SAÍDA
+    # -----------------------------------------
     try:
         row = Saida(
             sub_base=sub_base_user,
@@ -171,40 +189,38 @@ def registrar_saida(
 
         db.add(row)
         db.commit()
-        db.refresh(row)
-        # ================================
-        # Cobrança automática no modo IGNORAR_COLETA
-        # ================================
+        db.refresh(row)  # 🔥 agora row.id_saida está disponível
+
+        # -----------------------------------------
+        # COBRANÇA AUTOMÁTICA (quando ignorar_coleta = true)
+        # -----------------------------------------
         if ignorar:
             try:
-                owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_user))
+                from models import OwnerCobrancaItem
 
-                if not owner:
-                    print(
-                        f"[COBRANÇA_SAIDA] ALERTA: Owner não encontrado "
-                        f"para sub_base={sub_base_user}. Saída registrada sem cobrança."
-                    )
-                else:
-                    from models import OwnerCobrancaItem
-                    item = OwnerCobrancaItem(
-                        sub_base=sub_base_user,
-                        id_coleta=None,
-                        id_saida=row.id_saida,
-                        valor=owner.valor
-                    )
-                    db.add(item)
-                    db.commit()
+                item = OwnerCobrancaItem(
+                    sub_base=sub_base_user,
+                    id_coleta=None,
+                    id_saida=row.id_saida,   # <- AQUI GRAVA CORRETAMENTE
+                    valor=owner.valor
+                )
+
+                db.add(item)
+                db.commit()
+
+                print(f"[COBRANÇA_SAIDA] Registrado id_saida={row.id_saida}")
 
             except Exception as e:
-                # rollback APENAS da cobrança. A saída permanece válida
-                db.rollback()
-                print(f"[COBRANÇA_SAIDA] Erro ao registrar cobrança automática: {e}")
+                db.rollback()  # rollback apenas da cobrança
+                print(f"[COBRANÇA_SAIDA] Erro ao registrar cobrança: {e}")
 
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"Erro ao registrar saída: {e}")
 
+    # retorno final
     return SaidaOut.model_validate(row)
+
 
 
 
