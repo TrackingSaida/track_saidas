@@ -204,8 +204,9 @@ class OwnerCobrancaItem(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     sub_base = Column(Text, nullable=False)
-    id_coleta = Column(BigInteger, nullable=True, default=None)
-    id_saida = Column(BigInteger, nullable=True, default=None)
+    id_coleta = Column(BigInteger, nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
+
 
     valor = Column(Numeric(12, 2), nullable=False)
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
