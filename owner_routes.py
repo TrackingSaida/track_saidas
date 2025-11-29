@@ -53,6 +53,7 @@ class OwnerOut(BaseModel):
     sub_base: Optional[str]
     contato: Optional[str]
     ativo: bool
+    ignorar_coleta: bool
     model_config = ConfigDict(from_attributes=True)
 
 

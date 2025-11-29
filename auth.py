@@ -4,29 +4,33 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
+from fastapi import (
+    APIRouter, Depends, HTTPException, status,
+    Request, Response
+)
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import OAuth2PasswordBearer
+
 from pydantic import BaseModel, EmailStr, Field, AliasChoices, ConfigDict
+
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+
 from sqlalchemy.orm import Session
 from sqlalchemy import select, or_
 
 from db import get_db
-from models import User, Owner   # <- apenas 1 import correto aqui
+from models import User, Owner
 
-# ======================
-# OAuth2 para fluxo do ENTREGADOR
-# ======================
-from fastapi.security import OAuth2PasswordBearer
 
+# ======================================================
+# OAuth2 – Token do ENTREGADOR
+# ======================================================
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
-
-
-# ======================
+# ======================================================
 # Configurações JWT
-# ======================
+# ======================================================
 SECRET_KEY = os.getenv("SECRET_KEY", "troque-esta-chave-em-producao")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
@@ -35,28 +39,29 @@ REMEMBER_ME_EXPIRE_DAYS = int(os.getenv("REMEMBER_ME_EXPIRE_DAYS", "30"))
 # Cookies
 ACCESS_COOKIE_NAME = os.getenv("ACCESS_COOKIE_NAME", "access_token")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
-COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")  # ex.: ".seu-dominio.com"
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")
 
-# ======================
-# Hash de Senhas
-# ======================
+# ======================================================
+# Password hashing
+# ======================================================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
 
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-# ======================
+# ======================================================
 # HTTP Bearer (fallback)
-# ======================
+# ======================================================
 security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
-# ======================
+
+# ======================================================
 # Schemas
-# ======================
+# ======================================================
 class Token(BaseModel):
     access_token: str
     token_type: str
@@ -66,7 +71,7 @@ class UserLogin(BaseModel):
         min_length=1,
         validation_alias=AliasChoices("email", "username", "contato"),
         serialization_alias="email",
-        description="Aceita email, username ou contato",
+        description="Aceita email, username ou contato"
     )
     password: str
     remember: bool = False
@@ -80,18 +85,20 @@ class UserResponse(BaseModel):
     role: Optional[int]
     sub_base: Optional[str]
 
-# ======================
-# JWT Util
-# ======================
+
+# ======================================================
+# Utilities – JWT
+# ======================================================
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# ======================
+
+# ======================================================
 # Buscar usuário
-# ======================
+# ======================================================
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
     identifier = (identifier or "").strip()
     if not identifier:
@@ -101,7 +108,7 @@ def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
         or_(
             User.email == identifier,
             User.username == identifier,
-            User.contato == identifier,
+            User.contato == identifier
         )
     )
     return db.scalars(stmt).first()
@@ -114,85 +121,125 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
         return None
     return user
 
-# ======================
+
+# ======================================================
 # Usuário logado
-# ======================
+# ======================================================
 async def get_current_user(
     request: Request,
     db: Session = Depends(get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> User:
 
+    # --------------------------------------------------
+    # TENTAR recuperar token via cookie
+    # --------------------------------------------------
     token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
 
-    # fallback para header Authorization: Bearer
+    # fallback: Authorization: Bearer <token>
     if not token and credentials and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
 
     if not token:
         raise HTTPException(status_code=401, detail="Não autenticado")
 
-    # valida token
+    # --------------------------------------------------
+    # Validar token
+    # --------------------------------------------------
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         sub_value: str = payload.get("sub")
         if not sub_value:
-            raise HTTPException(status_code=401, detail="Token inválido (sem sub)")
+            raise HTTPException(status_code=401, detail="Token inválido (sub ausente)")
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
-    # pega usuário pelo token
+    # --------------------------------------------------
+    # Buscar usuário
+    # --------------------------------------------------
     user = get_user_by_identifier(db, sub_value)
     if not user:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
 
-    # ================================================================
-    # 🔒 BLOQUEIO POR OWNER — NOVO!
-    # ================================================================
-    if user.sub_base:
-        owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
-        if owner and owner.ativo is False:
-            raise HTTPException(
-                status_code=403,
-                detail="Operação bloqueada pelo administrador."
-            )
-    # ================================================================
+    # --------------------------------------------------
+    # Cada usuário SEMPRE deve ter sub_base válida
+    # --------------------------------------------------
+    if not user.sub_base:
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário sem sub_base definida. Configuração inválida."
+        )
+
+    # --------------------------------------------------
+    # Buscar Owner correspondente
+    # --------------------------------------------------
+    owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
+
+    if not owner:
+        raise HTTPException(
+            status_code=403,
+            detail="Nenhum Owner encontrado para esta sub_base. Contate o administrador."
+        )
+
+    if owner.ativo is False:
+        raise HTTPException(
+            status_code=403,
+            detail="Operação bloqueada pelo administrador."
+        )
+
+    # --------------------------------------------------
+    # Flag ignorar_coleta
+    # --------------------------------------------------
+    request.state.ignorar_coleta = owner.ignorar_coleta
 
     return user
 
-# ======================
+
+# ======================================================
 # Rotas de autenticação
-# ======================
+# ======================================================
 @router.post("/token", response_model=Token)
-async def login_for_access_token(user_credentials: UserLogin, db: Session = Depends(get_db)):
+async def login_for_access_token(
+    user_credentials: UserLogin,
+    db: Session = Depends(get_db)
+):
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
     subject = user.email or user.username or user.contato
+
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token({"sub": subject}, expires)
 
     return {"access_token": access_token, "token_type": "bearer"}
 
+
 @router.post("/login")
-async def login_set_cookie(user_credentials: UserLogin, response: Response, db: Session = Depends(get_db)):
+async def login_set_cookie(
+    user_credentials: UserLogin,
+    response: Response,
+    db: Session = Depends(get_db)
+):
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
-    # ================================================================
-    # 🔒 BLOQUEIO POR OWNER — ANTES DE GERAR TOKEN
-    # ================================================================
-    if user.sub_base:
-        owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
-        if owner and owner.ativo is False:
-            raise HTTPException(
-                status_code=403,
-                detail="owner_blocked"
-            )
-    # ================================================================
+    # --------------------------------------------------
+    # Validar existência e estado do Owner
+    # --------------------------------------------------
+    if not user.sub_base:
+        raise HTTPException(403, "Usuário sem sub_base definida.")
 
+    owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
+    if not owner:
+        raise HTTPException(403, "Nenhum Owner encontrado para esta sub_base.")
+    if owner.ativo is False:
+        raise HTTPException(403, "owner_blocked")
+
+    # --------------------------------------------------
+    # Gerar token
+    # --------------------------------------------------
     subject = user.email or user.username or user.contato
 
     expires = (
@@ -238,8 +285,11 @@ async def logout(response: Response):
     )
     return {"ok": True}
 
+
 @router.get("/me", response_model=UserResponse)
-async def read_users_me(current_user: User = Depends(get_current_user)):
+async def read_users_me(
+    current_user: User = Depends(get_current_user)
+):
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
@@ -249,9 +299,10 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
         sub_base=current_user.sub_base
     )
 
-# ======================
+
+# ======================================================
 # RESET PASSWORD
-# ======================
+# ======================================================
 class ResetPasswordPayload(BaseModel):
     identifier: str = Field(..., description="email, username ou contato")
     new_password: str = Field(min_length=8, description="Nova senha")

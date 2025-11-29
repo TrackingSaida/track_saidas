@@ -67,6 +67,8 @@ class Owner(Base):
     contato = Column(Text, nullable=True)
 
     ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    ignorar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
+
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -202,7 +204,9 @@ class OwnerCobrancaItem(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     sub_base = Column(Text, nullable=False)
-    id_coleta = Column(BigInteger, nullable=False)
+    id_coleta = Column(BigInteger, nullable=True, default=None)
+    id_saida = Column(BigInteger, nullable=True, default=None)
+
     valor = Column(Numeric(12, 2), nullable=False)
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 

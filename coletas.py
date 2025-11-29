@@ -248,6 +248,7 @@ def registrar_coleta_em_lote(
             item = OwnerCobrancaItem(
                 sub_base=sub_base,
                 id_coleta=coleta.id_coleta,
+                id_saida=None,
                 valor=valor_unit
             )
             db.add(item)
