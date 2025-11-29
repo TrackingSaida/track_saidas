@@ -288,16 +288,26 @@ async def logout(response: Response):
 
 @router.get("/me", response_model=UserResponse)
 async def read_users_me(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
+    # Obter o owner da sub_base do usuário
+    owner = None
+    if current_user.sub_base:
+        owner = db.scalar(
+            select(Owner).where(Owner.sub_base == current_user.sub_base)
+        )
+
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
         username=current_user.username,
         contato=current_user.contato,
         role=current_user.role,
-        sub_base=current_user.sub_base
+        sub_base=current_user.sub_base,
+        ignorar_coleta=owner.ignorar_coleta if owner else False
     )
+
 
 
 # ======================================================
