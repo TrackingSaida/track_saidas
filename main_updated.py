@@ -67,7 +67,7 @@ from ml_routes import router as ml_router
 from entregador_entregas_routes import router as entregador_entregas_router
 
 app.include_router(ml_router, prefix=API_PREFIX)
-app.include_router(ui_router)
+app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(users_router,        prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
