@@ -230,6 +230,7 @@ def listar_saidas(
     de: Optional[date] = Query(None),
     ate: Optional[date] = Query(None),
     base: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
     entregador: Optional[str] = Query(None),
     status_: Optional[str] = Query(None, alias="status"),
     codigo: Optional[str] = Query(None),
