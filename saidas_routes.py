@@ -273,6 +273,7 @@ def listar_saidas(
         SaidaGridItem(
             id_saida=r.id_saida,
             timestamp=r.timestamp,
+            username=r.username,
             entregador=r.entregador,
             codigo=r.codigo,
             servico=r.servico,
