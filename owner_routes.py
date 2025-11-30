@@ -41,6 +41,9 @@ class OwnerUpdate(BaseModel):
     username: Optional[str] = None
     valor: Optional[float] = None
     contato: Optional[str] = None
+    ativo: Optional[bool] = None
+    ignorar_coleta: Optional[bool] = None
+
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -176,6 +179,13 @@ def update_owner(
 
     if body.contato is not None:
         owner.contato = body.contato
+
+    if body.ativo is not None:
+    owner.ativo = body.ativo
+
+    if body.ignorar_coleta is not None:
+    owner.ignorar_coleta = body.ignorar_coleta
+    
 
     db.commit()
     db.refresh(owner)
