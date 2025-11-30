@@ -45,6 +45,7 @@ class SaidaOut(BaseModel):
 class SaidaGridItem(BaseModel):
     id_saida: int
     timestamp: datetime
+    username: Optional[str]
     entregador: Optional[str]
     codigo: Optional[str]
     servico: Optional[str]
