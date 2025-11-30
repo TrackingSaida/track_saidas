@@ -29,6 +29,8 @@ MENU_DEFS = [
         "items": [
             {"label": "Entregadores", "href": "tracking-entregador.html"},
             {"label": "Bases",        "href": "tracking-base.html"},
+            {"label": "Usuários",     "href": "tracking-usuarios.html", "roles": [1]},
+            {"label": "Owners",       "href": "admin-owners.html", "roles": [0]},
         ]
     },
 ]
