@@ -5,11 +5,14 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import (
-    APIRouter, Depends, HTTPException, Request, Response
+    APIRouter, Depends, HTTPException, status,
+    Request, Response
 )
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import OAuth2PasswordBearer
 
 from pydantic import BaseModel, EmailStr, Field, AliasChoices, ConfigDict
+
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
@@ -21,22 +24,22 @@ from models import User, Owner
 
 
 # ======================================================
-# OAuth2 (entregador future use)
+# OAuth2 – Token do ENTREGADOR
 # ======================================================
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 # ======================================================
-# JWT Settings
+# Configurações JWT
 # ======================================================
 SECRET_KEY = os.getenv("SECRET_KEY", "troque-esta-chave-em-producao")
 ALGORITHM = "HS256"
-
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 REMEMBER_ME_EXPIRE_DAYS = int(os.getenv("REMEMBER_ME_EXPIRE_DAYS", "30"))
 
 # Cookies
 ACCESS_COOKIE_NAME = os.getenv("ACCESS_COOKIE_NAME", "access_token")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")
 
 # ======================================================
 # Password hashing
@@ -68,7 +71,7 @@ class UserLogin(BaseModel):
         min_length=1,
         validation_alias=AliasChoices("email", "username", "contato"),
         serialization_alias="email",
-        description="Aceita email, username ou telefone"
+        description="Aceita email, username ou contato"
     )
     password: str
     remember: bool = False
@@ -84,8 +87,9 @@ class UserResponse(BaseModel):
     ignorar_coleta: Optional[bool] = False
 
 
+
 # ======================================================
-# JWT Utility
+# Utilities – JWT
 # ======================================================
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
@@ -95,7 +99,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 # ======================================================
-# Get user by email/username/contato
+# Buscar usuário
 # ======================================================
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
     identifier = (identifier or "").strip()
@@ -106,11 +110,10 @@ def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
         or_(
             User.email == identifier,
             User.username == identifier,
-            User.contato == identifier,
+            User.contato == identifier
         )
     )
     return db.scalars(stmt).first()
-
 
 def authenticate_user(db: Session, identifier: str, password: str) -> Optional[User]:
     user = get_user_by_identifier(db, identifier)
@@ -122,7 +125,7 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
 
 
 # ======================================================
-# get_current_user — usado em TODAS rotas protegidas
+# Usuário logado
 # ======================================================
 async def get_current_user(
     request: Request,
@@ -130,50 +133,90 @@ async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> User:
 
-    # Tentar via cookie
+    # --------------------------------------------------
+    # TENTAR recuperar token via cookie
+    # --------------------------------------------------
     token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
 
-    # Fallback Bearer
+    # fallback: Authorization: Bearer <token>
     if not token and credentials and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
 
     if not token:
-        raise HTTPException(401, "Não autenticado")
+        raise HTTPException(status_code=401, detail="Não autenticado")
 
+    # --------------------------------------------------
     # Validar token
+    # --------------------------------------------------
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        sub_value = payload.get("sub")
+        sub_value: str = payload.get("sub")
         if not sub_value:
-            raise HTTPException(401, "Token inválido (sem sub)")
+            raise HTTPException(status_code=401, detail="Token inválido (sub ausente)")
     except JWTError:
-        raise HTTPException(401, "Token inválido ou expirado")
+        raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
+    # --------------------------------------------------
     # Buscar usuário
+    # --------------------------------------------------
     user = get_user_by_identifier(db, sub_value)
     if not user:
-        raise HTTPException(401, "Usuário não encontrado")
+        raise HTTPException(status_code=401, detail="Usuário não encontrado")
 
+    # --------------------------------------------------
+    # Cada usuário SEMPRE deve ter sub_base válida
+    # --------------------------------------------------
     if not user.sub_base:
-        raise HTTPException(403, "Usuário sem sub_base configurada.")
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário sem sub_base definida. Configuração inválida."
+        )
 
-    # Buscar owner
+    # --------------------------------------------------
+    # Buscar Owner correspondente
+    # --------------------------------------------------
     owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
+
     if not owner:
-        raise HTTPException(403, "Nenhum Owner encontrado para esta sub_base.")
+        raise HTTPException(
+            status_code=403,
+            detail="Nenhum Owner encontrado para esta sub_base. Contate o administrador."
+        )
 
     if owner.ativo is False:
-        raise HTTPException(403, "Operação bloqueada pelo administrador.")
+        raise HTTPException(
+            status_code=403,
+            detail="Operação bloqueada pelo administrador."
+        )
 
+    # --------------------------------------------------
     # Flag ignorar_coleta
+    # --------------------------------------------------
     request.state.ignorar_coleta = owner.ignorar_coleta
 
     return user
 
 
 # ======================================================
-# LOGIN — grava cookie
+# Rotas de autenticação
 # ======================================================
+@router.post("/token", response_model=Token)
+async def login_for_access_token(
+    user_credentials: UserLogin,
+    db: Session = Depends(get_db)
+):
+    user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Login ou senha incorretos")
+
+    subject = user.email or user.username or user.contato
+
+    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token({"sub": subject}, expires)
+
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
 @router.post("/login")
 async def login_set_cookie(
     user_credentials: UserLogin,
@@ -182,10 +225,13 @@ async def login_set_cookie(
 ):
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
-        raise HTTPException(401, "Login ou senha incorretos")
+        raise HTTPException(status_code=401, detail="Login ou senha incorretos")
 
+    # --------------------------------------------------
+    # Validar existência e estado do Owner
+    # --------------------------------------------------
     if not user.sub_base:
-        raise HTTPException(403, "Usuário sem sub_base configurada.")
+        raise HTTPException(403, "Usuário sem sub_base definida.")
 
     owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
     if not owner:
@@ -193,18 +239,21 @@ async def login_set_cookie(
     if owner.ativo is False:
         raise HTTPException(403, "owner_blocked")
 
+    # --------------------------------------------------
+    # Gerar token
+    # --------------------------------------------------
     subject = user.email or user.username or user.contato
 
     expires = (
         timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
-        if user_credentials.remember else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        if user_credentials.remember
+        else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
 
     token = create_access_token({"sub": subject}, expires)
 
     samesite = "None" if COOKIE_SECURE else "Lax"
 
-    # 🔥 CORREÇÃO IMPORTANTE — REMOVIDO domain=
     response.set_cookie(
         key=ACCESS_COOKIE_NAME,
         value=token,
@@ -213,6 +262,7 @@ async def login_set_cookie(
         samesite=samesite,
         max_age=int(expires.total_seconds()),
         path="/",
+        domain=COOKIE_DOMAIN,
     )
 
     return {
@@ -223,50 +273,32 @@ async def login_set_cookie(
             "username": user.username,
             "contato": user.contato,
             "role": user.role,
-            "sub_base": user.sub_base,
+            "sub_base": user.sub_base
         }
     }
 
 
-# ======================================================
-# TOKEN login (para API externa)
-# ======================================================
-@router.post("/token", response_model=Token)
-async def login_for_access_token(user_credentials: UserLogin, db: Session = Depends(get_db)):
-    user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
-    if not user:
-        raise HTTPException(401, "Login ou senha incorretos")
-
-    subject = user.email or user.username or user.contato
-    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-
-    return {
-        "access_token": create_access_token({"sub": subject}, expires),
-        "token_type": "bearer"
-    }
-
-
-# ======================================================
-# LOGOUT
-# ======================================================
 @router.post("/logout")
 async def logout(response: Response):
     response.delete_cookie(
         key=ACCESS_COOKIE_NAME,
         path="/",
+        domain=COOKIE_DOMAIN,
     )
     return {"ok": True}
 
 
-# ======================================================
-# /auth/me
-# ======================================================
 @router.get("/me", response_model=UserResponse)
 async def read_users_me(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    owner = db.scalar(select(Owner).where(Owner.sub_base == current_user.sub_base))
+    # Obter o owner da sub_base do usuário
+    owner = None
+    if current_user.sub_base:
+        owner = db.scalar(
+            select(Owner).where(Owner.sub_base == current_user.sub_base)
+        )
 
     return UserResponse(
         id=current_user.id,
@@ -275,22 +307,23 @@ async def read_users_me(
         contato=current_user.contato,
         role=current_user.role,
         sub_base=current_user.sub_base,
-        ignorar_coleta=(owner.ignorar_coleta if owner else False)
+        ignorar_coleta=owner.ignorar_coleta if owner else False
     )
 
 
+
 # ======================================================
-# Reset password
+# RESET PASSWORD
 # ======================================================
 class ResetPasswordPayload(BaseModel):
-    identifier: str
-    new_password: str = Field(min_length=8)
+    identifier: str = Field(..., description="email, username ou contato")
+    new_password: str = Field(min_length=8, description="Nova senha")
 
 @router.post("/reset-password")
 async def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db)):
     user = get_user_by_identifier(db, payload.identifier)
     if not user:
-        raise HTTPException(404, "Usuário não encontrado")
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
 
     user.password_hash = get_password_hash(payload.new_password)
     db.commit()
