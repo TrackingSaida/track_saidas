@@ -24,16 +24,15 @@ logger = logging.getLogger("routes.users")
 
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=4, description="Senha em claro; será hasheada")
+    password: str = Field(min_length=4)
     username: str = Field(min_length=3)
     contato: str
 
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
-    status: Optional[bool] = True
 
-    # Agora obrigatório
-    sub_base: str = Field(min_length=1, description="sub_base deve já existir e ter Owner")
+    role: int = Field(default=2, description="1 = admin, 2 = operador")
+    status: Optional[bool] = True
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -48,27 +47,33 @@ class UserOut(BaseModel):
     sub_base: Optional[str] = None
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
+    role: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
-class UserFull(BaseModel):
-    id: int
-    email: Optional[EmailStr] = None
-    username: Optional[str] = None
-    contato: Optional[str] = None
+class UserFull(UserOut):
+    pass
+
+
+class AdminUserUpdate(BaseModel):
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
-    sub_base: Optional[str] = None
+    username: Optional[str] = None
+    contato: Optional[str] = None
+    email: Optional[EmailStr] = None
     status: Optional[bool] = None
+    role: Optional[int] = None
+
     model_config = ConfigDict(from_attributes=True)
 
 
 class UserUpdatePayload(BaseModel):
-    nome: Optional[str] = Field(default=None)
-    sobrenome: Optional[str] = Field(default=None)
-    contato: Optional[str] = Field(default=None)
-    email: Optional[EmailStr] = Field(default=None)
+    nome: Optional[str] = None
+    sobrenome: Optional[str] = None
+    contato: Optional[str] = None
+    email: Optional[EmailStr] = None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -78,113 +83,160 @@ class PasswordChangePayload(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# =========================
-# POST /users — CRIAR USUÁRIO
-# =========================
-
+# =====================================================================
+# POST /users — CRIAR USUÁRIO (herda sub_base automaticamente)
+# =====================================================================
 @router.post("/", status_code=status.HTTP_201_CREATED)
-def create_user(body: UserCreate, db: Session = Depends(get_db)):
-    """Cria um novo usuário garantindo a existência de Owner na sub_base."""
+def create_user(
+    body: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Cria um novo usuário sempre herdando a sub_base do usuário logado."""
 
-    # Log seguro
-    try:
-        payload_log = body.model_dump(exclude={"password"})
-        payload_log["password"] = "***"
-    except Exception:
-        payload_log = "erro ao processar payload"
-    logger.info("POST /users payload=%s", payload_log)
+    sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(400, "Usuário atual não possui sub_base definida.")
 
-    # Unicidade de email
-    exists_email = db.scalars(select(User).where(User.email == body.email)).first()
-    if exists_email:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="endereço de email já existente"
-        )
-
-    # Unicidade de username
-    exists_username = db.scalars(select(User).where(User.username == body.username)).first()
-    if exists_username:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="username já existe"
-        )
-
-    # ###############################
-    # 🔒 VALIDAÇÃO NOVA — OWNER OBRIGATÓRIO
-    # ###############################
-    owner = db.scalar(select(Owner).where(Owner.sub_base == body.sub_base))
+    # Validar existência do Owner
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     if not owner:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Não existe Owner cadastrado para a sub_base '{body.sub_base}'."
-        )
-
+        raise HTTPException(400, f"Não existe Owner para a sub_base '{sub_base}'.")
     if owner.ativo is False:
-        raise HTTPException(
-            status_code=403,
-            detail=f"O Owner da sub_base '{body.sub_base}' está inativo."
-        )
+        raise HTTPException(403, "Owner desta sub_base está inativo.")
 
-    # ===============================
-    # Criar usuário
-    # ===============================
+    # Unicidade
+    if db.scalar(select(User).where(User.email == body.email)):
+        raise HTTPException(409, "Email já existe.")
+    if db.scalar(select(User).where(User.username == body.username)):
+        raise HTTPException(409, "Username já existe.")
+
     try:
-        hashed_password = get_password_hash(body.password)
-        obj = User(
+        new_user = User(
             email=body.email,
-            password_hash=hashed_password,
+            password_hash=get_password_hash(body.password),
             username=body.username,
             contato=body.contato,
             nome=body.nome,
             sobrenome=body.sobrenome,
-            status=True if body.status is None else body.status,
-            sub_base=body.sub_base,
+            status=True,
+            role=body.role,
+            sub_base=sub_base
         )
-        db.add(obj)
+
+        db.add(new_user)
         db.commit()
-        db.refresh(obj)
+        db.refresh(new_user)
 
-        logger.info("User criado com sucesso id=%s", obj.id)
-
-        return {"ok": True, "action": "created", "id": obj.id}
-
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.exception("SQLAlchemyError ao criar user: %s", e)
-        raise
+        return {"ok": True, "id": new_user.id}
 
     except Exception as e:
         db.rollback()
-        logger.exception("Erro inesperado ao criar user: %s", e)
-        raise
+        logger.exception("Erro ao criar usuário: %s", e)
+        raise HTTPException(500, "Erro interno ao criar usuário.")
 
 
-# =========================
+# =====================================================================
 # GET /users/me
-# =========================
+# =====================================================================
 @router.get("/me", response_model=UserFull)
 def read_current_user(current_user: User = Depends(get_current_user)) -> UserFull:
     return current_user
 
 
-# =========================
-# GET /users/{user_id}
-# =========================
+# =====================================================================
+# LISTAR USERS — SEMPRE DA MESMA SUB_BASE
+# =====================================================================
+@router.get("/all", response_model=list[UserOut])
+def list_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Lista usuários SOMENTE da mesma sub_base do usuário logado."""
+
+    if current_user.role not in (0, 1):
+        raise HTTPException(403, "Apenas admin podem listar usuários.")
+
+    return db.scalars(
+        select(User).where(User.sub_base == current_user.sub_base)
+    ).all()
+
+
+# =====================================================================
+# GET USER BY ID — respeita sub_base
+# =====================================================================
 @router.get("/{user_id}", response_model=UserOut)
-def get_user(user_id: int, db: Session = Depends(get_db)):
+def get_user(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+
     user = db.get(User, user_id)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Usuário não encontrado"
-        )
+        raise HTTPException(404, "Usuário não encontrado")
+
+    if user.sub_base != current_user.sub_base:
+        raise HTTPException(403, "Acesso negado.")
+
     return user
 
 
-# =========================
-# PATCH /users/me
-# =========================
+# =====================================================================
+# PATCH /users/{id} — Edição ADMIN
+# =====================================================================
+@router.patch("/{user_id}", response_model=UserOut)
+def admin_update_user(
+    user_id: int,
+    payload: AdminUserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    if current_user.role not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "Usuário não encontrado")
+
+    # admin e root só editam sua sub_base
+    if user.sub_base != current_user.sub_base:
+        raise HTTPException(403, "Acesso negado.")
+
+    # Atualizar atributos enviados
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(user, field, value)
+
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+# =====================================================================
+# DELETE USER — com validação sub_base
+# =====================================================================
+@router.delete("/{user_id}", status_code=200)
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    if current_user.role not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "Usuário não encontrado")
+
+    if user.sub_base != current_user.sub_base:
+        raise HTTPException(403, "Acesso negado.")
+
+    db.delete(user)
+    db.commit()
+    return {"ok": True, "deleted": user_id}
+
+
+# =====================================================================
+# PATCH /users/me — atualizar dados do próprio user
+# =====================================================================
 @router.patch("/me", response_model=UserFull)
 def update_current_user(
     payload: UserUpdatePayload,
@@ -201,19 +253,21 @@ def update_current_user(
     if payload.contato is not None:
         contato = payload.contato.strip()
         if not contato:
-            raise HTTPException(400, "O campo 'contato' não pode ficar vazio.")
-        other = db.query(User).filter(User.contato == contato, User.id != current_user.id).first()
-        if other:
-            raise HTTPException(409, "Já existe um usuário com esse contato.")
+            raise HTTPException(400, "Contato não pode ser vazio.")
+
+        exists = db.query(User).filter(User.contato == contato, User.id != current_user.id).first()
+        if exists:
+            raise HTTPException(409, "Contato já em uso.")
         current_user.contato = contato
 
     if payload.email is not None:
         email = payload.email.strip()
         if not email:
-            raise HTTPException(400, "O campo 'email' não pode ficar vazio.")
-        other = db.query(User).filter(User.email == email, User.id != current_user.id).first()
-        if other:
-            raise HTTPException(409, "Já existe um usuário com esse e-mail.")
+            raise HTTPException(400, "Email não pode ser vazio.")
+
+        exists = db.query(User).filter(User.email == email, User.id != current_user.id).first()
+        if exists:
+            raise HTTPException(409, "Email já em uso.")
         current_user.email = email
 
     db.commit()
@@ -221,9 +275,9 @@ def update_current_user(
     return current_user
 
 
-# =========================
+# =====================================================================
 # POST /users/me/password
-# =========================
+# =====================================================================
 @router.post("/me/password")
 def change_password(
     payload: PasswordChangePayload,
@@ -232,7 +286,7 @@ def change_password(
 ):
 
     if not verify_password(payload.current_password, current_user.password_hash):
-        raise HTTPException(status_code=401, detail="Senha atual incorreta.")
+        raise HTTPException(401, "Senha atual incorreta.")
 
     current_user.password_hash = get_password_hash(payload.new_password)
     db.commit()
