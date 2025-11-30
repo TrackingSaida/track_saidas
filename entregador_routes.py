@@ -123,6 +123,14 @@ def _find_matching_user(db: Session, sub_base: str, username_ent: Optional[str])
 # =========================================================
 # ROTAS
 # =========================================================
+
+def _optional(value):
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_entregador(
     body: EntregadorCreate,
@@ -142,19 +150,21 @@ def create_entregador(
     """
     sub_base_user = _resolve_user_base(db, current_user)
 
-    # normalização
+    # normalização (obrigatórios)
     nome        = (body.nome or "").strip()
     telefone    = (body.telefone or "").strip()
     documento   = (body.documento or "").strip()
-    rua         = (body.rua or "").strip()
-    numero      = (body.numero or "").strip()
-    complemento = (body.complemento or "").strip()
-    cep         = (body.cep or "").strip()
-    cidade      = (body.cidade or "").strip()
-    bairro      = (body.bairro or "").strip()
 
     if not documento:
         raise HTTPException(status_code=400, detail="O campo 'documento' é obrigatório.")
+
+    # normalização (opcionais)
+    rua         = _optional(body.rua)
+    numero      = _optional(body.numero)
+    complemento = _optional(body.complemento)
+    cep         = _optional(body.cep)
+    cidade      = _optional(body.cidade)
+    bairro      = _optional(body.bairro)
 
     coletador_flag = bool(body.coletador)
     username_ent = (body.username_entregador or "").strip() if coletador_flag else None
@@ -217,6 +227,7 @@ def create_entregador(
         db.commit()
         db.refresh(ent)
         return {"ok": True, "action": "created", "id": ent.id_entregador}
+
     except Exception:
         db.rollback()
         raise
@@ -265,12 +276,17 @@ def patch_entregador(
     - Atualiza dados do entregador.
     - username alvo = body.username_entregador (se enviado) senão o atual do entregador.
     - Procura/corrige o User correspondente. Se *não* existir e:
-        (a) coletador está sendo marcado como True (no body) OU o entregador já é coletador,
+        (a) coletador=True no body OU o entregador já é coletador,
         (b) e existir username_alvo e senha no PATCH,
-      então CRIA o User com password_hash, username, sub_base, nome/contato, coletador e role=3.
-    - Se o User existir, sincroniza: username, coletador, senha (hash), nome, contato, role.
-    - 'ativo' só altera na tabela entregador (não mexe no status do user).
+      então CRIA um User (role=3).
+    - Se o User existir, sincroniza tudo.
     """
+    def _optional(v):
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
 
@@ -279,14 +295,16 @@ def patch_entregador(
         # 1) Atualiza ENTREGADOR
         # =======================
         if body.nome is not None:
-            obj.nome = body.nome.strip()
-        if body.telefone is not None:
-            obj.telefone = body.telefone.strip()
+            obj.nome = _optional(body.nome)
 
+        if body.telefone is not None:
+            obj.telefone = _optional(body.telefone)
+
+        # --- documento ---
         if body.documento is not None:
             novo_doc = (body.documento or "").strip()
             if not novo_doc:
-                raise HTTPException(status_code=400, detail="O campo 'documento' não pode ficar vazio.")
+                raise HTTPException(status_code=400, detail="O campo 'documento' não pode ser vazio.")
             if novo_doc != obj.documento:
                 exists = db.scalars(
                     select(Entregador).where(
@@ -299,42 +317,48 @@ def patch_entregador(
                     raise HTTPException(status_code=409, detail="Já existe um entregador com esse documento nesta sub_base.")
             obj.documento = novo_doc
 
-        if body.rua is not None:         obj.rua = body.rua.strip()
-        if body.numero is not None:      obj.numero = body.numero.strip()
-        if body.complemento is not None: obj.complemento = body.complemento.strip()
-        if body.cep is not None:         obj.cep = body.cep.strip()
-        if body.cidade is not None:      obj.cidade = body.cidade.strip()
-        if body.bairro is not None:      obj.bairro = body.bairro.strip()
+        # opcionais (rua, número, cep, cidade, etc)
+        if body.rua is not None:         obj.rua = _optional(body.rua)
+        if body.numero is not None:      obj.numero = _optional(body.numero)
+        if body.complemento is not None: obj.complemento = _optional(body.complemento)
+        if body.cep is not None:         obj.cep = _optional(body.cep)
+        if body.cidade is not None:      obj.cidade = _optional(body.cidade)
+        if body.bairro is not None:      obj.bairro = _optional(body.bairro)
 
-        # Ativa/desativa ENTREGADOR (não mexe no status do User)
+        # --- ativo ---
         if body.ativo is not None:
             obj.ativo = bool(body.ativo)
 
-        # username alvo para vincular/atualizar o User
-        username_alvo = (body.username_entregador or obj.username_entregador or "").strip()
+        # username para vincular ao user
+        username_alvo = (
+            (body.username_entregador or "").strip()
+            if body.username_entregador is not None
+            else (obj.username_entregador or "").strip()
+        ) or None
 
-        # Se o PATCH pediu mudança de username do ENTREGADOR, já grava aqui
+        # Se foi enviado no PATCH, grava no entregador
         if body.username_entregador is not None:
-            obj.username_entregador = username_alvo or None
+            obj.username_entregador = username_alvo
 
-        # Coletador desejado (se não veio, mantém o atual do entregador)
-        coletador_desejado = bool(obj.coletador) if body.coletador is None else bool(body.coletador)
+        # coletador desejado
+        coletador_desejado = (
+            obj.coletador if body.coletador is None else bool(body.coletador)
+        )
 
         # ==========================
-        # 2) Localiza/Cria o USER
+        # 2) Localiza / Cria USER
         # ==========================
-        user = _find_matching_user(db, sub_base_user, username_alvo if username_alvo else obj.username_entregador)
+        user = _find_matching_user(db, sub_base_user, username_alvo)
 
-        # (A) Se não existe user e devemos promover/criar:
         deve_criar_user = (
             user is None and
-            coletador_desejado is True and               # está virando ou já é coletador
-            bool(username_alvo) and                      # temos username alvo
-            (body.senha is not None and body.senha.strip() != "")  # e temos senha para hash
+            coletador_desejado is True and
+            username_alvo and
+            (body.senha and body.senha.strip())
         )
 
         if deve_criar_user:
-            # Unicidade do username (global)
+            # unicidade global
             clash = db.scalars(select(User).where(User.username == username_alvo)).first()
             if clash:
                 raise HTTPException(status_code=409, detail="Já existe um usuário com este username.")
@@ -344,59 +368,65 @@ def patch_entregador(
                 username=username_alvo,
                 username_entregador=username_alvo,
                 sub_base=sub_base_user,
-                nome=(body.nome or obj.nome) or None,
-                contato=(body.telefone or obj.telefone) or "",
+                nome=obj.nome,
+                contato=obj.telefone or "",
                 coletador=True,
                 role=3,
                 status=True,
             )
             db.add(user)
 
-        # (B) Se o user já existe, sincroniza alterações
+        # =============================
+        # 3) Atualiza USER se existir
+        # =============================
         if user is not None:
-            houve_alteracao_user = False
+            mudou = False
 
-            # Se o PATCH trocou o username_entregador, precisamos garantir unicidade
+            # username
             if body.username_entregador is not None:
                 if username_alvo:
                     outro = db.scalars(select(User).where(User.username == username_alvo)).first()
                     if outro and outro is not user:
                         raise HTTPException(status_code=409, detail="Já existe um usuário com este username.")
-                    if user.username != username_alvo:
-                        user.username = username_alvo
-                        houve_alteracao_user = True
-                    if user.username_entregador != username_alvo:
-                        user.username_entregador = username_alvo
-                        houve_alteracao_user = True
 
-            # Sincroniza coletador
+                if user.username != username_alvo:
+                    user.username = username_alvo
+                    mudou = True
+                if user.username_entregador != username_alvo:
+                    user.username_entregador = username_alvo
+                    mudou = True
+
+            # coletador
             if user.coletador != coletador_desejado:
                 user.coletador = coletador_desejado
-                houve_alteracao_user = True
+                mudou = True
 
-            # Atualiza nome/contato a partir do PATCH (se enviados)
-            if body.nome is not None and body.nome.strip():
-                if user.nome != body.nome.strip():
-                    user.nome = body.nome.strip()
-                    houve_alteracao_user = True
-            if body.telefone is not None and body.telefone.strip():
-                if user.contato != body.telefone.strip():
-                    user.contato = body.telefone.strip()
-                    houve_alteracao_user = True
+            # sincronizar nome/telefone (quando enviados)
+            if body.nome is not None:
+                nome_val = _optional(body.nome)
+                if nome_val and user.nome != nome_val:
+                    user.nome = nome_val
+                    mudou = True
 
-            # Atualiza senha (hash) se enviada
+            if body.telefone is not None:
+                tel_val = _optional(body.telefone)
+                if tel_val and user.contato != tel_val:
+                    user.contato = tel_val
+                    mudou = True
+
+            # senha
             if body.senha is not None:
                 raw = body.senha.strip()
                 if not raw:
-                    raise HTTPException(status_code=400, detail="A nova 'senha' não pode ser vazia.")
+                    raise HTTPException(status_code=400, detail="A nova senha não pode ser vazia.")
                 user.password_hash = get_password_hash(raw)
-                houve_alteracao_user = True
+                mudou = True
 
-            # Marca role=3 quando houver alterações relevantes
-            if houve_alteracao_user:
+            # sempre role=3
+            if mudou:
                 user.role = 3
 
-        # Por fim, espelha o coletador no ENTREGADOR (depois de criar/sincronizar user)
+        # espelhar coletador no entregador
         if body.coletador is not None:
             obj.coletador = coletador_desejado
 
