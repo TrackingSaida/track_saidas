@@ -14,13 +14,12 @@ from auth import get_current_user, get_password_hash, verify_password
 from models import User, Owner
 
 router = APIRouter(prefix="/users", tags=["Users"])
-
 logger = logging.getLogger("routes.users")
 
 
-# =========================
+# ============================================================
 # Schemas
-# =========================
+# ============================================================
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -31,8 +30,8 @@ class UserCreate(BaseModel):
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
 
-    role: int = Field(default=2, description="1 = admin, 2 = operador")
-    status: Optional[bool] = True
+    # frontend só permite: admin=1, operador=2, coletador=3
+    role: int = Field(default=2)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -48,6 +47,7 @@ class UserOut(BaseModel):
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
     role: Optional[int] = None
+    coletador: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -63,7 +63,7 @@ class AdminUserUpdate(BaseModel):
     contato: Optional[str] = None
     email: Optional[EmailStr] = None
     status: Optional[bool] = None
-    role: Optional[int] = None
+    role: Optional[int] = None  # 1,2 ou 3
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -83,33 +83,38 @@ class PasswordChangePayload(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# =====================================================================
-# POST /users — CRIAR USUÁRIO (herda sub_base automaticamente)
-# =====================================================================
+# ============================================================
+# POST /users — CRIAR USUÁRIO COM SUB_BASE AUTOMÁTICA
+# ============================================================
+
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_user(
     body: UserCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Cria um novo usuário sempre herdando a sub_base do usuário logado."""
+    """Cria usuário herdando sub_base e setando coletador baseado no role."""
 
     sub_base = current_user.sub_base
     if not sub_base:
-        raise HTTPException(400, "Usuário atual não possui sub_base definida.")
+        raise HTTPException(400, "Usuário atual não possui sub_base.")
 
-    # Validar existência do Owner
+    # Owner válido
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     if not owner:
         raise HTTPException(400, f"Não existe Owner para a sub_base '{sub_base}'.")
-    if owner.ativo is False:
+    if not owner.ativo:
         raise HTTPException(403, "Owner desta sub_base está inativo.")
 
-    # Unicidade
+    # Emails e usernames únicos
     if db.scalar(select(User).where(User.email == body.email)):
         raise HTTPException(409, "Email já existe.")
+
     if db.scalar(select(User).where(User.username == body.username)):
         raise HTTPException(409, "Username já existe.")
+
+    # --- MAPEAR ROLE → COLETADOR ---
+    coletador = (body.role == 3)
 
     try:
         new_user = User(
@@ -121,6 +126,7 @@ def create_user(
             sobrenome=body.sobrenome,
             status=True,
             role=body.role,
+            coletador=coletador,
             sub_base=sub_base
         )
 
@@ -136,23 +142,24 @@ def create_user(
         raise HTTPException(500, "Erro interno ao criar usuário.")
 
 
-# =====================================================================
+# ============================================================
 # GET /users/me
-# =====================================================================
+# ============================================================
+
 @router.get("/me", response_model=UserFull)
-def read_current_user(current_user: User = Depends(get_current_user)) -> UserFull:
+def read_current_user(current_user: User = Depends(get_current_user)):
     return current_user
 
 
-# =====================================================================
-# LISTAR USERS — SEMPRE DA MESMA SUB_BASE
-# =====================================================================
+# ============================================================
+# LISTAR USERS — APENAS MESMA SUB_BASE
+# ============================================================
+
 @router.get("/all", response_model=list[UserOut])
 def list_users(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Lista usuários SOMENTE da mesma sub_base do usuário logado."""
 
     if current_user.role not in (0, 1):
         raise HTTPException(403, "Apenas admin podem listar usuários.")
@@ -162,12 +169,16 @@ def list_users(
     ).all()
 
 
-# =====================================================================
+# ============================================================
 # GET USER BY ID — respeita sub_base
-# =====================================================================
-@router.get("/{user_id}", response_model=UserOut)
-def get_user(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+# ============================================================
 
+@router.get("/{user_id}", response_model=UserOut)
+def get_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(404, "Usuário não encontrado")
@@ -178,9 +189,10 @@ def get_user(user_id: int, db: Session = Depends(get_db), current_user: User = D
     return user
 
 
-# =====================================================================
-# PATCH /users/{id} — Edição ADMIN
-# =====================================================================
+# ============================================================
+# PATCH /users/{id} — Atualização ADMIN
+# ============================================================
+
 @router.patch("/{user_id}", response_model=UserOut)
 def admin_update_user(
     user_id: int,
@@ -188,7 +200,6 @@ def admin_update_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-
     if current_user.role not in (0, 1):
         raise HTTPException(403, "Acesso negado.")
 
@@ -196,12 +207,20 @@ def admin_update_user(
     if not user:
         raise HTTPException(404, "Usuário não encontrado")
 
-    # admin e root só editam sua sub_base
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
 
-    # Atualizar atributos enviados
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+
+    # ROLE → define COLETADOR
+    if "role" in updates:
+        user.role = updates["role"]
+        user.coletador = (updates["role"] == 3)
+
+    # outros campos
+    for field, value in updates.items():
+        if field == "role":
+            continue
         setattr(user, field, value)
 
     db.commit()
@@ -209,16 +228,16 @@ def admin_update_user(
     return user
 
 
-# =====================================================================
-# DELETE USER — com validação sub_base
-# =====================================================================
+# ============================================================
+# DELETE USER
+# ============================================================
+
 @router.delete("/{user_id}", status_code=200)
 def delete_user(
     user_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-
     if current_user.role not in (0, 1):
         raise HTTPException(403, "Acesso negado.")
 
@@ -234,16 +253,16 @@ def delete_user(
     return {"ok": True, "deleted": user_id}
 
 
-# =====================================================================
-# PATCH /users/me — atualizar dados do próprio user
-# =====================================================================
+# ============================================================
+# PATCH /users/me
+# ============================================================
+
 @router.patch("/me", response_model=UserFull)
 def update_current_user(
     payload: UserUpdatePayload,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> UserFull:
-
+):
     if payload.nome is not None:
         current_user.nome = payload.nome.strip() or None
 
@@ -275,20 +294,19 @@ def update_current_user(
     return current_user
 
 
-# =====================================================================
+# ============================================================
 # POST /users/me/password
-# =====================================================================
+# ============================================================
+
 @router.post("/me/password")
 def change_password(
     payload: PasswordChangePayload,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
     if not verify_password(payload.current_password, current_user.password_hash):
         raise HTTPException(401, "Senha atual incorreta.")
 
     current_user.password_hash = get_password_hash(payload.new_password)
     db.commit()
-
     return {"ok": True, "message": "Senha alterada com sucesso"}
