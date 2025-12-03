@@ -13,7 +13,7 @@ from db import get_db
 from auth import get_current_user, get_password_hash, verify_password
 from models import User, Owner
 
-router = APIRouter(prefix="/users", tags=["Users"])
+router = APIRouter(prefix="/users/", tags=["Users"])
 logger = logging.getLogger("routes.users")
 
 
