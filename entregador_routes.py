@@ -25,7 +25,7 @@ class EntregadorCreate(BaseModel):
     # --- endereço (obrigatórios) ---
     rua: str = Field(min_length=1)
     numero: str = Field(min_length=1)
-    complemento: str = Field(min_length=1)
+    complemento: Optional[str] = None
     cep: str = Field(min_length=1)
     cidade: str = Field(min_length=1)
     bairro: str = Field(min_length=1)
