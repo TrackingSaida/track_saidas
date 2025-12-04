@@ -155,25 +155,21 @@ def registrar_saida(
             {"code": "DUPLICATE_SAIDA", "message": f"Código '{codigo}' já registrado."}
         )
 
-    # -----------------------------------------
-    # SE NÃO IGNORAR → coleta obrigatória
-    # -----------------------------------------
+   # -----------------------------------------
+# SE NÃO IGNORAR → coleta obrigatória
+# mas permite registrar com status "Não Coletado"
+# -----------------------------------------
     if not ignorar:
-        from models import Coleta
-        coleta_exists = db.scalar(
-            select(Coleta).where(
-                Coleta.sub_base == sub_base_user,
-                Coleta.username_entregador == entregador
-            )
+    from models import Coleta
+    coleta_exists = db.scalar(
+        select(Coleta).where(
+            Coleta.sub_base == sub_base_user,
+            Coleta.username_entregador == entregador
         )
-        if not coleta_exists:
-            raise HTTPException(
-                409,
-                {
-                    "code": "COLETA_OBRIGATORIA",
-                    "message": "Este cliente exige coleta antes da saída."
-                }
-            )
+    )
+    if not coleta_exists:
+        print(f"[AVISO] Sem coleta encontrada para {entregador} — registrando como 'Não Coletado'.")
+        status_val = "Não Coletado"
 
     # -----------------------------------------
     # CRIAR SAÍDA
