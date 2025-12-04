@@ -160,17 +160,16 @@ def registrar_saida(
     # mas permite registrar com status "Não Coletado"
     # -----------------------------------------
     if not ignorar:
-    from models import Coleta
-    coleta_exists = db.scalar(
-        select(Coleta).where(
-            Coleta.sub_base == sub_base_user,
-            Coleta.username_entregador == entregador
+        from models import Coleta
+        coleta_exists = db.scalar(
+            select(Coleta).where(
+                Coleta.sub_base == sub_base_user,
+                Coleta.username_entregador == entregador
+            )
         )
-    )
-    if not coleta_exists:
-        print(f"[AVISO] Sem coleta encontrada para {entregador} — registrando como 'Não Coletado'.")
-        status_val = "Não Coletado"
-
+        if not coleta_exists:
+            print(f"[AVISO] Sem coleta encontrada para {entregador} — registrando como 'Não Coletado'.")
+            status_val = "Não Coletado"
 
     # -----------------------------------------
     # CRIAR SAÍDA
@@ -187,7 +186,7 @@ def registrar_saida(
 
         db.add(row)
         db.commit()
-        db.refresh(row)  # 🔥 agora row.id_saida está disponível
+        db.refresh(row)  #  agora row.id_saida está disponível
 
         # -----------------------------------------
         # COBRANÇA AUTOMÁTICA (quando ignorar_coleta = true)
