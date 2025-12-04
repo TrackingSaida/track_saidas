@@ -155,10 +155,10 @@ def registrar_saida(
             {"code": "DUPLICATE_SAIDA", "message": f"Código '{codigo}' já registrado."}
         )
 
-   # -----------------------------------------
-# SE NÃO IGNORAR → coleta obrigatória
-# mas permite registrar com status "Não Coletado"
-# -----------------------------------------
+    # -----------------------------------------
+    # SE NÃO IGNORAR → coleta obrigatória
+    # mas permite registrar com status "Não Coletado"
+    # -----------------------------------------
     if not ignorar:
     from models import Coleta
     coleta_exists = db.scalar(
@@ -170,6 +170,7 @@ def registrar_saida(
     if not coleta_exists:
         print(f"[AVISO] Sem coleta encontrada para {entregador} — registrando como 'Não Coletado'.")
         status_val = "Não Coletado"
+
 
     # -----------------------------------------
     # CRIAR SAÍDA
