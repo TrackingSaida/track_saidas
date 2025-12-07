@@ -229,11 +229,8 @@ def registrar_saida(
     # retorno final
     return SaidaOut.model_validate(row)
 
-
-
-
 # ---------- GET: LISTAR ----------
-@router.get("/listar", response_model=SaidaListOut)
+@router.get("/listar")
 def listar_saidas(
     de: Optional[date] = Query(None),
     ate: Optional[date] = Query(None),
@@ -249,16 +246,21 @@ def listar_saidas(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-    # construir filtro sem paginação para poder contar o total
+  
     filtered_stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
+  
     if base and base.strip() and base.lower() != "(todas)":
         filtered_stmt = filtered_stmt.where(Saida.base == base.strip())
 
     if de:
-        filtered_stmt = filtered_stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
+        filtered_stmt = filtered_stmt.where(
+            Saida.timestamp >= datetime.combine(de, datetime.min.time())
+        )
     if ate:
-        filtered_stmt = filtered_stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
+        filtered_stmt = filtered_stmt.where(
+            Saida.timestamp <= datetime.combine(ate, datetime.max.time())
+        )
 
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
         filtered_stmt = filtered_stmt.where(Saida.entregador == entregador.strip())
@@ -267,13 +269,36 @@ def listar_saidas(
         filtered_stmt = filtered_stmt.where(Saida.status == status_.strip())
 
     if codigo and codigo.strip():
-        filtered_stmt = filtered_stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
+        filtered_stmt = filtered_stmt.where(
+            Saida.codigo.ilike(f"%{codigo.strip()}%")
+        )
 
-    # total sem limite/offset
+
     count_stmt = select(func.count()).select_from(filtered_stmt.subquery())
     total = int(db.scalar(count_stmt) or 0)
 
-    # aplicar ordenacao e paginação para buscar os itens
+ 
+    subq = filtered_stmt.subquery()
+
+    sumShopee = db.scalar(
+        select(func.count()).select_from(subq).where(subq.c.servico == "Shopee")
+    ) or 0
+
+    sumMercado = db.scalar(
+        select(func.count()).select_from(subq).where(subq.c.servico == "Mercado Livre")
+    ) or 0
+
+    # tudo que não for Shopee nem Mercado Livre → Avulso
+    sumAvulso = db.scalar(
+        select(func.count()).select_from(subq).where(
+            (subq.c.servico != "Shopee") &
+            (subq.c.servico != "Mercado Livre")
+        )
+    ) or 0
+
+    # -------------------------------------------
+    # PAGINAÇÃO
+    # -------------------------------------------
     stmt = filtered_stmt.order_by(Saida.timestamp.desc())
 
     if limit:
@@ -284,20 +309,26 @@ def listar_saidas(
     rows = db.execute(stmt).scalars().all()
 
     items = [
-        SaidaGridItem(
-            id_saida=r.id_saida,
-            timestamp=r.timestamp,
-            username=r.username,
-            entregador=r.entregador,
-            codigo=r.codigo,
-            servico=r.servico,
-            status=r.status,
-            base=r.base,
-        )
+        {
+            "id_saida": r.id_saida,
+            "timestamp": r.timestamp,
+            "username": r.username,
+            "entregador": r.entregador,
+            "codigo": r.codigo,
+            "servico": r.servico,
+            "status": r.status,
+            "base": r.base,
+        }
         for r in rows
     ]
 
-    return SaidaListOut(total=total, items=items)
+    return {
+        "total": total,
+        "sumShopee": sumShopee,
+        "sumMercado": sumMercado,
+        "sumAvulso": sumAvulso,
+        "items": items,
+    }
 
 
 # ---------- PATCH: ATUALIZAR SAÍDA ----------
