@@ -65,6 +65,7 @@ class SaidaUpdate(BaseModel):
     status: Optional[str] = Field(None)
     codigo: Optional[str] = Field(None)
     servico: Optional[str] = Field(None)
+    base: Optional[str] = Field(None)
 
 
 # ---------- HELPERS ----------
@@ -246,13 +247,17 @@ def listar_saidas(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-  
-    filtered_stmt = select(Saida).where(Saida.sub_base == sub_base_user)
+    filtered_stmt = select(Saida).where(
+        func.lower(Saida.sub_base) == sub_base_user.lower()
+    )
 
-  
+    # BASE
     if base and base.strip() and base.lower() != "(todas)":
-        filtered_stmt = filtered_stmt.where(Saida.base == base.strip())
+        filtered_stmt = filtered_stmt.where(
+            func.lower(Saida.base) == base.strip().lower()
+        )
 
+    # DATA
     if de:
         filtered_stmt = filtered_stmt.where(
             Saida.timestamp >= datetime.combine(de, datetime.min.time())
@@ -262,45 +267,50 @@ def listar_saidas(
             Saida.timestamp <= datetime.combine(ate, datetime.max.time())
         )
 
+    # ENTREGADOR
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
-        filtered_stmt = filtered_stmt.where(Saida.entregador == entregador.strip())
+        filtered_stmt = filtered_stmt.where(
+            func.lower(Saida.entregador) == entregador.strip().lower()
+        )
 
+    # STATUS
     if status_ and status_.strip() and status_.lower() != "(todos)":
-        filtered_stmt = filtered_stmt.where(Saida.status == status_.strip())
+        filtered_stmt = filtered_stmt.where(
+            func.lower(Saida.status) == status_.strip().lower()
+        )
 
+    # CÓDIGO
     if codigo and codigo.strip():
         filtered_stmt = filtered_stmt.where(
             Saida.codigo.ilike(f"%{codigo.strip()}%")
         )
 
-
-    count_stmt = select(func.count()).select_from(filtered_stmt.subquery())
-    total = int(db.scalar(count_stmt) or 0)
-
- 
+    # TOTAL
     subq = filtered_stmt.subquery()
 
+    total = db.scalar(select(func.count()).select_from(subq)) or 0
+
+    # SUMS (case-insensitive)
     sumShopee = db.scalar(
-        select(func.count()).select_from(subq).where(subq.c.servico == "Shopee")
+        select(func.count()).select_from(subq)
+        .where(func.lower(subq.c.servico) == "shopee")
     ) or 0
 
     sumMercado = db.scalar(
-        select(func.count()).select_from(subq).where(subq.c.servico == "Mercado Livre")
+        select(func.count()).select_from(subq)
+        .where(func.lower(subq.c.servico) == "mercado livre")
     ) or 0
 
-    # tudo que não for Shopee nem Mercado Livre → Avulso
     sumAvulso = db.scalar(
-        select(func.count()).select_from(subq).where(
-            (subq.c.servico != "Shopee") &
-            (subq.c.servico != "Mercado Livre")
+        select(func.count()).select_from(subq)
+        .where(
+            func.lower(subq.c.servico) != "shopee",
+            func.lower(subq.c.servico) != "mercado livre"
         )
     ) or 0
 
-    # -------------------------------------------
     # PAGINAÇÃO
-    # -------------------------------------------
     stmt = filtered_stmt.order_by(Saida.timestamp.desc())
-
     if limit:
         stmt = stmt.limit(limit)
     if offset:
@@ -373,6 +383,10 @@ def atualizar_saida(
 
         if payload.servico is not None:
              obj.servico = payload.servico.strip()
+
+        if payload.base is not None:
+             obj.base = payload.base.strip()
+   
     
 
         db.add(obj)
