@@ -5,7 +5,7 @@ from datetime import datetime, date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -54,10 +54,17 @@ class SaidaGridItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SaidaListOut(BaseModel):
+    total: int
+    items: List[SaidaGridItem]
+    model_config = ConfigDict(from_attributes=True)
+
+
 class SaidaUpdate(BaseModel):
     entregador: Optional[str] = Field(None)
     status: Optional[str] = Field(None)
     codigo: Optional[str] = Field(None)
+    servico: Optional[str] = Field(None)
 
 
 # ---------- HELPERS ----------
@@ -157,7 +164,6 @@ def registrar_saida(
 
     # -----------------------------------------
     # SE NÃO IGNORAR → coleta obrigatória
-    # mas permite registrar com status "Não Coletado"
     # -----------------------------------------
     if not ignorar:
         from models import Coleta
@@ -168,8 +174,13 @@ def registrar_saida(
             )
         )
         if not coleta_exists:
-            print(f"[AVISO] Sem coleta encontrada para {entregador} — registrando como 'Não Coletado'.")
-            status_val = "Não Coletado"
+            raise HTTPException(
+                409,
+                {
+                    "code": "COLETA_OBRIGATORIA",
+                    "message": "Este cliente exige coleta antes da saída."
+                }
+            )
 
     # -----------------------------------------
     # CRIAR SAÍDA
@@ -186,7 +197,7 @@ def registrar_saida(
 
         db.add(row)
         db.commit()
-        db.refresh(row)  #  agora row.id_saida está disponível
+        db.refresh(row)  # 🔥 agora row.id_saida está disponível
 
         # -----------------------------------------
         # COBRANÇA AUTOMÁTICA (quando ignorar_coleta = true)
@@ -222,7 +233,7 @@ def registrar_saida(
 
 
 # ---------- GET: LISTAR ----------
-@router.get("/listar", response_model=List[SaidaGridItem])
+@router.get("/listar", response_model=SaidaListOut)
 def listar_saidas(
     de: Optional[date] = Query(None),
     ate: Optional[date] = Query(None),
@@ -238,26 +249,32 @@ def listar_saidas(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-    stmt = select(Saida).where(Saida.sub_base == sub_base_user)
+    # construir filtro sem paginação para poder contar o total
+    filtered_stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
     if base and base.strip() and base.lower() != "(todas)":
-        stmt = stmt.where(Saida.base == base.strip())
+        filtered_stmt = filtered_stmt.where(Saida.base == base.strip())
 
     if de:
-        stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
+        filtered_stmt = filtered_stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
     if ate:
-        stmt = stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
+        filtered_stmt = filtered_stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
 
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
-        stmt = stmt.where(Saida.entregador == entregador.strip())
+        filtered_stmt = filtered_stmt.where(Saida.entregador == entregador.strip())
 
     if status_ and status_.strip() and status_.lower() != "(todos)":
-        stmt = stmt.where(Saida.status == status_.strip())
+        filtered_stmt = filtered_stmt.where(Saida.status == status_.strip())
 
     if codigo and codigo.strip():
-        stmt = stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
+        filtered_stmt = filtered_stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
 
-    stmt = stmt.order_by(Saida.timestamp.desc())
+    # total sem limite/offset
+    count_stmt = select(func.count()).select_from(filtered_stmt.subquery())
+    total = int(db.scalar(count_stmt) or 0)
+
+    # aplicar ordenacao e paginação para buscar os itens
+    stmt = filtered_stmt.order_by(Saida.timestamp.desc())
 
     if limit:
         stmt = stmt.limit(limit)
@@ -266,7 +283,7 @@ def listar_saidas(
 
     rows = db.execute(stmt).scalars().all()
 
-    return [
+    items = [
         SaidaGridItem(
             id_saida=r.id_saida,
             timestamp=r.timestamp,
@@ -280,6 +297,8 @@ def listar_saidas(
         for r in rows
     ]
 
+    return SaidaListOut(total=total, items=items)
+
 
 # ---------- PATCH: ATUALIZAR SAÍDA ----------
 @router.patch("/{id_saida}", response_model=SaidaOut)
@@ -292,7 +311,7 @@ def atualizar_saida(
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_saida(db, sub_base_user, id_saida)
 
-    if payload.codigo is None and payload.entregador is None and payload.status is None:
+    if payload.codigo is None and payload.entregador is None and payload.status is None and payload.servico is None:
         raise HTTPException(
             422,
             {"code": "NO_FIELDS_TO_UPDATE", "message": "Nenhum campo enviado."}
@@ -320,6 +339,10 @@ def atualizar_saida(
 
         if payload.status is not None:
             obj.status = payload.status.strip()
+
+        if payload.servico is not None:
+             obj.servico = payload.servico.strip()
+    
 
         db.add(obj)
         db.commit()

@@ -15,6 +15,11 @@ from sqlalchemy import (
 from sqlalchemy.sql import func
 
 from db import Base
+from sqlalchemy import event
+from sqlalchemy.orm import Session
+from sqlalchemy.orm import relationship
+from sqlalchemy import ForeignKey
+
 
 
 # ==========================
@@ -94,6 +99,9 @@ class Coleta(Base):
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
 
+    saidas = relationship("Saida", back_populates="coleta")
+
+
     def __repr__(self) -> str:
         return f"<Coleta id_coleta={self.id_coleta} sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
 
@@ -139,6 +147,11 @@ class Saida(Base):
     codigo = Column(Text, nullable=True)
     servico = Column(Text, nullable=True, server_default=text("'padrao'::text"))
     status = Column(Text, nullable=True, server_default=text("'saiu'::text"))
+    id_coleta = Column(BigInteger, ForeignKey("coletas.id_coleta"), nullable=True)
+
+    coleta = relationship("Coleta", back_populates="saidas")
+
+
 
     def __repr__(self) -> str:
         return f"<Saida id_saida={self.id_saida} data={self.data} servico={self.servico!r}>"
@@ -257,3 +270,24 @@ class SaidaDetail(Base):
 
     def __repr__(self):
         return f"<SaidaDetail id_detail={self.id_detail} id_saida={self.id_saida}>"
+    
+
+@event.listens_for(Saida, "after_update")
+def saida_after_update(mapper, connection, target: Saida):
+    """
+    Recalcula automaticamente a coleta sempre que uma saída for alterada.
+    """
+    if not target.id_coleta:
+        return
+
+    # Cria sessão vinculada a essa conexão
+    db = Session(bind=connection)
+
+    try:
+        # Import atrasado para evitar circular import
+        from coletas import recalcular_coleta
+        recalcular_coleta(db, target.id_coleta)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise

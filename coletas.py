@@ -165,6 +165,70 @@ def _get_precos(db: Session, sub_base: str, base: str) -> Tuple[Decimal, Decimal
         )
     return _decimal(precos.shopee), _decimal(precos.ml), _decimal(precos.avulso)
 
+def recalcular_coleta(db: Session, id_coleta: int):
+    """
+    Recalcula todos os campos da coleta com base nas saídas vinculadas.
+    Atualiza:
+      - shopee
+      - mercado_livre
+      - avulso
+      - valor_total
+    """
+    # Buscar coleta
+    coleta = db.get(Coleta, id_coleta)
+    if not coleta:
+        raise HTTPException(404, f"Coleta {id_coleta} não encontrada.")
+
+    # Buscar todas as saídas da coleta
+    saidas = db.scalars(
+        select(Saida).where(Saida.id_coleta == id_coleta)
+    ).all()
+
+    if not saidas:
+        raise HTTPException(400, f"A coleta {id_coleta} não possui saídas vinculadas.")
+
+    # Zerar contadores
+    count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
+
+    # Recontar serviços (robusto)
+    for s in saidas:
+        serv = (s.servico or "").lower().replace("_", " ").strip()
+
+        if serv == "shopee":
+            count["shopee"] += 1
+
+        elif serv.startswith("mercado"):   # cobre "mercado livre", "Mercado Livre", "mercado_livre", "ML"
+            count["mercado_livre"] += 1
+
+        else:
+            count["avulso"] += 1
+
+    # Obter preços vigentes da base e sub_base da coleta
+    p_shopee, p_ml, p_avulso = _get_precos(
+        db,
+        sub_base=coleta.sub_base,
+        base=coleta.base
+    )
+
+    # Recalcular valor total
+    total = (
+        _decimal(count["shopee"]) * p_shopee +
+        _decimal(count["mercado_livre"]) * p_ml +
+        _decimal(count["avulso"]) * p_avulso
+    ).quantize(Decimal("0.01"))
+
+    # Atualizar coleta
+    coleta.shopee = count["shopee"]
+    coleta.mercado_livre = count["mercado_livre"]
+    coleta.avulso = count["avulso"]
+    coleta.valor_total = total
+
+    db.commit()
+    db.refresh(coleta)
+
+    return coleta
+
+
 
 # =========================
 # POST /coletas/lote
@@ -178,21 +242,38 @@ def registrar_coleta_em_lote(
 ):
     sub_base, entregador_nome, username_entregador = _resolve_entregador_ou_user_base(db, current_user)
 
-    # === BUSCAR OWNER DA SUB_BASE ===
+    # === OWNER ===
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     if not owner:
         raise HTTPException(404, "Owner não encontrado para esta sub_base.")
     valor_unit = Decimal(str(owner.valor or 0))
 
+    # === PREÇOS ===
     p_shopee, p_ml, p_avulso = _get_precos(db, sub_base=sub_base, base=payload.base)
 
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
     created = 0
+    saidas_ids = []
 
     try:
-        # =====================================
-        # REGISTRAR SAÍDAS DO LOTE
-        # =====================================
+        # ======================================================
+        # 1) CRIAR COLETA PRIMEIRO (necessário por causa da FK)
+        # ======================================================
+        coleta = Coleta(
+            sub_base=sub_base,
+            base=payload.base,
+            username_entregador=username_entregador,
+            shopee=0,
+            mercado_livre=0,
+            avulso=0,
+            valor_total=Decimal("0.00")
+        )
+        db.add(coleta)
+        db.flush()  # 🔥 AGORA coleta.id_coleta EXISTE
+
+        # ======================================================
+        # 2) REGISTRAR SAÍDAS DO LOTE (agora com id_coleta)
+        # ======================================================
         for item in payload.itens:
             serv = _normalize_servico(item.servico)
             codigo = (item.codigo or "").strip()
@@ -212,48 +293,52 @@ def registrar_coleta_em_lote(
             saida = Saida(
                 sub_base=sub_base,
                 base=payload.base,
-                username=getattr(current_user, "username", None),
+                username=current_user.username,
                 entregador=entregador_nome,
                 codigo=codigo,
                 servico=_servico_label_for_saida(serv),
                 status="coletado",
+                id_coleta=coleta.id_coleta  # 🔥 VÍNCULO DA FK
             )
             db.add(saida)
-            created += 1
-            count[serv] += 1
+            db.flush()          # garante id_saida
+            saidas_ids.append(saida.id_saida)
 
-        total = (
+            count[serv] += 1
+            created += 1
+
+        # ======================================================
+        # 3) ATUALIZAR COLETA COM OS CONTADORES
+        # ======================================================
+        coleta.shopee = count["shopee"]
+        coleta.mercado_livre = count["mercado_livre"]
+        coleta.avulso = count["avulso"]
+
+        # ======================================================
+        # 4) CALCULAR O TOTAL ANTES DO COMMIT
+        # ======================================================
+        coleta.valor_total = (
             _decimal(count["shopee"]) * p_shopee +
             _decimal(count["mercado_livre"]) * p_ml +
             _decimal(count["avulso"]) * p_avulso
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-        coleta = Coleta(
-            sub_base=sub_base,
-            base=payload.base,
-            username_entregador=username_entregador,
-            shopee=count["shopee"],
-            mercado_livre=count["mercado_livre"],
-            avulso=count["avulso"],
-            valor_total=total,
-        )
-        db.add(coleta)
-        db.commit()
-        db.refresh(coleta)
+        db.flush()
 
-        # =====================================
-        # REGISTRAR COBRANÇA (NOVO)
-        # =====================================
-        for _ in range(created):
+        # ======================================================
+        # 5) REGISTRAR COBRANÇA COM id_saida (opcional, mas correto)
+        # ======================================================
+        for id_saida in saidas_ids:
             item = OwnerCobrancaItem(
                 sub_base=sub_base,
                 id_coleta=coleta.id_coleta,
-                id_saida=None,
+                id_saida=id_saida,
                 valor=valor_unit
             )
             db.add(item)
 
         db.commit()
+        db.refresh(coleta)
 
     except HTTPException as e:
         db.rollback()
@@ -263,9 +348,9 @@ def registrar_coleta_em_lote(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Falha ao registrar lote: {e}")
 
-    # =====================================
-    # RESPOSTA FINAL
-    # =====================================
+    # ======================================================
+    # 6) RESPOSTA FINAL
+    # ======================================================
     return LoteResponse(
         coleta=ColetaOut.model_validate(coleta),
         resumo=ResumoLote(
@@ -281,6 +366,7 @@ def registrar_coleta_em_lote(
             total=_fmt_money(coleta.valor_total)
         )
     )
+
 
 # =========================
 # GET /coletas
@@ -335,3 +421,15 @@ def list_coletas(
    
 
     return rows
+
+# =========================      
+# POST /coletas/recalcular/{id_coleta}
+# ========================= 
+@router.post("/recalcular/{id_coleta}", response_model=ColetaOut)
+def api_recalcular_coleta(
+    id_coleta: int,
+    db: Session = Depends(get_db),
+):
+    coleta = recalcular_coleta(db, id_coleta)
+    return ColetaOut.model_validate(coleta)
+
