@@ -13,14 +13,24 @@ from auth import get_current_user
 from models import User, Owner, Saida
 
 
-# ============================================================
-# ROTAS DE SAÍDAS
-# ============================================================
-
 router = APIRouter(prefix="/saidas", tags=["Saídas"])
 
 
-# ---------- SCHEMAS ----------
+# ============================================================
+# NORMALIZADORES
+# ============================================================
+
+def norm_str(x: str | None) -> str | None:
+    """Remove espaços, baixa caixa e normaliza unicode."""
+    if not x:
+        return None
+    return x.strip().casefold()
+
+
+# ============================================================
+# SCHEMAS
+# ============================================================
+
 class SaidaCreate(BaseModel):
     entregador: str = Field(min_length=1)
     codigo: str = Field(min_length=1)
@@ -68,55 +78,44 @@ class SaidaUpdate(BaseModel):
     base: Optional[str] = Field(None)
 
 
-# ---------- HELPERS ----------
+# ============================================================
+# HELPERS
+# ============================================================
+
 def _resolve_user_base(db: Session, current_user: User) -> str:
-    user_id = getattr(current_user, "id", None)
-    if user_id:
-        u = db.get(User, user_id)
-        if u and u.sub_base:
-            return u.sub_base
+    """Resolve a sub_base do usuário logado."""
+    for field in ("id", "email", "username"):
+        value = getattr(current_user, field, None)
+        if value:
+            u = db.scalars(select(User).where(getattr(User, field) == value)).first()
+            if u and u.sub_base:
+                return u.sub_base
 
-    email = getattr(current_user, "email", None)
-    if email:
-        u = db.scalars(select(User).where(User.email == email)).first()
-        if u and u.sub_base:
-            return u.sub_base
-
-    username = getattr(current_user, "username", None)
-    if username:
-        u = db.scalars(select(User).where(User.username == username)).first()
-        if u and u.sub_base:
-            return u.sub_base
-
-    raise HTTPException(status_code=401, detail="Usuário sem sub_base definida.")
+    raise HTTPException(401, "Usuário sem sub_base definida.")
 
 
 def _get_owned_saida(db: Session, sub_base_user: str, id_saida: int) -> Saida:
     obj = db.get(Saida, id_saida)
     if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(
-            status_code=404,
-            detail={"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."}
+            404,
+            {"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."}
         )
     return obj
 
 
 def _check_delete_window_or_409(ts: datetime):
     if ts is None:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "DELETE_WINDOW_EXPIRED", "message": "Janela para exclusão expirada."}
-        )
+        raise HTTPException(409, {"code": "DELETE_WINDOW_EXPIRED", "message": "Janela expirada."})
 
-    agora = datetime.utcnow()
-    if agora - ts > timedelta(days=1):
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "DELETE_WINDOW_EXPIRED", "message": "Janela para exclusão expirada."}
-        )
+    if datetime.utcnow() - ts > timedelta(days=1):
+        raise HTTPException(409, {"code": "DELETE_WINDOW_EXPIRED", "message": "Janela expirada."})
 
 
-# ---------- POST: REGISTRAR SAÍDA ----------
+# ============================================================
+# POST /registrar
+# ============================================================
+
 @router.post("/registrar", status_code=201)
 def registrar_saida(
     payload: SaidaCreate,
@@ -128,44 +127,29 @@ def registrar_saida(
     if not username:
         raise HTTPException(401, "Usuário sem username.")
 
-    # sub_base do usuário logado
     sub_base_user = _resolve_user_base(db, current_user)
 
-    # normalizar payload
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
-    servico = payload.servico.strip()
-    status_val = payload.status.strip() if payload.status else "Saiu para entrega"
+    servico_norm = payload.servico.strip().title()
+    status_norm = payload.status.strip() if payload.status else "Saiu para entrega"
 
-    # -----------------------------------------
-    # Buscar OWNER (para ignorar_coleta E valor)
-    # -----------------------------------------
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_user))
     if not owner:
-        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+        raise HTTPException(404, "Owner não encontrado.")
 
     ignorar = bool(owner.ignorar_coleta)
-    # Debug opcional
-    print(f"[DEBUG] ignorar_coleta={ignorar} sub_base={sub_base_user}")
 
-    # -----------------------------------------
-    # DUPLICIDADE
-    # -----------------------------------------
     existente = db.scalars(
-        select(Saida).where(
-            Saida.sub_base == sub_base_user,
-            Saida.codigo == codigo
-        )
+        select(Saida).where(Saida.sub_base == sub_base_user, Saida.codigo == codigo)
     ).first()
+
     if existente:
         raise HTTPException(
             409,
             {"code": "DUPLICATE_SAIDA", "message": f"Código '{codigo}' já registrado."}
         )
 
-    # -----------------------------------------
-    # SE NÃO IGNORAR → coleta obrigatória
-    # -----------------------------------------
     if not ignorar:
         from models import Coleta
         coleta_exists = db.scalar(
@@ -177,32 +161,23 @@ def registrar_saida(
         if not coleta_exists:
             raise HTTPException(
                 409,
-                {
-                    "code": "COLETA_OBRIGATORIA",
-                    "message": "Este cliente exige coleta antes da saída."
-                }
+                {"code": "COLETA_OBRIGATORIA", "message": "Cliente exige coleta antes."}
             )
 
-    # -----------------------------------------
-    # CRIAR SAÍDA
-    # -----------------------------------------
     try:
         row = Saida(
             sub_base=sub_base_user,
             username=username,
             entregador=entregador,
             codigo=codigo,
-            servico=servico,
-            status=status_val,
+            servico=servico_norm,
+            status=status_norm,
         )
 
         db.add(row)
         db.commit()
-        db.refresh(row)  # 🔥 agora row.id_saida está disponível
+        db.refresh(row)
 
-        # -----------------------------------------
-        # COBRANÇA AUTOMÁTICA (quando ignorar_coleta = true)
-        # -----------------------------------------
         if ignorar:
             try:
                 from models import OwnerCobrancaItem
@@ -210,27 +185,27 @@ def registrar_saida(
                 item = OwnerCobrancaItem(
                     sub_base=sub_base_user,
                     id_coleta=None,
-                    id_saida=row.id_saida,   # <- AQUI GRAVA CORRETAMENTE
+                    id_saida=row.id_saida,
                     valor=owner.valor
                 )
-
                 db.add(item)
                 db.commit()
 
-                print(f"[COBRANÇA_SAIDA] Registrado id_saida={row.id_saida}")
-
             except Exception as e:
-                db.rollback()  # rollback apenas da cobrança
-                print(f"[COBRANÇA_SAIDA] Erro ao registrar cobrança: {e}")
+                db.rollback()
+                print("[COBRANÇA] erro:", e)
 
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"Erro ao registrar saída: {e}")
 
-    # retorno final
     return SaidaOut.model_validate(row)
 
-# ---------- GET: LISTAR ----------
+
+# ============================================================
+# GET /listar
+# ============================================================
+
 @router.get("/listar")
 def listar_saidas(
     de: Optional[date] = Query(None),
@@ -247,17 +222,18 @@ def listar_saidas(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-    filtered_stmt = select(Saida).where(
-        func.lower(Saida.sub_base) == sub_base_user.lower()
-    )
+    filtered_stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
-    # BASE
+    # normalizadores SQL
+    srv = func.lower(func.trim(Saida.servico))
+    sts = func.lower(func.trim(Saida.status))
+    bs = func.lower(func.trim(Saida.base))
+
+    # FILTRO BASE
     if base and base.strip() and base.lower() != "(todas)":
-        filtered_stmt = filtered_stmt.where(
-            func.lower(Saida.base) == base.strip().lower()
-        )
+        filtered_stmt = filtered_stmt.where(bs == base.strip().lower())
 
-    # DATA
+    # FILTRO DATA
     if de:
         filtered_stmt = filtered_stmt.where(
             Saida.timestamp >= datetime.combine(de, datetime.min.time())
@@ -267,50 +243,47 @@ def listar_saidas(
             Saida.timestamp <= datetime.combine(ate, datetime.max.time())
         )
 
-    # ENTREGADOR
+    # FILTRO ENTREGADOR
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
         filtered_stmt = filtered_stmt.where(
-            func.lower(Saida.entregador) == entregador.strip().lower()
+            func.lower(func.trim(Saida.entregador)) == entregador.strip().lower()
         )
 
-    # STATUS
+    # FILTRO STATUS
     if status_ and status_.strip() and status_.lower() != "(todos)":
         filtered_stmt = filtered_stmt.where(
-            func.lower(Saida.status) == status_.strip().lower()
+            sts == status_.strip().lower()
         )
 
-    # CÓDIGO
+    # FILTRO CÓDIGO
     if codigo and codigo.strip():
         filtered_stmt = filtered_stmt.where(
-            Saida.codigo.ilike(f"%{codigo.strip()}%")
+            func.lower(Saida.codigo).ilike(f"%{codigo.strip().lower()}%")
         )
 
     # TOTAL
+    total = db.scalar(select(func.count()).select_from(filtered_stmt.subquery())) or 0
+
     subq = filtered_stmt.subquery()
+    srv_q = func.lower(func.trim(subq.c.servico))
 
-    total = db.scalar(select(func.count()).select_from(subq)) or 0
-
-    # SUMS (case-insensitive)
     sumShopee = db.scalar(
-        select(func.count()).select_from(subq)
-        .where(func.lower(subq.c.servico) == "shopee")
+        select(func.count()).select_from(subq).where(srv_q == "shopee")
     ) or 0
 
     sumMercado = db.scalar(
-        select(func.count()).select_from(subq)
-        .where(func.lower(subq.c.servico) == "mercado livre")
+        select(func.count()).select_from(subq).where(srv_q == "mercado livre")
     ) or 0
 
     sumAvulso = db.scalar(
-        select(func.count()).select_from(subq)
-        .where(
-            func.lower(subq.c.servico) != "shopee",
-            func.lower(subq.c.servico) != "mercado livre"
+        select(func.count()).select_from(subq).where(
+            (srv_q != "shopee") & (srv_q != "mercado livre")
         )
     ) or 0
 
-    # PAGINAÇÃO
+    # paginação
     stmt = filtered_stmt.order_by(Saida.timestamp.desc())
+
     if limit:
         stmt = stmt.limit(limit)
     if offset:
@@ -341,7 +314,10 @@ def listar_saidas(
     }
 
 
-# ---------- PATCH: ATUALIZAR SAÍDA ----------
+# ============================================================
+# PATCH /id
+# ============================================================
+
 @router.patch("/{id_saida}", response_model=SaidaOut)
 def atualizar_saida(
     id_saida: int,
@@ -352,28 +328,25 @@ def atualizar_saida(
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_saida(db, sub_base_user, id_saida)
 
-    if payload.codigo is None and payload.entregador is None and payload.status is None and payload.servico is None:
-        raise HTTPException(
-            422,
-            {"code": "NO_FIELDS_TO_UPDATE", "message": "Nenhum campo enviado."}
-        )
+    if not any([payload.codigo, payload.entregador, payload.status, payload.servico, payload.base]):
+        raise HTTPException(422, {"code": "NO_FIELDS_TO_UPDATE", "message": "Nenhum campo enviado."})
 
     try:
         if payload.codigo is not None:
             novo = payload.codigo.strip()
             if not novo:
-                raise HTTPException(422, "Código não pode ser vazio.")
-            if novo != obj.codigo:
-                dup = db.scalars(
-                    select(Saida).where(
-                        Saida.sub_base == obj.sub_base,
-                        Saida.codigo == novo,
-                        Saida.id_saida != obj.id_saida,
-                    )
-                ).first()
-                if dup:
-                    raise HTTPException(409, f"Código '{novo}' já registrado.")
-                obj.codigo = novo
+                raise HTTPException(422, "Código vazio.")
+            # verificar duplicidade
+            dup = db.scalars(
+                select(Saida).where(
+                    Saida.sub_base == obj.sub_base,
+                    Saida.codigo == novo,
+                    Saida.id_saida != obj.id_saida,
+                )
+            ).first()
+            if dup:
+                raise HTTPException(409, f"Código '{novo}' já existe.")
+            obj.codigo = novo
 
         if payload.entregador is not None:
             obj.entregador = payload.entregador.strip()
@@ -382,12 +355,10 @@ def atualizar_saida(
             obj.status = payload.status.strip()
 
         if payload.servico is not None:
-             obj.servico = payload.servico.strip()
+            obj.servico = payload.servico.strip().title()
 
         if payload.base is not None:
-             obj.base = payload.base.strip()
-   
-    
+            obj.base = payload.base.strip().title()
 
         db.add(obj)
         db.commit()
@@ -399,15 +370,15 @@ def atualizar_saida(
 
     except Exception:
         db.rollback()
-        raise HTTPException(
-            500,
-            {"code": "UPDATE_FAILED", "message": "Erro ao atualizar."}
-        )
+        raise HTTPException(500, {"code": "UPDATE_FAILED", "message": "Erro ao atualizar."})
 
     return SaidaOut.model_validate(obj)
 
 
-# ---------- DELETE ----------
+# ============================================================
+# DELETE /id
+# ============================================================
+
 @router.delete("/{id_saida}", status_code=204)
 def deletar_saida(
     id_saida: int,
