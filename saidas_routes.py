@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import User, Owner, Saida
+from sqlalchemy import func
 
 
 router = APIRouter(prefix="/saidas", tags=["Saídas"])
@@ -251,8 +252,9 @@ def listar_saidas(
 
     # FILTRO STATUS
     if status_ and status_.strip() and status_.lower() != "(todos)":
-        filtered_stmt = filtered_stmt.where(
-            sts == status_.strip().lower()
+       status_norm = status_.strip().lower()
+         filtered_stmt = filtered_stmt.where(
+         func.unaccent(func.lower(Saida.status)) == func.unaccent(status_norm)
         )
 
     # FILTRO CÓDIGO
