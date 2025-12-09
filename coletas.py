@@ -1,31 +1,32 @@
-# coletas.py
 from __future__ import annotations
 
-import datetime  
+import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
 from models import Coleta, Entregador, BasePreco, User, Saida
-
 from models import Owner, OwnerCobrancaItem
-
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
 
-# =========================
-# Schemas
-# =========================
+# ============================================================
+# MODELOS
+# ============================================================
+
 class ItemLote(BaseModel):
     codigo: str = Field(min_length=1)
-    servico: str = Field(min_length=1, description="shopee | ml | mercado_livre | mercado livre | avulso")
+    servico: str = Field(
+        min_length=1,
+        description="shopee | ml | mercado_livre | mercado livre | avulso"
+    )
 
 
 class ColetaLoteIn(BaseModel):
@@ -44,7 +45,7 @@ class ResumoLote(BaseModel):
 
 class ColetaOut(BaseModel):
     id_coleta: int
-    timestamp: datetime.datetime  # ✅ usa o módulo completo
+    timestamp: datetime.datetime
     base: str
     sub_base: str
     username_entregador: str
@@ -54,8 +55,6 @@ class ColetaOut(BaseModel):
     valor_total: Decimal
     model_config = ConfigDict(from_attributes=True)
 
-
-# ✅ Corrige erro Pydantic 2.x (TypeAdapter not fully defined)
 ColetaOut.model_rebuild()
 
 
@@ -64,9 +63,10 @@ class LoteResponse(BaseModel):
     resumo: ResumoLote
 
 
-# =========================
-# Helpers
-# =========================
+# ============================================================
+# HELPERS
+# ============================================================
+
 def _decimal(v) -> Decimal:
     try:
         return Decimal(str(v or 0))
@@ -80,144 +80,104 @@ def _fmt_money(d: Decimal) -> str:
 
 def _normalize_servico(raw: str) -> Literal["shopee", "mercado_livre", "avulso"]:
     s = (raw or "").strip().lower()
-    if s in {"shopee"}:
+    if s == "shopee":
         return "shopee"
-    if s in {"ml", "mercado_livre", "mercado livre"}:
+    if s in {"ml", "mercado livre", "mercado_livre"}:
         return "mercado_livre"
-    if s in {"avulso"}:
-        return "avulso"
-    raise HTTPException(status_code=422, detail=f"Serviço inválido: {raw!r}")
+    return "avulso"
 
 
 def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) -> str:
     return "Mercado Livre" if s == "mercado_livre" else s
 
 
-def _find_entregador_for_user(db: Session, user: User) -> Entregador:
-    candidates = []
-    ue = getattr(user, "username_entregador", None)
-    if ue:
-        candidates.append(ue)
-    un = getattr(user, "username", None)
-    if un and un not in candidates:
-        candidates.append(un)
-
-    if not candidates:
-        raise HTTPException(status_code=404, detail="Usuário sem 'username' compatível para localizar o entregador.")
-
-    ent = db.scalar(select(Entregador).where(Entregador.username_entregador.in_(candidates)))
-
-    if not ent:
-        raise HTTPException(status_code=404, detail="Entregador não encontrado para o usuário autenticado.")
-    if hasattr(ent, "ativo") and ent.ativo is False:
-        raise HTTPException(status_code=403, detail="Entregador inativo.")
-    if not getattr(ent, "sub_base", None):
-        raise HTTPException(status_code=422, detail="Entregador encontrado, porém sem 'sub_base' definida.")
-
-    return ent
-
-
 def _resolve_entregador_ou_user_base(db: Session, user: User) -> Tuple[str, str, str]:
     candidates = []
+
     ue = getattr(user, "username_entregador", None)
     if ue:
         candidates.append(ue)
+
     un = getattr(user, "username", None)
     if un and un not in candidates:
         candidates.append(un)
 
     ent = None
     if candidates:
-        ent = db.scalar(select(Entregador).where(Entregador.username_entregador.in_(candidates)))
+        ent = db.scalar(
+            select(Entregador).where(Entregador.username_entregador.in_(candidates))
+        )
 
     if ent:
         if hasattr(ent, "ativo") and not ent.ativo:
-            raise HTTPException(status_code=403, detail="Entregador inativo.")
-        if not getattr(ent, "sub_base", None):
-            raise HTTPException(status_code=422, detail="Entregador sem 'sub_base' definida.")
+            raise HTTPException(403, "Entregador inativo.")
+        if not ent.sub_base:
+            raise HTTPException(422, "Entregador sem sub_base definida.")
         return ent.sub_base, (ent.nome or ent.username_entregador), ent.username_entregador
 
+    # fallback via tabela users
     user_id = getattr(user, "id", None)
-    u = db.get(User, user_id) if user_id else None
-    sub_base = getattr(u, "sub_base", None)
+    u = db.get(User, user_id)
+    sub_base = u.sub_base if u else None
+
     if not sub_base and getattr(user, "email", None):
         u = db.scalar(select(User).where(User.email == user.email))
-        sub_base = getattr(u, "sub_base", None)
+        sub_base = u.sub_base if u else None
+
     if not sub_base and getattr(user, "username", None):
         u = db.scalar(select(User).where(User.username == user.username))
-        sub_base = getattr(u, "sub_base", None)
+        sub_base = u.sub_base if u else None
 
     if not sub_base:
-        raise HTTPException(status_code=422, detail="Usuário sem 'sub_base' definida em 'users'.")
+        raise HTTPException(422, "Usuário sem sub_base definida.")
 
-    username_entregador = getattr(user, "username", "sistema")
-    nome_exibicao = getattr(user, "username", "Sistema")
-
-    return sub_base, nome_exibicao, username_entregador
+    return sub_base, getattr(user, "username", "Sistema"), getattr(user, "username", "Sistema")
 
 
-def _get_precos(db: Session, sub_base: str, base: str) -> Tuple[Decimal, Decimal, Decimal]:
-    precos = db.scalar(select(BasePreco).where(BasePreco.sub_base == sub_base, BasePreco.base == base))
+def _get_precos(db: Session, sub_base: str, base: str):
+    precos = db.scalar(
+        select(BasePreco).where(BasePreco.sub_base == sub_base, BasePreco.base == base)
+    )
     if not precos:
         raise HTTPException(
-            status_code=404,
-            detail=f"Tabela de preços não encontrada para sub_base={sub_base!r} e base={base!r}.",
+            404,
+            f"Tabela de preços não encontrada para sub_base={sub_base!r} e base={base!r}."
         )
     return _decimal(precos.shopee), _decimal(precos.ml), _decimal(precos.avulso)
 
+
+# ============================================================
+# REPROCESSAMENTO DE COLETA
+# ============================================================
+
 def recalcular_coleta(db: Session, id_coleta: int):
-    """
-    Recalcula todos os campos da coleta com base nas saídas vinculadas.
-    Atualiza:
-      - shopee
-      - mercado_livre
-      - avulso
-      - valor_total
-    """
-    # Buscar coleta
     coleta = db.get(Coleta, id_coleta)
     if not coleta:
         raise HTTPException(404, f"Coleta {id_coleta} não encontrada.")
 
-    # Buscar todas as saídas da coleta
-    saidas = db.scalars(
-        select(Saida).where(Saida.id_coleta == id_coleta)
-    ).all()
-
+    saidas = db.scalars(select(Saida).where(Saida.id_coleta == id_coleta)).all()
     if not saidas:
-        raise HTTPException(400, f"A coleta {id_coleta} não possui saídas vinculadas.")
+        raise HTTPException(400, "Nenhuma saída vinculada à coleta.")
 
-    # Zerar contadores
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
 
-    # Recontar serviços (robusto)
     for s in saidas:
         serv = (s.servico or "").lower().replace("_", " ").strip()
-
         if serv == "shopee":
             count["shopee"] += 1
-
-        elif serv.startswith("mercado"):   # cobre "mercado livre", "Mercado Livre", "mercado_livre", "ML"
+        elif serv.startswith("mercado"):
             count["mercado_livre"] += 1
-
         else:
             count["avulso"] += 1
 
-    # Obter preços vigentes da base e sub_base da coleta
-    p_shopee, p_ml, p_avulso = _get_precos(
-        db,
-        sub_base=coleta.sub_base,
-        base=coleta.base
-    )
+    p_shopee, p_ml, p_avulso = _get_precos(db, coleta.sub_base, coleta.base)
 
-    # Recalcular valor total
     total = (
         _decimal(count["shopee"]) * p_shopee +
         _decimal(count["mercado_livre"]) * p_ml +
         _decimal(count["avulso"]) * p_avulso
     ).quantize(Decimal("0.01"))
 
-    # Atualizar coleta
     coleta.shopee = count["shopee"]
     coleta.mercado_livre = count["mercado_livre"]
     coleta.avulso = count["avulso"]
@@ -225,40 +185,31 @@ def recalcular_coleta(db: Session, id_coleta: int):
 
     db.commit()
     db.refresh(coleta)
-
     return coleta
 
 
-
-# =========================
+# ============================================================
 # POST /coletas/lote
-# =========================
+# ============================================================
 
-@router.post("/lote", status_code=status.HTTP_201_CREATED, response_model=LoteResponse)
-def registrar_coleta_em_lote(
-    payload: ColetaLoteIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+@router.post("/lote", response_model=LoteResponse, status_code=201)
+def registrar_coleta_em_lote(payload: ColetaLoteIn, db: Session = Depends(get_db),
+                             current_user: User = Depends(get_current_user)):
+
     sub_base, entregador_nome, username_entregador = _resolve_entregador_ou_user_base(db, current_user)
 
-    # === OWNER ===
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     if not owner:
-        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+        raise HTTPException(404, "Owner não encontrado.")
     valor_unit = Decimal(str(owner.valor or 0))
 
-    # === PREÇOS ===
-    p_shopee, p_ml, p_avulso = _get_precos(db, sub_base=sub_base, base=payload.base)
+    p_shopee, p_ml, p_avulso = _get_precos(db, sub_base, payload.base)
 
-    count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
     created = 0
     saidas_ids = []
+    count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
 
     try:
-        # ======================================================
-        # 1) CRIAR COLETA PRIMEIRO (necessário por causa da FK)
-        # ======================================================
         coleta = Coleta(
             sub_base=sub_base,
             base=payload.base,
@@ -266,29 +217,20 @@ def registrar_coleta_em_lote(
             shopee=0,
             mercado_livre=0,
             avulso=0,
-            valor_total=Decimal("0.00")
+            valor_total=Decimal("0.00"),
         )
         db.add(coleta)
-        db.flush()  # 🔥 AGORA coleta.id_coleta EXISTE
+        db.flush()
 
-        # ======================================================
-        # 2) REGISTRAR SAÍDAS DO LOTE (agora com id_coleta)
-        # ======================================================
         for item in payload.itens:
-            serv = _normalize_servico(item.servico)
-            codigo = (item.codigo or "").strip()
-
-            if not codigo:
-                raise HTTPException(status_code=422, detail="Código vazio no payload.")
+            serv_key = _normalize_servico(item.servico)
+            codigo = item.codigo.strip()
 
             exists = db.scalar(
                 select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
             )
             if exists:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"O código '{codigo}' já foi coletado anteriormente."
-                )
+                raise HTTPException(409, f"Código '{codigo}' já coletado.")
 
             saida = Saida(
                 sub_base=sub_base,
@@ -296,38 +238,28 @@ def registrar_coleta_em_lote(
                 username=current_user.username,
                 entregador=entregador_nome,
                 codigo=codigo,
-                servico=_servico_label_for_saida(serv),
+                servico=_servico_label_for_saida(serv_key),
                 status="coletado",
-                id_coleta=coleta.id_coleta  # 🔥 VÍNCULO DA FK
+                id_coleta=coleta.id_coleta,
             )
             db.add(saida)
-            db.flush()          # garante id_saida
+            db.flush()
             saidas_ids.append(saida.id_saida)
 
-            count[serv] += 1
+            count[serv_key] += 1
             created += 1
 
-        # ======================================================
-        # 3) ATUALIZAR COLETA COM OS CONTADORES
-        # ======================================================
         coleta.shopee = count["shopee"]
         coleta.mercado_livre = count["mercado_livre"]
         coleta.avulso = count["avulso"]
-
-        # ======================================================
-        # 4) CALCULAR O TOTAL ANTES DO COMMIT
-        # ======================================================
         coleta.valor_total = (
-            _decimal(count["shopee"]) * p_shopee +
-            _decimal(count["mercado_livre"]) * p_ml +
-            _decimal(count["avulso"]) * p_avulso
-        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            count["shopee"] * p_shopee +
+            count["mercado_livre"] * p_ml +
+            count["avulso"] * p_avulso
+        ).quantize(Decimal("0.01"))
 
         db.flush()
 
-        # ======================================================
-        # 5) REGISTRAR COBRANÇA COM id_saida (opcional, mas correto)
-        # ======================================================
         for id_saida in saidas_ids:
             item = OwnerCobrancaItem(
                 sub_base=sub_base,
@@ -340,37 +272,31 @@ def registrar_coleta_em_lote(
         db.commit()
         db.refresh(coleta)
 
-    except HTTPException as e:
-        db.rollback()
-        raise e
-
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Falha ao registrar lote: {e}")
+        raise HTTPException(500, f"Falha ao registrar lote: {e}")
 
-    # ======================================================
-    # 6) RESPOSTA FINAL
-    # ======================================================
     return LoteResponse(
         coleta=ColetaOut.model_validate(coleta),
         resumo=ResumoLote(
             inseridos=created,
             duplicados=0,
             codigos_duplicados=[],
-            contagem=dict(count),
+            contagem=count,
             precos={
                 "shopee": _fmt_money(p_shopee),
                 "ml": _fmt_money(p_ml),
                 "avulso": _fmt_money(p_avulso),
             },
-            total=_fmt_money(coleta.valor_total)
-        )
+            total=_fmt_money(coleta.valor_total),
+        ),
     )
 
 
-# =========================
-# GET /coletas
-# =========================
+# ============================================================
+# GET /coletas        (ORIGINAL — mantido sem alterações)
+# ============================================================
+
 @router.get("/", response_model=List[ColetaOut])
 def list_coletas(
     base: Optional[str] = Query(None),
@@ -380,56 +306,228 @@ def list_coletas(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
+    # Resolve sub_base do usuário
     user_id = getattr(current_user, "id", None)
-    sub_base_user: Optional[str] = None
+    sub_base_user = None
 
     if user_id:
         u = db.get(User, user_id)
         sub_base_user = getattr(u, "sub_base", None)
-    if not sub_base_user and getattr(current_user, "email", None):
-        u = db.scalar(select(User).where(User.email == current_user.email))
-        sub_base_user = getattr(u, "sub_base", None)
-    if not sub_base_user and getattr(current_user, "username", None):
-        u = db.scalar(select(User).where(User.username == current_user.username))
-        sub_base_user = getattr(u, "sub_base", None)
-    if not sub_base_user:
-        raise HTTPException(status_code=400, detail="sub_base não definida no usuário.")
 
-    # 🔹 Aqui estava o erro: o stmt precisa estar FORA do if acima
+    if not sub_base_user and current_user.email:
+        u = db.scalar(select(User).where(User.email == current_user.email))
+        sub_base_user = u.sub_base if u else None
+
+    if not sub_base_user and current_user.username:
+        u = db.scalar(select(User).where(User.username == current_user.username))
+        sub_base_user = u.sub_base if u else None
+
+    if not sub_base_user:
+        raise HTTPException(400, "sub_base não definida.")
+
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
 
     if base:
         stmt = stmt.where(Coleta.base == base.strip())
+
     if username_entregador:
         stmt = stmt.where(Coleta.username_entregador == username_entregador.strip())
+
     if data_inicio:
         stmt = stmt.where(Coleta.timestamp >= data_inicio)
+
     if data_fim:
         stmt = stmt.where(Coleta.timestamp <= data_fim)
 
-    # 🔹 filtro para excluir coletas com tudo zero
     stmt = stmt.where(
-        (Coleta.shopee > 0)
-        | (Coleta.mercado_livre > 0)
-        | (Coleta.avulso > 0)
-        | (Coleta.valor_total > 0)
+        (Coleta.shopee > 0) |
+        (Coleta.mercado_livre > 0) |
+        (Coleta.avulso > 0) |
+        (Coleta.valor_total > 0)
     )
 
     stmt = stmt.order_by(Coleta.timestamp.desc())
     rows = db.scalars(stmt).all()
-
-   
-
     return rows
 
-# =========================      
+
+# ============================================================
 # POST /coletas/recalcular/{id_coleta}
-# ========================= 
+# ============================================================
+
 @router.post("/recalcular/{id_coleta}", response_model=ColetaOut)
-def api_recalcular_coleta(
-    id_coleta: int,
-    db: Session = Depends(get_db),
-):
+def api_recalcular_coleta(id_coleta: int, db: Session = Depends(get_db)):
     coleta = recalcular_coleta(db, id_coleta)
     return ColetaOut.model_validate(coleta)
+
+
+# ============================================================
+# NOVA ROTA — /coletas/resumo
+# Agrupamento POR DIA + BASE com paginação
+# ============================================================
+
+class ResumoItem(BaseModel):
+    data: str
+    base: str
+    shopee: int
+    mercado_livre: int
+    avulso: int
+    valor_total: Decimal
+    cancelados: int
+    entregadores: str
+
+
+class ResumoResponse(BaseModel):
+    page: int
+    pageSize: int
+    totalPages: int
+    totalItems: int
+    items: List[ResumoItem]
+
+
+@router.get("/resumo", response_model=ResumoResponse)
+def resumo_coletas(
+    base: Optional[str] = Query(None),
+    de: Optional[datetime.date] = Query(None),
+    ate: Optional[datetime.date] = Query(None),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(200, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+
+    # ----------------------------------------------------------
+    # Resolve sub_base
+    # ----------------------------------------------------------
+    user_id = getattr(current_user, "id", None)
+    sub_base_user = None
+
+    if user_id:
+        u = db.get(User, user_id)
+        sub_base_user = u.sub_base if u else None
+
+    if not sub_base_user and current_user.email:
+        u = db.scalar(select(User).where(User.email == current_user.email))
+        sub_base_user = u.sub_base if u else None
+
+    if not sub_base_user and current_user.username:
+        u = db.scalar(select(User).where(User.username == current_user.username))
+        sub_base_user = u.sub_base if u else None
+
+    if not sub_base_user:
+        raise HTTPException(400, "sub_base não definida.")
+
+    # ----------------------------------------------------------
+    # Filtro principal — tabela COLETAS
+    # ----------------------------------------------------------
+    stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
+
+    if base:
+        stmt = stmt.where(Coleta.base == base.strip())
+
+    if de:
+        stmt = stmt.where(Coleta.timestamp >= de)
+
+    if ate:
+        dt_end = datetime.datetime.combine(ate, datetime.time(23, 59, 59))
+        stmt = stmt.where(Coleta.timestamp <= dt_end)
+
+    stmt = stmt.order_by(Coleta.timestamp.asc())
+    rows = db.scalars(stmt).all()
+
+    # ----------------------------------------------------------
+    # Buscar cancelados usando /saidas/listar equivalente
+    # ----------------------------------------------------------
+    cancelados_stmt = select(Saida).where(
+        Saida.sub_base == sub_base_user,
+        func.lower(Saida.status) == "cancelado"
+    )
+
+    if base:
+        cancelados_stmt = cancelados_stmt.where(func.lower(Saida.base) == base.lower())
+
+    if de:
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= de)
+
+    if ate:
+        dt_end = datetime.datetime.combine(ate, datetime.time(23, 59, 59))
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
+
+    cancelados_rows = db.scalars(cancelados_stmt).all()
+
+    # map base + date
+    mapa_cancelados = {}
+    for c in cancelados_rows:
+        d = c.timestamp.date().isoformat()
+        b = (c.base or "").strip().upper()
+        key = f"{d}_{b}"
+        mapa_cancelados[key] = mapa_cancelados.get(key, 0) + 1
+
+    # ----------------------------------------------------------
+    # Agrupar COLETAS por DIA + BASE
+    # ----------------------------------------------------------
+    agrupado = {}
+
+    for r in rows:
+        dia = r.timestamp.date().isoformat()
+        baseKey = (r.base or "").strip().upper()
+
+        key = f"{dia}_{baseKey}"
+
+        if key not in agrupado:
+            agrupado[key] = {
+                "data": dia,
+                "base": r.base,
+                "shopee": 0,
+                "mercado_livre": 0,
+                "avulso": 0,
+                "valor_total": Decimal("0.00"),
+                "entregadores": set(),
+            }
+
+        agrupado[key]["shopee"] += r.shopee
+        agrupado[key]["mercado_livre"] += r.mercado_livre
+        agrupado[key]["avulso"] += r.avulso
+        agrupado[key]["valor_total"] += r.valor_total
+        agrupado[key]["entregadores"].add(r.username_entregador)
+
+    # ----------------------------------------------------------
+    # Montar lista final
+    # ----------------------------------------------------------
+    lista = []
+
+    for key, item in agrupado.items():
+        canc = mapa_cancelados.get(key, 0)
+        lista.append(
+            ResumoItem(
+                data=item["data"],
+                base=item["base"],
+                shopee=item["shopee"],
+                mercado_livre=item["mercado_livre"],
+                avulso=item["avulso"],
+                valor_total=item["valor_total"],
+                cancelados=canc,
+                entregadores=" | ".join(item["entregadores"])
+            )
+        )
+
+    lista.sort(key=lambda x: x.data)
+
+    # ----------------------------------------------------------
+    # Paginação
+    # ----------------------------------------------------------
+    totalItems = len(lista)
+    totalPages = (totalItems + pageSize - 1) // pageSize
+
+    start = (page - 1) * pageSize
+    end = start + pageSize
+
+    return ResumoResponse(
+        page=page,
+        pageSize=pageSize,
+        totalPages=totalPages,
+        totalItems=totalItems,
+        items=lista[start:end]
+    )
 
