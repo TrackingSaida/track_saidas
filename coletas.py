@@ -433,12 +433,12 @@ def resumo_coletas(
 
     # Data início
     if data_inicio:
-    stmt = stmt.where(Coleta.timestamp >= data_inicio)
+        stmt = stmt.where(Coleta.timestamp >= data_inicio)
 
     # Data fim (incluindo o dia inteiro)
     if data_fim:
-    dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
-    stmt = stmt.where(Coleta.timestamp <= dt_end)
+        dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
+        stmt = stmt.where(Coleta.timestamp <= dt_end)
 
     stmt = stmt.order_by(Coleta.timestamp.asc())
 
@@ -456,10 +456,10 @@ def resumo_coletas(
         cancelados_stmt = cancelados_stmt.where(func.lower(Saida.base) == base_norm)
 
     if data_inicio:
-    cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= data_inicio)
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= data_inicio)
 
     if data_fim:
-    cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
 
     cancelados_rows = db.scalars(cancelados_stmt).all()
 
