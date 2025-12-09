@@ -11,15 +11,13 @@ from sqlalchemy import (
     Boolean,
     text,
     UniqueConstraint,
+    ForeignKey,
 )
 from sqlalchemy.sql import func
 
 from db import Base
 from sqlalchemy import event
-from sqlalchemy.orm import Session
-from sqlalchemy.orm import relationship
-from sqlalchemy import ForeignKey
-
+from sqlalchemy.orm import Session, relationship
 
 
 # ==========================
@@ -49,7 +47,7 @@ class User(Base):
     # PERFIL DE COLETADOR (NOVO)
     coletador = Column(Boolean, nullable=False, server_default=text("false"))
     username_entregador = Column(Text, nullable=True)  # espelha o username do entregador quando aplicável
-    role = Column(Integer, nullable=False, server_default="2") 
+    role = Column(Integer, nullable=False, server_default="2")
 
     def __repr__(self) -> str:
         return (
@@ -57,10 +55,10 @@ class User(Base):
             f"coletador={self.coletador} sub_base={self.sub_base!r}>"
         )
 
+
 # ==========================
 # Tabela: owner
 # ==========================
-
 class Owner(Base):
     __tablename__ = "owner"
 
@@ -74,10 +72,8 @@ class Owner(Base):
     ativo = Column(Boolean, nullable=False, server_default=text("true"))
     ignorar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
 
-
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
-
 
 
 # ==========================
@@ -89,21 +85,23 @@ class Coleta(Base):
     id_coleta = Column(BigInteger, primary_key=True, autoincrement=True)
 
     timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
-    sub_base  = Column(Text, nullable=True)
-    base      = Column(Text, nullable=True)
+    sub_base = Column(Text, nullable=True)
+    base = Column(Text, nullable=True)
     username_entregador = Column(Text, nullable=True)
 
-    shopee         = Column(Integer, nullable=False, server_default=text("0"))
-    mercado_livre  = Column(Integer, nullable=False, server_default=text("0"))
-    avulso         = Column(Integer, nullable=False, server_default=text("0"))
+    shopee = Column(Integer, nullable=False, server_default=text("0"))
+    mercado_livre = Column(Integer, nullable=False, server_default=text("0"))
+    avulso = Column(Integer, nullable=False, server_default=text("0"))
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
 
     saidas = relationship("Saida", back_populates="coleta")
 
-
     def __repr__(self) -> str:
-        return f"<Coleta id_coleta={self.id_coleta} sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
+        return (
+            f"<Coleta id_coleta={self.id_coleta} "
+            f"sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
+        )
 
 
 # ==========================
@@ -112,15 +110,15 @@ class Coleta(Base):
 class BasePreco(Base):
     __tablename__ = "base"
 
-    id_base   = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_base = Column(BigInteger, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
-    base      = Column(Text, nullable=True)
-    sub_base  = Column(Text, nullable=True)
-    username  = Column(Text, nullable=True)
+    base = Column(Text, nullable=True)
+    sub_base = Column(Text, nullable=True)
+    username = Column(Text, nullable=True)
 
     shopee = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    ml     = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ml = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     avulso = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     ativo = Column(Boolean, nullable=False, server_default=text("false"))
 
@@ -139,7 +137,7 @@ class Saida(Base):
     data = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
 
     sub_base = Column(Text, nullable=True)
-    base = Column(Text, nullable=True)              # NOVA COLUNA (de onde veio a mercadoria)
+    base = Column(Text, nullable=True)  # de onde veio a mercadoria
     username = Column(Text, nullable=True)
     entregador_id = Column(BigInteger, nullable=True)
     entregador = Column(Text, nullable=True)
@@ -150,8 +148,6 @@ class Saida(Base):
     id_coleta = Column(BigInteger, ForeignKey("coletas.id_coleta"), nullable=True)
 
     coleta = relationship("Coleta", back_populates="saidas")
-
-
 
     def __repr__(self) -> str:
         return f"<Saida id_saida={self.id_saida} data={self.data} servico={self.servico!r}>"
@@ -167,7 +163,7 @@ class Entregador(Base):
     )
 
     id_entregador = Column(BigInteger, primary_key=True)
-    sub_base = Column(Text, nullable=True)          # base herdada do solicitante
+    sub_base = Column(Text, nullable=True)  # base herdada do solicitante
 
     # dados do entregador
     nome = Column(Text, nullable=False)
@@ -192,6 +188,7 @@ class Entregador(Base):
     def __repr__(self) -> str:
         return f"<Entregador id_entregador={self.id_entregador} nome={self.nome!r} coletador={self.coletador}>"
 
+
 # ==========================
 # Tabela: mercado_livre_tokens
 # ==========================
@@ -210,6 +207,25 @@ class MercadoLivreToken(Base):
 
 
 # ==========================
+# Tabela: shopee_tokens
+# ==========================
+class ShopeeToken(Base):
+    __tablename__ = "shopee_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    shop_id = Column(BigInteger, nullable=False)
+    main_account_id = Column(BigInteger, nullable=True)
+
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=True)
+    expires_at = Column(DateTime(timezone=False), nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<ShopeeToken id={self.id} shop_id={self.shop_id}>"
+
+
+# ==========================
 # Tabela: owner_cobranca_itens
 # ==========================
 class OwnerCobrancaItem(Base):
@@ -220,7 +236,6 @@ class OwnerCobrancaItem(Base):
     id_coleta = Column(BigInteger, nullable=True)
     id_saida = Column(BigInteger, nullable=True)
 
-
     valor = Column(Numeric(12, 2), nullable=False)
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
@@ -229,18 +244,16 @@ class OwnerCobrancaItem(Base):
     fechado = Column(Boolean, nullable=False, server_default=text("false"))
 
 
- # ==========================
- # Tabela: saidas_detail
- # ==========================       
+# ==========================
+# Tabela: saidas_detail
+# ==========================
 class SaidaDetail(Base):
     __tablename__ = "saidas_detail"
 
     id_detail = Column(BigInteger, primary_key=True, autoincrement=True)
 
     id_saida = Column(BigInteger, nullable=False)
-
-    id_entregador = Column(BigInteger, nullable=False)
- # entregador responsável pela entrega
+    id_entregador = Column(BigInteger, nullable=False)  # entregador responsável pela entrega
 
     status = Column(Text, nullable=False, server_default=text("'Em Rota'"))
     tentativa = Column(Integer, nullable=False, server_default=text("1"))
@@ -270,7 +283,7 @@ class SaidaDetail(Base):
 
     def __repr__(self):
         return f"<SaidaDetail id_detail={self.id_detail} id_saida={self.id_saida}>"
-    
+
 
 @event.listens_for(Saida, "after_update")
 def saida_after_update(mapper, connection, target: Saida):
@@ -286,6 +299,7 @@ def saida_after_update(mapper, connection, target: Saida):
     try:
         # Import atrasado para evitar circular import
         from coletas import recalcular_coleta
+
         recalcular_coleta(db, target.id_coleta)
         db.commit()
     except Exception:
