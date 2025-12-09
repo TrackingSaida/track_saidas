@@ -48,19 +48,23 @@ def _get_shopee_config():
     return host, partner_id, partner_key, redirect_url
 
 
-def _sign_auth_url(partner_id: int, path: str, timestamp: int) -> str:
+def _sign_auth_url(partner_id: int, partner_key: str, path: str, timestamp: int) -> str:
     """
-    Assinatura usada na URL de autorização.
-    (Na doc da Shopee é um SHA256 simples sem chave.)
+    Assinatura usada na URL de autorização:
+    HMAC-SHA256( partner_key, partner_id + path + timestamp )
     """
     base_string = f"{partner_id}{path}{timestamp}"
-    return hashlib.sha256(base_string.encode("utf-8")).hexdigest()
+    return hmac.new(
+        partner_key.encode("utf-8"),
+        base_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _sign_api(partner_id: int, partner_key: str, path: str, timestamp: int) -> str:
     """
-    Assinatura usada nas chamadas de API (token/get, refresh, orders, etc):
-    HMAC-SHA256( partner_key, partner_id + path + timestamp )
+    Assinatura usada nas chamadas de API (token/get, refresh, etc).
+    É o mesmo formato da auth URL.
     """
     base_string = f"{partner_id}{path}{timestamp}"
     return hmac.new(
@@ -82,7 +86,7 @@ def gerar_auth_url():
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
-    sign = _sign_auth_url(partner_id, path, timestamp)
+    sign = _sign_auth_url(partner_id, partner_key, path, timestamp)
 
     auth_url = (
         f"{host}{path}"
@@ -114,14 +118,12 @@ def shopee_callback(
     timestamp = int(time.time())
     sign = _sign_api(partner_id, partner_key, path, timestamp)
 
-    url = f"{host}{path}"
+    url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
 
     payload = {
-        "partner_id": partner_id,
         "code": code,
         "shop_id": shop_id,
-        "sign": sign,
-        "timestamp": timestamp,
+        "partner_id": partner_id,
     }
 
     try:
