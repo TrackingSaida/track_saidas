@@ -66,6 +66,8 @@ from routes_ui import router as ui_router
 from ml_routes import router as ml_router
 from entregador_entregas_routes import router as entregador_entregas_router
 from signup_routes import router as signup_router
+from shopee_routes import router as shopee_router
+
 
 app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
@@ -78,6 +80,7 @@ app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
 app.include_router(entregador_entregas_router, prefix=API_PREFIX)
 app.include_router(signup_router, prefix=API_PREFIX)
+app.include_router(shopee_router, prefix=API_PREFIX)
 
 
 # ──────────────────────────────────────────────────────────────────
