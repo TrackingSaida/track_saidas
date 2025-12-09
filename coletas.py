@@ -365,10 +365,7 @@ def api_recalcular_coleta(id_coleta: int, db: Session = Depends(get_db)):
 # ============================================================
 # NOVA ROTA — /coletas/resumo
 # Agrupamento POR DIA + BASE com paginação real
-# Compatível com o front-end atual
 # ============================================================
-
-from sqlalchemy import func
 
 class ResumoItem(BaseModel):
     data: str
@@ -379,6 +376,7 @@ class ResumoItem(BaseModel):
     valor_total: Decimal
     cancelados: int
     entregadores: str
+
 
 class ResumoResponse(BaseModel):
     page: int
@@ -391,87 +389,99 @@ class ResumoResponse(BaseModel):
 @router.get("/resumo", response_model=ResumoResponse)
 def resumo_coletas(
     base: Optional[str] = Query(None),
-    data_inicio: Optional[datetime.date] = Query(None),
-    data_fim: Optional[datetime.date] = Query(None),
-    limit: int = Query(200, ge=1, le=500),
-    offset: int = Query(0, ge=0),
+    de: Optional[datetime.date] = Query(None),
+    ate: Optional[datetime.date] = Query(None),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
 
     # ----------------------------------------------------------
-    # 1) Descobrir SUB_BASE do usuário
+    # Resolver sub_base
     # ----------------------------------------------------------
+    user_id = getattr(current_user, "id", None)
     sub_base_user = None
 
-    for field in ["id", "email", "username"]:
-        value = getattr(current_user, field, None)
-        if value:
-            u = (
-                db.get(User, value)
-                if field == "id"
-                else db.scalar(select(User).where(getattr(User, field) == value))
-            )
-            if u and u.sub_base:
-                sub_base_user = u.sub_base
-                break
+    if user_id:
+        u = db.get(User, user_id)
+        sub_base_user = u.sub_base if u else None
+
+    if not sub_base_user and current_user.email:
+        u = db.scalar(select(User).where(User.email == current_user.email))
+        sub_base_user = u.sub_base if u else None
+
+    if not sub_base_user and current_user.username:
+        u = db.scalar(select(User).where(User.username == current_user.username))
+        sub_base_user = u.sub_base if u else None
 
     if not sub_base_user:
         raise HTTPException(400, "sub_base não definida.")
 
+    # Normaliza base (se houver)
+    base_norm = base.strip().lower() if base else None
+
     # ----------------------------------------------------------
-    # 2) Filtro principal — tabela COLETAS
+    # Filtro principal — tabela COLETAS
     # ----------------------------------------------------------
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
 
-    if base:
-        stmt = stmt.where(func.upper(Coleta.base) == base.strip().upper())
+    # Base case-insensitive
+    if base_norm:
+        stmt = stmt.where(func.lower(Coleta.base) == base_norm)
 
-    if data_inicio:
-        stmt = stmt.where(Coleta.timestamp >= data_inicio)
+    # Data início
+    if de:
+        stmt = stmt.where(Coleta.timestamp >= de)
 
-    if data_fim:
-        dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
+    # Data fim (incluindo o dia inteiro)
+    if ate:
+        dt_end = datetime.datetime.combine(ate, datetime.time(23, 59, 59))
         stmt = stmt.where(Coleta.timestamp <= dt_end)
 
     stmt = stmt.order_by(Coleta.timestamp.asc())
-    coletas = db.scalars(stmt).all()
+
+    rows = db.scalars(stmt).all()
 
     # ----------------------------------------------------------
-    # 3) Buscar Cancelados (com mesmos filtros)
+    # Buscar cancelados — tabela SAIDAS
     # ----------------------------------------------------------
-    canc_stmt = select(Saida).where(
+    cancelados_stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         func.lower(Saida.status) == "cancelado"
     )
 
-    if base:
-        canc_stmt = canc_stmt.where(func.upper(Saida.base) == base.upper())
+    if base_norm:
+        cancelados_stmt = cancelados_stmt.where(func.lower(Saida.base) == base_norm)
 
-    if data_inicio:
-        canc_stmt = canc_stmt.where(Saida.timestamp >= data_inicio)
+    if de:
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= de)
 
-    if data_fim:
-        dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
-        canc_stmt = canc_stmt.where(Saida.timestamp <= dt_end)
+    if ate:
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
 
-    cancelados_rows = db.scalars(canc_stmt).all()
+    cancelados_rows = db.scalars(cancelados_stmt).all()
 
+    # ----------------------------------------------------------
+    # Montar mapa de cancelados
+    # ----------------------------------------------------------
     mapa_cancelados = {}
+
     for c in cancelados_rows:
-        d = c.timestamp.date().isoformat()
-        b = (c.base or "").strip().upper()
-        key = f"{d}_{b}"
+        dia = c.timestamp.date().isoformat()
+        baseKey = (c.base or "").strip().upper()
+        key = f"{dia}_{baseKey}"
         mapa_cancelados[key] = mapa_cancelados.get(key, 0) + 1
 
     # ----------------------------------------------------------
-    # 4) AGRUPAR COLETAS por DIA + BASE
+    # Agrupar coletas por DIA + BASE
     # ----------------------------------------------------------
     agrupado = {}
 
-    for r in coletas:
+    for r in rows:
         dia = r.timestamp.date().isoformat()
         baseKey = (r.base or "").strip().upper()
+
         key = f"{dia}_{baseKey}"
 
         if key not in agrupado:
@@ -489,14 +499,16 @@ def resumo_coletas(
         agrupado[key]["mercado_livre"] += r.mercado_livre
         agrupado[key]["avulso"] += r.avulso
         agrupado[key]["valor_total"] += r.valor_total
-        agrupado[key]["entregadores"].add((r.username_entregador or "").upper())
+        agrupado[key]["entregadores"].add(r.username_entregador or "-")
 
     # ----------------------------------------------------------
-    # 5) Montar lista final
+    # Lista final
     # ----------------------------------------------------------
     lista = []
 
     for key, item in agrupado.items():
+        canc = mapa_cancelados.get(key, 0)
+
         lista.append(
             ResumoItem(
                 data=item["data"],
@@ -505,27 +517,28 @@ def resumo_coletas(
                 mercado_livre=item["mercado_livre"],
                 avulso=item["avulso"],
                 valor_total=item["valor_total"],
-                cancelados=mapa_cancelados.get(key, 0),
-                entregadores=" | ".join(sorted(item["entregadores"])),
+                cancelados=canc,
+                entregadores=" | ".join(item["entregadores"])
             )
         )
 
+    # Ordenação por data ASC
     lista.sort(key=lambda x: x.data)
 
     # ----------------------------------------------------------
-    # 6) Paginação real
+    # Paginação REAL (igual front usa)
     # ----------------------------------------------------------
     totalItems = len(lista)
-    page = (offset // limit) + 1
-    totalPages = (totalItems + limit - 1) // limit
+    totalPages = (totalItems + pageSize - 1) // pageSize
 
-    items = lista[offset : offset + limit]
+    start = (page - 1) * pageSize
+    end = start + pageSize
+    items = lista[start:end]
 
     return ResumoResponse(
         page=page,
-        pageSize=limit,
+        pageSize=pageSize,
         totalPages=totalPages,
         totalItems=totalItems,
         items=items
     )
-
