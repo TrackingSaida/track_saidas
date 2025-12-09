@@ -389,13 +389,14 @@ class ResumoResponse(BaseModel):
 @router.get("/resumo", response_model=ResumoResponse)
 def resumo_coletas(
     base: Optional[str] = Query(None),
-    de: Optional[datetime.date] = Query(None),
-    ate: Optional[datetime.date] = Query(None),
+    data_inicio: Optional[datetime.date] = Query(None),
+    data_fim: Optional[datetime.date] = Query(None),
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
 
     # ----------------------------------------------------------
     # Resolver sub_base
@@ -431,13 +432,13 @@ def resumo_coletas(
         stmt = stmt.where(func.lower(Coleta.base) == base_norm)
 
     # Data início
-    if de:
-        stmt = stmt.where(Coleta.timestamp >= de)
+    if data_inicio:
+    stmt = stmt.where(Coleta.timestamp >= data_inicio)
 
     # Data fim (incluindo o dia inteiro)
-    if ate:
-        dt_end = datetime.datetime.combine(ate, datetime.time(23, 59, 59))
-        stmt = stmt.where(Coleta.timestamp <= dt_end)
+    if data_fim:
+    dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
+    stmt = stmt.where(Coleta.timestamp <= dt_end)
 
     stmt = stmt.order_by(Coleta.timestamp.asc())
 
@@ -454,11 +455,11 @@ def resumo_coletas(
     if base_norm:
         cancelados_stmt = cancelados_stmt.where(func.lower(Saida.base) == base_norm)
 
-    if de:
-        cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= de)
+    if data_inicio:
+    cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= data_inicio)
 
-    if ate:
-        cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
+    if data_fim:
+    cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
 
     cancelados_rows = db.scalars(cancelados_stmt).all()
 
