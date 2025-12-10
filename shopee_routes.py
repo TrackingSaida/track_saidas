@@ -1,4 +1,3 @@
-# shopee_routes.py
 from __future__ import annotations
 
 import os
@@ -46,18 +45,6 @@ def _get_shopee_config():
         raise RuntimeError("Config Shopee incompleta nas variáveis de ambiente.")
 
     return host, partner_id, partner_key, redirect_url, env
-
-
-def _sign_auth_url(partner_id: int, path: str, timestamp: int) -> str:
-    """
-    Assinatura usada na URL de autorização v2.
-
-    DOC OFICIAL:
-    - base_string = partner_id + path + timestamp
-    - sign = SHA256(base_string)  (não é HMAC)
-    """
-    base_string = f"{partner_id}{path}{timestamp}"
-    return hashlib.sha256(base_string.encode("utf-8")).hexdigest()
 
 
 def _build_sign_base(
@@ -122,8 +109,13 @@ def gerar_auth_url():
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
 
-    # AGORA: SHA256 simples, sem partner_key
-    sign = _sign_auth_url(partner_id, path, timestamp)
+    # CORREÇÃO: Usar a função _sign_api, que calcula o HMAC-SHA256 corretamente.
+    sign = _sign_api(
+        partner_id=partner_id,
+        partner_key=partner_key,
+        path=path,
+        timestamp=timestamp,
+    )
 
     auth_url = (
         f"{host}{path}"
@@ -248,9 +240,9 @@ def gerar_auth_url_debug():
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
 
-    # Mesmo cálculo que o /auth-url
-    base_string = f"{partner_id}{path}{timestamp}"
-    sign = hashlib.sha256(base_string.encode("utf-8")).hexdigest()
+    # CORREÇÃO: Usar a função _sign_api para gerar a assinatura correta para debug.
+    base_string = _build_sign_base(partner_id, path, timestamp)
+    sign = _sign_api(partner_id, partner_key, path, timestamp)
 
     partner_key_len = len(partner_key)
     partner_key_start = partner_key[:6]
