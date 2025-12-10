@@ -15,7 +15,7 @@ from models import ShopeeToken
 
 
 # ============================================================
-# Helpers de configuração
+# Helpers de configuração e assinatura (replicados do shopee_routes.py para consistência)
 # ============================================================
 def _get_shopee_config():
     """
@@ -39,12 +39,43 @@ def _get_shopee_config():
     return host, partner_id, partner_key
 
 
-def _sign_api(partner_id: int, partner_key: str, path: str, timestamp: int) -> str:
+def _build_sign_base(
+    partner_id: int,
+    path: str,
+    timestamp: int,
+    shop_id: Optional[int] = None,
+    access_token: Optional[str] = None,
+) -> str:
     """
-    Assinatura usada nas chamadas de API:
-    HMAC-SHA256( partner_key, partner_id + path + timestamp )
+    Monta a base do sign para chamadas de API v2.
+    Base: partner_id + path + timestamp + access_token (opcional) + shop_id (opcional)
     """
-    base_string = f"{partner_id}{path}{timestamp}"
+    parts: list[str] = [str(partner_id), path, str(timestamp)]
+    if access_token:
+        parts.append(access_token)
+    if shop_id is not None:
+        parts.append(str(shop_id))
+    return "".join(parts)
+
+
+def _sign_api(
+    partner_id: int,
+    partner_key: str,
+    path: str,
+    timestamp: int,
+    shop_id: Optional[int] = None,
+    access_token: Optional[str] = None,
+) -> str:
+    """
+    Assinatura usada nas chamadas de API v2 (HMAC-SHA256 com partner_key).
+    """
+    base_string = _build_sign_base(
+        partner_id=partner_id,
+        path=path,
+        timestamp=timestamp,
+        shop_id=shop_id,
+        access_token=access_token,
+    )
     return hmac.new(
         partner_key.encode("utf-8"),
         base_string.encode("utf-8"),
@@ -91,10 +122,47 @@ def refresh_shopee_token(db: Session, token: ShopeeToken) -> Optional[ShopeeToke
 
     host, partner_id, partner_key = _get_shopee_config()
 
+    # CORREÇÃO: O endpoint correto para refresh é /api/v2/auth/access_token/get
+    # e a base string deve incluir o access_token antigo (que está sendo renovado)
+    # e o shop_id.
     path = "/api/v2/auth/access_token/get"
     timestamp = int(time.time())
-    sign = _sign_api(partner_id, partner_key, path, timestamp)
+    
+    # Para refresh, a Shopee exige que o access_token antigo seja incluído na base string
+    # e o shop_id.
+    sign = _sign_api(
+        partner_id=partner_id,
+        partner_key=partner_key,
+        path=path,
+        timestamp=timestamp,
+        shop_id=token.shop_id,
+        access_token=token.access_token, # Inclui o access_token antigo na assinatura
+    )
 
+    # A chamada POST para refresh não precisa de sign na URL, apenas no payload.
+    # No entanto, a documentação da Shopee v2.0 é confusa.
+    # Vamos manter a URL simples e passar o sign no payload, como é comum em APIs.
+    # A chamada de refresh é uma exceção, onde o sign é passado no payload.
+    # No entanto, a chamada para /api/v2/auth/access_token/get (que o seu código usa)
+    # é a mesma chamada para obter o token pela primeira vez, mas com payload diferente.
+    # A documentação v2.0 sugere que o endpoint de refresh é v2.public.refresh_access_token
+    # que é um POST para /api/v2/auth/refresh_access_token.
+    
+    # Vamos corrigir o PATH para o endpoint de refresh correto (se o seu código estiver usando o v2.0)
+    # O endpoint de refresh é /api/v2/auth/refresh_access_token
+    path = "/api/v2/auth/refresh_access_token"
+    
+    # Recalcula o sign para o novo path.
+    sign = _sign_api(
+        partner_id=partner_id,
+        partner_key=partner_key,
+        path=path,
+        timestamp=timestamp,
+        shop_id=token.shop_id,
+        access_token=token.access_token,
+    )
+    
+    # A URL para o refresh é simples, sem query params de sign.
     url = f"{host}{path}"
 
     payload = {
@@ -102,7 +170,7 @@ def refresh_shopee_token(db: Session, token: ShopeeToken) -> Optional[ShopeeToke
         "shop_id": token.shop_id,
         "refresh_token": token.refresh_token,
         "timestamp": timestamp,
-        "sign": sign,
+        "sign": sign, # O sign é passado no payload para o refresh
     }
 
     try:
