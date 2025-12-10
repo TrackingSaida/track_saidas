@@ -1,3 +1,4 @@
+# shopee_routes.py
 from __future__ import annotations
 
 import os
@@ -110,6 +111,7 @@ def gerar_auth_url():
     timestamp = int(time.time())
 
     # CORREÇÃO: Usar a função _sign_api, que calcula o HMAC-SHA256 corretamente.
+    # A base string será: partner_id + path + timestamp
     sign = _sign_api(
         partner_id=partner_id,
         partner_key=partner_key,
@@ -156,6 +158,7 @@ def shopee_callback(
         shop_id=shop_id,
     )
 
+    # O sign deve ser passado como parâmetro na URL para a chamada POST
     url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
 
     payload = {
