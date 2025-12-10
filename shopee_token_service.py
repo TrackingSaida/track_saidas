@@ -29,7 +29,7 @@ def _get_shopee_config():
         partner_id = int(os.getenv("SHOPEE_PROD_PARTNER_ID", "0"))
         partner_key = os.getenv("SHOPEE_PROD_PARTNER_KEY", "")
     else:
-        host = "https://partner.test-stable.shopeemobile.com"
+        host = "https://openplatform.sandbox.test-stable.shopee.sg"
         partner_id = int(os.getenv("SHOPEE_TEST_PARTNER_ID", "0"))
         partner_key = os.getenv("SHOPEE_TEST_PARTNER_KEY", "")
 
