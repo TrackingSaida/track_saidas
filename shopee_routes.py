@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os
 import time
-import hmac
 import hashlib
+import hmac
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -15,8 +15,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from models import ShopeeToken
 
-
-# Router principal da Shopee
+# Router principal
 router = APIRouter(prefix="/shopee", tags=["Shopee"])
 
 
@@ -24,10 +23,6 @@ router = APIRouter(prefix="/shopee", tags=["Shopee"])
 # Helpers de configuração
 # -------------------------------------------------
 def _get_shopee_config():
-    """
-    Lê as configs da Shopee do .env
-    Usa SHOPEE_ENV para decidir entre sandbox x produção.
-    """
     env = os.getenv("SHOPEE_ENV", "sandbox").lower()
 
     if env == "production":
@@ -35,7 +30,6 @@ def _get_shopee_config():
         partner_id = int(os.getenv("SHOPEE_PROD_PARTNER_ID", "0"))
         partner_key = os.getenv("SHOPEE_PROD_PARTNER_KEY", "")
     else:
-        # SANDBOX
         host = "https://partner.test-stable.shopeemobile.com"
         partner_id = int(os.getenv("SHOPEE_TEST_PARTNER_ID", "0"))
         partner_key = os.getenv("SHOPEE_TEST_PARTNER_KEY", "")
@@ -48,45 +42,42 @@ def _get_shopee_config():
     return host, partner_id, partner_key, redirect_url
 
 
-def _sign_auth_url(partner_id: int, partner_key: str, path: str, timestamp: int) -> str:
+# -------------------------------------------------
+# SIGNATURES
+# -------------------------------------------------
+def _sign_auth_url(partner_id: int, path: str, timestamp: int) -> str:
     """
-    Assinatura usada na URL de autorização:
-    HMAC-SHA256( partner_key, partner_id + path + timestamp )
+    Shopee AUTH_URL (auth_partner) usa:
+        SHA256( partner_id + path + timestamp )
+    NÃO USA HMAC e NÃO USA partner_key.
     """
     base_string = f"{partner_id}{path}{timestamp}"
-    return hmac.new(
-        partner_key.encode("utf-8"),
-        base_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    return hashlib.sha256(base_string.encode("utf-8")).hexdigest()
 
 
 def _sign_api(partner_id: int, partner_key: str, path: str, timestamp: int) -> str:
     """
-    Assinatura usada nas chamadas de API (token/get, refresh, etc).
-    É o mesmo formato da auth URL.
+    Shopee API endpoints (token/get, refresh, orders, etc) usam:
+        HMAC-SHA256( base_string , partner_key )
     """
     base_string = f"{partner_id}{path}{timestamp}"
     return hmac.new(
         partner_key.encode("utf-8"),
         base_string.encode("utf-8"),
-        hashlib.sha256,
+        hashlib.sha256
     ).hexdigest()
 
 
 # -------------------------------------------------
-# 1) Gerar URL de autorização da Shopee
+# 1) AUTH URL
 # -------------------------------------------------
-@router.get(
-    "/auth-url",
-    summary="Gera a URL para o seller autorizar a Shopee",
-)
+@router.get("/auth-url", summary="Gera a URL de autorização da Shopee")
 def gerar_auth_url():
     host, partner_id, partner_key, redirect_url = _get_shopee_config()
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
-    sign = _sign_auth_url(partner_id, partner_key, path, timestamp)
+    sign = _sign_auth_url(partner_id, path, timestamp)
 
     auth_url = (
         f"{host}{path}"
@@ -95,17 +86,13 @@ def gerar_auth_url():
         f"&sign={sign}"
         f"&redirect={redirect_url}"
     )
-
     return {"auth_url": auth_url}
 
 
 # -------------------------------------------------
-# 2) Callback: troca code por token e salva em shopee_tokens
+# 2) CALLBACK → troca code por tokens
 # -------------------------------------------------
-@router.get(
-    "/callback",
-    summary="Callback da Shopee (troca code por tokens)",
-)
+@router.get("/callback", summary="Callback da Shopee")
 def shopee_callback(
     code: str = Query(...),
     shop_id: int = Query(...),
@@ -120,25 +107,15 @@ def shopee_callback(
 
     url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
 
-    payload = {
-        "code": code,
-        "shop_id": shop_id,
-        "partner_id": partner_id,
-    }
+    payload = {"code": code, "shop_id": shop_id, "partner_id": partner_id}
 
     try:
         resp = requests.post(url, json=payload, timeout=20)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Erro ao conectar na Shopee: {e}",
-        )
+        raise HTTPException(502, detail=f"Erro ao conectar na Shopee: {e}")
 
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail={"msg": "Erro ao obter token Shopee", "body": resp.text},
-        )
+        raise HTTPException(resp.status_code, detail={"erro": resp.text})
 
     data = resp.json()
 
@@ -147,25 +124,14 @@ def shopee_callback(
     expires_in = data.get("expire_in") or data.get("expires_in")
 
     if not access_token:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"msg": "Shopee não retornou access_token", "body": data},
-        )
+        raise HTTPException(400, detail={"erro": "Shopee não retornou access_token", "raw": data})
 
-    expires_at = None
-    if expires_in:
-        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
 
-    # Já existe token para essa shop?
-    existente = (
-        db.query(ShopeeToken)
-        .filter(ShopeeToken.shop_id == shop_id)
-        .first()
-    )
-
+    existente = db.query(ShopeeToken).filter(ShopeeToken.shop_id == shop_id).first()
     if existente:
         existente.access_token = access_token
-        existente.refresh_token = refresh_token or existente.refresh_token
+        existente.refresh_token = refresh_token
         existente.expires_at = expires_at
         existente.main_account_id = main_account_id
         db.commit()
@@ -183,15 +149,12 @@ def shopee_callback(
         db.commit()
         db.refresh(token)
 
-    return {
-        "msg": "Tokens da Shopee salvos/atualizados com sucesso.",
-        "shop_id": shop_id,
-        "main_account_id": main_account_id,
-        "expires_at": expires_at,
-        "raw": data,
-    }
+    return {"msg": "Tokens salvos com sucesso", "raw": data}
 
 
+# -------------------------------------------------
+# 3) DEBUG
+# -------------------------------------------------
 @router.get("/auth-url-debug")
 def gerar_auth_url_debug():
     host, partner_id, partner_key, redirect_url = _get_shopee_config()
@@ -199,11 +162,7 @@ def gerar_auth_url_debug():
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
     base_string = f"{partner_id}{path}{timestamp}"
-    sign = hmac.new(
-        partner_key.encode("utf-8"),
-        base_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    sign = hashlib.sha256(base_string.encode("utf-8")).hexdigest()
 
     auth_url = (
         f"{host}{path}"
@@ -215,8 +174,6 @@ def gerar_auth_url_debug():
 
     return {
         "host": host,
-        "partner_id": partner_id,
-        "redirect_url": redirect_url,
         "timestamp": timestamp,
         "base_string": base_string,
         "sign": sign,
