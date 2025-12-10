@@ -48,25 +48,60 @@ def _get_shopee_config():
     return host, partner_id, partner_key, redirect_url, env
 
 
-def _sign_auth_url(partner_id: int, partner_key: str, path: str, timestamp: int) -> str:
+def _sign_auth_url(partner_id: int, path: str, timestamp: int) -> str:
     """
-    Assinatura usada na URL de autorização:
-    HMAC-SHA256( partner_key, partner_id + path + timestamp )
+    Assinatura usada na URL de autorização v2.
+
+    DOC OFICIAL:
+    - base_string = partner_id + path + timestamp
+    - sign = SHA256(base_string)  (não é HMAC)
     """
     base_string = f"{partner_id}{path}{timestamp}"
-    return hmac.new(
-        partner_key.encode("utf-8"),
-        base_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    return hashlib.sha256(base_string.encode("utf-8")).hexdigest()
 
 
-def _sign_api(partner_id: int, partner_key: str, path: str, timestamp: int) -> str:
+def _build_sign_base(
+    partner_id: int,
+    path: str,
+    timestamp: int,
+    shop_id: Optional[int] = None,
+    access_token: Optional[str] = None,
+) -> str:
     """
-    Assinatura usada nas chamadas de API (token/get, refresh, etc).
-    É o mesmo formato da auth URL.
+    Monta a base do sign para chamadas de API v2 (token/get, refresh, etc).
+
+    Regra geral da doc:
+    base = partner_id + path + timestamp + access_token + shop_id
+    (para token/get e refresh, pode pular o access_token)
     """
-    base_string = f"{partner_id}{path}{timestamp}"
+    parts: list[str] = [str(partner_id), path, str(timestamp)]
+    if access_token:
+        parts.append(access_token)
+    if shop_id is not None:
+        parts.append(str(shop_id))
+    return "".join(parts)
+
+
+def _sign_api(
+    partner_id: int,
+    partner_key: str,
+    path: str,
+    timestamp: int,
+    shop_id: Optional[int] = None,
+    access_token: Optional[str] = None,
+) -> str:
+    """
+    Assinatura usada nas chamadas de API v2 (token/get, refresh, pedidos, etc).
+
+    Aqui SIM é HMAC-SHA256 com partner_key.
+    """
+    base_string = _build_sign_base(
+        partner_id=partner_id,
+        path=path,
+        timestamp=timestamp,
+        shop_id=shop_id,
+        access_token=access_token,
+    )
     return hmac.new(
         partner_key.encode("utf-8"),
         base_string.encode("utf-8"),
@@ -86,7 +121,9 @@ def gerar_auth_url():
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
-    sign = _sign_auth_url(partner_id, partner_key, path, timestamp)
+
+    # AGORA: SHA256 simples, sem partner_key
+    sign = _sign_auth_url(partner_id, path, timestamp)
 
     auth_url = (
         f"{host}{path}"
@@ -116,7 +153,16 @@ def shopee_callback(
 
     path = "/api/v2/auth/token/get"
     timestamp = int(time.time())
-    sign = _sign_api(partner_id, partner_key, path, timestamp)
+
+    # Para token/get: HMAC-SHA256 com partner_key.
+    # base inclui partner_id + path + timestamp + shop_id (sem access_token).
+    sign = _sign_api(
+        partner_id=partner_id,
+        partner_key=partner_key,
+        path=path,
+        timestamp=timestamp,
+        shop_id=shop_id,
+    )
 
     url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
 
@@ -201,12 +247,10 @@ def gerar_auth_url_debug():
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
+
+    # Mesmo cálculo que o /auth-url
     base_string = f"{partner_id}{path}{timestamp}"
-    sign = hmac.new(
-        partner_key.encode("utf-8"),
-        base_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    sign = hashlib.sha256(base_string.encode("utf-8")).hexdigest()
 
     partner_key_len = len(partner_key)
     partner_key_start = partner_key[:6]
