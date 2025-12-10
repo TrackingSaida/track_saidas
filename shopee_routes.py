@@ -191,8 +191,8 @@ def shopee_callback(
         "raw": data,
     }
 
-    
-    @router.get("/auth-url-debug")
+
+@router.get("/auth-url-debug")
 def gerar_auth_url_debug():
     host, partner_id, partner_key, redirect_url = _get_shopee_config()
 
@@ -222,4 +222,3 @@ def gerar_auth_url_debug():
         "sign": sign,
         "auth_url": auth_url,
     }
-
