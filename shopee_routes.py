@@ -190,3 +190,36 @@ def shopee_callback(
         "expires_at": expires_at,
         "raw": data,
     }
+
+    
+    @router.get("/auth-url-debug")
+def gerar_auth_url_debug():
+    host, partner_id, partner_key, redirect_url = _get_shopee_config()
+
+    path = "/api/v2/shop/auth_partner"
+    timestamp = int(time.time())
+    base_string = f"{partner_id}{path}{timestamp}"
+    sign = hmac.new(
+        partner_key.encode("utf-8"),
+        base_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    auth_url = (
+        f"{host}{path}"
+        f"?partner_id={partner_id}"
+        f"&timestamp={timestamp}"
+        f"&sign={sign}"
+        f"&redirect={redirect_url}"
+    )
+
+    return {
+        "host": host,
+        "partner_id": partner_id,
+        "redirect_url": redirect_url,
+        "timestamp": timestamp,
+        "base_string": base_string,
+        "sign": sign,
+        "auth_url": auth_url,
+    }
+
