@@ -11,6 +11,8 @@ from typing import Optional
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
+from fastapi.responses import RedirectResponse
+
 
 from db import get_db
 from models import ShopeeToken
@@ -143,16 +145,12 @@ def shopee_callback(
     path = "/api/v2/auth/token/get"
     timestamp = int(time.time())
 
-    # ✅ CORREÇÃO IMPORTANTE:
-    # token/get: base = partner_id + path + timestamp
-    # (não incluir shop_id no sign, senão dá error_sign / Wrong sign)
     sign = _sign_api(
         partner_id=partner_id,
         partner_key=partner_key,
         path=path,
         timestamp=timestamp,
-        shop_id=None,
-        access_token=None,
+        shop_id=shop_id,
     )
 
     url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
@@ -161,38 +159,29 @@ def shopee_callback(
         "code": code,
         "shop_id": shop_id,
         "partner_id": partner_id,
-        # "main_account_id": main_account_id,  # se a Shopee exigir, você pode incluir aqui também
     }
 
     try:
         resp = requests.post(url, json=payload, timeout=20)
+        data = resp.json()
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Erro ao conectar na Shopee: {e}",
         )
 
-    # tenta parsear json mesmo quando vier erro (pra ver "error_sign", etc)
-    try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
-
-    if resp.status_code != 200:
+    if resp.status_code != 200 or not data.get("access_token"):
         raise HTTPException(
-            status_code=resp.status_code,
-            detail={"msg": "Erro ao obter token Shopee", "body": data},
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "msg": "Erro ao obter token Shopee",
+                "body": data,
+            },
         )
 
     access_token = data.get("access_token")
     refresh_token = data.get("refresh_token")
     expires_in = data.get("expire_in") or data.get("expires_in")
-
-    if not access_token:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"msg": "Shopee não retornou access_token", "body": data},
-        )
 
     expires_at = None
     if expires_in:
@@ -210,8 +199,6 @@ def shopee_callback(
         existente.expires_at = expires_at
         existente.main_account_id = main_account_id
         db.commit()
-        db.refresh(existente)
-        token = existente
     else:
         token = ShopeeToken(
             shop_id=shop_id,
@@ -222,12 +209,9 @@ def shopee_callback(
         )
         db.add(token)
         db.commit()
-        db.refresh(token)
 
-    return {
-        "msg": "Tokens da Shopee salvos/atualizados com sucesso.",
-        "shop_id": shop_id,
-        "main_account_id": main_account_id,
-        "expires_at": expires_at,
-        "raw": data,
-    }
+    # ✅ SUCESSO → REDIRECT PARA A LANDING
+    return RedirectResponse(
+        url="https://tracking-saidas.com.br/landing-tracking.html",
+        status_code=302,
+    )
