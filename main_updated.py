@@ -22,7 +22,7 @@ else:
         "http://localhost:5500", "http://127.0.0.1:5500",
         "http://localhost:8000", "http://127.0.0.1:8000",
         "http://localhost:3000", "http://172.30.33.97:3000",
-        "https://sandbox.test-stable.shopeemobile.com",
+        "http://account.sandbox.test-stable.shopee.com",
     ]
 
 # ──────────────────────────────────────────────────────────────────
