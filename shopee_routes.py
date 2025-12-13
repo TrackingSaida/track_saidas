@@ -15,8 +15,6 @@ from sqlalchemy.orm import Session
 from db import get_db
 from models import ShopeeToken
 
-
-# Router principal da Shopee
 router = APIRouter(prefix="/shopee", tags=["Shopee"])
 
 
@@ -36,6 +34,7 @@ def _get_shopee_config():
         partner_key = os.getenv("SHOPEE_PROD_PARTNER_KEY", "")
     else:
         # SANDBOX
+        # (você confirmou que este host é o correto no seu ambiente)
         host = "https://openplatform.sandbox.test-stable.shopee.sg"
         partner_id = int(os.getenv("SHOPEE_TEST_PARTNER_ID", "0"))
         partner_key = os.getenv("SHOPEE_TEST_PARTNER_KEY", "")
@@ -56,11 +55,12 @@ def _build_sign_base(
     access_token: Optional[str] = None,
 ) -> str:
     """
-    Monta a base do sign para chamadas de API v2 (token/get, refresh, etc).
+    Base string usada para assinatura HMAC-SHA256.
 
-    Regra geral da doc:
-    base = partner_id + path + timestamp + access_token + shop_id
-    (para token/get e refresh, pode pular o access_token)
+    Observação prática:
+    - Para auth_partner: base = partner_id + path + timestamp
+    - Para token/get:    base = partner_id + path + timestamp   (NÃO inclui shop_id)
+    - Para chamadas com access_token (ex.: pedidos): geralmente inclui access_token + shop_id
     """
     parts: list[str] = [str(partner_id), path, str(timestamp)]
     if access_token:
@@ -78,11 +78,6 @@ def _sign_api(
     shop_id: Optional[int] = None,
     access_token: Optional[str] = None,
 ) -> str:
-    """
-    Assinatura usada nas chamadas de API v2 (token/get, refresh, pedidos, etc).
-
-    Aqui SIM é HMAC-SHA256 com partner_key.
-    """
     base_string = _build_sign_base(
         partner_id=partner_id,
         path=path,
@@ -110,13 +105,14 @@ def gerar_auth_url():
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
 
-    # CORREÇÃO: Usar a função _sign_api, que calcula o HMAC-SHA256 corretamente.
-    # A base string será: partner_id + path + timestamp
+    # auth_partner: base = partner_id + path + timestamp
     sign = _sign_api(
         partner_id=partner_id,
         partner_key=partner_key,
         path=path,
         timestamp=timestamp,
+        shop_id=None,
+        access_token=None,
     )
 
     auth_url = (
@@ -126,7 +122,6 @@ def gerar_auth_url():
         f"&sign={sign}"
         f"&redirect={redirect_url}"
     )
-
     return {"auth_url": auth_url}
 
 
@@ -148,23 +143,25 @@ def shopee_callback(
     path = "/api/v2/auth/token/get"
     timestamp = int(time.time())
 
-    # Para token/get: HMAC-SHA256 com partner_key.
-    # base inclui partner_id + path + timestamp + shop_id (sem access_token).
+    # ✅ CORREÇÃO IMPORTANTE:
+    # token/get: base = partner_id + path + timestamp
+    # (não incluir shop_id no sign, senão dá error_sign / Wrong sign)
     sign = _sign_api(
         partner_id=partner_id,
         partner_key=partner_key,
         path=path,
         timestamp=timestamp,
-        shop_id=shop_id,
+        shop_id=None,
+        access_token=None,
     )
 
-    # O sign deve ser passado como parâmetro na URL para a chamada POST
     url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
 
     payload = {
         "code": code,
         "shop_id": shop_id,
         "partner_id": partner_id,
+        # "main_account_id": main_account_id,  # se a Shopee exigir, você pode incluir aqui também
     }
 
     try:
@@ -175,13 +172,17 @@ def shopee_callback(
             detail=f"Erro ao conectar na Shopee: {e}",
         )
 
+    # tenta parsear json mesmo quando vier erro (pra ver "error_sign", etc)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+
     if resp.status_code != 200:
         raise HTTPException(
             status_code=resp.status_code,
-            detail={"msg": "Erro ao obter token Shopee", "body": resp.text},
+            detail={"msg": "Erro ao obter token Shopee", "body": data},
         )
-
-    data = resp.json()
 
     access_token = data.get("access_token")
     refresh_token = data.get("refresh_token")
@@ -195,9 +196,8 @@ def shopee_callback(
 
     expires_at = None
     if expires_in:
-        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+        expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in))
 
-    # Já existe token para essa shop?
     existente = (
         db.query(ShopeeToken)
         .filter(ShopeeToken.shop_id == shop_id)
@@ -230,49 +230,4 @@ def shopee_callback(
         "main_account_id": main_account_id,
         "expires_at": expires_at,
         "raw": data,
-    }
-
-
-# -------------------------------------------------
-# Endpoint de DEBUG: mostra detalhes da assinatura
-# -------------------------------------------------
-@router.get("/auth-url-debug")
-def gerar_auth_url_debug():
-    host, partner_id, partner_key, redirect_url, env = _get_shopee_config()
-
-    path = "/api/v2/shop/auth_partner"
-    timestamp = int(time.time())
-
-    # CORREÇÃO: Usar a função _sign_api para gerar a assinatura correta para debug.
-    base_string = _build_sign_base(partner_id, path, timestamp)
-    sign = _sign_api(partner_id, partner_key, path, timestamp)
-
-    partner_key_len = len(partner_key)
-    partner_key_start = partner_key[:6]
-    partner_key_end = partner_key[-6:]
-    leading_space = partner_key.startswith(" ")
-    trailing_space = partner_key.endswith(" ")
-
-    auth_url = (
-        f"{host}{path}"
-        f"?partner_id={partner_id}"
-        f"&timestamp={timestamp}"
-        f"&sign={sign}"
-        f"&redirect={redirect_url}"
-    )
-
-    return {
-        "env": env,
-        "host": host,
-        "partner_id": partner_id,
-        "redirect_url": redirect_url,
-        "timestamp": timestamp,
-        "base_string": base_string,
-        "sign": sign,
-        "partner_key_len": partner_key_len,
-        "partner_key_start": partner_key_start,
-        "partner_key_end": partner_key_end,
-        "leading_space": leading_space,
-        "trailing_space": trailing_space,
-        "auth_url": auth_url,
     }
