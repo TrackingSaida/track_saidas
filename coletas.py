@@ -383,7 +383,14 @@ class ResumoResponse(BaseModel):
     pageSize: int
     totalPages: int
     totalItems: int
-    items: List[ResumoItem]
+    items: List[ResumoItem]    
+    sumShopee: int
+    sumMercado: int
+    sumAvulso: int
+    sumValor: Decimal
+    sumCancelados: int
+    sumTotalColetas: int
+
 
 
 @router.get("/resumo", response_model=ResumoResponse)
@@ -526,6 +533,13 @@ def resumo_coletas(
     # Ordenação por data ASC
     lista.sort(key=lambda x: x.data)
 
+    sumShopee = sum(i.shopee for i in lista)
+    sumMercado = sum(i.mercado_livre for i in lista)
+    sumAvulso = sum(i.avulso for i in lista)
+    sumValor = sum(i.valor_total for i in lista)
+    sumCancelados = sum(i.cancelados for i in lista)
+    sumTotalColetas = sumShopee + sumMercado + sumAvulso
+
     # ----------------------------------------------------------
     # Paginação REAL (igual front usa)
     # ----------------------------------------------------------
@@ -537,9 +551,18 @@ def resumo_coletas(
     items = lista[start:end]
 
     return ResumoResponse(
-        page=page,
-        pageSize=pageSize,
-        totalPages=totalPages,
-        totalItems=totalItems,
-        items=items
-    )
+    page=page,
+    pageSize=pageSize,
+    totalPages=totalPages,
+    totalItems=totalItems,
+    items=items,
+
+    sumShopee=sumShopee,
+    sumMercado=sumMercado,
+    sumAvulso=sumAvulso,
+    sumValor=sumValor,
+    sumCancelados=sumCancelados,
+    sumTotalColetas=sumTotalColetas
+)
+
+
