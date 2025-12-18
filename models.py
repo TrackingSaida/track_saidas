@@ -305,3 +305,41 @@ def saida_after_update(mapper, connection, target: Saida):
     except Exception:
         db.rollback()
         raise
+
+# ==========================
+# Tabela: logs_leitura
+# ==========================
+class LogLeitura(Base):
+    __tablename__ = "logs_leitura"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # escopo / auditoria
+    sub_base = Column(Text, nullable=False, index=True)
+    username = Column(Text, nullable=False, index=True)
+
+    # contexto da leitura
+    origem = Column(Text, nullable=False)   # camera | teclado
+    tipo = Column(Text, nullable=False)     # saida | coleta
+
+    codigo = Column(Text, nullable=True, index=True)
+    servico = Column(Text, nullable=True)
+    entregador = Column(Text, nullable=True, index=True)
+
+    # resultado final
+    resultado = Column(Text, nullable=False)
+
+    # métricas (ms)
+    delta_from_last_read_ms = Column(Numeric(12, 3), nullable=True)
+    delta_read_to_send_ms = Column(Numeric(12, 3), nullable=True)
+    delta_send_to_response_ms = Column(Numeric(12, 3), nullable=True)
+
+    # timestamps
+    ts_read = Column(Numeric(16, 6), nullable=True)  # performance.now()
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<LogLeitura id={self.id} tipo={self.tipo} "
+            f"origem={self.origem} resultado={self.resultado}>"
+        )

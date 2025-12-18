@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Optional, List
 from datetime import datetime, date, timedelta
-import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ConfigDict
@@ -69,12 +68,15 @@ class SaidaUpdate(BaseModel):
 # ============================================================
 
 def _resolve_user_base(db: Session, current_user: User) -> str:
+    """Retorna a sub_base do usuário autenticado."""
     for field in ("id", "email", "username"):
         value = getattr(current_user, field, None)
         if value:
-            u = db.scalars(select(User).where(getattr(User, field) == value)).first()
+            q = select(User).where(getattr(User, field) == value)
+            u = db.scalars(q).first()
             if u and u.sub_base:
                 return u.sub_base
+
     raise HTTPException(status_code=401, detail="Usuário sem sub_base definida.")
 
 
@@ -104,7 +106,7 @@ def _check_delete_window_or_409(ts: datetime):
 
 
 # ============================================================
-# POST — REGISTRAR SAÍDA (COM LOG)
+# POST — REGISTRAR SAÍDA
 # ============================================================
 
 @router.post("/registrar", status_code=201)
@@ -114,8 +116,6 @@ def registrar_saida(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    start_ts = time.perf_counter()
-    outcome = "unknown"
 
     username = getattr(current_user, "username", None)
     if not username:
@@ -123,50 +123,49 @@ def registrar_saida(
 
     sub_base_user = _resolve_user_base(db, current_user)
 
+    # Normalizar
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
+
+    # ⬇ Servico normalizado (primeira letra maiúscula)
     servico = payload.servico.strip().title()
+
     status_val = (payload.status.strip() if payload.status else "Saiu para entrega").title()
 
-    try:
-        owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_user))
-        if not owner:
-            outcome = "owner_not_found"
-            raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+    # Buscar owner
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_user))
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
 
-        ignorar = bool(owner.ignorar_coleta)
+    ignorar = bool(owner.ignorar_coleta)
 
-        # Verificar duplicidade
-        existente = db.scalars(
-            select(Saida).where(
-                Saida.sub_base == sub_base_user,
-                Saida.codigo == codigo
+    # Verificar duplicidade
+    existente = db.scalars(
+        select(Saida).where(Saida.sub_base == sub_base_user, Saida.codigo == codigo)
+    ).first()
+    if existente:
+        raise HTTPException(
+            409,
+            {"code": "DUPLICATE_SAIDA", "message": f"Código '{codigo}' já registrado."}
+        )
+
+    # Se exigir coleta
+    if not ignorar:
+        from models import Coleta
+        coleta_exists = db.scalar(
+            select(Coleta).where(
+                Coleta.sub_base == sub_base_user,
+                Coleta.username_entregador == entregador
             )
-        ).first()
-        if existente:
-            outcome = "duplicado"
+        )
+        if not coleta_exists:
             raise HTTPException(
                 409,
-                {"code": "DUPLICATE_SAIDA", "message": f"Código '{codigo}' já registrado."}
+                {"code": "COLETA_OBRIGATORIA", "message": "Este cliente exige coleta antes da saída."}
             )
 
-        # Exigir coleta se necessário
-        if not ignorar:
-            from models import Coleta
-            coleta_exists = db.scalar(
-                select(Coleta).where(
-                    Coleta.sub_base == sub_base_user,
-                    Coleta.username_entregador == entregador
-                )
-            )
-            if not coleta_exists:
-                outcome = "coleta_obrigatoria"
-                raise HTTPException(
-                    409,
-                    {"code": "COLETA_OBRIGATORIA", "message": "Este cliente exige coleta antes da saída."}
-                )
-
-        # Criar saída
+    # Criar saída
+    try:
         row = Saida(
             sub_base=sub_base_user,
             username=username,
@@ -179,50 +178,33 @@ def registrar_saida(
         db.commit()
         db.refresh(row)
 
-        outcome = "sucesso"
-
-        # Cobrança quando ignorar coleta
+        # Se ignorar coleta → gerar cobrança
         if ignorar:
             try:
                 from models import OwnerCobrancaItem
-                db.add(
-                    OwnerCobrancaItem(
-                        sub_base=sub_base_user,
-                        id_coleta=None,
-                        id_saida=row.id_saida,
-                        valor=owner.valor
-                    )
+
+                item = OwnerCobrancaItem(
+                    sub_base=sub_base_user,
+                    id_coleta=None,
+                    id_saida=row.id_saida,
+                    valor=owner.valor
                 )
+                db.add(item)
                 db.commit()
+
             except Exception:
                 db.rollback()
                 print("[COBRANÇA] Falha ao inserir item de cobrança")
 
-        return SaidaOut.model_validate(row)
-
-    except HTTPException:
-        raise
-
     except Exception as e:
-        outcome = "erro_500"
         db.rollback()
         raise HTTPException(500, f"Erro ao registrar saída: {e}")
 
-    finally:
-        elapsed = round((time.perf_counter() - start_ts) * 1000, 2)
-        print({
-            "layer": "backend",
-            "endpoint": "/saidas/registrar",
-            "sub_base": sub_base_user,
-            "username": username,
-            "codigo_tail": codigo[-4:],
-            "resultado": outcome,
-            "tempo_ms": elapsed
-        })
+    return SaidaOut.model_validate(row)
 
 
 # ============================================================
-# GET — LISTAR SAÍDAS (COM LOG)
+# GET — LISTAR SAÍDAS COM FILTROS ACENTO-INSENSITIVE
 # ============================================================
 
 @router.get("/listar")
@@ -239,39 +221,54 @@ def listar_saidas(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    start_ts = time.perf_counter()
 
     sub_base_user = _resolve_user_base(db, current_user)
+
     filtered_stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
+    # ======================
+    # FILTRO POR BASE (CI / AI)
+    # ======================
     if base and base.strip() and base.lower() != "(todas)":
         base_norm = base.strip().lower()
         filtered_stmt = filtered_stmt.where(
             func.unaccent(func.lower(Saida.base)) == func.unaccent(base_norm)
         )
 
+    # Data
     if de:
         filtered_stmt = filtered_stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
     if ate:
         filtered_stmt = filtered_stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
 
+    # Entregador
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
         entreg_norm = entregador.strip().lower()
         filtered_stmt = filtered_stmt.where(
             func.unaccent(func.lower(Saida.entregador)) == func.unaccent(entreg_norm)
         )
 
+    # ======================
+    # FILTRO POR STATUS (CI / AI)
+    # ======================
     if status_ and status_.strip() and status_.lower() != "(todos)":
         status_norm = status_.strip().lower()
         filtered_stmt = filtered_stmt.where(
             func.unaccent(func.lower(Saida.status)) == func.unaccent(status_norm)
         )
 
+    # Código
     if codigo and codigo.strip():
         filtered_stmt = filtered_stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
 
+    # ======================
+    # TOTAL
+    # ======================
     total = int(db.scalar(select(func.count()).select_from(filtered_stmt.subquery())) or 0)
 
+    # ======================
+    # CONTADORES NORMALIZADOS
+    # ======================
     subq = filtered_stmt.subquery()
 
     sumShopee = db.scalar(
@@ -293,6 +290,9 @@ def listar_saidas(
         )
     ) or 0
 
+    # ======================
+    # PAGINAÇÃO
+    # ======================
     stmt = filtered_stmt.order_by(Saida.timestamp.desc())
 
     if limit:
@@ -302,33 +302,26 @@ def listar_saidas(
 
     rows = db.execute(stmt).scalars().all()
 
-    elapsed = round((time.perf_counter() - start_ts) * 1000, 2)
-    print({
-        "layer": "backend",
-        "endpoint": "/saidas/listar",
-        "sub_base": sub_base_user,
-        "total": total,
-        "tempo_ms": elapsed
-    })
+    items = [
+        {
+            "id_saida": r.id_saida,
+            "timestamp": r.timestamp,
+            "username": r.username,
+            "entregador": r.entregador,
+            "codigo": r.codigo,
+            "servico": r.servico,
+            "status": r.status,
+            "base": r.base,
+        }
+        for r in rows
+    ]
 
     return {
         "total": total,
         "sumShopee": sumShopee,
         "sumMercado": sumMercado,
         "sumAvulso": sumAvulso,
-        "items": [
-            {
-                "id_saida": r.id_saida,
-                "timestamp": r.timestamp,
-                "username": r.username,
-                "entregador": r.entregador,
-                "codigo": r.codigo,
-                "servico": r.servico,
-                "status": r.status,
-                "base": r.base,
-            }
-            for r in rows
-        ],
+        "items": items,
     }
 
 
@@ -343,6 +336,7 @@ def atualizar_saida(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_saida(db, sub_base_user, id_saida)
 
@@ -407,6 +401,7 @@ def deletar_saida(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_saida(db, sub_base_user, id_saida)
 
