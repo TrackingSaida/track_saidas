@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime, date, timedelta
+from decimal import Decimal
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ConfigDict
@@ -64,6 +66,37 @@ class SaidaUpdate(BaseModel):
 
 
 # ============================================================
+# CACHE (TTL curto, por-processo)
+# - Evita SELECT Owner repetido para o mesmo sub_base
+# - Seguro porque ignorar_coleta/valor mudam raramente e TTL é curto
+# ============================================================
+
+_OWNER_CACHE_TTL_S = 30.0  # ajuste: 10–60s costuma ser ótimo
+_owner_cache: Dict[str, Tuple[float, bool, Decimal]] = {}  # sub_base -> (expires_ts, ignorar, valor)
+
+def _owner_policy_cached(db: Session, sub_base: str) -> Tuple[bool, Decimal]:
+    """
+    Retorna (ignorar_coleta, owner.valor) com cache TTL.
+    """
+    now = time.time()
+    hit = _owner_cache.get(sub_base)
+    if hit:
+        exp, ignorar, valor = hit
+        if exp > now:
+            return ignorar, valor
+
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+
+    ignorar = bool(owner.ignorar_coleta)
+    valor = Decimal(str(owner.valor or 0))
+
+    _owner_cache[sub_base] = (now + _OWNER_CACHE_TTL_S, ignorar, valor)
+    return ignorar, valor
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -106,7 +139,12 @@ def _check_delete_window_or_409(ts: datetime):
 
 
 # ============================================================
-# POST — REGISTRAR SAÍDA
+# POST — REGISTRAR SAÍDA (REFATORADO)
+# Objetivos:
+# - 1 commit por request (saída + cobrança no mesmo commit)
+# - cache de Owner por sub_base (TTL curto)
+# - early exits claros
+# - mesma API / mesmas regras
 # ============================================================
 
 @router.post("/registrar", status_code=201)
@@ -116,44 +154,36 @@ def registrar_saida(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
     username = getattr(current_user, "username", None)
     if not username:
         raise HTTPException(401, "Usuário sem username.")
 
     sub_base_user = _resolve_user_base(db, current_user)
 
-    # Normalizar
+    # Normalizar (mantém comportamento)
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
-
-    # ⬇ Servico normalizado (primeira letra maiúscula)
     servico = payload.servico.strip().title()
-
     status_val = (payload.status.strip() if payload.status else "Saiu para entrega").title()
 
-    # Buscar owner
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_user))
-    if not owner:
-        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+    # Policy do owner (cache TTL)
+    ignorar, owner_valor = _owner_policy_cached(db, sub_base_user)
 
-    ignorar = bool(owner.ignorar_coleta)
-
-    # Verificar duplicidade
-    existente = db.scalars(
-        select(Saida).where(Saida.sub_base == sub_base_user, Saida.codigo == codigo)
-    ).first()
+    # Duplicidade (continua antes da escrita)
+    existente = db.scalar(
+        select(Saida.id_saida).where(Saida.sub_base == sub_base_user, Saida.codigo == codigo)
+    )
     if existente:
         raise HTTPException(
             409,
             {"code": "DUPLICATE_SAIDA", "message": f"Código '{codigo}' já registrado."}
         )
 
-    # Se exigir coleta
+    # Se exigir coleta, validar antes de escrever
     if not ignorar:
         from models import Coleta
         coleta_exists = db.scalar(
-            select(Coleta).where(
+            select(Coleta.id_coleta).where(
                 Coleta.sub_base == sub_base_user,
                 Coleta.username_entregador == entregador
             )
@@ -164,7 +194,7 @@ def registrar_saida(
                 {"code": "COLETA_OBRIGATORIA", "message": "Este cliente exige coleta antes da saída."}
             )
 
-    # Criar saída
+    # Escrita (saída + cobrança) com 1 commit
     try:
         row = Saida(
             sub_base=sub_base_user,
@@ -175,27 +205,26 @@ def registrar_saida(
             status=status_val,
         )
         db.add(row)
+        db.flush()  # garante id_saida sem commit
+
+        # Se ignorar coleta → gerar cobrança (mesma transação)
+        if ignorar:
+            from models import OwnerCobrancaItem
+
+            item = OwnerCobrancaItem(
+                sub_base=sub_base_user,
+                id_coleta=None,
+                id_saida=row.id_saida,
+                valor=owner_valor,
+            )
+            db.add(item)
+
         db.commit()
         db.refresh(row)
 
-        # Se ignorar coleta → gerar cobrança
-        if ignorar:
-            try:
-                from models import OwnerCobrancaItem
-
-                item = OwnerCobrancaItem(
-                    sub_base=sub_base_user,
-                    id_coleta=None,
-                    id_saida=row.id_saida,
-                    valor=owner.valor
-                )
-                db.add(item)
-                db.commit()
-
-            except Exception:
-                db.rollback()
-                print("[COBRANÇA] Falha ao inserir item de cobrança")
-
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"Erro ao registrar saída: {e}")
@@ -205,6 +234,7 @@ def registrar_saida(
 
 # ============================================================
 # GET — LISTAR SAÍDAS COM FILTROS ACENTO-INSENSITIVE
+# (mantido, só pequenos ajustes de consistência)
 # ============================================================
 
 @router.get("/listar")
@@ -221,14 +251,11 @@ def listar_saidas(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
     sub_base_user = _resolve_user_base(db, current_user)
 
     filtered_stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
-    # ======================
-    # FILTRO POR BASE (CI / AI)
-    # ======================
+    # Base (CI / AI)
     if base and base.strip() and base.lower() != "(todas)":
         base_norm = base.strip().lower()
         filtered_stmt = filtered_stmt.where(
@@ -248,9 +275,7 @@ def listar_saidas(
             func.unaccent(func.lower(Saida.entregador)) == func.unaccent(entreg_norm)
         )
 
-    # ======================
-    # FILTRO POR STATUS (CI / AI)
-    # ======================
+    # Status (CI / AI)
     if status_ and status_.strip() and status_.lower() != "(todos)":
         status_norm = status_.strip().lower()
         filtered_stmt = filtered_stmt.where(
@@ -261,14 +286,10 @@ def listar_saidas(
     if codigo and codigo.strip():
         filtered_stmt = filtered_stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
 
-    # ======================
     # TOTAL
-    # ======================
     total = int(db.scalar(select(func.count()).select_from(filtered_stmt.subquery())) or 0)
 
-    # ======================
     # CONTADORES NORMALIZADOS
-    # ======================
     subq = filtered_stmt.subquery()
 
     sumShopee = db.scalar(
@@ -290,11 +311,8 @@ def listar_saidas(
         )
     ) or 0
 
-    # ======================
     # PAGINAÇÃO
-    # ======================
     stmt = filtered_stmt.order_by(Saida.timestamp.desc())
-
     if limit:
         stmt = stmt.limit(limit)
     if offset:
@@ -326,7 +344,7 @@ def listar_saidas(
 
 
 # ============================================================
-# PATCH — ATUALIZAR
+# PATCH — ATUALIZAR (mantido)
 # ============================================================
 
 @router.patch("/{id_saida}", response_model=SaidaOut)
@@ -336,7 +354,6 @@ def atualizar_saida(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_saida(db, sub_base_user, id_saida)
 
@@ -383,7 +400,6 @@ def atualizar_saida(
     except HTTPException:
         db.rollback()
         raise
-
     except Exception:
         db.rollback()
         raise HTTPException(500, {"code": "UPDATE_FAILED", "message": "Erro ao atualizar."})
@@ -392,7 +408,7 @@ def atualizar_saida(
 
 
 # ============================================================
-# DELETE — EXCLUIR SAÍDA
+# DELETE — EXCLUIR SAÍDA (mantido)
 # ============================================================
 
 @router.delete("/{id_saida}", status_code=204)
@@ -401,7 +417,6 @@ def deletar_saida(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_saida(db, sub_base_user, id_saida)
 
@@ -410,7 +425,6 @@ def deletar_saida(
     try:
         db.delete(obj)
         db.commit()
-
     except Exception:
         db.rollback()
         raise HTTPException(500, "Erro ao deletar saída.")
