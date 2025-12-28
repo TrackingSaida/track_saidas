@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import datetime
+import time
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import Coleta, Entregador, BasePreco, User, Saida
-from models import Owner, OwnerCobrancaItem
+from models import OwnerCobrancaItem  # Owner NÃO é mais necessário (valor vem do JWT)
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -91,50 +92,61 @@ def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) ->
     return "Mercado Livre" if s == "mercado_livre" else s
 
 
-def _resolve_entregador_ou_user_base(db: Session, user: User) -> Tuple[str, str, str]:
-    candidates = []
+def _sub_base_from_token_or_422(user: User) -> str:
+    """
+    Novo contrato: sub_base vem no JWT (auth stateless).
+    """
+    sb = getattr(user, "sub_base", None)
+    if not sb:
+        raise HTTPException(422, "Usuário sem sub_base definida.")
+    return sb
 
-    ue = getattr(user, "username_entregador", None)
-    if ue:
-        candidates.append(ue)
 
-    un = getattr(user, "username", None)
-    if un and un not in candidates:
-        candidates.append(un)
+def _resolve_entregador_info(db: Session, user: User) -> Tuple[str, str, str]:
+    """
+    Objetivo: reduzir consultas.
+    - Primeiro usa o que já vem do JWT (sub_base + username).
+    - Opcionalmente consulta Entregador 1x para validar ativo e pegar 'nome'.
+    - Não faz fallback para tabela User (isso era custo antigo do auth).
+    """
+    sub_base = _sub_base_from_token_or_422(user)
+    username = getattr(user, "username", None) or "Sistema"
 
-    ent = None
-    if candidates:
-        ent = db.scalar(
-            select(Entregador).where(Entregador.username_entregador.in_(candidates))
-        )
-
+    # Se existir Entregador, valida ativo e melhora o nome exibido
+    ent = db.scalar(
+        select(Entregador).where(Entregador.username_entregador == username)
+    )
     if ent:
         if hasattr(ent, "ativo") and not ent.ativo:
             raise HTTPException(403, "Entregador inativo.")
-        if not ent.sub_base:
-            raise HTTPException(422, "Entregador sem sub_base definida.")
-        return ent.sub_base, (ent.nome or ent.username_entregador), ent.username_entregador
+        if getattr(ent, "sub_base", None):
+            sub_base = ent.sub_base  # mantém compatibilidade se a verdade estiver no Entregador
+        entregador_nome = (getattr(ent, "nome", None) or ent.username_entregador)
+        return sub_base, entregador_nome, ent.username_entregador
 
-    # fallback via tabela users
-    user_id = getattr(user, "id", None)
-    u = db.get(User, user_id)
-    sub_base = u.sub_base if u else None
-
-    if not sub_base and getattr(user, "email", None):
-        u = db.scalar(select(User).where(User.email == user.email))
-        sub_base = u.sub_base if u else None
-
-    if not sub_base and getattr(user, "username", None):
-        u = db.scalar(select(User).where(User.username == user.username))
-        sub_base = u.sub_base if u else None
-
-    if not sub_base:
-        raise HTTPException(422, "Usuário sem sub_base definida.")
-
-    return sub_base, getattr(user, "username", "Sistema"), getattr(user, "username", "Sistema")
+    # Sem Entregador cadastrado: usa JWT
+    return sub_base, username, username
 
 
-def _get_precos(db: Session, sub_base: str, base: str):
+# ============================================================
+# CACHE BasePreco (TTL curto, por-processo)
+# ============================================================
+_BASE_PRECO_CACHE_TTL_S = 120.0
+_base_preco_cache: Dict[Tuple[str, str], Tuple[float, Decimal, Decimal, Decimal]] = {}
+
+
+def _get_precos_cached(db: Session, sub_base: str, base: str) -> Tuple[Decimal, Decimal, Decimal]:
+    """
+    Evita SELECT repetido de BasePreco quando o usuário faz vários lotes na mesma base.
+    TTL curto para tolerar atualizações.
+    """
+    key = (sub_base, base)
+    now = time.time()
+    hit = _base_preco_cache.get(key)
+    if hit and hit[0] > now:
+        _, p_shopee, p_ml, p_avulso = hit
+        return p_shopee, p_ml, p_avulso
+
     precos = db.scalar(
         select(BasePreco).where(BasePreco.sub_base == sub_base, BasePreco.base == base)
     )
@@ -143,7 +155,13 @@ def _get_precos(db: Session, sub_base: str, base: str):
             404,
             f"Tabela de preços não encontrada para sub_base={sub_base!r} e base={base!r}."
         )
-    return _decimal(precos.shopee), _decimal(precos.ml), _decimal(precos.avulso)
+
+    p_shopee = _decimal(precos.shopee)
+    p_ml = _decimal(precos.ml)
+    p_avulso = _decimal(precos.avulso)
+
+    _base_preco_cache[key] = (now + _BASE_PRECO_CACHE_TTL_S, p_shopee, p_ml, p_avulso)
+    return p_shopee, p_ml, p_avulso
 
 
 # ============================================================
@@ -170,7 +188,7 @@ def recalcular_coleta(db: Session, id_coleta: int):
         else:
             count["avulso"] += 1
 
-    p_shopee, p_ml, p_avulso = _get_precos(db, coleta.sub_base, coleta.base)
+    p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
 
     total = (
         _decimal(count["shopee"]) * p_shopee +
@@ -193,20 +211,52 @@ def recalcular_coleta(db: Session, id_coleta: int):
 # ============================================================
 
 @router.post("/lote", response_model=LoteResponse, status_code=201)
-def registrar_coleta_em_lote(payload: ColetaLoteIn, db: Session = Depends(get_db),
-                             current_user: User = Depends(get_current_user)):
+def registrar_coleta_em_lote(
+    payload: ColetaLoteIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # 1) Resolve sub_base + entregador com no máximo 1 SELECT (Entregador) e sem fallback para User
+    sub_base, entregador_nome, username_entregador = _resolve_entregador_info(db, current_user)
 
-    sub_base, entregador_nome, username_entregador = _resolve_entregador_ou_user_base(db, current_user)
+    # 2) valor unitário vem do JWT (sem SELECT em Owner)
+    valor_unit = Decimal(getattr(current_user, "owner_valor", "0"))
 
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    if not owner:
-        raise HTTPException(404, "Owner não encontrado.")
-    valor_unit = Decimal(str(owner.valor or 0))
+    # 3) preços com cache TTL curto
+    p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base)
 
-    p_shopee, p_ml, p_avulso = _get_precos(db, sub_base, payload.base)
+    # 4) Normaliza itens e detecta duplicados no próprio payload (zero DB)
+    #    (você vai tratar duplicidade no front, mas aqui evita lixo óbvio e reduz queries)
+    norm_codes: List[str] = []
+    seen = set()
+    for it in payload.itens:
+        c = (it.codigo or "").strip()
+        if not c:
+            raise HTTPException(422, "Código inválido.")
+        if c in seen:
+            # Mantém comportamento de falhar, mas agora sem DB
+            raise HTTPException(409, f"Código '{c}' duplicado no lote.")
+        seen.add(c)
+        norm_codes.append(c)
+
+    # 5) Checagem de duplicidade no banco em 1 consulta (IN)
+    #    Mesmo com front ajustado, isso protege integridade e evita N SELECTs.
+    existing_codes = set(
+        db.scalars(
+            select(Saida.codigo).where(
+                Saida.sub_base == sub_base,
+                Saida.codigo.in_(norm_codes)
+            )
+        ).all()
+    )
+    if existing_codes:
+        # Para manter compatibilidade com o comportamento antigo (falha no primeiro),
+        # escolhemos um determinístico.
+        dup = sorted(existing_codes)[0]
+        raise HTTPException(409, f"Código '{dup}' já coletado.")
 
     created = 0
-    saidas_ids = []
+    saidas_ids: List[int] = []
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
 
     try:
@@ -222,20 +272,15 @@ def registrar_coleta_em_lote(payload: ColetaLoteIn, db: Session = Depends(get_db
         db.add(coleta)
         db.flush()
 
+        # 6) Inserção em loop, mas sem SELECTs dentro
         for item in payload.itens:
             serv_key = _normalize_servico(item.servico)
             codigo = item.codigo.strip()
 
-            exists = db.scalar(
-                select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
-            )
-            if exists:
-                raise HTTPException(409, f"Código '{codigo}' já coletado.")
-
             saida = Saida(
                 sub_base=sub_base,
                 base=payload.base,
-                username=current_user.username,
+                username=getattr(current_user, "username", None),
                 entregador=entregador_nome,
                 codigo=codigo,
                 servico=_servico_label_for_saida(serv_key),
@@ -260,18 +305,23 @@ def registrar_coleta_em_lote(payload: ColetaLoteIn, db: Session = Depends(get_db
 
         db.flush()
 
+        # 7) Cobrança: adiciona N itens, sem consultas
         for id_saida in saidas_ids:
-            item = OwnerCobrancaItem(
-                sub_base=sub_base,
-                id_coleta=coleta.id_coleta,
-                id_saida=id_saida,
-                valor=valor_unit
+            db.add(
+                OwnerCobrancaItem(
+                    sub_base=sub_base,
+                    id_coleta=coleta.id_coleta,
+                    id_saida=id_saida,
+                    valor=valor_unit
+                )
             )
-            db.add(item)
 
         db.commit()
         db.refresh(coleta)
 
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"Falha ao registrar lote: {e}")
@@ -294,7 +344,8 @@ def registrar_coleta_em_lote(payload: ColetaLoteIn, db: Session = Depends(get_db
 
 
 # ============================================================
-# GET /coletas        (ORIGINAL — mantido sem alterações)
+# GET /coletas
+# (REFATORADO: sub_base vem do JWT; remove 2-3 SELECTs por request)
 # ============================================================
 
 @router.get("/", response_model=List[ColetaOut])
@@ -306,25 +357,7 @@ def list_coletas(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
-    # Resolve sub_base do usuário
-    user_id = getattr(current_user, "id", None)
-    sub_base_user = None
-
-    if user_id:
-        u = db.get(User, user_id)
-        sub_base_user = getattr(u, "sub_base", None)
-
-    if not sub_base_user and current_user.email:
-        u = db.scalar(select(User).where(User.email == current_user.email))
-        sub_base_user = u.sub_base if u else None
-
-    if not sub_base_user and current_user.username:
-        u = db.scalar(select(User).where(User.username == current_user.username))
-        sub_base_user = u.sub_base if u else None
-
-    if not sub_base_user:
-        raise HTTPException(400, "sub_base não definida.")
+    sub_base_user = _sub_base_from_token_or_422(current_user)
 
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
 
@@ -338,7 +371,9 @@ def list_coletas(
         stmt = stmt.where(Coleta.timestamp >= data_inicio)
 
     if data_fim:
-        stmt = stmt.where(Coleta.timestamp <= data_fim)
+        # inclui dia inteiro
+        dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
+        stmt = stmt.where(Coleta.timestamp <= dt_end)
 
     stmt = stmt.where(
         (Coleta.shopee > 0) |
@@ -365,6 +400,7 @@ def api_recalcular_coleta(id_coleta: int, db: Session = Depends(get_db)):
 # ============================================================
 # NOVA ROTA — /coletas/resumo
 # Agrupamento POR DIA + BASE com paginação real
+# (REFATORADO: sub_base vem do JWT; remove 2-3 SELECTs por request)
 # ============================================================
 
 class ResumoItem(BaseModel):
@@ -383,14 +419,13 @@ class ResumoResponse(BaseModel):
     pageSize: int
     totalPages: int
     totalItems: int
-    items: List[ResumoItem]    
+    items: List[ResumoItem]
     sumShopee: int
     sumMercado: int
     sumAvulso: int
     sumValor: Decimal
     sumCancelados: int
     sumTotalColetas: int
-
 
 
 @router.get("/resumo", response_model=ResumoResponse)
@@ -403,56 +438,34 @@ def resumo_coletas(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    sub_base_user = _sub_base_from_token_or_422(current_user)
 
-
-    # ----------------------------------------------------------
-    # Resolver sub_base
-    # ----------------------------------------------------------
-    user_id = getattr(current_user, "id", None)
-    sub_base_user = None
-
-    if user_id:
-        u = db.get(User, user_id)
-        sub_base_user = u.sub_base if u else None
-
-    if not sub_base_user and current_user.email:
-        u = db.scalar(select(User).where(User.email == current_user.email))
-        sub_base_user = u.sub_base if u else None
-
-    if not sub_base_user and current_user.username:
-        u = db.scalar(select(User).where(User.username == current_user.username))
-        sub_base_user = u.sub_base if u else None
-
-    if not sub_base_user:
-        raise HTTPException(400, "sub_base não definida.")
-
-    # Normaliza base (se houver)
     base_norm = base.strip().lower() if base else None
+
+    # intervalo fim (incluindo dia inteiro)
+    dt_end = None
+    if data_fim:
+        dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
 
     # ----------------------------------------------------------
     # Filtro principal — tabela COLETAS
     # ----------------------------------------------------------
     stmt = select(Coleta).where(Coleta.sub_base == sub_base_user)
 
-    # Base case-insensitive
     if base_norm:
         stmt = stmt.where(func.lower(Coleta.base) == base_norm)
 
-    # Data início
     if data_inicio:
         stmt = stmt.where(Coleta.timestamp >= data_inicio)
 
-    # Data fim (incluindo o dia inteiro)
-    if data_fim:
-        dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
+    if dt_end:
         stmt = stmt.where(Coleta.timestamp <= dt_end)
 
     stmt = stmt.order_by(Coleta.timestamp.asc())
-
     rows = db.scalars(stmt).all()
 
     # ----------------------------------------------------------
-    # Buscar cancelados — tabela SAIDAS
+    # Buscar cancelados — tabela SAIDAS (mantido)
     # ----------------------------------------------------------
     cancelados_stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
@@ -465,16 +478,12 @@ def resumo_coletas(
     if data_inicio:
         cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= data_inicio)
 
-    if data_fim:
+    if dt_end:
         cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
 
     cancelados_rows = db.scalars(cancelados_stmt).all()
 
-    # ----------------------------------------------------------
-    # Montar mapa de cancelados
-    # ----------------------------------------------------------
-    mapa_cancelados = {}
-
+    mapa_cancelados: Dict[str, int] = {}
     for c in cancelados_rows:
         dia = c.timestamp.date().isoformat()
         baseKey = (c.base or "").strip().upper()
@@ -484,12 +493,10 @@ def resumo_coletas(
     # ----------------------------------------------------------
     # Agrupar coletas por DIA + BASE
     # ----------------------------------------------------------
-    agrupado = {}
-
+    agrupado: Dict[str, Dict] = {}
     for r in rows:
         dia = r.timestamp.date().isoformat()
         baseKey = (r.base or "").strip().upper()
-
         key = f"{dia}_{baseKey}"
 
         if key not in agrupado:
@@ -509,14 +516,9 @@ def resumo_coletas(
         agrupado[key]["valor_total"] += r.valor_total
         agrupado[key]["entregadores"].add(r.username_entregador or "-")
 
-    # ----------------------------------------------------------
-    # Lista final
-    # ----------------------------------------------------------
-    lista = []
-
+    lista: List[ResumoItem] = []
     for key, item in agrupado.items():
         canc = mapa_cancelados.get(key, 0)
-
         lista.append(
             ResumoItem(
                 data=item["data"],
@@ -526,11 +528,10 @@ def resumo_coletas(
                 avulso=item["avulso"],
                 valor_total=item["valor_total"],
                 cancelados=canc,
-                entregadores=" | ".join(item["entregadores"])
+                entregadores=" | ".join(item["entregadores"]),
             )
         )
 
-    # Ordenação por data ASC
     lista.sort(key=lambda x: x.data)
 
     sumShopee = sum(i.shopee for i in lista)
@@ -540,9 +541,6 @@ def resumo_coletas(
     sumCancelados = sum(i.cancelados for i in lista)
     sumTotalColetas = sumShopee + sumMercado + sumAvulso
 
-    # ----------------------------------------------------------
-    # Paginação REAL (igual front usa)
-    # ----------------------------------------------------------
     totalItems = len(lista)
     totalPages = (totalItems + pageSize - 1) // pageSize
 
@@ -551,18 +549,15 @@ def resumo_coletas(
     items = lista[start:end]
 
     return ResumoResponse(
-    page=page,
-    pageSize=pageSize,
-    totalPages=totalPages,
-    totalItems=totalItems,
-    items=items,
-
-    sumShopee=sumShopee,
-    sumMercado=sumMercado,
-    sumAvulso=sumAvulso,
-    sumValor=sumValor,
-    sumCancelados=sumCancelados,
-    sumTotalColetas=sumTotalColetas
-)
-
-
+        page=page,
+        pageSize=pageSize,
+        totalPages=totalPages,
+        totalItems=totalItems,
+        items=items,
+        sumShopee=sumShopee,
+        sumMercado=sumMercado,
+        sumAvulso=sumAvulso,
+        sumValor=sumValor,
+        sumCancelados=sumCancelados,
+        sumTotalColetas=sumTotalColetas,
+    )
