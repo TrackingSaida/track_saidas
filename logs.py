@@ -30,8 +30,6 @@ class LogLeituraCreate(BaseModel):
 
     # dados do código
     codigo: Optional[str] = None
-    servico: Optional[str] = None
-    entregador: Optional[str] = None
 
     # resultado final
     resultado: str = Field(
@@ -47,13 +45,34 @@ class LogLeituraCreate(BaseModel):
         ],
     )
 
-    # métricas de tempo (ms)
+    # ─────────────────────────────
+    # MÉTRICAS ANTIGAS (mantidas)
     delta_from_last_read_ms: Optional[float] = None
     delta_read_to_send_ms: Optional[float] = None
     delta_send_to_response_ms: Optional[float] = None
 
-    # timestamp da leitura (performance.now())
+    # timestamp da leitura (performance.now)
     ts_read: Optional[float] = None
+
+    # ─────────────────────────────
+    # 🔥 NOVAS MÉTRICAS — FRONTEND
+    front_processing_ms: Optional[float] = None
+    front_network_ms: Optional[float] = None
+    front_total_ms: Optional[float] = None
+
+    # 🔥 NOVA MÉTRICA — BACKEND
+    backend_processing_ms: Optional[float] = None
+
+    # ─────────────────────────────
+    # CORRELAÇÃO / CONTROLE
+    request_id: Optional[str] = None
+    attempt: Optional[int] = None
+
+    # ─────────────────────────────
+    # CONTEXTO DE DEVICE / REDE
+    network_status: Optional[str] = None
+    device_type: Optional[str] = None
+    os: Optional[str] = None
 
 
 # ============================================================
@@ -81,7 +100,7 @@ def registrar_log_leitura(
     sub_base = getattr(current_user, "sub_base", None)
     username = getattr(current_user, "username", None)
 
-    # 🔕 Se faltar contexto mínimo, ignora
+    # 🔕 Se faltar contexto mínimo, ignora silenciosamente
     if not sub_base or not username:
         return
 
@@ -92,18 +111,29 @@ def registrar_log_leitura(
 
             origem=payload.origem,
             tipo=payload.tipo,
-
             codigo=payload.codigo,
-            servico=payload.servico,
-            entregador=payload.entregador,
 
             resultado=payload.resultado,
 
+            # métricas antigas
             delta_from_last_read_ms=payload.delta_from_last_read_ms,
             delta_read_to_send_ms=payload.delta_read_to_send_ms,
             delta_send_to_response_ms=payload.delta_send_to_response_ms,
 
             ts_read=payload.ts_read,
+
+            # novas métricas
+            front_processing_ms=payload.front_processing_ms,
+            front_network_ms=payload.front_network_ms,
+            front_total_ms=payload.front_total_ms,
+            backend_processing_ms=payload.backend_processing_ms,
+
+            request_id=payload.request_id,
+            attempt=payload.attempt,
+
+            network_status=payload.network_status,
+            device_type=payload.device_type,
+            os=payload.os,
         )
 
         db.add(log)

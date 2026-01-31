@@ -323,20 +323,36 @@ class LogLeitura(Base):
     tipo = Column(Text, nullable=False)     # saida | coleta
 
     codigo = Column(Text, nullable=True, index=True)
-    servico = Column(Text, nullable=True)
-    entregador = Column(Text, nullable=True, index=True)
 
     # resultado final
     resultado = Column(Text, nullable=False)
 
-    # métricas (ms)
+    # métricas antigas (mantidas)
     delta_from_last_read_ms = Column(Numeric(12, 3), nullable=True)
     delta_read_to_send_ms = Column(Numeric(12, 3), nullable=True)
     delta_send_to_response_ms = Column(Numeric(12, 3), nullable=True)
 
     # timestamps
-    ts_read = Column(Numeric(16, 6), nullable=True)  # performance.now()
+    ts_read = Column(Numeric(16, 6), nullable=True)
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    # ─────────────────────────────
+    # 🔥 NOVAS MÉTRICAS (FRONT)
+    front_processing_ms = Column(Numeric(12, 3), nullable=True)
+    front_network_ms = Column(Numeric(12, 3), nullable=True)
+    front_total_ms = Column(Numeric(12, 3), nullable=True)
+
+    # 🔥 NOVA MÉTRICA (BACK)
+    backend_processing_ms = Column(Numeric(12, 3), nullable=True)
+
+    # correlação / controle
+    request_id = Column(Text, nullable=True)
+    attempt = Column(Integer, nullable=True)
+
+    # contexto do device
+    network_status = Column(Text, nullable=True)
+    device_type = Column(Text, nullable=True)
+    os = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return (

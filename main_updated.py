@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -29,12 +30,26 @@ else:
 # App
 app = FastAPI(
     title="API Saídas",
-    version="0.2.0",
+    version="0.2.1",  # bump leve (opcional)
     openapi_url=f"{API_PREFIX}/openapi.json",
     docs_url=f"{API_PREFIX}/docs",
     redoc_url=f"{API_PREFIX}/redoc",
 )
 
+# ──────────────────────────────────────────────────────────────────
+# 🔥 Middleware — tempo real de processamento do BACKEND
+@app.middleware("http")
+async def backend_timing_middleware(request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    end = time.perf_counter()
+
+    # tempo em ms, apenas processamento interno do backend
+    response.headers["X-Backend-Process-Time"] = f"{(end - start) * 1000:.3f}"
+    return response
+
+
+# ──────────────────────────────────────────────────────────────────
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -49,8 +64,8 @@ app.add_middleware(
         "Accept-Language",
         "Cache-Control", "Pragma",
     ],
-    max_age=86400,                           # (opcional) cache do preflight
-    # expose_headers=["Set-Cookie"],         # opcional, só p/ depurar
+    max_age=86400,                           # cache do preflight
+    # expose_headers=["X-Backend-Process-Time"],  # só se quiser debugar via browser
 )
 
 # ──────────────────────────────────────────────────────────────────
@@ -69,8 +84,6 @@ from signup_routes import router as signup_router
 from shopee_routes import router as shopee_router
 from logs import router as logs_router
 
-
-
 app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
@@ -84,8 +97,6 @@ app.include_router(entregador_entregas_router, prefix=API_PREFIX)
 app.include_router(signup_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
-
-
 
 # ──────────────────────────────────────────────────────────────────
 # Rotina de startup — renova tokens ML ao inicializar a API
@@ -102,6 +113,7 @@ def startup_event():
         print(f"[ML] Erro durante renovação inicial: {e}")
     finally:
         db.close()
+
 # ──────────────────────────────────────────────────────────────────
 # Healthcheck
 @app.get(f"{API_PREFIX}/health", tags=["Health"])
