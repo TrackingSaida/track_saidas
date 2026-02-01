@@ -43,6 +43,12 @@ MENU_DEFS = [
                 "roles": [0, 1],
                 "group": "resumos"
             },
+            {
+                "label": "Resumo por Entregador",
+                "href": "tracking-entregadores-resumo.html",
+                "roles": [0, 1],
+                "group": "resumos"
+            },
         ]
     },
 
