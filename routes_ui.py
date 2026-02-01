@@ -66,6 +66,7 @@ MENU_DEFS = [
             {"label": "Entregadores", "href": "tracking-entregador.html", "roles": [0, 1, 2]},
             {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1]},
             {"label": "Usuários",     "href": "tracking-usuarios.html",   "roles": [0, 1]},
+            {"label": "Valores de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
             {"label": "Owners",       "href": "admin-owners.html",        "roles": [0]},  # exclusivo root
         ]
     },
