@@ -17,14 +17,36 @@ MENU_DEFS = [
     {
         "section": "Operação",
         "icon": "las la-motorcycle",
-        "roles": [0, 1, 2, 3],   # root (0) vê tudo
+        "roles": [0, 1, 2, 3],
         "items": [
-            {"label": "Leitura de Coletas",  "href": "tracking-coleta-leitura.html", "roles": [0, 1, 2, 3]},
-            {"label": "Resumo de Coletas",   "href": "tracking-coletas-resumo.html", "roles": [0, 1]},
-            {"label": "Leitura de Saídas",   "href": "tracking-leitura.html",        "roles": [0, 1, 2, 3]},
-            {"label": "Registros de Saídas", "href": "tracking-registros.html",      "roles": [0, 1, 2, 3]},
+            {
+                "label": "Registrar Coletas",
+                "href": "tracking-coleta-leitura.html",
+                "roles": [0, 1, 2, 3],
+                "group": "registrar"
+            },
+            {
+                "label": "Registrar Saídas",
+                "href": "tracking-leitura.html",
+                "roles": [0, 1, 2, 3],
+                "group": "registrar"
+            },
+            {
+                "label": "Registros Gerais",
+                "href": "tracking-registros.html",
+                "roles": [0, 1, 2, 3],
+                "group": "registros"
+            },
+            {
+                "label": "Resumo de Coletas",
+                "href": "tracking-coletas-resumo.html",
+                "roles": [0, 1],
+                "group": "resumos"
+            },
         ]
     },
+
+
 
     {
         "section": "Dashboards",
