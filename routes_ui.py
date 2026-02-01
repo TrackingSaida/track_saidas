@@ -23,13 +23,13 @@ MENU_DEFS = [
                 "label": "Registrar Coletas",
                 "href": "tracking-coleta-leitura.html",
                 "roles": [0, 1, 2, 3],
-                "group": "registrar"
+                "group": "leituras"
             },
             {
                 "label": "Registrar Saídas",
                 "href": "tracking-leitura.html",
                 "roles": [0, 1, 2, 3],
-                "group": "registrar"
+                "group": "leituras"
             },
             {
                 "label": "Registros Gerais",

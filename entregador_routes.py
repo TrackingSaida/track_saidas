@@ -1,15 +1,16 @@
 from __future__ import annotations
-from typing import Optional, List
+from datetime import date, datetime, time
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices
-from sqlalchemy import select, or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
-from datetime import date
 
 from db import get_db
 from auth import get_current_user, get_password_hash
-from models import User, Entregador
+from models import Entregador, EntregadorPreco, EntregadorPrecoGlobal, Saida, User
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
@@ -79,6 +80,60 @@ class EntregadorOut(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+class EntregadorResumoItem(BaseModel):
+    data: str  # YYYY-MM-DD
+    entregador_id: int
+    entregador_nome: str
+    shopee: Dict[str, Any]  # {qtde, valor_unit, total}
+    flex: Dict[str, Any]
+    avulso: Dict[str, Any]
+    total_dia: Decimal
+
+
+class EntregadorResumoResponse(BaseModel):
+    page: int
+    pageSize: int
+    totalPages: int
+    totalItems: int
+    items: List[EntregadorResumoItem]
+    sumShopee: int
+    sumFlex: int
+    sumAvulso: int
+    sumValor: Decimal
+    sumTotalEntregas: int
+
+
+class PrecoGlobalOut(BaseModel):
+    shopee_valor: Decimal
+    ml_valor: Decimal
+    avulso_valor: Decimal
+
+
+class PrecoGlobalUpdate(BaseModel):
+    shopee_valor: Optional[Decimal] = Field(None, ge=0)
+    ml_valor: Optional[Decimal] = Field(None, ge=0)
+    avulso_valor: Optional[Decimal] = Field(None, ge=0)
+
+
+class PrecoIndividualItem(BaseModel):
+    entregador_id: int
+    entregador_nome: Optional[str] = None
+    shopee_valor: Optional[Decimal] = None
+    ml_valor: Optional[Decimal] = None
+    avulso_valor: Optional[Decimal] = None
+
+
+class PrecoIndividuaisResponse(BaseModel):
+    items: List[PrecoIndividualItem]
+
+
+class PrecoEntregadorUpdate(BaseModel):
+    shopee_valor: Optional[Decimal] = Field(None, ge=0)
+    ml_valor: Optional[Decimal] = Field(None, ge=0)
+    avulso_valor: Optional[Decimal] = Field(None, ge=0)
+
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -119,6 +174,47 @@ def _find_matching_user(db: Session, sub_base: str, username_ent: Optional[str])
         ),
     )
     return db.scalars(stmt).first()
+
+
+def resolver_precos_entregador(
+    db: Session,
+    id_entregador: int,
+    sub_base: str,
+) -> Dict[str, Decimal]:
+    """
+    Retorna {shopee_valor, ml_valor, avulso_valor} para o entregador.
+
+    Lógica:
+    1. Buscar EntregadorPreco onde id_entregador = X
+    2. Se existir E usa_preco_global = False E valor != NULL:
+       usar valor específico do entregador
+    3. Caso contrário:
+       usar EntregadorPrecoGlobal da sub_base
+    """
+    zero = Decimal("0.00")
+
+    preco = db.scalars(
+        select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
+    ).first()
+
+    global_row = db.scalars(
+        select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
+    ).first()
+
+    shopee_global = global_row.shopee_valor if global_row else zero
+    ml_global = global_row.ml_valor if global_row else zero
+    avulso_global = global_row.avulso_valor if global_row else zero
+
+    if preco and preco.usa_preco_global is False:
+        shopee_valor = preco.shopee_valor if preco.shopee_valor is not None else shopee_global
+        ml_valor = preco.ml_valor if preco.ml_valor is not None else ml_global
+        avulso_valor = preco.avulso_valor if preco.avulso_valor is not None else avulso_global
+        return {"shopee_valor": shopee_valor, "ml_valor": ml_valor, "avulso_valor": avulso_valor}
+
+    if global_row:
+        return {"shopee_valor": shopee_global, "ml_valor": ml_global, "avulso_valor": avulso_global}
+    return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero}
+
 
 # =========================================================
 # ROTAS
@@ -250,6 +346,220 @@ def list_entregadores(
     stmt = stmt.order_by(Entregador.nome)
 
     return db.scalars(stmt).all()
+
+
+def _normalizar_servico(servico: Optional[str]) -> str:
+    s = (servico or "").lower()
+    if "shopee" in s:
+        return "shopee"
+    if "ml" in s or "mercado" in s:
+        return "flex"
+    return "avulso"
+
+
+@router.get("/resumo", response_model=EntregadorResumoResponse)
+def resumo_entregadores(
+    data_inicio: Optional[date] = Query(None),
+    data_fim: Optional[date] = Query(None),
+    entregador_id: Optional[int] = Query(None),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(200, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    sub_base_user = _resolve_user_base(db, current_user)
+
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega"]
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base_user,
+        Saida.codigo.isnot(None),
+        func.lower(Saida.status).in_(status_validos),
+        or_(
+            Saida.entregador_id.isnot(None),
+            Saida.entregador.isnot(None),
+        ),
+    )
+
+    if data_inicio is not None:
+        stmt = stmt.where(Saida.timestamp >= datetime.combine(data_inicio, time.min))
+    if data_fim is not None:
+        stmt = stmt.where(Saida.timestamp <= datetime.combine(data_fim, time(23, 59, 59)))
+    if entregador_id is not None:
+        stmt = stmt.where(Saida.entregador_id == entregador_id)
+
+    rows = db.scalars(stmt).all()
+
+    agrupado: Dict[str, Dict[str, Any]] = {}
+    for saida in rows:
+        if saida.entregador_id is None:
+            continue
+        dia = saida.timestamp.date().isoformat()
+        ent_id = saida.entregador_id
+        ent_nome = saida.entregador or "Sem nome"
+
+        key = f"{dia}_{ent_id}"
+        if key not in agrupado:
+            agrupado[key] = {
+                "data": dia,
+                "entregador_id": ent_id,
+                "entregador_nome": ent_nome,
+                "qtde_shopee": 0,
+                "qtde_flex": 0,
+                "qtde_avulso": 0,
+            }
+        tipo = _normalizar_servico(saida.servico)
+        agrupado[key][f"qtde_{tipo}"] += 1
+
+    cache_precos: Dict[int, Dict[str, Decimal]] = {}
+    lista: List[EntregadorResumoItem] = []
+    for key, item in agrupado.items():
+        eid = item["entregador_id"]
+        if eid not in cache_precos:
+            cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base_user)
+        precos = cache_precos[eid]
+        valor_shopee = item["qtde_shopee"] * precos["shopee_valor"]
+        valor_flex = item["qtde_flex"] * precos["ml_valor"]
+        valor_avulso = item["qtde_avulso"] * precos["avulso_valor"]
+        total_dia = valor_shopee + valor_flex + valor_avulso
+        lista.append(
+            EntregadorResumoItem(
+                data=item["data"],
+                entregador_id=item["entregador_id"],
+                entregador_nome=item["entregador_nome"],
+                shopee={
+                    "qtde": item["qtde_shopee"],
+                    "valor_unit": precos["shopee_valor"],
+                    "total": valor_shopee,
+                },
+                flex={
+                    "qtde": item["qtde_flex"],
+                    "valor_unit": precos["ml_valor"],
+                    "total": valor_flex,
+                },
+                avulso={
+                    "qtde": item["qtde_avulso"],
+                    "valor_unit": precos["avulso_valor"],
+                    "total": valor_avulso,
+                },
+                total_dia=total_dia,
+            )
+        )
+
+    lista.sort(key=lambda x: (x.data, x.entregador_nome))
+
+    # Totalizadores globais: soma sobre TODOS os registros filtrados (lista completa).
+    # Paginação afeta APENAS o array "items". Filtros já aplicados: data_inicio, data_fim, entregador_id.
+    sumShopee = sum(i.shopee["qtde"] for i in lista)
+    sumFlex = sum(i.flex["qtde"] for i in lista)
+    sumAvulso = sum(i.avulso["qtde"] for i in lista)
+    sumValor = sum((i.total_dia for i in lista), Decimal("0.00"))
+    sumTotalEntregas = sumShopee + sumFlex + sumAvulso
+
+    totalItems = len(lista)
+    totalPages = (totalItems + pageSize - 1) // pageSize if totalItems else 0
+    start = (page - 1) * pageSize
+    end = start + pageSize
+    items = lista[start:end]
+
+    return EntregadorResumoResponse(
+        page=page,
+        pageSize=pageSize,
+        totalPages=totalPages,
+        totalItems=totalItems,
+        items=items,
+        sumShopee=sumShopee,
+        sumFlex=sumFlex,
+        sumAvulso=sumAvulso,
+        sumValor=sumValor,
+        sumTotalEntregas=sumTotalEntregas,
+    )
+
+
+# =========================================================
+# PREÇOS (global e individuais)
+# =========================================================
+_zero = Decimal("0.00")
+
+
+@router.get("/precos/global", response_model=PrecoGlobalOut)
+def get_preco_global(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Retorna valores globais de preço da sub_base do owner."""
+    sub_base_user = _resolve_user_base(db, current_user)
+    row = db.scalars(
+        select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base_user)
+    ).first()
+    if row:
+        return PrecoGlobalOut(
+            shopee_valor=row.shopee_valor,
+            ml_valor=row.ml_valor,
+            avulso_valor=row.avulso_valor,
+        )
+    return PrecoGlobalOut(shopee_valor=_zero, ml_valor=_zero, avulso_valor=_zero)
+
+
+@router.patch("/precos/global", response_model=PrecoGlobalOut)
+def patch_preco_global(
+    body: PrecoGlobalUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Cria ou atualiza valores globais da sub_base do owner. Payload não vazio."""
+    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
+        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
+    sub_base_user = _resolve_user_base(db, current_user)
+    row = db.scalars(
+        select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base_user)
+    ).first()
+    if row:
+        if body.shopee_valor is not None:
+            row.shopee_valor = body.shopee_valor
+        if body.ml_valor is not None:
+            row.ml_valor = body.ml_valor
+        if body.avulso_valor is not None:
+            row.avulso_valor = body.avulso_valor
+    else:
+        row = EntregadorPrecoGlobal(
+            sub_base=sub_base_user,
+            shopee_valor=body.shopee_valor if body.shopee_valor is not None else _zero,
+            ml_valor=body.ml_valor if body.ml_valor is not None else _zero,
+            avulso_valor=body.avulso_valor if body.avulso_valor is not None else _zero,
+        )
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return PrecoGlobalOut(shopee_valor=row.shopee_valor, ml_valor=row.ml_valor, avulso_valor=row.avulso_valor)
+
+
+@router.get("/precos/individuais", response_model=PrecoIndividuaisResponse)
+def get_precos_individuais(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Lista apenas exceções (usa_preco_global=False) da sub_base do owner."""
+    sub_base_user = _resolve_user_base(db, current_user)
+    stmt = (
+        select(EntregadorPreco)
+        .join(Entregador, EntregadorPreco.id_entregador == Entregador.id_entregador)
+        .where(
+            Entregador.sub_base == sub_base_user,
+            EntregadorPreco.usa_preco_global.is_(False),
+        )
+    )
+    rows = db.scalars(stmt).all()
+    items = [
+        PrecoIndividualItem(
+            entregador_id=ep.id_entregador,
+            entregador_nome=ep.entregador.nome if ep.entregador else None,
+            shopee_valor=ep.shopee_valor,
+            ml_valor=ep.ml_valor,
+            avulso_valor=ep.avulso_valor,
+        )
+        for ep in rows
+    ]
+    return PrecoIndividuaisResponse(items=items)
 
 
 @router.get("/{id_entregador}", response_model=EntregadorOut)
@@ -440,6 +750,69 @@ def patch_entregador(
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Erro ao atualizar o entregador/coletador.")
+
+
+@router.post("/{id_entregador}/precos", response_model=PrecoIndividualItem)
+def post_entregador_precos(
+    id_entregador: int,
+    body: PrecoEntregadorUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Cria ou atualiza exceção de preço para um entregador. Força usa_preco_global=False."""
+    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
+        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
+    sub_base_user = _resolve_user_base(db, current_user)
+    ent = _get_owned_entregador(db, sub_base_user, id_entregador)
+    ep = db.scalars(
+        select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
+    ).first()
+    if ep:
+        ep.usa_preco_global = False
+        if body.shopee_valor is not None:
+            ep.shopee_valor = body.shopee_valor
+        if body.ml_valor is not None:
+            ep.ml_valor = body.ml_valor
+        if body.avulso_valor is not None:
+            ep.avulso_valor = body.avulso_valor
+    else:
+        ep = EntregadorPreco(
+            id_entregador=id_entregador,
+            shopee_valor=body.shopee_valor,
+            ml_valor=body.ml_valor,
+            avulso_valor=body.avulso_valor,
+            usa_preco_global=False,
+        )
+        db.add(ep)
+    db.commit()
+    db.refresh(ep)
+    return PrecoIndividualItem(
+        entregador_id=id_entregador,
+        entregador_nome=ent.nome,
+        shopee_valor=ep.shopee_valor,
+        ml_valor=ep.ml_valor,
+        avulso_valor=ep.avulso_valor,
+    )
+
+
+@router.delete("/{id_entregador}/precos", status_code=status.HTTP_204_NO_CONTENT)
+def delete_entregador_precos(
+    id_entregador: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Remove exceção de preço; entregador volta a usar valores globais."""
+    sub_base_user = _resolve_user_base(db, current_user)
+    _get_owned_entregador(db, sub_base_user, id_entregador)
+    ep = db.scalars(
+        select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
+    ).first()
+    if ep:
+        db.delete(ep)
+    db.commit()
+    return
+
+
 @router.delete("/{id_entregador}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_entregador(
     id_entregador: int,

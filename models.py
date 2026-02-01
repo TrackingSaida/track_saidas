@@ -185,8 +185,59 @@ class Entregador(Base):
     coletador = Column(Boolean, nullable=False, server_default=text("false"))
     username_entregador = Column(Text, nullable=True)
 
+    preco = relationship("EntregadorPreco", uselist=False, back_populates="entregador")
+
     def __repr__(self) -> str:
         return f"<Entregador id_entregador={self.id_entregador} nome={self.nome!r} coletador={self.coletador}>"
+
+
+# ==========================
+# Tabela: entregador_preco_global
+# ==========================
+class EntregadorPrecoGlobal(Base):
+    __tablename__ = "entregador_preco_global"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False, unique=True)
+
+    shopee_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ml_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    avulso_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<EntregadorPrecoGlobal id={self.id} sub_base={self.sub_base!r}>"
+
+
+# ==========================
+# Tabela: entregador_preco
+# ==========================
+class EntregadorPreco(Base):
+    __tablename__ = "entregador_preco"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_entregador = Column(
+        BigInteger,
+        ForeignKey("entregador.id_entregador"),
+        nullable=False,
+        unique=True,
+    )
+
+    shopee_valor = Column(Numeric(12, 2), nullable=True)
+    ml_valor = Column(Numeric(12, 2), nullable=True)
+    avulso_valor = Column(Numeric(12, 2), nullable=True)
+
+    usa_preco_global = Column(Boolean, nullable=False, server_default=text("true"))
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    entregador = relationship("Entregador", back_populates="preco")
+
+    def __repr__(self) -> str:
+        return f"<EntregadorPreco id={self.id} id_entregador={self.id_entregador}>"
 
 
 # ==========================
