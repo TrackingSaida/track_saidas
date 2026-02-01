@@ -112,7 +112,7 @@ def registrar_saida(
     codigo = payload.codigo.strip()
     entregador = payload.entregador.strip()
     servico = payload.servico.strip().title()
-    status_val = (payload.status.strip() if payload.status else "Saiu para entrega").title()
+    status_val = (payload.status.strip() if payload.status else "saiu").title()
 
     # Duplicidade
     existente = db.scalar(
