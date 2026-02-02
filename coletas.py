@@ -102,7 +102,7 @@ def _sub_base_from_token_or_422(user: User) -> str:
     return sb
 
 
-def _resolve_entregador_info(db: Session, user: User) -> Tuple[str, str, str]:
+def _resolve_entregador_info(db: Session, user: User) -> Tuple[str, str, str, Optional[int]]:
     """
     Objetivo: reduzir consultas.
     - Primeiro usa o que já vem do JWT (sub_base + username).
@@ -122,10 +122,10 @@ def _resolve_entregador_info(db: Session, user: User) -> Tuple[str, str, str]:
         if getattr(ent, "sub_base", None):
             sub_base = ent.sub_base  # mantém compatibilidade se a verdade estiver no Entregador
         entregador_nome = (getattr(ent, "nome", None) or ent.username_entregador)
-        return sub_base, entregador_nome, ent.username_entregador
+        return sub_base, entregador_nome, ent.username_entregador, ent.id_entregador
 
     # Sem Entregador cadastrado: usa JWT
-    return sub_base, username, username
+    return sub_base, username, username, None
 
 
 # ============================================================
@@ -217,7 +217,7 @@ def registrar_coleta_em_lote(
     current_user: User = Depends(get_current_user),
 ):
     # 1) Resolve sub_base + entregador com no máximo 1 SELECT (Entregador) e sem fallback para User
-    sub_base, entregador_nome, username_entregador = _resolve_entregador_info(db, current_user)
+    sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
 
     # 2) valor unitário vem do JWT (sem SELECT em Owner)
     valor_unit = Decimal(getattr(current_user, "owner_valor", "0"))
@@ -282,6 +282,7 @@ def registrar_coleta_em_lote(
                 base=payload.base,
                 username=getattr(current_user, "username", None),
                 entregador=entregador_nome,
+                entregador_id=entregador_id,
                 codigo=codigo,
                 servico=_servico_label_for_saida(serv_key),
                 status="coletado",

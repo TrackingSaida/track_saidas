@@ -369,7 +369,8 @@ def resumo_entregadores(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega"]
+    # Inclui saída e entrega; exclui cancelados
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.codigo.isnot(None),
@@ -391,12 +392,13 @@ def resumo_entregadores(
 
     agrupado: Dict[str, Dict[str, Any]] = {}
     for saida in rows:
-        if saida.entregador_id is None:
-            continue
-        dia = saida.timestamp.date().isoformat()
         ent_id = saida.entregador_id
         ent_nome = saida.entregador or "Sem nome"
+        if ent_id is None:
+            # fallback: usa hash do nome como "id" fictício para agrupamento
+            ent_id = -abs(hash(ent_nome))
 
+        dia = saida.timestamp.date().isoformat()
         key = f"{dia}_{ent_id}"
         if key not in agrupado:
             agrupado[key] = {

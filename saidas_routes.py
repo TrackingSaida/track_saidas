@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, Saida, Coleta, OwnerCobrancaItem
+from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem
 
 
 # ============================================================
@@ -114,6 +114,17 @@ def registrar_saida(
     servico = payload.servico.strip().title()
     status_val = (payload.status.strip() if payload.status else "saiu").title()
 
+    # Buscar entregador_id pelo nome
+    entregador_id = None
+    ent = db.scalar(
+        select(Entregador).where(
+            Entregador.sub_base == sub_base,
+            Entregador.nome == entregador,
+        )
+    )
+    if ent:
+        entregador_id = ent.id_entregador
+
     # Duplicidade
     existente = db.scalar(
         select(Saida.id_saida).where(
@@ -146,6 +157,7 @@ def registrar_saida(
             sub_base=sub_base,
             username=username,
             entregador=entregador,
+            entregador_id=entregador_id,
             codigo=codigo,
             servico=servico,
             status=status_val,
