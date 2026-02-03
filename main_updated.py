@@ -84,8 +84,10 @@ from entregador_entregas_routes import router as entregador_entregas_router
 from signup_routes import router as signup_router
 from shopee_routes import router as shopee_router
 from logs import router as logs_router
+from contabilidade_routes import router as contabilidade_router
 
 app.include_router(ml_router, prefix=API_PREFIX)
+app.include_router(contabilidade_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(users_router,        prefix=API_PREFIX)
