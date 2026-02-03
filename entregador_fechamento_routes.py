@@ -307,6 +307,11 @@ def atualizar_fechamento(
     fech = db.get(EntregadorFechamento, id_fechamento)
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
+    if (fech.status or "").upper() != STATUS_GERADO:
+        raise HTTPException(
+            400,
+            "Apenas fechamentos com status GERADO podem ser reajustados.",
+        )
 
     # Recalcular valor_base
     valor_base_recalc = _calcular_valor_base(

@@ -91,6 +91,11 @@ class EntregadorResumoItem(BaseModel):
     total_dia: Decimal
     fechamento_status: Optional[str] = None  # PENDENTE | GERADO | REAJUSTADO
     id_fechamento: Optional[int] = None  # quando existe fechamento
+    pode_reajustar: Optional[bool] = None  # True quando GERADO e valor_base atual != valor_base fechado
+    valor_base_atual: Optional[Decimal] = None  # valor_base recalculado no período
+    valor_base_fechado: Optional[Decimal] = None  # valor_base gravado no fechamento
+    periodo_inicio: Optional[str] = None  # YYYY-MM-DD, quando existe fechamento
+    periodo_fim: Optional[str] = None  # YYYY-MM-DD, quando existe fechamento
 
 
 class EntregadorResumoResponse(BaseModel):
@@ -359,24 +364,16 @@ def _normalizar_servico(servico: Optional[str]) -> str:
     return "avulso"
 
 
-@router.get("/fechamentos/calcular")
-def calcular_valor_base_fechamento(
-    entregador_id: int = Query(...),
-    periodo_inicio: date = Query(...),
-    periodo_fim: date = Query(...),
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    """Retorna valor_base calculado para o período (para modal de fechamento)."""
-    sub_base_user = _resolve_user_base(db, current_user)
-
+def _calcular_valor_base_periodo(
+    db: Session,
+    sub_base_user: str,
+    entregador_id: int,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> Decimal:
+    """Calcula o valor_base a partir das saídas do entregador no período (para resumo e modal)."""
     if periodo_inicio > periodo_fim:
-        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-
-    ent = db.get(Entregador, entregador_id)
-    if not ent or (ent.sub_base and ent.sub_base != sub_base_user):
-        raise HTTPException(404, "Entregador não encontrado.")
-
+        return Decimal("0.00")
     status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
@@ -387,7 +384,6 @@ def calcular_valor_base_fechamento(
         func.lower(Saida.status).in_(status_validos),
     )
     rows = db.scalars(stmt).all()
-
     precos = resolver_precos_entregador(db, entregador_id, sub_base_user)
     total = Decimal("0.00")
     for saida in rows:
@@ -398,9 +394,27 @@ def calcular_valor_base_fechamento(
             total += precos["ml_valor"]
         else:
             total += precos["avulso_valor"]
+    return total.quantize(Decimal("0.01"))
 
+
+@router.get("/fechamentos/calcular")
+def calcular_valor_base_fechamento(
+    entregador_id: int = Query(...),
+    periodo_inicio: date = Query(...),
+    periodo_fim: date = Query(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Retorna valor_base calculado para o período (para modal de fechamento)."""
+    sub_base_user = _resolve_user_base(db, current_user)
+    if periodo_inicio > periodo_fim:
+        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+    ent = db.get(Entregador, entregador_id)
+    if not ent or (ent.sub_base and ent.sub_base != sub_base_user):
+        raise HTTPException(404, "Entregador não encontrado.")
+    valor_base = _calcular_valor_base_periodo(db, sub_base_user, entregador_id, periodo_inicio, periodo_fim)
     return {
-        "valor_base": total.quantize(Decimal("0.01")),
+        "valor_base": valor_base,
         "entregador_id": entregador_id,
         "entregador_nome": ent.nome,
         "periodo_inicio": periodo_inicio.isoformat(),
@@ -413,6 +427,7 @@ def resumo_entregadores(
     data_inicio: Optional[date] = Query(None),
     data_fim: Optional[date] = Query(None),
     entregador_id: Optional[int] = Query(None),
+    fechamento_status: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -465,16 +480,17 @@ def resumo_entregadores(
 
     cache_precos: Dict[int, Dict[str, Decimal]] = {}
     cache_fechamento: Dict[tuple, Optional[EntregadorFechamento]] = {}
+    cache_valor_base: Dict[tuple, Decimal] = {}  # (eid, periodo_inicio, periodo_fim) -> valor_base
 
     def _get_fechamento(eid: int, data_str: str) -> tuple:
-        """Retorna (status, id_fechamento). Apenas entregadores reais (id > 0)."""
+        """Retorna (status, id_fechamento, fechamento ou None). Apenas entregadores reais (id > 0)."""
         if eid <= 0:
-            return ("PENDENTE", None)
+            return ("PENDENTE", None, None)
         from datetime import datetime as dt
         try:
             data_ref = dt.strptime(data_str, "%Y-%m-%d").date()
         except (ValueError, TypeError):
-            return ("PENDENTE", None)
+            return ("PENDENTE", None, None)
         key_cache = (sub_base_user, eid, data_str)
         if key_cache not in cache_fechamento:
             fech = db.scalars(
@@ -491,8 +507,8 @@ def resumo_entregadores(
             st = (fech.status or "").upper()
             if st == "FECHADO":
                 st = "GERADO"  # legado
-            return (st or "GERADO", fech.id_fechamento)
-        return ("PENDENTE", None)
+            return (st or "GERADO", fech.id_fechamento, fech)
+        return ("PENDENTE", None, None)
 
     lista: List[EntregadorResumoItem] = []
     for key, item in agrupado.items():
@@ -505,7 +521,27 @@ def resumo_entregadores(
         valor_avulso = item["qtde_avulso"] * precos["avulso_valor"]
         total_dia = valor_shopee + valor_flex + valor_avulso
 
-        fech_status, id_fech = _get_fechamento(eid, item["data"])
+        fech_status, id_fech, fech = _get_fechamento(eid, item["data"])
+
+        pode_reajustar = None
+        valor_base_atual = None
+        valor_base_fechado = None
+        periodo_inicio_str = None
+        periodo_fim_str = None
+        if fech_status == "GERADO" and fech is not None and id_fech is not None:
+            key_vb = (eid, fech.periodo_inicio, fech.periodo_fim)
+            if key_vb not in cache_valor_base:
+                cache_valor_base[key_vb] = _calcular_valor_base_periodo(
+                    db, sub_base_user, eid, fech.periodo_inicio, fech.periodo_fim
+                )
+            valor_base_atual = cache_valor_base[key_vb]
+            valor_base_fechado = fech.valor_base
+            pode_reajustar = valor_base_atual != valor_base_fechado
+            periodo_inicio_str = fech.periodo_inicio.isoformat() if hasattr(fech.periodo_inicio, "isoformat") else str(fech.periodo_inicio)
+            periodo_fim_str = fech.periodo_fim.isoformat() if hasattr(fech.periodo_fim, "isoformat") else str(fech.periodo_fim)
+        if fech is not None and id_fech is not None and periodo_inicio_str is None:
+            periodo_inicio_str = fech.periodo_inicio.isoformat() if hasattr(fech.periodo_inicio, "isoformat") else str(fech.periodo_inicio)
+            periodo_fim_str = fech.periodo_fim.isoformat() if hasattr(fech.periodo_fim, "isoformat") else str(fech.periodo_fim)
 
         lista.append(
             EntregadorResumoItem(
@@ -530,13 +566,22 @@ def resumo_entregadores(
                 total_dia=total_dia,
                 fechamento_status=fech_status,
                 id_fechamento=id_fech,
+                pode_reajustar=pode_reajustar,
+                valor_base_atual=valor_base_atual,
+                valor_base_fechado=valor_base_fechado,
+                periodo_inicio=periodo_inicio_str,
+                periodo_fim=periodo_fim_str,
             )
         )
 
     lista.sort(key=lambda x: (x.data, x.entregador_nome))
 
+    if fechamento_status and str(fechamento_status).strip():
+        status_upper = str(fechamento_status).strip().upper()
+        lista = [i for i in lista if (i.fechamento_status or "PENDENTE").upper() == status_upper]
+
     # Totalizadores globais: soma sobre TODOS os registros filtrados (lista completa).
-    # Paginação afeta APENAS o array "items". Filtros já aplicados: data_inicio, data_fim, entregador_id.
+    # Paginação afeta APENAS o array "items". Filtros já aplicados: data_inicio, data_fim, entregador_id, fechamento_status.
     sumShopee = sum(i.shopee["qtde"] for i in lista)
     sumFlex = sum(i.flex["qtde"] for i in lista)
     sumAvulso = sum(i.avulso["qtde"] for i in lista)
