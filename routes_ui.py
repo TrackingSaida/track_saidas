@@ -44,18 +44,9 @@ MENU_DEFS = [
         "icon": "ri-money-dollar-circle-line",
         "roles": [0, 1],
         "items": [
-            {
-                "label": "Resumo de Coletas",
-                "href": "tracking-coletas-resumo.html",
-                "roles": [0, 1],
-                "group": "resumos"
-            },
-            {
-                "label": "Resumo por Entregador",
-                "href": "tracking-entregadores-resumo.html",
-                "roles": [0, 1],
-                "group": "resumos"
-            },
+            {"label": "Resumo de Coletas", "href": "tracking-coletas-resumo.html", "roles": [0, 1]},
+            {"label": "Resumo por Entregador", "href": "tracking-entregadores-resumo.html", "roles": [0, 1]},
+            {"label": "Contabilidade", "href": "tracking-contabilidade.html", "roles": [0, 1]},
         ]
     },
     {
