@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user, get_password_hash
-from models import Entregador, EntregadorPreco, EntregadorPrecoGlobal, Saida, User
+from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Saida, User
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
@@ -89,6 +89,8 @@ class EntregadorResumoItem(BaseModel):
     flex: Dict[str, Any]
     avulso: Dict[str, Any]
     total_dia: Decimal
+    fechamento_status: Optional[str] = None  # PENDENTE | GERADO | REAJUSTADO
+    id_fechamento: Optional[int] = None  # quando existe fechamento
 
 
 class EntregadorResumoResponse(BaseModel):
@@ -357,6 +359,55 @@ def _normalizar_servico(servico: Optional[str]) -> str:
     return "avulso"
 
 
+@router.get("/fechamentos/calcular")
+def calcular_valor_base_fechamento(
+    entregador_id: int = Query(...),
+    periodo_inicio: date = Query(...),
+    periodo_fim: date = Query(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Retorna valor_base calculado para o período (para modal de fechamento)."""
+    sub_base_user = _resolve_user_base(db, current_user)
+
+    if periodo_inicio > periodo_fim:
+        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+
+    ent = db.get(Entregador, entregador_id)
+    if not ent or (ent.sub_base and ent.sub_base != sub_base_user):
+        raise HTTPException(404, "Entregador não encontrado.")
+
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base_user,
+        Saida.entregador_id == entregador_id,
+        Saida.codigo.isnot(None),
+        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
+        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
+        func.lower(Saida.status).in_(status_validos),
+    )
+    rows = db.scalars(stmt).all()
+
+    precos = resolver_precos_entregador(db, entregador_id, sub_base_user)
+    total = Decimal("0.00")
+    for saida in rows:
+        tipo = _normalizar_servico(saida.servico)
+        if tipo == "shopee":
+            total += precos["shopee_valor"]
+        elif tipo == "flex":
+            total += precos["ml_valor"]
+        else:
+            total += precos["avulso_valor"]
+
+    return {
+        "valor_base": total.quantize(Decimal("0.01")),
+        "entregador_id": entregador_id,
+        "entregador_nome": ent.nome,
+        "periodo_inicio": periodo_inicio.isoformat(),
+        "periodo_fim": periodo_fim.isoformat(),
+    }
+
+
 @router.get("/resumo", response_model=EntregadorResumoResponse)
 def resumo_entregadores(
     data_inicio: Optional[date] = Query(None),
@@ -413,6 +464,36 @@ def resumo_entregadores(
         agrupado[key][f"qtde_{tipo}"] += 1
 
     cache_precos: Dict[int, Dict[str, Decimal]] = {}
+    cache_fechamento: Dict[tuple, Optional[EntregadorFechamento]] = {}
+
+    def _get_fechamento(eid: int, data_str: str) -> tuple:
+        """Retorna (status, id_fechamento). Apenas entregadores reais (id > 0)."""
+        if eid <= 0:
+            return ("PENDENTE", None)
+        from datetime import datetime as dt
+        try:
+            data_ref = dt.strptime(data_str, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return ("PENDENTE", None)
+        key_cache = (sub_base_user, eid, data_str)
+        if key_cache not in cache_fechamento:
+            fech = db.scalars(
+                select(EntregadorFechamento).where(
+                    EntregadorFechamento.sub_base == sub_base_user,
+                    EntregadorFechamento.id_entregador == eid,
+                    EntregadorFechamento.periodo_inicio <= data_ref,
+                    EntregadorFechamento.periodo_fim >= data_ref,
+                )
+            ).first()
+            cache_fechamento[key_cache] = fech
+        fech = cache_fechamento[key_cache]
+        if fech:
+            st = (fech.status or "").upper()
+            if st == "FECHADO":
+                st = "GERADO"  # legado
+            return (st or "GERADO", fech.id_fechamento)
+        return ("PENDENTE", None)
+
     lista: List[EntregadorResumoItem] = []
     for key, item in agrupado.items():
         eid = item["entregador_id"]
@@ -423,6 +504,9 @@ def resumo_entregadores(
         valor_flex = item["qtde_flex"] * precos["ml_valor"]
         valor_avulso = item["qtde_avulso"] * precos["avulso_valor"]
         total_dia = valor_shopee + valor_flex + valor_avulso
+
+        fech_status, id_fech = _get_fechamento(eid, item["data"])
+
         lista.append(
             EntregadorResumoItem(
                 data=item["data"],
@@ -444,6 +528,8 @@ def resumo_entregadores(
                     "total": valor_avulso,
                 },
                 total_dia=total_dia,
+                fechamento_status=fech_status,
+                id_fechamento=id_fech,
             )
         )
 

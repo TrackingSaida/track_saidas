@@ -296,6 +296,44 @@ class OwnerCobrancaItem(Base):
 
 
 # ==========================
+# Tabela: entregador_fechamentos
+# ==========================
+class EntregadorFechamento(Base):
+    __tablename__ = "entregador_fechamentos"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base", "id_entregador", "periodo_inicio", "periodo_fim",
+            name="uq_entregador_fechamento_periodo",
+        ),
+    )
+
+    id_fechamento = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    id_entregador = Column(BigInteger, nullable=False)
+    username_entregador = Column(Text, nullable=False)
+
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+
+    valor_base = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_adicao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_adicao = Column(Text, nullable=True)
+    valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_subtracao = Column(Text, nullable=True)
+
+    valor_final = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    status = Column(Text, nullable=False, server_default=text("'fechado'::text"))
+
+    criado_em = Column(DateTime(timezone=False), server_default=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<EntregadorFechamento id_fechamento={self.id_fechamento} "
+            f"id_entregador={self.id_entregador} status={self.status!r}>"
+        )
+
+
+# ==========================
 # Tabela: saidas_detail
 # ==========================
 class SaidaDetail(Base):

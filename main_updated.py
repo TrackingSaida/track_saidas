@@ -72,6 +72,7 @@ app.add_middleware(
 # Routers em uso
 from users_routes_updated import router as users_router
 from entregador_routes import router as entregadores_router
+from entregador_fechamento_routes import router as fechamento_router
 from auth import router as auth_router
 from saidas_routes import router as saidas_router
 from owner_routes import router as owners_router
@@ -89,6 +90,7 @@ app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(users_router,        prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
+app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
