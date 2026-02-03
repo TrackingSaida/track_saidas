@@ -1,7 +1,6 @@
 """
 Rotas de Contabilidade / Financeiro
-GET /contabilidade/resumo — resumo financeiro por período (receita, despesa, lucro, indicadores).
-Usa apenas dados consolidados: coletas (receita) e fechamentos GERADO/REAJUSTADO (despesa).
+GET /contabilidade/resumo — resumo financeiro por período (receita, despesas confirmadas/pendentes, lucro).
 """
 from __future__ import annotations
 
@@ -16,29 +15,14 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, EntregadorFechamento, Saida, User
+from models import Coleta, Entregador, EntregadorFechamento, Saida
+
+from entregador_routes import resolver_precos_entregador, _normalizar_servico
 
 router = APIRouter(prefix="/contabilidade", tags=["Contabilidade"])
 
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue", "pendente"]
 STATUS_FECHAMENTO_CONTABIL = ("GERADO", "REAJUSTADO", "FECHADO")  # FECHADO = legado
-
-
-def _resolve_user_base(db: Session, current_user) -> str:
-    sb = getattr(current_user, "sub_base", None)
-    if sb:
-        return sb
-    user_id = getattr(current_user, "id", None)
-    if user_id is not None:
-        u = db.get(User, user_id)
-        if u and getattr(u, "sub_base", None):
-            return u.sub_base
-    uname = getattr(current_user, "username", None)
-    if uname:
-        u = db.scalars(select(User).where(User.username == uname)).first()
-        if u and getattr(u, "sub_base", None):
-            return u.sub_base
-    raise HTTPException(status_code=400, detail="sub_base não definida para o usuário.")
 
 
 def _decimal(v) -> Decimal:
@@ -107,6 +91,8 @@ class ContabilidadeResumoResponse(BaseModel):
     data_inicio: str
     data_fim: str
     receita_bruta: Decimal
+    despesas_confirmadas: Decimal
+    despesas_pendentes: Decimal
     despesas_totais: Decimal
     lucro_liquido: Decimal
     margem_liquida: Decimal
@@ -134,7 +120,9 @@ def get_resumo_contabilidade(
     if data_inicio > data_fim:
         raise HTTPException(400, "data_inicio deve ser menor ou igual a data_fim.")
 
-    sub_base = _resolve_user_base(db, current_user)
+    sub_base = getattr(current_user, "sub_base", None)
+    if not sub_base:
+        raise HTTPException(403, "sub_base não encontrada no token. Faça login novamente.")
     dt_start = datetime.combine(data_inicio, time.min)
     dt_end = datetime.combine(data_fim, time(23, 59, 59))
 
@@ -192,7 +180,7 @@ def get_resumo_contabilidade(
     saidas_ml = sum(1 for s in rows_saidas if (s.servico or "").lower() in ("mercado livre", "mercado_livre", "ml", "flex"))
     saidas_avulso = total_saidas - saidas_shopee - saidas_ml
 
-    # ---- 3) DESPESA (fechamentos GERADO/REAJUSTADO que intersectam o período) ----
+    # ---- 3) DESPESA CONFIRMADA (fechamentos GERADO/REAJUSTADO/FECHADO) ----
     stmt_fech = (
         select(EntregadorFechamento)
         .where(
@@ -203,9 +191,44 @@ def get_resumo_contabilidade(
         )
     )
     rows_fech = db.scalars(stmt_fech).all()
-    despesas_totais = sum(_decimal(f.valor_final) for f in rows_fech)
+    despesas_confirmadas = sum(_decimal(f.valor_final) for f in rows_fech)
 
-    # Despesa por entregador
+    # Cache: (entregador_id, data) -> fechamento cobre
+    cache_coberto: Dict[tuple, bool] = {}
+    for f in rows_fech:
+        d = f.periodo_inicio
+        while d <= f.periodo_fim:
+            cache_coberto[(f.id_entregador, d)] = True
+            d += timedelta(days=1)
+
+    # ---- 3b) DESPESA PENDENTE (saídas não cobertas por fechamento) ----
+    cache_precos: Dict[int, Dict[str, Decimal]] = {}
+    despesas_pendentes = Decimal("0")
+    for s in rows_saidas:
+        eid = s.entregador_id
+        if eid is None:
+            continue
+        data_saida = s.timestamp.date()
+        if cache_coberto.get((eid, data_saida), False):
+            continue
+        if eid not in cache_precos:
+            try:
+                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+            except Exception:
+                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[eid]
+        tipo = _normalizar_servico(s.servico)
+        if tipo == "shopee":
+            despesas_pendentes += precos["shopee_valor"]
+        elif tipo == "flex":
+            despesas_pendentes += precos["ml_valor"]
+        else:
+            despesas_pendentes += precos["avulso_valor"]
+
+    despesas_pendentes = despesas_pendentes.quantize(Decimal("0.01"))
+    despesas_totais = (despesas_confirmadas + despesas_pendentes).quantize(Decimal("0.01"))
+
+    # Despesa por entregador (confirmada)
     despesa_por_ent: Dict[int, Decimal] = {}
     for f in rows_fech:
         eid = f.id_entregador
@@ -392,6 +415,8 @@ def get_resumo_contabilidade(
         data_inicio=data_inicio.isoformat(),
         data_fim=data_fim.isoformat(),
         receita_bruta=receita_bruta.quantize(Decimal("0.01")),
+        despesas_confirmadas=despesas_confirmadas.quantize(Decimal("0.01")),
+        despesas_pendentes=despesas_pendentes.quantize(Decimal("0.01")),
         despesas_totais=despesas_totais.quantize(Decimal("0.01")),
         lucro_liquido=lucro_liquido.quantize(Decimal("0.01")),
         margem_liquida=margem_liquida.quantize(Decimal("0.01")),
