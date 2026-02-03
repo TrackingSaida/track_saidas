@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import time
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -14,6 +16,10 @@ API_PREFIX = os.getenv("API_PREFIX", "/api")
 _env_origins = os.getenv("ALLOWED_ORIGINS")
 if _env_origins:
     ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
+    # Garantir localhost:3000 para desenvolvimento/testes mesmo quando ENV está definida
+    for origin in ("http://localhost:3000", "http://127.0.0.1:3000"):
+        if origin not in ALLOWED_ORIGINS:
+            ALLOWED_ORIGINS.append(origin)
 else:
     ALLOWED_ORIGINS = [
         "https://admirable-sprinkles-d10196.netlify.app",
@@ -35,6 +41,31 @@ app = FastAPI(
     docs_url=f"{API_PREFIX}/docs",
     redoc_url=f"{API_PREFIX}/redoc",
 )
+
+# ──────────────────────────────────────────────────────────────────
+# CORS fallback (primeiro middleware = último na volta): garante que
+# toda resposta, inclusive de erro/500, tenha CORS quando houver Origin.
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+class CORSFallbackMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            origin = request.headers.get("origin")
+            headers = {}
+            if origin:
+                headers["Access-Control-Allow-Origin"] = origin
+                headers["Access-Control-Allow-Credentials"] = "true"
+            return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=headers)
+        origin = request.headers.get("origin")
+        if origin and "access-control-allow-origin" not in [k.lower() for k in response.headers.keys()]:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+
+app.add_middleware(CORSFallbackMiddleware)
 
 # ──────────────────────────────────────────────────────────────────
 # 🔥 Middleware — tempo real de processamento do BACKEND
@@ -102,6 +133,48 @@ app.include_router(signup_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
 
+
+def _cors_headers_for_request(request: Request):
+    """Headers CORS na resposta de erro para a origem da requisição (evita CORS missing em 500)."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+    }
+
+
+@app.exception_handler(FastAPIHTTPException)
+async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
+    """Garante que respostas HTTPException (401, 404, etc.) tenham CORS para o browser não bloquear."""
+    detail = exc.detail
+    if isinstance(detail, dict):
+        detail = detail.get("message", detail.get("detail", str(detail)))
+    body = {"detail": str(detail) if detail else "Erro"}
+    headers = dict(_cors_headers_for_request(request))
+    return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Garante que respostas de erro (500) incluam headers CORS para o browser não bloquear."""
+    status = 500
+    detail = str(exc) or "Erro interno do servidor"
+    try:
+        if hasattr(exc, "status_code"):
+            status = getattr(exc, "status_code", 500)
+        if hasattr(exc, "detail"):
+            d = getattr(exc, "detail", None)
+            if d is not None:
+                detail = d if isinstance(d, str) else str(d.get("message", d.get("detail", d)))
+    except Exception:
+        pass
+    body = {"detail": detail}
+    headers = dict(_cors_headers_for_request(request))
+    return JSONResponse(status_code=status, content=body, headers=headers)
+
+
 # ──────────────────────────────────────────────────────────────────
 # Rotina de startup — renova tokens ML ao inicializar a API
 from db import SessionLocal
@@ -129,7 +202,7 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app",
+        "main_updated:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         reload=os.getenv("RELOAD", "true").lower() == "true",
