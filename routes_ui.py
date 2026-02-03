@@ -37,6 +37,13 @@ MENU_DEFS = [
                 "roles": [0, 1, 2, 3],
                 "group": "registros"
             },
+        ]
+    },
+    {
+        "section": "Financeiro",
+        "icon": "ri-money-dollar-circle-line",
+        "roles": [0, 1],
+        "items": [
             {
                 "label": "Resumo de Coletas",
                 "href": "tracking-coletas-resumo.html",
@@ -51,9 +58,6 @@ MENU_DEFS = [
             },
         ]
     },
-
-
-
     {
         "section": "Dashboards",
         "icon": "ri-dashboard-2-line",
