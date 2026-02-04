@@ -23,7 +23,8 @@ MENU_DEFS = [
                 "label": "Registrar Coletas",
                 "href": "tracking-coleta-leitura.html",
                 "roles": [0, 1, 2, 3],
-                "group": "leituras"
+                "group": "leituras",
+                "coleta_only": True
             },
             {
                 "label": "Registrar Saídas",
@@ -44,7 +45,7 @@ MENU_DEFS = [
         "icon": "ri-money-dollar-circle-line",
         "roles": [0, 1],
         "items": [
-            {"label": "Resumo de Coletas", "href": "tracking-coletas-resumo.html", "roles": [0, 1]},
+            {"label": "Resumo de Coletas", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True},
             {"label": "Resumo por Entregador", "href": "tracking-entregadores-resumo.html", "roles": [0, 1]},
             {"label": "Contabilidade", "href": "tracking-contabilidade.html", "roles": [0, 1]},
         ]
@@ -78,16 +79,17 @@ MENU_DEFS = [
 # FUNÇÃO QUE MONTA MENU FINAL
 # =============================
 
-def menu_for_role(role: int):
+def menu_for_role(role: int, ignorar_coleta: bool = False):
     visible_sections = []
 
     for section in MENU_DEFS:
         # Se o usuário pode ver a seção inteira
         if role in section["roles"]:
-            # Filtra os itens permitidos
+            # Filtra os itens permitidos (role + ignorar_coleta)
             allowed_items = [
                 item for item in section["items"]
                 if ("roles" not in item or role in item["roles"])
+                and not (ignorar_coleta and item.get("coleta_only"))
             ]
 
             if allowed_items:
@@ -114,7 +116,8 @@ def get_menu(user: User = Depends(get_current_user)):
     Usa get_current_user diretamente, garantindo compatibilidade com /auth/me.
     """
     role = int(user.role)
-    menu = menu_for_role(role)
+    ignorar_coleta = bool(getattr(user, "ignorar_coleta", False))
+    menu = menu_for_role(role, ignorar_coleta)
 
     return {
         "role": role,

@@ -219,14 +219,14 @@ def get_resumo_contabilidade(
         precos = cache_precos[eid]
         tipo = _normalizar_servico(s.servico)
         if tipo == "shopee":
-            despesas_pendentes += precos["shopee_valor"]
+            despesas_pendentes += _decimal(precos.get("shopee_valor", 0))
         elif tipo == "flex":
-            despesas_pendentes += precos["ml_valor"]
+            despesas_pendentes += _decimal(precos.get("ml_valor", 0))
         else:
-            despesas_pendentes += precos["avulso_valor"]
+            despesas_pendentes += _decimal(precos.get("avulso_valor", 0))
 
-    despesas_pendentes = despesas_pendentes.quantize(Decimal("0.01"))
-    despesas_totais = (despesas_confirmadas + despesas_pendentes).quantize(Decimal("0.01"))
+    despesas_pendentes = _decimal(despesas_pendentes).quantize(Decimal("0.01"))
+    despesas_totais = _decimal(despesas_confirmadas + despesas_pendentes).quantize(Decimal("0.01"))
 
     # Despesa por entregador (confirmada)
     despesa_por_ent: Dict[int, Decimal] = {}
@@ -243,54 +243,60 @@ def get_resumo_contabilidade(
         despesa_shopee = despesa_ml = despesa_avulso = Decimal("0")
 
     # ---- 4) Lucro e margem ----
-    lucro_liquido = receita_bruta - despesas_totais
-    margem_liquida = (lucro_liquido / receita_bruta * 100) if receita_bruta else Decimal("0")
+    lucro_liquido = _decimal(receita_bruta - despesas_totais)
+    rec_bruta = _decimal(receita_bruta)
+    margem_liquida = (_decimal(lucro_liquido) / rec_bruta * Decimal("100")) if rec_bruta else Decimal("0")
 
-    # ---- 5) Indicadores operacionais ----
-    ticket_medio = (receita_bruta / total_coletas) if total_coletas else Decimal("0")
-    custo_medio = (despesas_totais / total_saidas) if total_saidas else Decimal("0")
-    lucro_pacote = (lucro_liquido / total_coletas) if total_coletas else Decimal("0")
-    taxa_conv = (Decimal(total_saidas) / total_coletas * 100) if total_coletas else Decimal("0")
+    # ---- 5) Indicadores operacionais (garantir Decimal antes de divisão e quantize) ----
+    tot_c = _decimal(total_coletas)
+    tot_s = _decimal(total_saidas)
+    ticket_medio = (_decimal(receita_bruta) / tot_c) if tot_c else Decimal("0")
+    custo_medio = (_decimal(despesas_totais) / tot_s) if tot_s else Decimal("0")
+    lucro_pacote = (_decimal(lucro_liquido) / tot_c) if tot_c else Decimal("0")
+    taxa_conv = (tot_s / tot_c * Decimal("100")) if tot_c else Decimal("0")
 
     indicadores = IndicadoresOperacionais(
         total_coletas=total_coletas,
         total_saidas=total_saidas,
-        ticket_medio_coleta=ticket_medio.quantize(Decimal("0.01")),
-        custo_medio_saida=custo_medio.quantize(Decimal("0.01")),
-        lucro_por_pacote=lucro_pacote.quantize(Decimal("0.01")),
-        taxa_conversao=taxa_conv.quantize(Decimal("0.01")),
+        ticket_medio_coleta=_decimal(ticket_medio).quantize(Decimal("0.01")),
+        custo_medio_saida=_decimal(custo_medio).quantize(Decimal("0.01")),
+        lucro_por_pacote=_decimal(lucro_pacote).quantize(Decimal("0.01")),
+        taxa_conversao=_decimal(taxa_conv).quantize(Decimal("0.01")),
     )
 
     # ---- 6) Análise por serviço ----
     def _margem(rec: Decimal, desp: Decimal) -> Decimal:
-        return (Decimal("0") if rec == 0 else ((rec - desp) / rec * 100).quantize(Decimal("0.01")))
+        r = _decimal(rec)
+        if r == 0:
+            return Decimal("0")
+        return (_decimal(r - desp) / r * Decimal("100")).quantize(Decimal("0.01"))
 
     analise_servico = [
         ServicoItem(
             servico="shopee",
             coletas=coletas_shopee,
             saidas=saidas_shopee,
-            receita=receita_shopee.quantize(Decimal("0.01")),
-            despesa=despesa_shopee.quantize(Decimal("0.01")),
-            lucro=(receita_shopee - despesa_shopee).quantize(Decimal("0.01")),
+            receita=_decimal(receita_shopee).quantize(Decimal("0.01")),
+            despesa=_decimal(despesa_shopee).quantize(Decimal("0.01")),
+            lucro=_decimal(receita_shopee - despesa_shopee).quantize(Decimal("0.01")),
             margem=_margem(receita_shopee, despesa_shopee),
         ),
         ServicoItem(
             servico="mercado_livre",
             coletas=coletas_ml,
             saidas=saidas_ml,
-            receita=receita_ml.quantize(Decimal("0.01")),
-            despesa=despesa_ml.quantize(Decimal("0.01")),
-            lucro=(receita_ml - despesa_ml).quantize(Decimal("0.01")),
+            receita=_decimal(receita_ml).quantize(Decimal("0.01")),
+            despesa=_decimal(despesa_ml).quantize(Decimal("0.01")),
+            lucro=_decimal(receita_ml - despesa_ml).quantize(Decimal("0.01")),
             margem=_margem(receita_ml, despesa_ml),
         ),
         ServicoItem(
             servico="avulso",
             coletas=coletas_avulso,
             saidas=saidas_avulso,
-            receita=receita_avulso.quantize(Decimal("0.01")),
-            despesa=despesa_avulso.quantize(Decimal("0.01")),
-            lucro=(receita_avulso - despesa_avulso).quantize(Decimal("0.01")),
+            receita=_decimal(receita_avulso).quantize(Decimal("0.01")),
+            despesa=_decimal(despesa_avulso).quantize(Decimal("0.01")),
+            lucro=_decimal(receita_avulso - despesa_avulso).quantize(Decimal("0.01")),
             margem=_margem(receita_avulso, despesa_avulso),
         ),
     ]
@@ -300,19 +306,22 @@ def get_resumo_contabilidade(
     for c in rows_coletas:
         b = (c.base or "").strip().upper() or "SEM BASE"
         base_receita[b] = base_receita.get(b, Decimal("0")) + _decimal(c.valor_total)
-    if receita_bruta > 0:
+    if _decimal(receita_bruta) > 0:
         rentabilidade = []
+        rec_bruta_r = _decimal(receita_bruta)
+        desp_tot = _decimal(despesas_totais)
         for base_nome, rec in sorted(base_receita.items(), key=lambda x: -x[1]):
-            pct = rec / receita_bruta
-            desp_base = (despesas_totais * pct).quantize(Decimal("0.01"))
-            lucro_base = (rec - desp_base).quantize(Decimal("0.01"))
-            margem_base = _margem(rec, desp_base)
+            rec_d = _decimal(rec)
+            pct = rec_d / rec_bruta_r
+            desp_base = _decimal(desp_tot * pct).quantize(Decimal("0.01"))
+            lucro_base = _decimal(rec_d - desp_base).quantize(Decimal("0.01"))
+            margem_base = _margem(rec_d, desp_base)
             rentabilidade.append(
-                BaseItem(base=base_nome, receita=rec, despesa=desp_base, lucro=lucro_base, margem=margem_base)
+                BaseItem(base=base_nome, receita=rec_d, despesa=desp_base, lucro=lucro_base, margem=margem_base)
             )
         rentabilidade.sort(key=lambda x: -x.lucro)
     else:
-        rentabilidade = [BaseItem(base=b, receita=r, despesa=Decimal("0"), lucro=r, margem=Decimal("0")) for b, r in sorted(base_receita.items())]
+        rentabilidade = [BaseItem(base=b, receita=_decimal(r), despesa=Decimal("0"), lucro=_decimal(r), margem=Decimal("0")) for b, r in sorted(base_receita.items())]
 
     # ---- 8) Distribuição de despesas por entregador ----
     ent_ids = list(despesa_por_ent.keys())
@@ -325,14 +334,16 @@ def get_resumo_contabilidade(
         if s.entregador_id:
             saidas_por_ent[s.entregador_id] = saidas_por_ent.get(s.entregador_id, 0) + 1
     dist_despesas = []
+    desp_tot_dist = _decimal(despesas_totais)
     for eid, desp in despesa_por_ent.items():
-        pct = (desp / despesas_totais * 100).quantize(Decimal("0.01")) if despesas_totais else Decimal("0")
+        desp_d = _decimal(desp)
+        pct = (_decimal(desp_d) / desp_tot_dist * Decimal("100")).quantize(Decimal("0.01")) if desp_tot_dist else Decimal("0")
         dist_despesas.append(
             EntregadorDespesaItem(
                 id_entregador=eid,
                 nome=ent_nomes.get(eid, "—"),
                 saidas=saidas_por_ent.get(eid, 0),
-                despesa=desp.quantize(Decimal("0.01")),
+                despesa=_decimal(desp_d).quantize(Decimal("0.01")),
                 percentual=pct,
             )
         )
@@ -342,22 +353,22 @@ def get_resumo_contabilidade(
     dre = [
         DRELinha(
             label="RECEITA BRUTA",
-            valor=receita_bruta.quantize(Decimal("0.01")),
+            valor=_decimal(receita_bruta).quantize(Decimal("0.01")),
             detalhes=[
-                f"Shopee ({coletas_shopee} × ticket) = {receita_shopee.quantize(Decimal('0.01'))}",
-                f"Mercado Livre ({coletas_ml} × ticket) = {receita_ml.quantize(Decimal('0.01'))}",
-                f"Avulso ({coletas_avulso} × ticket) = {receita_avulso.quantize(Decimal('0.01'))}",
+                f"Shopee ({coletas_shopee} × ticket) = {_decimal(receita_shopee).quantize(Decimal('0.01'))}",
+                f"Mercado Livre ({coletas_ml} × ticket) = {_decimal(receita_ml).quantize(Decimal('0.01'))}",
+                f"Avulso ({coletas_avulso} × ticket) = {_decimal(receita_avulso).quantize(Decimal('0.01'))}",
             ],
         ),
         DRELinha(
             label="(-) DESPESAS OPERACIONAIS",
-            valor=despesas_totais.quantize(Decimal("0.01")),
-            detalhes=[f"Custo de Entregas ({total_saidas} × {custo_medio.quantize(Decimal('0.01'))}) = {despesas_totais.quantize(Decimal('0.01'))}"],
+            valor=_decimal(despesas_totais).quantize(Decimal("0.01")),
+            detalhes=[f"Custo de Entregas ({total_saidas} × {_decimal(custo_medio).quantize(Decimal('0.01'))}) = {_decimal(despesas_totais).quantize(Decimal('0.01'))}"],
         ),
         DRELinha(
             label="LUCRO LÍQUIDO",
-            valor=lucro_liquido.quantize(Decimal("0.01")),
-            detalhes=[f"Margem: {margem_liquida.quantize(Decimal('0.01'))}%"],
+            valor=_decimal(lucro_liquido).quantize(Decimal("0.01")),
+            detalhes=[f"Margem: {_decimal(margem_liquida).quantize(Decimal('0.01'))}%"],
         ),
     ]
 
@@ -389,21 +400,23 @@ def get_resumo_contabilidade(
             ).all()
             rec_ant = sum(_decimal(c.valor_total) for c in rows_c_prev)
             desp_ant = sum(_decimal(f.valor_final) for f in rows_f_prev)
-            lucro_ant = rec_ant - desp_ant
-            margem_ant = (lucro_ant / rec_ant * 100) if rec_ant else Decimal("0")
-            v_rec = (receita_bruta - rec_ant) / rec_ant * 100 if rec_ant else None
-            v_desp = (despesas_totais - desp_ant) / desp_ant * 100 if desp_ant else None
-            v_lucro = (lucro_liquido - lucro_ant) / lucro_ant * 100 if lucro_ant else None
-            v_margem = (margem_liquida - margem_ant) if margem_ant is not None else None
+            rec_ant_d = _decimal(rec_ant)
+            desp_ant_d = _decimal(desp_ant)
+            lucro_ant = _decimal(rec_ant_d - desp_ant_d)
+            margem_ant = (lucro_ant / rec_ant_d * Decimal("100")) if rec_ant_d else Decimal("0")
+            v_rec = (_decimal(receita_bruta) - rec_ant_d) / rec_ant_d * Decimal("100") if rec_ant_d else None
+            v_desp = (_decimal(despesas_totais) - desp_ant_d) / desp_ant_d * Decimal("100") if desp_ant_d else None
+            v_lucro = (_decimal(lucro_liquido) - lucro_ant) / lucro_ant * Decimal("100") if lucro_ant else None
+            v_margem = _decimal(margem_liquida) - margem_ant if margem_ant is not None else None
             comparacao = ComparacaoPeriodoAnterior(
-                receita_anterior=rec_ant.quantize(Decimal("0.01")),
-                despesa_anterior=desp_ant.quantize(Decimal("0.01")),
-                lucro_anterior=lucro_ant.quantize(Decimal("0.01")),
-                margem_anterior=margem_ant.quantize(Decimal("0.01")) if isinstance(margem_ant, Decimal) else Decimal("0"),
-                variacao_receita_pct=v_rec.quantize(Decimal("0.01")) if v_rec is not None else None,
-                variacao_despesa_pct=v_desp.quantize(Decimal("0.01")) if v_desp is not None else None,
-                variacao_lucro_pct=v_lucro.quantize(Decimal("0.01")) if v_lucro is not None else None,
-                variacao_margem_pp=v_margem.quantize(Decimal("0.01")) if v_margem is not None else None,
+                receita_anterior=_decimal(rec_ant).quantize(Decimal("0.01")),
+                despesa_anterior=_decimal(desp_ant).quantize(Decimal("0.01")),
+                lucro_anterior=_decimal(lucro_ant).quantize(Decimal("0.01")),
+                margem_anterior=_decimal(margem_ant).quantize(Decimal("0.01")),
+                variacao_receita_pct=_decimal(v_rec).quantize(Decimal("0.01")) if v_rec is not None else None,
+                variacao_despesa_pct=_decimal(v_desp).quantize(Decimal("0.01")) if v_desp is not None else None,
+                variacao_lucro_pct=_decimal(v_lucro).quantize(Decimal("0.01")) if v_lucro is not None else None,
+                variacao_margem_pp=_decimal(v_margem).quantize(Decimal("0.01")) if v_margem is not None else None,
             )
     except Exception:
         comparacao = None
@@ -414,12 +427,12 @@ def get_resumo_contabilidade(
     return ContabilidadeResumoResponse(
         data_inicio=data_inicio.isoformat(),
         data_fim=data_fim.isoformat(),
-        receita_bruta=receita_bruta.quantize(Decimal("0.01")),
-        despesas_confirmadas=despesas_confirmadas.quantize(Decimal("0.01")),
-        despesas_pendentes=despesas_pendentes.quantize(Decimal("0.01")),
-        despesas_totais=despesas_totais.quantize(Decimal("0.01")),
-        lucro_liquido=lucro_liquido.quantize(Decimal("0.01")),
-        margem_liquida=margem_liquida.quantize(Decimal("0.01")),
+        receita_bruta=_decimal(receita_bruta).quantize(Decimal("0.01")),
+        despesas_confirmadas=_decimal(despesas_confirmadas).quantize(Decimal("0.01")),
+        despesas_pendentes=_decimal(despesas_pendentes).quantize(Decimal("0.01")),
+        despesas_totais=_decimal(despesas_totais).quantize(Decimal("0.01")),
+        lucro_liquido=_decimal(lucro_liquido).quantize(Decimal("0.01")),
+        margem_liquida=_decimal(margem_liquida).quantize(Decimal("0.01")),
         indicadores=indicadores,
         analise_por_servico=analise_servico,
         rentabilidade_por_base=rentabilidade,
