@@ -4,6 +4,7 @@ GET /contabilidade/resumo — resumo financeiro por período (receita, despesas 
 """
 from __future__ import annotations
 
+import unicodedata
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,33 @@ def _decimal(v) -> Decimal:
         return Decimal(str(v or 0))
     except Exception:
         return Decimal("0")
+
+
+def _normalizar_nome_entregador(s: str) -> str:
+    """Lower + unaccent para comparação de nome de entregador."""
+    s = (s or "").strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+def _resolve_entregador_id_saida(db: Session, sub_base: str, saida: Saida) -> Optional[int]:
+    """
+    Retorna o id_entregador efetivo da saída.
+    Se saida.entregador_id está preenchido, usa. Senão, tenta resolver pelo nome (saida.entregador).
+    """
+    if getattr(saida, "entregador_id", None) is not None:
+        return saida.entregador_id
+    nome = (getattr(saida, "entregador", None) or "").strip()
+    if not nome:
+        return None
+    nome_busca = _normalizar_nome_entregador(nome)
+    ent = db.scalar(
+        select(Entregador).where(
+            Entregador.sub_base == sub_base,
+            func.lower(func.unaccent(Entregador.nome)) == nome_busca,
+        )
+    )
+    return ent.id_entregador if ent else None
 
 
 # --------------- Schemas ---------------
@@ -202,10 +230,12 @@ def get_resumo_contabilidade(
             d += timedelta(days=1)
 
     # ---- 3b) DESPESA PENDENTE (saídas não cobertas por fechamento) ----
+    # Usa entregador_id da saída; se NULL, resolve pelo nome para incluir registros antigos
     cache_precos: Dict[int, Dict[str, Decimal]] = {}
     despesas_pendentes = Decimal("0")
+    despesa_pendente_por_ent: Dict[int, Decimal] = {}
     for s in rows_saidas:
-        eid = s.entregador_id
+        eid = _resolve_entregador_id_saida(db, sub_base, s)
         if eid is None:
             continue
         data_saida = s.timestamp.date()
@@ -218,21 +248,26 @@ def get_resumo_contabilidade(
                 cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
         precos = cache_precos[eid]
         tipo = _normalizar_servico(s.servico)
+        valor = Decimal("0")
         if tipo == "shopee":
-            despesas_pendentes += _decimal(precos.get("shopee_valor", 0))
+            valor = _decimal(precos.get("shopee_valor", 0))
         elif tipo == "flex":
-            despesas_pendentes += _decimal(precos.get("ml_valor", 0))
+            valor = _decimal(precos.get("ml_valor", 0))
         else:
-            despesas_pendentes += _decimal(precos.get("avulso_valor", 0))
+            valor = _decimal(precos.get("avulso_valor", 0))
+        despesas_pendentes += valor
+        despesa_pendente_por_ent[eid] = despesa_pendente_por_ent.get(eid, Decimal("0")) + valor
 
     despesas_pendentes = _decimal(despesas_pendentes).quantize(Decimal("0.01"))
     despesas_totais = _decimal(despesas_confirmadas + despesas_pendentes).quantize(Decimal("0.01"))
 
-    # Despesa por entregador (confirmada)
+    # Despesa por entregador (confirmada + pendente)
     despesa_por_ent: Dict[int, Decimal] = {}
     for f in rows_fech:
         eid = f.id_entregador
         despesa_por_ent[eid] = despesa_por_ent.get(eid, Decimal("0")) + _decimal(f.valor_final)
+    for eid, val in despesa_pendente_por_ent.items():
+        despesa_por_ent[eid] = despesa_por_ent.get(eid, Decimal("0")) + _decimal(val)
 
     # Despesa por serviço: rateio proporcional às saídas
     if total_saidas > 0:
@@ -331,8 +366,9 @@ def get_resumo_contabilidade(
             ent_nomes[e.id_entregador] = e.nome or ""
     saidas_por_ent: Dict[int, int] = {}
     for s in rows_saidas:
-        if s.entregador_id:
-            saidas_por_ent[s.entregador_id] = saidas_por_ent.get(s.entregador_id, 0) + 1
+        eid = _resolve_entregador_id_saida(db, sub_base, s)
+        if eid is not None:
+            saidas_por_ent[eid] = saidas_por_ent.get(eid, 0) + 1
     dist_despesas = []
     desp_tot_dist = _decimal(despesas_totais)
     for eid, desp in despesa_por_ent.items():
