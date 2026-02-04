@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from typing import Optional
 from datetime import datetime, date, timedelta
 from decimal import Decimal
@@ -26,7 +27,8 @@ router = APIRouter(prefix="/saidas", tags=["Saídas"])
 # ============================================================
 
 class SaidaCreate(BaseModel):
-    entregador: str = Field(min_length=1)
+    entregador_id: Optional[int] = None
+    entregador: Optional[str] = None
     codigo: str = Field(min_length=1)
     servico: str = Field(min_length=1)
     status: Optional[str] = None
@@ -59,6 +61,7 @@ class SaidaGridItem(BaseModel):
 
 
 class SaidaUpdate(BaseModel):
+    entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     status: Optional[str] = None
     codigo: Optional[str] = None
@@ -69,6 +72,67 @@ class SaidaUpdate(BaseModel):
 # ============================================================
 # HELPERS
 # ============================================================
+
+def _normalizar_nome(s: str) -> str:
+    """Lower + unaccent para comparação de nome de entregador."""
+    s = (s or "").strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+def normalizar_status_saida(raw: Optional[str]) -> str:
+    """Status canônico em lowercase. Banco é fonte da verdade."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return "saiu"
+    if s in ("saiu", "saiu para entrega", "saiu pra entrega"):
+        return "saiu"
+    if s in ("cancelado", "cancelada"):
+        return "cancelado"
+    if s in ("coletado", "coletada"):
+        return "coletado"
+    return s
+
+
+def _resolve_entregador(
+    db: Session,
+    sub_base: str,
+    entregador_id: Optional[int] = None,
+    entregador_nome: Optional[str] = None,
+) -> tuple[int, str]:
+    """
+    Retorna (id_entregador, nome). Prioriza entregador_id.
+    Levanta HTTPException 422 se não encontrar ou nenhum dado enviado.
+    """
+    if entregador_id is not None:
+        ent = db.get(Entregador, entregador_id)
+        if not ent or ent.sub_base != sub_base:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "ENTREGADOR_INVALIDO", "message": "Entregador não encontrado ou não pertence à sua base."},
+            )
+        return ent.id_entregador, (ent.nome or "").strip()
+
+    if entregador_nome and entregador_nome.strip():
+        nome_busca = _normalizar_nome(entregador_nome)
+        ent = db.scalar(
+            select(Entregador).where(
+                Entregador.sub_base == sub_base,
+                func.lower(func.unaccent(Entregador.nome)) == nome_busca,
+            )
+        )
+        if ent:
+            return ent.id_entregador, (ent.nome or "").strip()
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ENTREGADOR_NAO_ENCONTRADO", "message": "Entregador não encontrado pelo nome."},
+        )
+
+    raise HTTPException(
+        status_code=422,
+        detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe entregador_id ou entregador (nome)."},
+    )
+
 
 def _get_owned_saida(db: Session, sub_base: str, id_saida: int) -> Saida:
     obj = db.get(Saida, id_saida)
@@ -108,22 +172,17 @@ def registrar_saida(
     if not sub_base or not username:
         raise HTTPException(401, "Usuário inválido.")
 
+    # Resolver entregador (obrigatório): prioriza entregador_id, depois nome
+    entregador_id, entregador_nome = _resolve_entregador(
+        db, sub_base,
+        entregador_id=payload.entregador_id,
+        entregador_nome=payload.entregador,
+    )
+
     # Normalização
     codigo = payload.codigo.strip()
-    entregador = payload.entregador.strip()
     servico = payload.servico.strip().title()
-    status_val = (payload.status.strip() if payload.status else "saiu").title()
-
-    # Buscar entregador_id pelo nome
-    entregador_id = None
-    ent = db.scalar(
-        select(Entregador).where(
-            Entregador.sub_base == sub_base,
-            Entregador.nome == entregador,
-        )
-    )
-    if ent:
-        entregador_id = ent.id_entregador
+    status_val = normalizar_status_saida(payload.status)
 
     # Duplicidade
     existente = db.scalar(
@@ -143,7 +202,7 @@ def registrar_saida(
         coleta_exists = db.scalar(
             select(Coleta.id_coleta).where(
                 Coleta.sub_base == sub_base,
-                Coleta.username_entregador == entregador
+                Coleta.username_entregador == entregador_nome
             )
         )
         if not coleta_exists:
@@ -156,7 +215,7 @@ def registrar_saida(
         row = Saida(
             sub_base=sub_base,
             username=username,
-            entregador=entregador,
+            entregador=entregador_nome,
             entregador_id=entregador_id,
             codigo=codigo,
             servico=servico,
@@ -307,11 +366,17 @@ def atualizar_saida(
             raise HTTPException(409, f"Código '{novo}' já registrado.")
         obj.codigo = novo
 
-    if payload.entregador is not None:
-        obj.entregador = payload.entregador.strip()
+    if payload.entregador_id is not None or (payload.entregador is not None and payload.entregador.strip()):
+        entregador_id, entregador_nome = _resolve_entregador(
+            db, sub_base,
+            entregador_id=payload.entregador_id,
+            entregador_nome=payload.entregador,
+        )
+        obj.entregador_id = entregador_id
+        obj.entregador = entregador_nome
 
     if payload.status is not None:
-        obj.status = payload.status.strip().title()
+        obj.status = normalizar_status_saida(payload.status)
 
     if payload.servico is not None:
         obj.servico = payload.servico.strip().title()

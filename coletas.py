@@ -33,6 +33,7 @@ class ItemLote(BaseModel):
 class ColetaLoteIn(BaseModel):
     base: str = Field(min_length=1)
     itens: List[ItemLote] = Field(min_length=1)
+    entregador_id: Optional[int] = None
 
 
 class ResumoLote(BaseModel):
@@ -216,8 +217,19 @@ def registrar_coleta_em_lote(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # 1) Resolve sub_base + entregador com no máximo 1 SELECT (Entregador) e sem fallback para User
-    sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
+    # 1) Resolve sub_base + entregador: prioriza payload.entregador_id, senão JWT
+    sub_base = _sub_base_from_token_or_422(current_user)
+    if payload.entregador_id is not None:
+        ent = db.get(Entregador, payload.entregador_id)
+        if not ent or ent.sub_base != sub_base:
+            raise HTTPException(422, "Entregador não encontrado ou não pertence à sua base.")
+        if hasattr(ent, "ativo") and not ent.ativo:
+            raise HTTPException(403, "Entregador inativo.")
+        entregador_nome = (getattr(ent, "nome", None) or ent.username_entregador) or ""
+        username_entregador = ent.username_entregador or ""
+        entregador_id = ent.id_entregador
+    else:
+        sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
 
     # 2) valor unitário vem do JWT (sem SELECT em Owner)
     valor_unit = Decimal(getattr(current_user, "owner_valor", "0"))
