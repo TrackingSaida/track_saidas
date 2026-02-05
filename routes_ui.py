@@ -42,7 +42,7 @@ MENU_DEFS = [
                 "label": "Gerar Etiqueta",
                 "href": "tracking-etiquetas.html",
                 "roles": [0, 1, 2, 3],
-                "group": "registros"
+                "group": "operacao_direto"
             },
         ]
     },
