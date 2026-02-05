@@ -1,6 +1,6 @@
 """
 Rotas de Etiquetas
-POST /etiquetas/gerar — gera PDF de etiqueta 100x150mm (QR Code + Code128).
+POST /etiquetas/gerar — gera PDF de etiqueta 100x150mm (QR Code).
 Modos: generic (padrão), shopee, ml. Fallback automático para generic em falhas.
 """
 from __future__ import annotations
@@ -133,7 +133,7 @@ def _buscar_dados_ml(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
 
 
 # ============================================================
-# GERADOR DE PDF
+# GERADOR DE PDF — Layout profissional para impressão térmica
 # ============================================================
 
 def _gerar_pdf_etiqueta(
@@ -141,94 +141,111 @@ def _gerar_pdf_etiqueta(
     modo_final: str,
     dados_extras: Optional[Dict[str, Any]] = None,
 ) -> bytes:
-    """Gera PDF 100x150mm com QR Code e Code128."""
-    from reportlab.lib.pagesizes import A4
+    """
+    Gera PDF 100x150mm com layout limpo e profissional.
+    Foco total no QR Code. Sem código de barras.
+    """
     from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
     import qrcode
-    import barcode
-    from barcode.writer import ImageWriter
 
     dados = dados_extras or {}
-    largura = 100 * mm
-    altura = 150 * mm
+
+    # Dimensões da página
+    largura_pag = 100 * mm
+    altura_pag = 150 * mm
+    margin = 8 * mm
+    area_util_w = largura_pag - 2 * margin
+    area_util_h = altura_pag - 2 * margin
+
+    # Tamanho do QR Code (ideal 60x60mm)
+    qr_size = 60 * mm
 
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=(largura, altura))
-    c.setPageSize((largura, altura))
+    c = canvas.Canvas(buf, pagesize=(largura_pag, altura_pag))
+    c.setPageSize((largura_pag, altura_pag))
 
-    # Margens
-    margin = 5 * mm
-    x = margin
-    y = altura - margin
+    # Helper: centralizar elemento horizontalmente
+    def center_x(elem_width: float) -> float:
+        return (largura_pag - elem_width) / 2
 
-    # --- TOPO: Logo / Título ---
-    titulo = "Tracking Saídas"
+    y = altura_pag - margin
+
+    # ─────────────────────────────────────────────────────────
+    # TOPO — Nome do sistema/marketplace (centralizado)
+    # ─────────────────────────────────────────────────────────
+    titulo = "TRACKING SAÍDAS"
     if modo_final == "shopee":
-        titulo = "Shopee"
+        titulo = "SHOPEE ENTREGA"
     elif modo_final == "ml":
-        titulo = "Mercado Livre"
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(x, y, titulo)
-    y -= 8 * mm
+        titulo = "MERCADO ENVIOS"
 
-    # --- QR Code (aprox 25x25 mm) ---
-    qr = qrcode.QRCode(version=1, box_size=4, border=1)
+    c.setFont("Helvetica", 8)
+    tw = c.stringWidth(titulo, "Helvetica", 8)
+    c.drawString(center_x(tw), y, titulo)
+    y -= 6 * mm
+
+    # ─────────────────────────────────────────────────────────
+    # CORPO PRINCIPAL — QR Code (elemento dominante)
+    # ─────────────────────────────────────────────────────────
+    qr_x = center_x(qr_size)
+    qr_y = y - qr_size
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,  # Alta correção
+        box_size=12,   # Alta definição para impressão térmica
+        border=1,      # Quiet zone mínima
+    )
     qr.add_data(codigo)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white")
     qr_buf = io.BytesIO()
     qr_img.save(qr_buf, format="PNG")
     qr_buf.seek(0)
-    from reportlab.lib.utils import ImageReader
-    c.drawImage(ImageReader(qr_buf), x, y - 25 * mm, width=25 * mm, height=25 * mm)
-    y -= 28 * mm
+    c.drawImage(ImageReader(qr_buf), qr_x, qr_y, width=qr_size, height=qr_size)
 
-    c.setFont("Helvetica", 9)
-    c.drawString(x, y, codigo)
-    y -= 6 * mm
+    y = qr_y - 4 * mm
 
-    # --- Code128 ---
-    try:
-        import tempfile
-        import os
-        code128 = barcode.get_barcode_class("code128")
-        bc = code128(codigo, writer=ImageWriter())
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            bc.write(tmp_path)
-            with open(tmp_path, "rb") as f:
-                bc_bytes = f.read()
-            c.drawImage(ImageReader(io.BytesIO(bc_bytes)), x, y - 12 * mm, width=90 * mm, height=12 * mm)
-            y -= 15 * mm
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    except Exception:
-        c.setFont("Helvetica", 8)
-        c.drawString(x, y, codigo)
-        y -= 6 * mm
+    # ─────────────────────────────────────────────────────────
+    # ABAIXO DO QR — Código de rastreio em texto grande e bold
+    # ─────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 14)
+    tw = c.stringWidth(codigo, "Helvetica-Bold", 14)
+    # Quebra se ultrapassar área útil
+    if tw > area_util_w:
+        c.setFont("Helvetica-Bold", 10)
+        tw = c.stringWidth(codigo, "Helvetica-Bold", 10)
+    c.drawString(center_x(tw), y, codigo)
+    y -= 8 * mm
 
-    # --- Destinatário (se disponível) ---
+    # ─────────────────────────────────────────────────────────
+    # BLOCO DE INFORMAÇÕES — Somente se houver dados
+    # ─────────────────────────────────────────────────────────
     dest = dados.get("destinatario") or ""
     cidade = dados.get("cidade") or ""
     cep = dados.get("cep") or ""
-    if dest or cidade or cep:
-        c.setFont("Helvetica", 8)
-        if dest:
-            c.drawString(x, y, str(dest)[:40])
-            y -= 5 * mm
-        if cidade or cep:
-            c.drawString(x, y, f"{cidade} {cep}".strip()[:40])
-            y -= 5 * mm
 
-    # --- Rodapé ---
-    y = margin + 8 * mm
-    c.setFont("Helvetica", 7)
-    c.drawString(x, y, "Etiqueta de Envio - Tracking Saídas")
+    if dest or cidade or cep:
+        c.setFont("Helvetica", 7)
+        linhas = []
+        if dest:
+            linhas.append(str(dest)[:40])
+        if cidade or cep:
+            linhas.append(f"{cidade} {cep}".strip()[:40])
+        for i, linha in enumerate(linhas[:3]):  # Máx. 3 linhas
+            if linha:
+                c.drawString(margin, y, linha)
+                y -= 4 * mm
+
+    # ─────────────────────────────────────────────────────────
+    # RODAPÉ — Discreto e centralizado
+    # ─────────────────────────────────────────────────────────
+    rodape = "Etiqueta logística — Tracking Saídas"
+    c.setFont("Helvetica", 6)
+    rw = c.stringWidth(rodape, "Helvetica", 6)
+    c.drawString(center_x(rw), margin, rodape)
 
     c.save()
     buf.seek(0)
