@@ -38,6 +38,12 @@ MENU_DEFS = [
                 "roles": [0, 1, 2, 3],
                 "group": "registros"
             },
+            {
+                "label": "Gerar Etiqueta",
+                "href": "tracking-etiquetas.html",
+                "roles": [0, 1, 2, 3],
+                "group": "registros"
+            },
         ]
     },
     {
