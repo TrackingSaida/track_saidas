@@ -1,7 +1,7 @@
 """
 Rotas de Etiquetas
 POST /etiquetas/gerar — gera PDF de etiqueta 100x150mm (QR Code).
-Modos: generic (padrão), shopee, ml. Fallback automático para generic em falhas.
+Modo genérico (padrão). TODO: futuro - Shopee/ML com autenticação nas APIs.
 """
 from __future__ import annotations
 
@@ -33,103 +33,104 @@ logger = logging.getLogger(__name__)
 
 class EtiquetaGerarPayload(BaseModel):
     codigo: str = Field(min_length=1, description="Código de rastreio/pedido")
-    modo: str = Field(default="generic", description="generic | shopee | ml")
+    # modo: str = Field(default="generic", description="generic | shopee | ml")  # TODO: futuro - Shopee/ML
 
 
 # ============================================================
 # HELPERS — Resolução de dados externos (fallback em erro)
 # ============================================================
 
-def _normalizar_modo(modo: str) -> str:
-    m = (modo or "").strip().lower()
-    if m in ("shopee", "shp"):
-        return "shopee"
-    if m in ("ml", "mercado livre", "mercadolivre"):
-        return "ml"
-    return "generic"
+# def _normalizar_modo(modo: str) -> str:
+#     m = (modo or "").strip().lower()
+#     if m in ("shopee", "shp"):
+#         return "shopee"
+#     if m in ("ml", "mercado livre", "mercadolivre"):
+#         return "ml"
+#     return "generic"
 
 
-def _buscar_dados_shopee(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
-    """Tenta obter dados do envio na Shopee. Retorna None em qualquer falha."""
-    try:
-        from shopee_token_service import (
-            get_valid_shopee_access_token,
-            get_latest_shopee_token,
-            _get_shopee_config,
-            _sign_api,
-        )
-        import requests
-        import time
-
-        token = get_latest_shopee_token(db)
-        if not token:
-            return None
-        access_token = get_valid_shopee_access_token(db, shop_id=token.shop_id)
-        host, partner_id, partner_key = _get_shopee_config()
-        path = "/api/v2/order/get_order_list"
-        timestamp = int(time.time())
-        sign = _sign_api(partner_id, partner_key, path, timestamp, token.shop_id, access_token)
-        url = f"{host}{path}"
-        params = {
-            "partner_id": partner_id,
-            "timestamp": timestamp,
-            "sign": sign,
-            "shop_id": token.shop_id,
-        }
-        body = {"order_status": "READY_TO_SHIP", "page_size": 50}
-        resp = requests.post(url, params=params, json=body)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        orders = data.get("response", {}).get("order_list", []) or []
-        for o in orders:
-            tracking = (o.get("tracking_no") or "").strip()
-            if tracking and codigo.upper() in tracking.upper():
-                addr = o.get("recipient_address", {}) or {}
-                return {
-                    "destinatario": addr.get("name") or "",
-                    "cidade": addr.get("city") or "",
-                    "cep": addr.get("zipcode") or "",
-                }
-        return None
-    except Exception as e:
-        logger.warning("Shopee etiqueta: %s", e)
-        return None
-
-
-def _buscar_dados_ml(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
-    """Tenta obter dados do shipment no ML. Retorna None em qualquer falha."""
-    try:
-        from ml_token_service import get_valid_ml_access_token
-        import requests
-        access_token = get_valid_ml_access_token(db)
-        headers = {"Authorization": f"Bearer {access_token}"}
-        url = "https://api.mercadolibre.com/shipments/search"
-        resp = requests.get(url, headers=headers, params={"tracking_number": codigo})
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        results = data.get("results") or []
-        if not results:
-            return None
-        shipment = results[0]
-        shipment_id = shipment.get("id")
-        receiver = shipment.get("receiver_address") or {}
-        if shipment_id:
-            url2 = f"https://api.mercadolibre.com/marketplace/shipments/{shipment_id}"
-            resp2 = requests.get(url2, headers={**headers, "x-format-new": "true"})
-            if resp2.status_code == 200:
-                d2 = resp2.json()
-                dest = d2.get("destination") or {}
-                receiver = dest.get("receiver_address") or receiver
-        return {
-            "destinatario": receiver.get("receiver_name") or receiver.get("name") or "",
-            "cidade": receiver.get("city", {}).get("name") if isinstance(receiver.get("city"), dict) else (receiver.get("city") or ""),
-            "cep": receiver.get("zip_code") or receiver.get("zipcode") or "",
-        }
-    except Exception as e:
-        logger.warning("ML etiqueta: %s", e)
-        return None
+# TODO: Futuro - autenticação APIs Shopee e Mercado Livre para enriquecer etiquetas
+# def _buscar_dados_shopee(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
+#     """Tenta obter dados do envio na Shopee. Retorna None em qualquer falha."""
+#     try:
+#         from shopee_token_service import (
+#             get_valid_shopee_access_token,
+#             get_latest_shopee_token,
+#             _get_shopee_config,
+#             _sign_api,
+#         )
+#         import requests
+#         import time
+#
+#         token = get_latest_shopee_token(db)
+#         if not token:
+#             return None
+#         access_token = get_valid_shopee_access_token(db, shop_id=token.shop_id)
+#         host, partner_id, partner_key = _get_shopee_config()
+#         path = "/api/v2/order/get_order_list"
+#         timestamp = int(time.time())
+#         sign = _sign_api(partner_id, partner_key, path, timestamp, token.shop_id, access_token)
+#         url = f"{host}{path}"
+#         params = {
+#             "partner_id": partner_id,
+#             "timestamp": timestamp,
+#             "sign": sign,
+#             "shop_id": token.shop_id,
+#         }
+#         body = {"order_status": "READY_TO_SHIP", "page_size": 50}
+#         resp = requests.post(url, params=params, json=body)
+#         if resp.status_code != 200:
+#             return None
+#         data = resp.json()
+#         orders = data.get("response", {}).get("order_list", []) or []
+#         for o in orders:
+#             tracking = (o.get("tracking_no") or "").strip()
+#             if tracking and codigo.upper() in tracking.upper():
+#                 addr = o.get("recipient_address", {}) or {}
+#                 return {
+#                     "destinatario": addr.get("name") or "",
+#                     "cidade": addr.get("city") or "",
+#                     "cep": addr.get("zipcode") or "",
+#                 }
+#         return None
+#     except Exception as e:
+#         logger.warning("Shopee etiqueta: %s", e)
+#         return None
+#
+#
+# def _buscar_dados_ml(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
+#     """Tenta obter dados do shipment no ML. Retorna None em qualquer falha."""
+#     try:
+#         from ml_token_service import get_valid_ml_access_token
+#         import requests
+#         access_token = get_valid_ml_access_token(db)
+#         headers = {"Authorization": f"Bearer {access_token}"}
+#         url = "https://api.mercadolibre.com/shipments/search"
+#         resp = requests.get(url, headers=headers, params={"tracking_number": codigo})
+#         if resp.status_code != 200:
+#             return None
+#         data = resp.json()
+#         results = data.get("results") or []
+#         if not results:
+#             return None
+#         shipment = results[0]
+#         shipment_id = shipment.get("id")
+#         receiver = shipment.get("receiver_address") or {}
+#         if shipment_id:
+#             url2 = f"https://api.mercadolibre.com/marketplace/shipments/{shipment_id}"
+#             resp2 = requests.get(url2, headers={**headers, "x-format-new": "true"})
+#             if resp2.status_code == 200:
+#                 d2 = resp2.json()
+#                 dest = d2.get("destination") or {}
+#                 receiver = dest.get("receiver_address") or receiver
+#         return {
+#             "destinatario": receiver.get("receiver_name") or receiver.get("name") or "",
+#             "cidade": receiver.get("city", {}).get("name") if isinstance(receiver.get("city"), dict) else (receiver.get("city") or ""),
+#             "cep": receiver.get("zip_code") or receiver.get("zipcode") or "",
+#         }
+#     except Exception as e:
+#         logger.warning("ML etiqueta: %s", e)
+#         return None
 
 
 # ============================================================
@@ -271,21 +272,9 @@ def gerar_etiqueta(
     if not codigo:
         raise HTTPException(400, "Código obrigatório.")
 
-    modo = _normalizar_modo(payload.modo)
-    modo_final = modo
+    # Sempre modo genérico. TODO: futuro - Shopee/ML com autenticação nas APIs
+    modo_final = "generic"
     dados_extras: Optional[Dict[str, Any]] = None
-
-    if modo == "shopee":
-        dados_extras = _buscar_dados_shopee(db, codigo)
-        if dados_extras is None:
-            modo_final = "generic"
-            dados_extras = None
-
-    elif modo == "ml":
-        dados_extras = _buscar_dados_ml(db, codigo)
-        if dados_extras is None:
-            modo_final = "generic"
-            dados_extras = None
 
     try:
         pdf_bytes = _gerar_pdf_etiqueta(codigo, modo_final, dados_extras)
