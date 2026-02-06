@@ -366,6 +366,7 @@ def ler_saida(
                 "id_saida": existente.id_saida,
                 "message": "Código já saiu com outro entregador.",
                 "entregador_atual": existente.entregador,
+                "username": existente.username,
             },
         )
 
