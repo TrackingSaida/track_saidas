@@ -42,8 +42,7 @@ MENU_DEFS = [
                 "label": "Gerar Etiqueta",
                 "href": "tracking-etiquetas.html",
                 "roles": [0, 1, 2, 3],
-                "group": "etiquetas",
-                "icon": "ri-qr-code-line"
+                "group": "etiquetas"            
             },
         ]
     },
