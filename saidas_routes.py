@@ -6,6 +6,7 @@ from datetime import datetime, date, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
@@ -67,6 +68,14 @@ class SaidaUpdate(BaseModel):
     codigo: Optional[str] = None
     servico: Optional[str] = None
     base: Optional[str] = None
+
+
+class SaidaLerIn(BaseModel):
+    """Payload para POST /saidas/ler — leitura unificada (1 SELECT + 1 INSERT ou UPDATE)."""
+    codigo: str = Field(min_length=1)
+    entregador_id: Optional[int] = None
+    entregador: Optional[str] = None
+    servico: str = Field(min_length=1)
 
 
 # ============================================================
@@ -245,6 +254,123 @@ def registrar_saida(
         raise HTTPException(500, f"Erro ao registrar saída: {e}")
 
     return SaidaOut.model_validate(row)
+
+
+# ============================================================
+# POST — LER SAÍDA (fluxo unificado: 1 SELECT + 1 INSERT ou UPDATE)
+# ============================================================
+# Performance: evita GET listar?codigo= pesado; um único request decide e persiste.
+# Idempotência: mesmo código + mesmo entregador → 200 com dados existentes (409 só para TROCA_ENTREGADOR).
+@router.post("/ler")
+def ler_saida(
+    payload: SaidaLerIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = current_user.sub_base
+    username = current_user.username
+    ignorar_coleta = bool(current_user.ignorar_coleta)
+    owner_valor = Decimal(getattr(current_user, "owner_valor", 0))
+
+    if not sub_base or not username:
+        raise HTTPException(401, "Usuário inválido.")
+
+    entregador_id, entregador_nome = _resolve_entregador(
+        db, sub_base,
+        entregador_id=payload.entregador_id,
+        entregador_nome=payload.entregador,
+    )
+
+    codigo = payload.codigo.strip()
+    servico = payload.servico.strip().title()
+
+    # 1 SELECT por (sub_base, codigo) — índice existente, O(1)
+    existente = db.scalar(
+        select(Saida).where(
+            Saida.sub_base == sub_base,
+            Saida.codigo == codigo,
+        )
+    )
+
+    if existente is None:
+        # Não existe: ignorar_coleta → INSERT; senão 422 (erro de negócio, sem retry)
+        if not ignorar_coleta:
+            # JSONResponse direto para preservar código de erro sem passar pelo handler global.
+            return JSONResponse(
+                status_code=422,
+                content={"code": "NAO_COLETADO", "message": "Código não coletado."},
+            )
+        try:
+            row = Saida(
+                sub_base=sub_base,
+                username=username,
+                entregador=entregador_nome,
+                entregador_id=entregador_id,
+                codigo=codigo,
+                servico=servico,
+                status="saiu",
+            )
+            db.add(row)
+            db.flush()
+            db.add(
+                OwnerCobrancaItem(
+                    sub_base=sub_base,
+                    id_coleta=None,
+                    id_saida=row.id_saida,
+                    valor=owner_valor,
+                )
+            )
+            db.commit()
+            db.refresh(row)
+            return JSONResponse(
+                status_code=201,
+                content=SaidaOut.model_validate(row).model_dump(mode="json"),
+            )
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(500, f"Erro ao registrar saída: {e}")
+
+    # Existe: decidir por status e entregador
+    status_norm = normalizar_status_saida(existente.status)
+
+    if status_norm == "coletado":
+        # coletado → UPDATE para saiu
+        existente.status = "saiu"
+        existente.entregador_id = entregador_id
+        existente.entregador = entregador_nome
+        try:
+            db.commit()
+            db.refresh(existente)
+            return SaidaOut.model_validate(existente)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar saída.")
+
+    if status_norm == "saiu":
+        # mesmo entregador → 200 idempotente (sem 409)
+        mesmo_ent = (
+            (entregador_id is not None and existente.entregador_id == entregador_id)
+            or _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
+        )
+        if mesmo_ent:
+            return SaidaOut.model_validate(existente)
+        # outro entregador → 409 para front acionar PATCH de troca.
+        # Sem retry: front trata com Swal + PATCH, evita latência de retry em fluxo normal.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "TROCA_ENTREGADOR",
+                "id_saida": existente.id_saida,
+                "message": "Código já saiu com outro entregador.",
+                "entregador_atual": existente.entregador,
+            },
+        )
+
+    # status cancelado ou outro: retornar como está (idempotente) ou 422 conforme regra de negócio
+    return SaidaOut.model_validate(existente)
 
 
 # ============================================================
