@@ -425,18 +425,8 @@ class LogLeitura(Base):
     ts_read = Column(Numeric(16, 6), nullable=True)
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
-    # ─────────────────────────────
-    # 🔥 NOVAS MÉTRICAS (FRONT)
-    front_processing_ms = Column(Numeric(12, 3), nullable=True)
-    front_network_ms = Column(Numeric(12, 3), nullable=True)
-    front_total_ms = Column(Numeric(12, 3), nullable=True)
-
-    # 🔥 NOVA MÉTRICA (BACK)
+    # métrica backend (header X-Backend-Process-Time)
     backend_processing_ms = Column(Numeric(12, 3), nullable=True)
-
-    # correlação / controle
-    request_id = Column(Text, nullable=True)
-    attempt = Column(Integer, nullable=True)
 
     # contexto do device
     network_status = Column(Text, nullable=True)

@@ -55,18 +55,8 @@ class LogLeituraCreate(BaseModel):
     ts_read: Optional[float] = None
 
     # ─────────────────────────────
-    # 🔥 NOVAS MÉTRICAS — FRONTEND
-    front_processing_ms: Optional[float] = None
-    front_network_ms: Optional[float] = None
-    front_total_ms: Optional[float] = None
-
-    # 🔥 NOVA MÉTRICA — BACKEND
+    # MÉTRICA BACKEND (header X-Backend-Process-Time)
     backend_processing_ms: Optional[float] = None
-
-    # ─────────────────────────────
-    # CORRELAÇÃO / CONTROLE
-    request_id: Optional[str] = None
-    attempt: Optional[int] = None
 
     # ─────────────────────────────
     # CONTEXTO DE DEVICE / REDE
@@ -122,14 +112,7 @@ def registrar_log_leitura(
 
             ts_read=payload.ts_read,
 
-            # novas métricas
-            front_processing_ms=payload.front_processing_ms,
-            front_network_ms=payload.front_network_ms,
-            front_total_ms=payload.front_total_ms,
             backend_processing_ms=payload.backend_processing_ms,
-
-            request_id=payload.request_id,
-            attempt=payload.attempt,
 
             network_status=payload.network_status,
             device_type=payload.device_type,
