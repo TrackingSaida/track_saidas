@@ -76,6 +76,8 @@ class SaidaLerIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     servico: str = Field(min_length=1)
+    # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
+    registrar_nao_coletado: bool = False
 
 
 # ============================================================
@@ -100,6 +102,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return "cancelado"
     if s in ("coletado", "coletada"):
         return "coletado"
+    if s in ("não coletado", "nao coletado", "não coletada", "nao coletada"):
+        return "não coletado"
     return s
 
 
@@ -293,13 +297,15 @@ def ler_saida(
     )
 
     if existente is None:
-        # Não existe: ignorar_coleta → INSERT; senão 422 (erro de negócio, sem retry)
-        if not ignorar_coleta:
+        # Não existe: ignorar_coleta ou registrar_nao_coletado → INSERT; senão 422 (erro de negócio, sem retry)
+        if not ignorar_coleta and not payload.registrar_nao_coletado:
             # JSONResponse direto para preservar código de erro sem passar pelo handler global.
             return JSONResponse(
                 status_code=422,
                 content={"code": "NAO_COLETADO", "message": "Código não coletado."},
             )
+        # status: "saiu" quando ignorar_coleta; "não coletado" quando usuário confirmou registrar mesmo assim
+        status_inicial = "não coletado" if payload.registrar_nao_coletado else "saiu"
         try:
             row = Saida(
                 sub_base=sub_base,
@@ -308,7 +314,7 @@ def ler_saida(
                 entregador_id=entregador_id,
                 codigo=codigo,
                 servico=servico,
-                status="saiu",
+                status=status_inicial,
             )
             db.add(row)
             db.flush()
