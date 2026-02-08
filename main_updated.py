@@ -117,10 +117,12 @@ from shopee_routes import router as shopee_router
 from logs import router as logs_router
 from contabilidade_routes import router as contabilidade_router
 from etiquetas_routes import router as etiquetas_router
+from dashboard_routes import router as dashboard_router
 
 app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
 app.include_router(contabilidade_router, prefix=API_PREFIX)
+app.include_router(dashboard_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(users_router,        prefix=API_PREFIX)

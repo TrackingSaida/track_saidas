@@ -62,6 +62,7 @@ MENU_DEFS = [
         "roles": [0, 1, 2, 3],
         "items": [
             {"label": "Visão geral", "href": "dashboard-tracking-overview.html", "roles": [0, 1]},
+            {"label": "Visão 360", "href": "dashboard-visao-360.html", "roles": [0, 1], "visao360_only": True},
             {"label": "Ranking",     "href": "dashboard-tracking-saidas.html",   "roles": [0, 1, 2, 3]},
         ]
     },
@@ -92,10 +93,13 @@ def menu_for_role(role: int, ignorar_coleta: bool = False):
         # Se o usuário pode ver a seção inteira
         if role in section["roles"]:
             # Filtra os itens permitidos (role + ignorar_coleta)
+            # coleta_only: ocultar quando ignorar_coleta
+            # visao360_only: ocultar quando ignorar_coleta (mostrar só para ops com coleta ativa)
             allowed_items = [
                 item for item in section["items"]
                 if ("roles" not in item or role in item["roles"])
                 and not (ignorar_coleta and item.get("coleta_only"))
+                and not (ignorar_coleta and item.get("visao360_only"))
             ]
 
             if allowed_items:
