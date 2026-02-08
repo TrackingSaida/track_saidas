@@ -393,27 +393,27 @@ def get_visao_360(
         )
 
     # --- 9. Ranking motoboys (período atual) ---
-    entregador_agg: Dict[int, Dict[str, Any]] = {}
+    entregador_agg: Dict[str, Dict[str, Any]] = {}  # key: nome normalizado (evita duplicata mesmo id em uns, null em outros)
+
     for s in saidas_validas:
-        eid = s.entregador_id or -1
         nome = (s.entregador or "").strip() or "Sem nome"
-        if eid <= 0:
-            eid = -abs(hash(nome))
-        if eid not in entregador_agg:
-            entregador_agg[eid] = {
+        key = (nome.strip().upper() or "S/N").replace("  ", " ")  # nome normalizado como chave única
+
+        if key not in entregador_agg:
+            entregador_agg[key] = {
                 "nome": nome,
                 "entregas": 0,
                 "dias": set(),
                 "entregues": 0,
             }
-        entregador_agg[eid]["entregas"] += 1
+        entregador_agg[key]["entregas"] += 1
         if s.timestamp:
-            entregador_agg[eid]["dias"].add(s.timestamp.date() if hasattr(s.timestamp, "date") else s.timestamp)
+            entregador_agg[key]["dias"].add(s.timestamp.date() if hasattr(s.timestamp, "date") else s.timestamp)
         if (s.status or "").lower() == "entregue":
-            entregador_agg[eid]["entregues"] += 1
+            entregador_agg[key]["entregues"] += 1
 
     ranking_motoboys = []
-    for idx, (eid, agg) in enumerate(
+    for idx, (key, agg) in enumerate(
         sorted(entregador_agg.items(), key=lambda x: -x[1]["entregas"])[:10]
     ):
         total_e = agg["entregas"]
@@ -421,7 +421,7 @@ def get_visao_360(
         taxa_s = round((entregues_e / total_e * 100), 1) if total_e > 0 else 0
         ranking_motoboys.append(
             RankingMotoboyOut(
-                id=str(eid) if eid > 0 else f"n-{abs(eid)}",
+                id=key,
                 nome=agg["nome"],
                 entregas=total_e,
                 nivel=min(10, max(1, (idx + 1) * 2)),
