@@ -35,6 +35,17 @@ def _sub_base(user: User) -> str:
     return sb
 
 
+def _deve_exibir_saida(s: Saida) -> bool:
+    """Regra: sem base + status saiu/coletado → não exibir. Só exibe sem base se status ≠ coletado e ≠ saiu."""
+    base_ok = bool((s.base or "").strip())
+    if base_ok:
+        return True
+    st = (s.status or "").lower().strip()
+    if st in ("saiu", "saiu pra entrega", "saiu_pra_entrega", STATUS_COLETADO):
+        return False
+    return True
+
+
 def _classify_servico(servico: Optional[str]) -> str:
     s = (servico or "").lower()
     if "shopee" in s:
@@ -202,7 +213,10 @@ def get_visao_360(
         .where(Saida.codigo.isnot(None))
     )
     rows_saidas = db.execute(stmt_saidas).scalars().all()
-    saidas_validas = [s for s in rows_saidas if (s.status or "").lower() in STATUS_SAIDAS_VALIDOS]
+    saidas_validas = [
+        s for s in rows_saidas
+        if (s.status or "").lower() in STATUS_SAIDAS_VALIDOS and _deve_exibir_saida(s)
+    ]
     total_saidas = len(saidas_validas)
     cancelamentos = len([s for s in rows_saidas if (s.status or "").lower() == STATUS_CANCELADO])
 
@@ -263,7 +277,8 @@ def get_visao_360(
     )
     rows_30d = db.execute(stmt_30d).scalars().all()
     saidas_30d_validas = [
-        s for s in rows_30d if (s.status or "").lower() in STATUS_SAIDAS_VALIDOS
+        s for s in rows_30d
+        if (s.status or "").lower() in STATUS_SAIDAS_VALIDOS and _deve_exibir_saida(s)
     ]
     entregues_30d = len([s for s in saidas_30d_validas if (s.status or "").lower() == "entregue"])
     taxa_sucesso_historica = (
@@ -289,6 +304,8 @@ def get_visao_360(
     marketplaces_set: set = set()
 
     for s in rows_fifo:
+        if not _deve_exibir_saida(s):
+            continue
         d = (s.timestamp or getattr(s, "data", None)) or s.timestamp
         if hasattr(d, "date"):
             d = d.date()
@@ -319,6 +336,7 @@ def get_visao_360(
 
         data_coleta_str = d.strftime("%d/%m") if d else ""
         marketplace_label = "Shopee" if t == "shopee" else ("Mercado Livre" if t == "mercado_livre" else "Avulso")
+        status_real = (s.status or "coletado").strip() or "coletado"
         packages.append({
             "id": str(s.id_saida),
             "cliente_base": (s.base or "").strip() or "-",
@@ -326,7 +344,7 @@ def get_visao_360(
             "marketplace": marketplace_label,
             "data_coleta": data_coleta_str,
             "dias_em_fila": dias,
-            "status": "Em fila",
+            "status": status_real,
         })
 
     fifo_marketplaces = sorted(marketplaces_set) if marketplaces_set else ["Shopee", "Mercado Livre", "Avulso"]
@@ -362,7 +380,7 @@ def get_visao_360(
             .where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
         )
         rows_s_d = db.execute(stmt_s_d).scalars().all()
-        s_d_count = len(rows_s_d)
+        s_d_count = len([r for r in rows_s_d if _deve_exibir_saida(r)])
 
         taxa_conv = round((s_d_count / c_d * 100), 1) if c_d > 0 else 0.0
         daily_evolution.append(
@@ -470,7 +488,7 @@ def get_visao_360(
             bands=[FifoBandOut(label=b["label"], count=b["count"]) for b in bands],
             packages=[FifoPackageOut(**p) for p in packages[:20]],
             marketplaces=fifo_marketplaces,
-            total_parados=len(rows_fifo),
+            total_parados=len(packages),
         ),
         sla_estimado=SlaEstimadoOut(
             taxa_aceitacao=taxa_aceitacao,
