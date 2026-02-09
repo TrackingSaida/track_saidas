@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
+from base import _resolve_user_sub_base
 from models import BasePreco, Coleta, Entregador, Saida, User
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -683,9 +684,10 @@ def get_dashboard_coletas(
         (total_cancelados / total_coletas * 100), 1
     ) if total_coletas > 0 else 0.0
 
-    # --- Bases ativas: com/sem coletas e drill-down ---
+    # --- Bases ativas: sempre do cadastro (BasePreco ativo), mesma resolução que GET /base/ ---
+    sub_base_bases = _resolve_user_sub_base(db, current_user)
     stmt_bases = select(BasePreco.base).where(
-        BasePreco.sub_base == sub_base,
+        BasePreco.sub_base == sub_base_bases,
         BasePreco.ativo.is_(True),
         BasePreco.base.isnot(None),
     )
@@ -702,9 +704,7 @@ def get_dashboard_coletas(
     bases_sem_coletas_set = todas_bases_set - bases_com_coletas_set
     bases_sem_coletas_lista = sorted(bases_sem_coletas_set)
 
-    # Quando BasePreco vazio, usar bases que tiveram coletas como universo para exibir dados
-    if not todas_bases_set and bases_com_coletas_set:
-        todas_bases_set = bases_com_coletas_set
+    # bases_total_ativas = sempre do cadastro (BasePreco ativo), nunca zero "por falta de coleta"
     bases_total_ativas = len(todas_bases_set)
 
     bases_sem_coletas_detalhe: List[Dict[str, Any]] = []
