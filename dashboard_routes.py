@@ -756,7 +756,7 @@ def get_dashboard_coletas(
                 shopee=v["shopee"],
                 mercado_livre=v["mercado_livre"],
                 avulso=v["avulso"],
-                valor_total=v.get("valor_total", 0.0),
+                valor_total=round(v.get("valor_total", 0.0), 2),
             )
         )
 
