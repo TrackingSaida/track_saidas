@@ -160,13 +160,19 @@ def get_visao_360(
 ):
     """
     Retorna dados agregados para o dashboard Visão 360.
-    Disponível apenas para owners com ignorar_coleta=false.
+    Acesso: ignorar_coleta=false, role 0 ou 1.
     """
     ignorar_coleta = bool(getattr(request.state, "ignorar_coleta", True))
+    role = int(getattr(current_user, "role", 99))
     if ignorar_coleta:
         raise HTTPException(
             status_code=403,
             detail="Dashboard Visão 360 disponível apenas para operações com coleta ativa.",
+        )
+    if role not in (0, 1):
+        raise HTTPException(
+            status_code=403,
+            detail="Acesso restrito a administradores.",
         )
 
     sub_base = _sub_base(current_user)
@@ -498,4 +504,249 @@ def get_visao_360(
         daily_evolution=daily_evolution,
         ranking_motoboys=ranking_motoboys,
         ranking_bases=ranking_bases,
+    )
+
+
+# =============================================================================
+# Dashboard de Coletas — PROMESSA + ORIGEM + VOLUME (apenas coletas)
+# Acesso: ignorar_coleta=false, role 0 ou 1
+# =============================================================================
+
+
+class DashboardColetasCardsOut(BaseModel):
+    shopee: int
+    mercado_livre: int
+    avulso: int
+    cancelados: int
+    total_coletas: int
+    valor_total: float
+    taxa_cancelamento: float
+
+
+class DashboardColetasChartItemOut(BaseModel):
+    date: str
+    shopee: int
+    mercado_livre: int
+    avulso: int
+
+
+class DashboardColetasRankingBaseOut(BaseModel):
+    nome: str
+    coletas: int
+    shopee: int
+    mercado_livre: int
+    avulso: int
+    valor_total: float
+    pct_total: float
+    variacao_pct: Optional[float] = None
+
+
+class DashboardColetasConcentracaoOut(BaseModel):
+    top1_base_nome: str
+    top1_base_pct: float
+    top1_servico_nome: str
+    top1_servico_pct: float
+
+
+class DashboardColetasResponse(BaseModel):
+    cards: DashboardColetasCardsOut
+    chart_data: List[DashboardColetasChartItemOut]
+    ranking_bases: List[DashboardColetasRankingBaseOut]
+    concentracao: DashboardColetasConcentracaoOut
+
+
+@router.get("/coletas", response_model=DashboardColetasResponse)
+def get_dashboard_coletas(
+    request: Request,
+    data_inicio: Optional[date] = Query(None),
+    data_fim: Optional[date] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Dashboard de Coletas: promessa, origem e volume.
+    Acesso: owner ignorar_coleta=false, role 0 ou 1.
+    """
+    ignorar_coleta = bool(getattr(request.state, "ignorar_coleta", True))
+    role = int(getattr(current_user, "role", 99))
+    if ignorar_coleta:
+        raise HTTPException(
+            status_code=403,
+            detail="Dashboard de Coletas disponível apenas para operações com coleta ativa.",
+        )
+    if role not in (0, 1):
+        raise HTTPException(
+            status_code=403,
+            detail="Acesso restrito a administradores.",
+        )
+
+    sub_base = _sub_base(current_user)
+    hoje = date.today()
+
+    if data_inicio is None:
+        data_inicio = hoje
+    if data_fim is None:
+        data_fim = hoje
+    if data_inicio > data_fim:
+        data_inicio, data_fim = data_fim, data_inicio
+
+    dt_start = datetime.combine(data_inicio, time.min)
+    dt_end = datetime.combine(data_fim, time(23, 59, 59))
+    delta_days = (data_fim - data_inicio).days + 1
+
+    # Período anterior (mesmo número de dias)
+    data_fim_ant = data_inicio - timedelta(days=1)
+    data_inicio_ant = data_fim_ant - timedelta(days=delta_days - 1)
+    dt_start_ant = datetime.combine(data_inicio_ant, time.min)
+    dt_end_ant = datetime.combine(data_fim_ant, time(23, 59, 59))
+
+    # --- Coletas do período atual ---
+    stmt_c = (
+        select(Coleta)
+        .where(Coleta.sub_base == sub_base)
+        .where(Coleta.timestamp >= dt_start)
+        .where(Coleta.timestamp <= dt_end)
+        .where(
+            (Coleta.shopee > 0)
+            | (Coleta.mercado_livre > 0)
+            | (Coleta.avulso > 0)
+            | (Coleta.valor_total > 0)
+        )
+    )
+    rows_coletas = db.execute(stmt_c).scalars().all()
+
+    # --- Coletas do período anterior (para variação) ---
+    stmt_c_ant = (
+        select(Coleta)
+        .where(Coleta.sub_base == sub_base)
+        .where(Coleta.timestamp >= dt_start_ant)
+        .where(Coleta.timestamp <= dt_end_ant)
+        .where(
+            (Coleta.shopee > 0)
+            | (Coleta.mercado_livre > 0)
+            | (Coleta.avulso > 0)
+            | (Coleta.valor_total > 0)
+        )
+    )
+    rows_coletas_ant = db.execute(stmt_c_ant).scalars().all()
+
+    # --- Cancelados (tabela Saida) ---
+    stmt_cancel = (
+        select(Saida)
+        .where(Saida.sub_base == sub_base)
+        .where(func.lower(Saida.status) == STATUS_CANCELADO)
+        .where(Saida.timestamp >= dt_start)
+        .where(Saida.timestamp <= dt_end)
+    )
+    cancelados_rows = db.execute(stmt_cancel).scalars().all()
+    total_cancelados = len(cancelados_rows)
+
+    # --- Totais e cards ---
+    shopee = sum(c.shopee or 0 for c in rows_coletas)
+    ml = sum(c.mercado_livre or 0 for c in rows_coletas)
+    avulso = sum(c.avulso or 0 for c in rows_coletas)
+    total_coletas = shopee + ml + avulso
+    valor_total = float(sum(c.valor_total or 0 for c in rows_coletas))
+    taxa_cancelamento = round(
+        (total_cancelados / total_coletas * 100), 1
+    ) if total_coletas > 0 else 0.0
+
+    cards = DashboardColetasCardsOut(
+        shopee=shopee,
+        mercado_livre=ml,
+        avulso=avulso,
+        cancelados=total_cancelados,
+        total_coletas=total_coletas,
+        valor_total=valor_total,
+        taxa_cancelamento=taxa_cancelamento,
+    )
+
+    # --- Chart por dia ---
+    mapa_dia: Dict[str, Dict[str, int]] = {}
+    for c in rows_coletas:
+        d = (c.timestamp.date() if hasattr(c.timestamp, "date") else c.timestamp).isoformat()
+        if d not in mapa_dia:
+            mapa_dia[d] = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
+        mapa_dia[d]["shopee"] += c.shopee or 0
+        mapa_dia[d]["mercado_livre"] += c.mercado_livre or 0
+        mapa_dia[d]["avulso"] += c.avulso or 0
+
+    chart_data = []
+    for d in sorted(mapa_dia.keys()):
+        v = mapa_dia[d]
+        chart_data.append(
+            DashboardColetasChartItemOut(
+                date=d[8:10] + "/" + d[5:7],
+                shopee=v["shopee"],
+                mercado_livre=v["mercado_livre"],
+                avulso=v["avulso"],
+            )
+        )
+
+    # --- Ranking por base (atual) ---
+    base_agg: Dict[str, Dict[str, Any]] = {}
+    for c in rows_coletas:
+        b = (c.base or "").strip().upper() or "S/D"
+        if b not in base_agg:
+            base_agg[b] = {"coletas": 0, "shopee": 0, "ml": 0, "avulso": 0, "valor": 0.0}
+        base_agg[b]["coletas"] += (c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0)
+        base_agg[b]["shopee"] += c.shopee or 0
+        base_agg[b]["ml"] += c.mercado_livre or 0
+        base_agg[b]["avulso"] += c.avulso or 0
+        base_agg[b]["valor"] += float(c.valor_total or 0)
+
+    # --- Ranking por base (anterior, para variação) ---
+    base_agg_ant: Dict[str, int] = {}
+    for c in rows_coletas_ant:
+        b = (c.base or "").strip().upper() or "S/D"
+        base_agg_ant[b] = base_agg_ant.get(b, 0) + (c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0)
+
+    ranking_bases = []
+    for nome, agg in sorted(base_agg.items(), key=lambda x: -x[1]["coletas"])[:10]:
+        coletas_b = agg["coletas"]
+        pct_total = round((coletas_b / total_coletas * 100), 0) if total_coletas > 0 else 0
+        ant = base_agg_ant.get(nome, 0)
+        variacao_pct = None
+        if ant > 0:
+            variacao_pct = round(((coletas_b - ant) / ant * 100), 1)
+
+        ranking_bases.append(
+            DashboardColetasRankingBaseOut(
+                nome=nome,
+                coletas=coletas_b,
+                shopee=agg["shopee"],
+                mercado_livre=agg["ml"],
+                avulso=agg["avulso"],
+                valor_total=agg["valor"],
+                pct_total=pct_total,
+                variacao_pct=variacao_pct,
+            )
+        )
+
+    # --- Concentração ---
+    top1_base_nome = "-"
+    top1_base_pct = 0.0
+    if ranking_bases:
+        top1_base_nome = ranking_bases[0].nome
+        top1_base_pct = ranking_bases[0].pct_total
+
+    servicos = [("Shopee", shopee), ("Mercado Livre", ml), ("Avulso", avulso)]
+    servicos.sort(key=lambda x: -x[1])
+    top1_servico_nome = servicos[0][0] if servicos else "-"
+    top1_servico_pct = round(
+        (servicos[0][1] / total_coletas * 100), 0
+    ) if total_coletas > 0 and servicos else 0.0
+
+    concentracao = DashboardColetasConcentracaoOut(
+        top1_base_nome=top1_base_nome,
+        top1_base_pct=top1_base_pct,
+        top1_servico_nome=top1_servico_nome,
+        top1_servico_pct=top1_servico_pct,
+    )
+
+    return DashboardColetasResponse(
+        cards=cards,
+        chart_data=chart_data,
+        ranking_bases=ranking_bases,
+        concentracao=concentracao,
     )
