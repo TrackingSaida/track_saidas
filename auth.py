@@ -92,6 +92,7 @@ class UserResponse(BaseModel):
     id: int
     email: Optional[EmailStr]
     username: Optional[str]
+    nome: Optional[str] = None
     contato: Optional[str]
     role: Optional[int]
     sub_base: Optional[str]
@@ -307,6 +308,7 @@ async def read_users_me(
         id=current_user.id,
         email=current_user.email,
         username=current_user.username,
+        nome=getattr(current_user, "nome", None),
         contato=current_user.contato,
         role=current_user.role,
         sub_base=current_user.sub_base,
