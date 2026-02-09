@@ -702,6 +702,11 @@ def get_dashboard_coletas(
     bases_sem_coletas_set = todas_bases_set - bases_com_coletas_set
     bases_sem_coletas_lista = sorted(bases_sem_coletas_set)
 
+    # Quando BasePreco vazio, usar bases que tiveram coletas como universo para exibir dados
+    if not todas_bases_set and bases_com_coletas_set:
+        todas_bases_set = bases_com_coletas_set
+    bases_total_ativas = len(todas_bases_set)
+
     bases_sem_coletas_detalhe: List[Dict[str, Any]] = []
     bases_por_dia_list: List[Dict[str, Any]] = []
     if delta_days > 1:
@@ -742,7 +747,7 @@ def get_dashboard_coletas(
         valor_mercado_livre=valor_ml,
         valor_avulso=valor_avulso,
         taxa_cancelamento=taxa_cancelamento,
-        bases_total_ativas=len(todas_bases_set),
+        bases_total_ativas=bases_total_ativas,
         bases_com_coletas=len(bases_com_coletas_set),
         bases_sem_coletas=len(bases_sem_coletas_lista),
         bases_sem_coletas_lista=bases_sem_coletas_lista,
