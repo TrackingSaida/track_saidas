@@ -518,6 +518,12 @@ class DashboardColetasBasesSemColetasPorDataOut(BaseModel):
     bases: List[str]
 
 
+class DashboardColetasBasesPorDiaOut(BaseModel):
+    data: str
+    bases_com_coletas: int
+    bases_sem_coletas: int
+
+
 class DashboardColetasCardsOut(BaseModel):
     shopee: int
     mercado_livre: int
@@ -529,10 +535,12 @@ class DashboardColetasCardsOut(BaseModel):
     valor_mercado_livre: float = 0.0
     valor_avulso: float = 0.0
     taxa_cancelamento: float
+    bases_total_ativas: int = 0
     bases_com_coletas: int = 0
     bases_sem_coletas: int = 0
     bases_sem_coletas_lista: List[str] = []
     bases_sem_coletas_detalhe: List[DashboardColetasBasesSemColetasPorDataOut] = []
+    bases_por_dia: List[DashboardColetasBasesPorDiaOut] = []
 
 
 class DashboardColetasChartItemOut(BaseModel):
@@ -695,22 +703,29 @@ def get_dashboard_coletas(
     bases_sem_coletas_lista = sorted(bases_sem_coletas_set)
 
     bases_sem_coletas_detalhe: List[Dict[str, Any]] = []
+    bases_por_dia_list: List[Dict[str, Any]] = []
     if delta_days > 1:
-        # Por dia: quais bases não tiveram coletas
-        bases_por_dia: Dict[str, set] = {}
+        # Por dia: bases com/sem coletas (para gráfico e drill-down)
+        bases_por_dia_map: Dict[str, set] = {}
         for c in rows_coletas:
             d = (c.timestamp.date() if hasattr(c.timestamp, "date") else c.timestamp).isoformat()
             b = (c.base or "").strip().upper()
             if b:
-                if d not in bases_por_dia:
-                    bases_por_dia[d] = set()
-                bases_por_dia[d].add(b)
+                if d not in bases_por_dia_map:
+                    bases_por_dia_map[d] = set()
+                bases_por_dia_map[d].add(b)
         for d in sorted(
             (data_inicio + timedelta(days=i)).isoformat()
             for i in range(delta_days)
         ):
-            com_dia = bases_por_dia.get(d, set())
-            sem_dia = sorted(todas_bases_set - com_dia)
+            com_dia = bases_por_dia_map.get(d, set())
+            sem_dia_set = todas_bases_set - com_dia
+            sem_dia = sorted(sem_dia_set)
+            bases_por_dia_list.append({
+                "data": d,
+                "bases_com_coletas": len(com_dia),
+                "bases_sem_coletas": len(sem_dia_set),
+            })
             if sem_dia:
                 bases_sem_coletas_detalhe.append(
                     {"data": d, "bases": sem_dia}
@@ -727,12 +742,21 @@ def get_dashboard_coletas(
         valor_mercado_livre=valor_ml,
         valor_avulso=valor_avulso,
         taxa_cancelamento=taxa_cancelamento,
+        bases_total_ativas=len(todas_bases_set),
         bases_com_coletas=len(bases_com_coletas_set),
         bases_sem_coletas=len(bases_sem_coletas_lista),
         bases_sem_coletas_lista=bases_sem_coletas_lista,
         bases_sem_coletas_detalhe=[
             DashboardColetasBasesSemColetasPorDataOut(data=x["data"], bases=x["bases"])
             for x in bases_sem_coletas_detalhe
+        ],
+        bases_por_dia=[
+            DashboardColetasBasesPorDiaOut(
+                data=x["data"],
+                bases_com_coletas=x["bases_com_coletas"],
+                bases_sem_coletas=x["bases_sem_coletas"],
+            )
+            for x in bases_por_dia_list
         ],
     )
 
