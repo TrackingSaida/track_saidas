@@ -523,6 +523,8 @@ class DashboardColetasBasesPorDiaOut(BaseModel):
     data: str
     bases_com_coletas: int
     bases_sem_coletas: int
+    bases_com_coletas_lista: List[str] = []
+    bases_sem_coletas_lista: List[str] = []
 
 
 class DashboardColetasCardsOut(BaseModel):
@@ -732,6 +734,8 @@ def get_dashboard_coletas(
                 "data": d,
                 "bases_com_coletas": len(com_dia),
                 "bases_sem_coletas": len(sem_dia_set),
+                "bases_com_coletas_lista": sorted(com_dia),
+                "bases_sem_coletas_lista": sem_dia,
             })
             if sem_dia:
                 bases_sem_coletas_detalhe.append(
@@ -762,6 +766,8 @@ def get_dashboard_coletas(
                 data=x["data"],
                 bases_com_coletas=x["bases_com_coletas"],
                 bases_sem_coletas=x["bases_sem_coletas"],
+                bases_com_coletas_lista=x.get("bases_com_coletas_lista", []),
+                bases_sem_coletas_lista=x.get("bases_sem_coletas_lista", []),
             )
             for x in bases_por_dia_list
         ],
