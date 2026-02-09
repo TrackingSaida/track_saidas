@@ -18,6 +18,9 @@ from auth import get_current_user
 from base import _resolve_user_sub_base
 from models import BasePreco, Coleta, Entregador, Saida, User
 
+from contabilidade_routes import _resolve_entregador_id_saida
+from entregador_routes import resolver_precos_entregador, _normalizar_servico
+
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 # Status considerados "saiu para entrega" (válidos para taxa de sucesso)
@@ -878,4 +881,268 @@ def get_dashboard_coletas(
         chart_data=chart_data,
         ranking_bases=ranking_bases,
         concentracao=concentracao,
+    )
+
+
+# =============================================================================
+# Dashboard de Saídas — APENAS ENTREGAS (roles 0 e 1, sem checar ignorar_coleta)
+# Landing page quando owner tem ignorar_coleta=true
+# =============================================================================
+
+
+def _decimal(v) -> Decimal:
+    try:
+        return Decimal(str(v or 0))
+    except Exception:
+        return Decimal("0")
+
+
+class DashboardSaidasCardsOut(BaseModel):
+    total_saidas: int
+    custo_total: Decimal
+    custo_medio: Decimal
+    entregadores_ativos: int
+    cancelamentos: int
+    taxa_cancelamento: float
+
+
+class DashboardSaidasPorMarketplaceOut(BaseModel):
+    nome: str  # Shopee | Mercado Livre | Avulso
+    qty: int
+    valor: Decimal
+    pct: float
+
+
+class DashboardSaidasEvolucaoOut(BaseModel):
+    date: str
+    shopee: int
+    mercado_livre: int
+    avulso: int
+    valor_total: Decimal
+
+
+class DashboardSaidasRankingEntregadorOut(BaseModel):
+    id_entregador: int
+    nome: str
+    volume: int
+    custo: Decimal
+    shopee: int
+    mercado_livre: int
+    avulso: int
+
+
+class DashboardSaidasRankingBaseOut(BaseModel):
+    base: str
+    volume: int
+    pct: float
+
+
+class DashboardSaidasResponse(BaseModel):
+    cards: DashboardSaidasCardsOut
+    por_marketplace: List[DashboardSaidasPorMarketplaceOut]
+    evolucao_diaria: List[DashboardSaidasEvolucaoOut]
+    ranking_entregadores: List[DashboardSaidasRankingEntregadorOut]
+    ranking_bases: List[DashboardSaidasRankingBaseOut]
+
+
+@router.get("/saidas", response_model=DashboardSaidasResponse)
+def get_dashboard_saidas(
+    data_inicio: Optional[date] = Query(None, description="Data inicial (YYYY-MM-DD)"),
+    data_fim: Optional[date] = Query(None, description="Data final (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dashboard de saídas (entregas). Acesso: roles 0 e 1. Não checa ignorar_coleta."""
+    if current_user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a owners e admins.")
+    sub_base = _sub_base(current_user)
+    today = date.today()
+    if data_inicio is None:
+        data_inicio = today - timedelta(days=29)
+    if data_fim is None:
+        data_fim = today
+    if data_inicio > data_fim:
+        data_inicio, data_fim = data_fim, data_inicio
+    dt_min = datetime.combine(data_inicio, time.min)
+    dt_max = datetime.combine(data_fim, time(23, 59, 59))
+
+    # Saídas válidas (saiu, entregue) e canceladas no período
+    stmt_saidas = select(Saida).where(
+        Saida.sub_base == sub_base,
+        Saida.timestamp >= dt_min,
+        Saida.timestamp <= dt_max,
+        Saida.codigo.isnot(None),
+    )
+    rows_saidas = db.execute(stmt_saidas).scalars().all()
+    status_lower = [s.lower() for s in STATUS_SAIDAS_VALIDOS]
+    rows_validas = [s for s in rows_saidas if (s.status or "").lower() in status_lower]
+    cancelamentos = sum(1 for s in rows_saidas if (s.status or "").lower() in ("cancelado", "cancelada"))
+    total_saidas = len(rows_validas)
+    taxa_cancelamento = round((cancelamentos / (total_saidas + cancelamentos) * 100), 1) if (total_saidas + cancelamentos) > 0 else 0.0
+
+    # Entregadores ativos no período (que tiveram ao menos uma saída)
+    entregador_ids = set()
+    for s in rows_validas:
+        eid = _resolve_entregador_id_saida(db, sub_base, s)
+        if eid:
+            entregador_ids.add(eid)
+    entregadores_ativos = len(entregador_ids)
+
+    # Custo por saída (usando precos entregador)
+    cache_precos: Dict[int, Dict[str, Decimal]] = {}
+    custo_total = Decimal("0")
+    for s in rows_validas:
+        eid = _resolve_entregador_id_saida(db, sub_base, s)
+        if eid is None:
+            continue
+        if eid not in cache_precos:
+            try:
+                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+            except Exception:
+                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[eid]
+        tipo = _normalizar_servico(s.servico)
+        if tipo == "shopee":
+            custo_total += _decimal(precos.get("shopee_valor", 0))
+        elif tipo == "flex":
+            custo_total += _decimal(precos.get("ml_valor", 0))
+        else:
+            custo_total += _decimal(precos.get("avulso_valor", 0))
+    custo_total = custo_total.quantize(Decimal("0.01"))
+    custo_medio = (custo_total / total_saidas).quantize(Decimal("0.01")) if total_saidas > 0 else Decimal("0")
+
+    # Por marketplace
+    shopee_qty = sum(1 for s in rows_validas if _classify_servico(s.servico) == "shopee")
+    ml_qty = sum(1 for s in rows_validas if _classify_servico(s.servico) == "mercado_livre")
+    avulso_qty = total_saidas - shopee_qty - ml_qty
+    # Valor por marketplace: rateio proporcional ao custo total
+    shopee_valor = (custo_total * shopee_qty / total_saidas).quantize(Decimal("0.01")) if total_saidas > 0 else Decimal("0")
+    ml_valor = (custo_total * ml_qty / total_saidas).quantize(Decimal("0.01")) if total_saidas > 0 else Decimal("0")
+    avulso_valor = custo_total - shopee_valor - ml_valor
+    pct_shopee = round(shopee_qty / total_saidas * 100, 1) if total_saidas > 0 else 0.0
+    pct_ml = round(ml_qty / total_saidas * 100, 1) if total_saidas > 0 else 0.0
+    pct_avulso = round(avulso_qty / total_saidas * 100, 1) if total_saidas > 0 else 0.0
+    por_marketplace = [
+        DashboardSaidasPorMarketplaceOut(nome="Shopee", qty=shopee_qty, valor=shopee_valor, pct=pct_shopee),
+        DashboardSaidasPorMarketplaceOut(nome="Mercado Livre", qty=ml_qty, valor=ml_valor, pct=pct_ml),
+        DashboardSaidasPorMarketplaceOut(nome="Avulso", qty=avulso_qty, valor=avulso_valor, pct=pct_avulso),
+    ]
+
+    # Evolução diária
+    evolucao_map: Dict[str, Dict[str, Any]] = {}
+    for d in range((data_fim - data_inicio).days + 1):
+        dt = data_inicio + timedelta(days=d)
+        key = dt.isoformat()
+        evolucao_map[key] = {"date": key, "shopee": 0, "mercado_livre": 0, "avulso": 0, "valor_total": Decimal("0")}
+    for s in rows_validas:
+        eid = _resolve_entregador_id_saida(db, sub_base, s)
+        if eid is None:
+            continue
+        if eid not in cache_precos:
+            try:
+                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+            except Exception:
+                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[eid]
+        tipo = _normalizar_servico(s.servico)
+        if tipo == "shopee":
+            v = _decimal(precos.get("shopee_valor", 0))
+        elif tipo == "flex":
+            v = _decimal(precos.get("ml_valor", 0))
+        else:
+            v = _decimal(precos.get("avulso_valor", 0))
+        key = s.timestamp.date().isoformat()
+        if key in evolucao_map:
+            if _classify_servico(s.servico) == "shopee":
+                evolucao_map[key]["shopee"] += 1
+            elif _classify_servico(s.servico) == "mercado_livre":
+                evolucao_map[key]["mercado_livre"] += 1
+            else:
+                evolucao_map[key]["avulso"] += 1
+            evolucao_map[key]["valor_total"] += v
+    evolucao_diaria = [
+        DashboardSaidasEvolucaoOut(
+            date=v["date"],
+            shopee=v["shopee"],
+            mercado_livre=v["mercado_livre"],
+            avulso=v["avulso"],
+            valor_total=v["valor_total"].quantize(Decimal("0.01")),
+        )
+        for v in sorted(evolucao_map.values(), key=lambda x: x["date"])
+    ]
+
+    # Ranking entregadores (volume, custo por entregador)
+    ent_vol: Dict[int, int] = {}
+    ent_custo: Dict[int, Decimal] = {}
+    ent_shopee: Dict[int, int] = {}
+    ent_ml: Dict[int, int] = {}
+    ent_avulso: Dict[int, int] = {}
+    for s in rows_validas:
+        eid = _resolve_entregador_id_saida(db, sub_base, s)
+        if eid is None:
+            continue
+        ent_vol[eid] = ent_vol.get(eid, 0) + 1
+        if eid not in cache_precos:
+            try:
+                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+            except Exception:
+                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[eid]
+        tipo = _normalizar_servico(s.servico)
+        if tipo == "shopee":
+            v = _decimal(precos.get("shopee_valor", 0))
+            ent_shopee[eid] = ent_shopee.get(eid, 0) + 1
+        elif tipo == "flex":
+            v = _decimal(precos.get("ml_valor", 0))
+            ent_ml[eid] = ent_ml.get(eid, 0) + 1
+        else:
+            v = _decimal(precos.get("avulso_valor", 0))
+            ent_avulso[eid] = ent_avulso.get(eid, 0) + 1
+        ent_custo[eid] = ent_custo.get(eid, Decimal("0")) + v
+    ent_nomes: Dict[int, str] = {}
+    for eid in set(ent_vol.keys()):
+        ent = db.get(Entregador, eid)
+        ent_nomes[eid] = (ent.nome or f"ID {eid}") if ent else f"ID {eid}"
+    ranking_entregadores = [
+        DashboardSaidasRankingEntregadorOut(
+            id_entregador=eid,
+            nome=ent_nomes.get(eid, f"ID {eid}"),
+            volume=ent_vol[eid],
+            custo=ent_custo[eid].quantize(Decimal("0.01")),
+            shopee=ent_shopee.get(eid, 0),
+            mercado_livre=ent_ml.get(eid, 0),
+            avulso=ent_avulso.get(eid, 0),
+        )
+        for eid in sorted(ent_vol.keys(), key=lambda x: -ent_vol[x])
+    ][:15]
+
+    # Ranking bases (por volume de saídas)
+    base_vol: Dict[str, int] = {}
+    for s in rows_validas:
+        b = (s.base or "").strip() or "(sem base)"
+        base_vol[b] = base_vol.get(b, 0) + 1
+    total_base = sum(base_vol.values())
+    ranking_bases = [
+        DashboardSaidasRankingBaseOut(
+            base=b,
+            volume=v,
+            pct=round(v / total_base * 100, 1) if total_base > 0 else 0.0,
+        )
+        for b, v in sorted(base_vol.items(), key=lambda x: -x[1])
+    ][:15]
+
+    cards = DashboardSaidasCardsOut(
+        total_saidas=total_saidas,
+        custo_total=custo_total,
+        custo_medio=custo_medio,
+        entregadores_ativos=entregadores_ativos,
+        cancelamentos=cancelamentos,
+        taxa_cancelamento=taxa_cancelamento,
+    )
+    return DashboardSaidasResponse(
+        cards=cards,
+        por_marketplace=por_marketplace,
+        evolucao_diaria=evolucao_diaria,
+        ranking_entregadores=ranking_entregadores,
+        ranking_bases=ranking_bases,
     )

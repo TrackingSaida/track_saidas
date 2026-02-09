@@ -64,6 +64,7 @@ MENU_DEFS = [
             {"label": "Visão geral", "href": "dashboard-tracking-overview.html", "roles": [0, 1]},
             {"label": "Visão 360", "href": "dashboard-visao-360.html", "roles": [0, 1], "visao360_only": True},
             {"label": "Coletas", "href": "dashboard-coletas.html", "roles": [0, 1], "coleta_only": True},
+            {"label": "Saídas", "href": "dashboard-saidas.html", "roles": [0, 1]},
             {"label": "Ranking",     "href": "dashboard-tracking-saidas.html",   "roles": [0, 1, 2, 3]},
         ]
     },
