@@ -684,17 +684,19 @@ def get_dashboard_coletas(
         (total_cancelados / total_coletas * 100), 1
     ) if total_coletas > 0 else 0.0
 
-    # --- Bases ativas: sempre do cadastro (BasePreco ativo), mesma resolução que GET /base/ ---
+    # --- Bases ativas: sempre do cadastro (BasePreco ativo), mesma query que GET /base/?status=ativo ---
     sub_base_bases = _resolve_user_sub_base(db, current_user)
-    stmt_bases = select(BasePreco.base).where(
-        BasePreco.sub_base == sub_base_bases,
-        BasePreco.ativo.is_(True),
-        BasePreco.base.isnot(None),
+    stmt_bases = (
+        select(BasePreco)
+        .where(BasePreco.sub_base == sub_base_bases)
+        .where(BasePreco.ativo.is_(True))
+        .where(BasePreco.base.isnot(None))
     )
+    rows_bases = db.scalars(stmt_bases).all()
     todas_bases_set = {
-        str(r).strip().upper()
-        for r in db.execute(stmt_bases).scalars().all()
-        if r and str(r).strip()
+        str(b.base).strip().upper()
+        for b in rows_bases
+        if b and b.base and str(b.base).strip()
     }
     bases_com_coletas_set = {
         (c.base or "").strip().upper() or "S/D"
