@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, Saida, User
+from models import BasePreco, Coleta, Entregador, Saida, User
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -513,6 +513,11 @@ def get_visao_360(
 # =============================================================================
 
 
+class DashboardColetasBasesSemColetasPorDataOut(BaseModel):
+    data: str
+    bases: List[str]
+
+
 class DashboardColetasCardsOut(BaseModel):
     shopee: int
     mercado_livre: int
@@ -520,7 +525,14 @@ class DashboardColetasCardsOut(BaseModel):
     cancelados: int
     total_coletas: int
     valor_total: float
+    valor_shopee: float = 0.0
+    valor_mercado_livre: float = 0.0
+    valor_avulso: float = 0.0
     taxa_cancelamento: float
+    bases_com_coletas: int = 0
+    bases_sem_coletas: int = 0
+    bases_sem_coletas_lista: List[str] = []
+    bases_sem_coletas_detalhe: List[DashboardColetasBasesSemColetasPorDataOut] = []
 
 
 class DashboardColetasChartItemOut(BaseModel):
@@ -528,6 +540,7 @@ class DashboardColetasChartItemOut(BaseModel):
     shopee: int
     mercado_livre: int
     avulso: int
+    valor_total: float = 0.0
 
 
 class DashboardColetasRankingBaseOut(BaseModel):
@@ -646,10 +659,62 @@ def get_dashboard_coletas(
     ml = sum(c.mercado_livre or 0 for c in rows_coletas)
     avulso = sum(c.avulso or 0 for c in rows_coletas)
     total_coletas = shopee + ml + avulso
-    valor_total = float(sum(c.valor_total or 0 for c in rows_coletas))
+    valor_total = 0.0
+    valor_shopee = 0.0
+    valor_ml = 0.0
+    valor_avulso = 0.0
+    for c in rows_coletas:
+        vt = float(c.valor_total or 0)
+        valor_total += vt
+        tq = (c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0)
+        if tq > 0 and vt > 0:
+            valor_shopee += vt * (c.shopee or 0) / tq
+            valor_ml += vt * (c.mercado_livre or 0) / tq
+            valor_avulso += vt * (c.avulso or 0) / tq
     taxa_cancelamento = round(
         (total_cancelados / total_coletas * 100), 1
     ) if total_coletas > 0 else 0.0
+
+    # --- Bases ativas: com/sem coletas e drill-down ---
+    stmt_bases = select(BasePreco.base).where(
+        BasePreco.sub_base == sub_base,
+        BasePreco.ativo.is_(True),
+        BasePreco.base.isnot(None),
+    )
+    todas_bases_set = {
+        str(r).strip().upper()
+        for r in db.execute(stmt_bases).scalars().all()
+        if r and str(r).strip()
+    }
+    bases_com_coletas_set = {
+        (c.base or "").strip().upper() or "S/D"
+        for c in rows_coletas
+        if (c.base or "").strip()
+    }
+    bases_sem_coletas_set = todas_bases_set - bases_com_coletas_set
+    bases_sem_coletas_lista = sorted(bases_sem_coletas_set)
+
+    bases_sem_coletas_detalhe: List[Dict[str, Any]] = []
+    if delta_days > 1:
+        # Por dia: quais bases não tiveram coletas
+        bases_por_dia: Dict[str, set] = {}
+        for c in rows_coletas:
+            d = (c.timestamp.date() if hasattr(c.timestamp, "date") else c.timestamp).isoformat()
+            b = (c.base or "").strip().upper()
+            if b:
+                if d not in bases_por_dia:
+                    bases_por_dia[d] = set()
+                bases_por_dia[d].add(b)
+        for d in sorted(
+            (data_inicio + timedelta(days=i)).isoformat()
+            for i in range(delta_days)
+        ):
+            com_dia = bases_por_dia.get(d, set())
+            sem_dia = sorted(todas_bases_set - com_dia)
+            if sem_dia:
+                bases_sem_coletas_detalhe.append(
+                    {"data": d, "bases": sem_dia}
+                )
 
     cards = DashboardColetasCardsOut(
         shopee=shopee,
@@ -658,18 +723,29 @@ def get_dashboard_coletas(
         cancelados=total_cancelados,
         total_coletas=total_coletas,
         valor_total=valor_total,
+        valor_shopee=valor_shopee,
+        valor_mercado_livre=valor_ml,
+        valor_avulso=valor_avulso,
         taxa_cancelamento=taxa_cancelamento,
+        bases_com_coletas=len(bases_com_coletas_set),
+        bases_sem_coletas=len(bases_sem_coletas_lista),
+        bases_sem_coletas_lista=bases_sem_coletas_lista,
+        bases_sem_coletas_detalhe=[
+            DashboardColetasBasesSemColetasPorDataOut(data=x["data"], bases=x["bases"])
+            for x in bases_sem_coletas_detalhe
+        ],
     )
 
     # --- Chart por dia ---
-    mapa_dia: Dict[str, Dict[str, int]] = {}
+    mapa_dia: Dict[str, Dict[str, Any]] = {}
     for c in rows_coletas:
         d = (c.timestamp.date() if hasattr(c.timestamp, "date") else c.timestamp).isoformat()
         if d not in mapa_dia:
-            mapa_dia[d] = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
+            mapa_dia[d] = {"shopee": 0, "mercado_livre": 0, "avulso": 0, "valor_total": 0.0}
         mapa_dia[d]["shopee"] += c.shopee or 0
         mapa_dia[d]["mercado_livre"] += c.mercado_livre or 0
         mapa_dia[d]["avulso"] += c.avulso or 0
+        mapa_dia[d]["valor_total"] += float(c.valor_total or 0)
 
     chart_data = []
     for d in sorted(mapa_dia.keys()):
@@ -680,6 +756,7 @@ def get_dashboard_coletas(
                 shopee=v["shopee"],
                 mercado_livre=v["mercado_livre"],
                 avulso=v["avulso"],
+                valor_total=v.get("valor_total", 0.0),
             )
         )
 
