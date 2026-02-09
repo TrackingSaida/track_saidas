@@ -63,6 +63,7 @@ class StatusOperacionalOut(BaseModel):
     coletas_dia: int
     saidas_dia: int
     entregadores_ativos: int
+    bases_ativas: int
     cancelamentos_dia: int
 
 
@@ -234,6 +235,19 @@ def get_visao_360(
     )
     rows_entregadores = db.execute(stmt_ent).scalars().all()
     entregadores_ativos = len(rows_entregadores)
+
+    # --- 3b. Bases ativas (cadastro BasePreco ativo) ---
+    sub_base_bases = _resolve_user_sub_base(db, current_user)
+    stmt_bases = (
+        select(BasePreco)
+        .where(BasePreco.sub_base == sub_base_bases)
+        .where(BasePreco.ativo.is_(True))
+        .where(BasePreco.base.isnot(None))
+    )
+    rows_bases = db.scalars(stmt_bases).all()
+    bases_ativas = len(
+        {str(b.base).strip().upper() for b in rows_bases if b and b.base and str(b.base).strip()}
+    )
 
     # --- 4. Aceitação por marketplace ---
     coletas_shopee = sum(c.shopee or 0 for c in rows_coletas)
@@ -481,6 +495,7 @@ def get_visao_360(
             coletas_dia=total_coletas,
             saidas_dia=total_saidas,
             entregadores_ativos=entregadores_ativos,
+            bases_ativas=bases_ativas,
             cancelamentos_dia=cancelamentos,
         ),
         capacidade=CapacidadeOut(
