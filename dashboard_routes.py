@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func, and_, or_
+from sqlalchemy import select, func, and_, or_, cast
+from sqlalchemy.types import Date
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -1263,8 +1264,8 @@ def get_dashboard_admin(
 
     stmt_saidas = select(Saida).where(
         Saida.sub_base.in_(sub_bases),
-        Saida.timestamp >= dt_min,
-        Saida.timestamp <= dt_max,
+        Saida.data >= data_inicio,
+        Saida.data <= data_fim,
         Saida.codigo.isnot(None),
         func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
     )
@@ -1273,8 +1274,8 @@ def get_dashboard_admin(
 
     stmt_cob = select(OwnerCobrancaItem).where(
         OwnerCobrancaItem.sub_base.in_(sub_bases),
-        OwnerCobrancaItem.timestamp >= dt_min,
-        OwnerCobrancaItem.timestamp <= dt_max,
+        cast(OwnerCobrancaItem.timestamp, Date) >= data_inicio,
+        cast(OwnerCobrancaItem.timestamp, Date) <= data_fim,
         OwnerCobrancaItem.cancelado.is_(False),
     )
     rows_cob = db.execute(stmt_cob).scalars().all()

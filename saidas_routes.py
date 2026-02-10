@@ -407,9 +407,9 @@ def listar_saidas(
         stmt = stmt.where(func.unaccent(func.lower(Saida.base)) == func.unaccent(base_norm))
 
     if de:
-        stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
+        stmt = stmt.where(Saida.data >= de)
     if ate:
-        stmt = stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
+        stmt = stmt.where(Saida.data <= ate)
 
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
         ent_norm = entregador.strip().lower()
