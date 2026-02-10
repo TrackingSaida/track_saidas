@@ -1219,7 +1219,13 @@ def get_dashboard_admin(
         except Exception:
             return Decimal("0")
 
-    owners = db.scalars(select(Owner).where(Owner.ativo.is_(True))).all()
+    # Considera apenas owners ativos e não marcados como teste
+    owners = db.scalars(
+        select(Owner).where(
+            Owner.ativo.is_(True),
+            Owner.teste.is_(False),
+        )
+    ).all()
     if sub_bases_filter:
         owners = [o for o in owners if o.sub_base in sub_bases_filter]
     sub_bases = [o.sub_base for o in owners if o.sub_base]
@@ -1234,7 +1240,15 @@ def get_dashboard_admin(
             volume_por_owner=[],
             receita_por_owner=[],
             performance_por_owner=[],
-            owners=[{"id_owner": o.id_owner, "username": o.username, "sub_base": o.sub_base} for o in db.scalars(select(Owner)).all()],
+            owners=[
+                {"id_owner": o.id_owner, "username": o.username, "sub_base": o.sub_base}
+                for o in db.scalars(
+                    select(Owner).where(
+                        Owner.ativo.is_(True),
+                        Owner.teste.is_(False),
+                    )
+                ).all()
+            ],
         )
 
     stmt_coletas = select(Coleta).where(
@@ -1319,7 +1333,15 @@ def get_dashboard_admin(
             receita_admin=cob_por_sb.get(sb, Decimal("0")).quantize(Decimal("0.01")),
         ))
 
-    owners_list = [{"id_owner": o.id_owner, "username": o.username or "", "sub_base": o.sub_base or ""} for o in db.scalars(select(Owner)).all()]
+    owners_list = [
+        {"id_owner": o.id_owner, "username": o.username or "", "sub_base": o.sub_base or ""}
+        for o in db.scalars(
+            select(Owner).where(
+                Owner.ativo.is_(True),
+                Owner.teste.is_(False),
+            )
+        ).all()
+    ]
 
     return DashboardAdminResponse(
         cards=DashboardAdminCardsOut(

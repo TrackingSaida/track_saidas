@@ -24,6 +24,7 @@ class OwnerCreate(BaseModel):
     valor: Optional[float] = Field(default=None)
     sub_base: Optional[str] = None
     contato: Optional[str] = None
+    teste: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -35,6 +36,7 @@ class OwnerUpdate(BaseModel):
     contato: Optional[str] = None
     ativo: Optional[bool] = None
     ignorar_coleta: Optional[bool] = None
+    teste: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -48,6 +50,7 @@ class OwnerOut(BaseModel):
     contato: Optional[str]
     ativo: bool
     ignorar_coleta: bool
+    teste: bool
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -87,7 +90,8 @@ def create_owner(
         sub_base=body.sub_base,
         contato=body.contato,
         ativo=True,
-        ignorar_coleta=False
+        ignorar_coleta=False,
+        teste=bool(body.teste) if body.teste is not None else False,
     )
     db.add(obj)
     db.commit()
@@ -167,6 +171,9 @@ def update_owner(
 
     if body.ignorar_coleta is not None:
         owner.ignorar_coleta = body.ignorar_coleta
+
+    if body.teste is not None:
+        owner.teste = body.teste
 
     db.commit()
     db.refresh(owner)

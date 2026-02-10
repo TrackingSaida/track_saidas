@@ -71,6 +71,8 @@ class Owner(Base):
 
     ativo = Column(Boolean, nullable=False, server_default=text("true"))
     ignorar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
+     # Flag para owners de teste (não considerados em dashboards/admin)
+    teste = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"

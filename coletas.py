@@ -231,10 +231,7 @@ def registrar_coleta_em_lote(
     else:
         sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
 
-    # 2) valor unitário vem do JWT (sem SELECT em Owner)
-    valor_unit = Decimal(getattr(current_user, "owner_valor", "0"))
-
-    # 3) preços com cache TTL curto
+    # 2) preços com cache TTL curto (valores de cobrança por pacote)
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base)
 
     # 4) Normaliza itens e detecta duplicados no próprio payload (zero DB)
@@ -268,7 +265,6 @@ def registrar_coleta_em_lote(
         raise HTTPException(409, f"Código '{dup}' já coletado.")
 
     created = 0
-    saidas_ids: List[int] = []
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
 
     try:
@@ -284,7 +280,7 @@ def registrar_coleta_em_lote(
         db.add(coleta)
         db.flush()
 
-        # 6) Inserção em loop, mas sem SELECTs dentro
+        # 6) Inserção em loop, sem SELECTs dentro
         for item in payload.itens:
             serv_key = _normalize_servico(item.servico)
             codigo = item.codigo.strip()
@@ -302,7 +298,23 @@ def registrar_coleta_em_lote(
             )
             db.add(saida)
             db.flush()
-            saidas_ids.append(saida.id_saida)
+
+            # Valor de cobrança por pacote conforme o tipo de serviço
+            if serv_key == "shopee":
+                valor_cob = p_shopee
+            elif serv_key == "mercado_livre":
+                valor_cob = p_ml
+            else:
+                valor_cob = p_avulso
+
+            db.add(
+                OwnerCobrancaItem(
+                    sub_base=sub_base,
+                    id_coleta=coleta.id_coleta,
+                    id_saida=saida.id_saida,
+                    valor=valor_cob,
+                )
+            )
 
             count[serv_key] += 1
             created += 1
@@ -315,19 +327,6 @@ def registrar_coleta_em_lote(
             count["mercado_livre"] * p_ml +
             count["avulso"] * p_avulso
         ).quantize(Decimal("0.01"))
-
-        db.flush()
-
-        # 7) Cobrança: adiciona N itens, sem consultas
-        for id_saida in saidas_ids:
-            db.add(
-                OwnerCobrancaItem(
-                    sub_base=sub_base,
-                    id_coleta=coleta.id_coleta,
-                    id_saida=id_saida,
-                    valor=valor_unit
-                )
-            )
 
         db.commit()
         db.refresh(coleta)
