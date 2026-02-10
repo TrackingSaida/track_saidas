@@ -57,7 +57,7 @@ MENU_DEFS = [
         ]
     },
     {
-        "section": "Dashboards",
+        "section": "Indicadores",
         "icon": "ri-dashboard-2-line",
         "roles": [0, 1, 2, 3],
         "items": [
