@@ -115,6 +115,13 @@ class ComparacaoPeriodoAnterior(BaseModel):
     variacao_margem_pp: Optional[Decimal] = None  # pontos percentuais
 
 
+class EvolucaoDiariaItem(BaseModel):
+    date: str
+    ganhos: Decimal
+    despesas: Decimal
+    lucro: Decimal
+
+
 class ContabilidadeResumoResponse(BaseModel):
     data_inicio: str
     data_fim: str
@@ -130,6 +137,7 @@ class ContabilidadeResumoResponse(BaseModel):
     distribuicao_despesas: List[EntregadorDespesaItem]
     dre: List[DRELinha]
     comparacao_periodo_anterior: Optional[ComparacaoPeriodoAnterior] = None
+    evolucao_diaria: List[EvolucaoDiariaItem] = []
     aviso_apenas_fechamentos_gerados: bool = True
     aviso_pendentes: bool = False
     total_fechamentos_no_periodo: int = 0
@@ -385,6 +393,63 @@ def get_resumo_contabilidade(
         )
     dist_despesas.sort(key=lambda x: -x.despesa)
 
+    # ---- 8b) Evolução diária (ganhos, despesas, lucro por dia) ----
+    ganhos_por_dia: Dict[date, Decimal] = {}
+    for c in rows_coletas:
+        d = c.timestamp.date() if hasattr(c.timestamp, "date") else c.data
+        ganhos_por_dia[d] = ganhos_por_dia.get(d, Decimal("0")) + _decimal(c.valor_total)
+
+    despesas_por_dia: Dict[date, Decimal] = {}
+    for f in rows_fech:
+        num_dias = (f.periodo_fim - f.periodo_inicio).days + 1
+        if num_dias <= 0:
+            continue
+        v_por_dia = _decimal(f.valor_final) / Decimal(num_dias)
+        d = f.periodo_inicio
+        while d <= f.periodo_fim:
+            if data_inicio <= d <= data_fim:
+                despesas_por_dia[d] = despesas_por_dia.get(d, Decimal("0")) + v_por_dia
+            d += timedelta(days=1)
+    for s in rows_saidas:
+        data_saida = s.timestamp.date()
+        eid = _resolve_entregador_id_saida(db, sub_base, s)
+        if eid is None:
+            continue
+        if cache_coberto.get((eid, data_saida), False):
+            continue
+        if eid not in cache_precos:
+            try:
+                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+            except Exception:
+                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[eid]
+        tipo = _normalizar_servico(s.servico)
+        valor = Decimal("0")
+        if tipo == "shopee":
+            valor = _decimal(precos.get("shopee_valor", 0))
+        elif tipo == "flex":
+            valor = _decimal(precos.get("ml_valor", 0))
+        else:
+            valor = _decimal(precos.get("avulso_valor", 0))
+        if data_inicio <= data_saida <= data_fim:
+            despesas_por_dia[data_saida] = despesas_por_dia.get(data_saida, Decimal("0")) + valor
+
+    evolucao_diaria = []
+    d = data_inicio
+    while d <= data_fim:
+        ganhos = ganhos_por_dia.get(d, Decimal("0"))
+        despesas = despesas_por_dia.get(d, Decimal("0"))
+        lucro = _decimal(ganhos - despesas)
+        evolucao_diaria.append(
+            EvolucaoDiariaItem(
+                date=d.isoformat(),
+                ganhos=_decimal(ganhos).quantize(Decimal("0.01")),
+                despesas=_decimal(despesas).quantize(Decimal("0.01")),
+                lucro=_decimal(lucro).quantize(Decimal("0.01")),
+            )
+        )
+        d += timedelta(days=1)
+
     # ---- 9) DRE simplificado ----
     dre = [
         DRELinha(
@@ -475,6 +540,7 @@ def get_resumo_contabilidade(
         distribuicao_despesas=dist_despesas,
         dre=dre,
         comparacao_periodo_anterior=comparacao,
+        evolucao_diaria=evolucao_diaria,
         aviso_apenas_fechamentos_gerados=True,
         aviso_pendentes=aviso_pendentes,
         total_fechamentos_no_periodo=len(rows_fech),
