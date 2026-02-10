@@ -1264,7 +1264,11 @@ def get_dashboard_admin(
         OwnerCobrancaItem.cancelado.is_(False),
     )
     rows_cob = db.execute(stmt_cob).scalars().all()
-    receita_admin_total = sum(_decimal(c.valor) for c in rows_cob).quantize(Decimal("0.01"))
+    # Usa Decimal("0") como acumulador inicial para evitar int puro quando não houver linhas
+    receita_admin_total = sum(
+        (_decimal(c.valor) for c in rows_cob),
+        start=Decimal("0"),
+    ).quantize(Decimal("0.01"))
 
     owner_map = {o.sub_base: o for o in owners}
     owners_ativos = len([s for s in sub_bases if owner_map.get(s) and owner_map[s].ativo])
@@ -1276,7 +1280,11 @@ def get_dashboard_admin(
     for sb in sub_bases:
         coleta_por_sb[sb] = sum(1 for c in rows_coletas if c.sub_base == sb)
         saida_por_sb[sb] = sum(1 for s in rows_saidas if s.sub_base == sb)
-        cob_por_sb[sb] = sum(_decimal(c.valor) for c in rows_cob if c.sub_base == sb)
+        # Garante sempre Decimal, mesmo quando não houver cobranças para a sub_base
+        cob_por_sb[sb] = sum(
+            (_decimal(c.valor) for c in rows_cob if c.sub_base == sb),
+            start=Decimal("0"),
+        )
         cob_count_por_sb[sb] = sum(1 for c in rows_cob if c.sub_base == sb)
 
     volume_por_owner = [
