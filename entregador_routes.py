@@ -448,9 +448,9 @@ def resumo_entregadores(
     )
 
     if data_inicio is not None:
-        stmt = stmt.where(Saida.timestamp >= datetime.combine(data_inicio, time.min))
+        stmt = stmt.where(Saida.data >= data_inicio)
     if data_fim is not None:
-        stmt = stmt.where(Saida.timestamp <= datetime.combine(data_fim, time(23, 59, 59)))
+        stmt = stmt.where(Saida.data <= data_fim)
     if entregador_id is not None:
         stmt = stmt.where(Saida.entregador_id == entregador_id)
 

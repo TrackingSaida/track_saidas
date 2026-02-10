@@ -216,12 +216,12 @@ def get_visao_360(
         (c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0) for c in rows_coletas
     )
 
-    # --- 2. SAÍDAS do período (status válidos: saiu, entregue) ---
+    # --- 2. SAÍDAS do período (status válidos: saiu, entregue) — por dia civil ---
     stmt_saidas = (
         select(Saida)
         .where(Saida.sub_base == sub_base)
-        .where(Saida.timestamp >= dt_start)
-        .where(Saida.timestamp <= dt_end)
+        .where(Saida.data >= data_inicio)
+        .where(Saida.data <= data_fim)
         .where(Saida.codigo.isnot(None))
     )
     rows_saidas = db.execute(stmt_saidas).scalars().all()
@@ -399,8 +399,7 @@ def get_visao_360(
         stmt_s_d = (
             select(Saida)
             .where(Saida.sub_base == sub_base)
-            .where(Saida.timestamp >= dt_d_start)
-            .where(Saida.timestamp <= dt_d_end)
+            .where(Saida.data == d)
             .where(Saida.codigo.isnot(None))
             .where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
         )
@@ -673,13 +672,13 @@ def get_dashboard_coletas(
     )
     rows_coletas_ant = db.execute(stmt_c_ant).scalars().all()
 
-    # --- Cancelados (tabela Saida) ---
+    # --- Cancelados (tabela Saida) — por dia civil ---
     stmt_cancel = (
         select(Saida)
         .where(Saida.sub_base == sub_base)
         .where(func.lower(Saida.status) == STATUS_CANCELADO)
-        .where(Saida.timestamp >= dt_start)
-        .where(Saida.timestamp <= dt_end)
+        .where(Saida.data >= data_inicio)
+        .where(Saida.data <= data_fim)
     )
     cancelados_rows = db.execute(stmt_cancel).scalars().all()
     total_cancelados = len(cancelados_rows)
@@ -964,14 +963,11 @@ def get_dashboard_saidas(
         data_fim = today
     if data_inicio > data_fim:
         data_inicio, data_fim = data_fim, data_inicio
-    dt_min = datetime.combine(data_inicio, time.min)
-    dt_max = datetime.combine(data_fim, time(23, 59, 59))
-
-    # Saídas válidas (saiu, entregue) e canceladas no período
+    # Saídas válidas (saiu, entregue) e canceladas no período — por dia civil
     stmt_saidas = select(Saida).where(
         Saida.sub_base == sub_base,
-        Saida.timestamp >= dt_min,
-        Saida.timestamp <= dt_max,
+        Saida.data >= data_inicio,
+        Saida.data <= data_fim,
         Saida.codigo.isnot(None),
     )
     rows_saidas = db.execute(stmt_saidas).scalars().all()
@@ -1052,7 +1048,7 @@ def get_dashboard_saidas(
             v = _decimal(precos.get("ml_valor", 0))
         else:
             v = _decimal(precos.get("avulso_valor", 0))
-        key = s.timestamp.date().isoformat()
+        key = (s.data or s.timestamp.date()).isoformat()
         if key in evolucao_map:
             if _classify_servico(s.servico) == "shopee":
                 evolucao_map[key]["shopee"] += 1

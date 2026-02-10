@@ -377,10 +377,10 @@ def list_coletas(
         stmt = stmt.where(Coleta.username_entregador == username_entregador.strip())
 
     if data_inicio:
-        stmt = stmt.where(Coleta.timestamp >= data_inicio)
+        dt_start = datetime.datetime.combine(data_inicio, datetime.time.min)
+        stmt = stmt.where(Coleta.timestamp >= dt_start)
 
     if data_fim:
-        # inclui dia inteiro
         dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
         stmt = stmt.where(Coleta.timestamp <= dt_end)
 
@@ -451,8 +451,10 @@ def resumo_coletas(
 
     base_norm = base.strip().lower() if base else None
 
-    # intervalo fim (incluindo dia inteiro)
+    dt_start = None
     dt_end = None
+    if data_inicio:
+        dt_start = datetime.datetime.combine(data_inicio, datetime.time.min)
     if data_fim:
         dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
 
@@ -464,8 +466,8 @@ def resumo_coletas(
     if base_norm:
         stmt = stmt.where(func.lower(Coleta.base) == base_norm)
 
-    if data_inicio:
-        stmt = stmt.where(Coleta.timestamp >= data_inicio)
+    if dt_start:
+        stmt = stmt.where(Coleta.timestamp >= dt_start)
 
     if dt_end:
         stmt = stmt.where(Coleta.timestamp <= dt_end)
@@ -485,10 +487,10 @@ def resumo_coletas(
         cancelados_stmt = cancelados_stmt.where(func.lower(Saida.base) == base_norm)
 
     if data_inicio:
-        cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= data_inicio)
+        cancelados_stmt = cancelados_stmt.where(Saida.data >= data_inicio)
 
-    if dt_end:
-        cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
+    if data_fim:
+        cancelados_stmt = cancelados_stmt.where(Saida.data <= data_fim)
 
     cancelados_rows = db.scalars(cancelados_stmt).all()
 
