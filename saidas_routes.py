@@ -237,7 +237,8 @@ def registrar_saida(
         db.add(row)
         db.flush()
 
-        if ignorar_coleta:
+        # ignorar_coleta: cobrança apenas para status "saiu" (cancelado e outros não cobram)
+        if ignorar_coleta and status_val == "saiu":
             db.add(
                 OwnerCobrancaItem(
                     sub_base=sub_base,
@@ -509,7 +510,15 @@ def atualizar_saida(
         obj.entregador = entregador_nome
 
     if payload.status is not None:
-        obj.status = normalizar_status_saida(payload.status)
+        novo_status = normalizar_status_saida(payload.status)
+        obj.status = novo_status
+        # Se alterou para cancelado, marcar cobrança como cancelada (não contabilizada)
+        if novo_status == "cancelado":
+            itens = db.scalars(
+                select(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida == obj.id_saida)
+            ).all()
+            for item in itens:
+                item.cancelado = True
 
     if payload.servico is not None:
         obj.servico = payload.servico.strip().title()

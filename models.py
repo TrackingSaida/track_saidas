@@ -293,6 +293,7 @@ class OwnerCobrancaItem(Base):
     periodo_inicio = Column(Date, nullable=True)
     periodo_fim = Column(Date, nullable=True)
     fechado = Column(Boolean, nullable=False, server_default=text("false"))
+    cancelado = Column(Boolean, nullable=False, server_default=text("false"))
 
 
 # ==========================

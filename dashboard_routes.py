@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from base import _resolve_user_sub_base
-from models import BasePreco, Coleta, Entregador, Saida, User
+from models import BasePreco, Coleta, Entregador, Owner, OwnerCobrancaItem, Saida, User
 
 from contabilidade_routes import _resolve_entregador_id_saida
 from entregador_routes import resolver_precos_entregador, _normalizar_servico
@@ -1145,4 +1145,183 @@ def get_dashboard_saidas(
         evolucao_diaria=evolucao_diaria,
         ranking_entregadores=ranking_entregadores,
         ranking_bases=ranking_bases,
+    )
+
+
+# =============================================================================
+# Dashboard Admin — supervisão de todos os owners (apenas role 0)
+# =============================================================================
+
+
+class DashboardAdminCardsOut(BaseModel):
+    total_coletas: int
+    total_saidas: int
+    receita_admin: Decimal
+    owners_ativos: int
+
+
+class DashboardAdminVolumeOwnerOut(BaseModel):
+    sub_base: str
+    coletas: int
+    saidas: int
+    receita: Decimal
+
+
+class DashboardAdminReceitaOwnerOut(BaseModel):
+    sub_base: str
+    receita: Decimal
+    pct: float
+
+
+class DashboardAdminPerformanceOwnerOut(BaseModel):
+    sub_base: str
+    tipo: str  # "Coleta" | "Só Saída"
+    coletas: int
+    saidas: int
+    base_cobranca: int
+    receita_admin: Decimal
+
+
+class DashboardAdminResponse(BaseModel):
+    cards: DashboardAdminCardsOut
+    volume_por_owner: List[DashboardAdminVolumeOwnerOut]
+    receita_por_owner: List[DashboardAdminReceitaOwnerOut]
+    performance_por_owner: List[DashboardAdminPerformanceOwnerOut]
+    owners: List[Dict[str, Any]]  # [{id_owner, username, sub_base}, ...] para o filtro
+
+
+@router.get("/admin", response_model=DashboardAdminResponse)
+def get_dashboard_admin(
+    data_inicio: Optional[date] = Query(None),
+    data_fim: Optional[date] = Query(None),
+    sub_base: Optional[str] = Query(None, description="Filtro por owner (sub_base)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dashboard administrativo. Acesso: apenas role 0."""
+    if current_user.role != 0:
+        raise HTTPException(403, "Acesso restrito ao administrador.")
+    today = date.today()
+    if data_inicio is None:
+        data_inicio = today
+    if data_fim is None:
+        data_fim = today
+    if data_inicio > data_fim:
+        data_inicio, data_fim = data_fim, data_inicio
+    dt_min = datetime.combine(data_inicio, time.min)
+    dt_max = datetime.combine(data_fim, time(23, 59, 59))
+
+    sub_bases_filter = [sub_base] if sub_base and sub_base.strip() else None
+
+    def _decimal(v) -> Decimal:
+        try:
+            return Decimal(str(v or 0))
+        except Exception:
+            return Decimal("0")
+
+    owners = db.scalars(select(Owner).where(Owner.ativo.is_(True))).all()
+    if sub_bases_filter:
+        owners = [o for o in owners if o.sub_base in sub_bases_filter]
+    sub_bases = [o.sub_base for o in owners if o.sub_base]
+    if not sub_bases:
+        return DashboardAdminResponse(
+            cards=DashboardAdminCardsOut(
+                total_coletas=0,
+                total_saidas=0,
+                receita_admin=Decimal("0"),
+                owners_ativos=0,
+            ),
+            volume_por_owner=[],
+            receita_por_owner=[],
+            performance_por_owner=[],
+            owners=[{"id_owner": o.id_owner, "username": o.username, "sub_base": o.sub_base} for o in db.scalars(select(Owner)).all()],
+        )
+
+    stmt_coletas = select(Coleta).where(
+        Coleta.sub_base.in_(sub_bases),
+        Coleta.timestamp >= dt_min,
+        Coleta.timestamp <= dt_max,
+    ).where(
+        (Coleta.shopee > 0) | (Coleta.mercado_livre > 0) | (Coleta.avulso > 0) | (Coleta.valor_total > 0)
+    )
+    rows_coletas = db.execute(stmt_coletas).scalars().all()
+    total_coletas = len(rows_coletas)
+
+    stmt_saidas = select(Saida).where(
+        Saida.sub_base.in_(sub_bases),
+        Saida.timestamp >= dt_min,
+        Saida.timestamp <= dt_max,
+        Saida.codigo.isnot(None),
+        func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
+    )
+    rows_saidas = db.execute(stmt_saidas).scalars().all()
+    total_saidas = len(rows_saidas)
+
+    stmt_cob = select(OwnerCobrancaItem).where(
+        OwnerCobrancaItem.sub_base.in_(sub_bases),
+        OwnerCobrancaItem.timestamp >= dt_min,
+        OwnerCobrancaItem.timestamp <= dt_max,
+        OwnerCobrancaItem.cancelado.is_(False),
+    )
+    rows_cob = db.execute(stmt_cob).scalars().all()
+    receita_admin_total = sum(_decimal(c.valor) for c in rows_cob).quantize(Decimal("0.01"))
+
+    owner_map = {o.sub_base: o for o in owners}
+    owners_ativos = len([s for s in sub_bases if owner_map.get(s) and owner_map[s].ativo])
+
+    coleta_por_sb: Dict[str, int] = {}
+    saida_por_sb: Dict[str, int] = {}
+    cob_por_sb: Dict[str, Decimal] = {}
+    cob_count_por_sb: Dict[str, int] = {}
+    for sb in sub_bases:
+        coleta_por_sb[sb] = sum(1 for c in rows_coletas if c.sub_base == sb)
+        saida_por_sb[sb] = sum(1 for s in rows_saidas if s.sub_base == sb)
+        cob_por_sb[sb] = sum(_decimal(c.valor) for c in rows_cob if c.sub_base == sb)
+        cob_count_por_sb[sb] = sum(1 for c in rows_cob if c.sub_base == sb)
+
+    volume_por_owner = [
+        DashboardAdminVolumeOwnerOut(
+            sub_base=sb,
+            coletas=coleta_por_sb.get(sb, 0),
+            saidas=saida_por_sb.get(sb, 0),
+            receita=cob_por_sb.get(sb, Decimal("0")).quantize(Decimal("0.01")),
+        )
+        for sb in sub_bases
+    ]
+
+    receita_por_owner = sorted(
+        [DashboardAdminReceitaOwnerOut(
+            sub_base=sb,
+            receita=cob_por_sb.get(sb, Decimal("0")).quantize(Decimal("0.01")),
+            pct=round(float(cob_por_sb.get(sb, 0) / receita_admin_total * 100), 1) if receita_admin_total else 0.0,
+        ) for sb in sub_bases],
+        key=lambda x: -float(x.receita),
+    )[:5]
+
+    performance_por_owner = []
+    for sb in sub_bases:
+        o = owner_map.get(sb)
+        tipo = "Só Saída" if o and o.ignorar_coleta else "Coleta"
+        performance_por_owner.append(DashboardAdminPerformanceOwnerOut(
+            sub_base=sb,
+            tipo=tipo,
+            coletas=coleta_por_sb.get(sb, 0),
+            saidas=saida_por_sb.get(sb, 0),
+            base_cobranca=cob_count_por_sb.get(sb, 0),
+            receita_admin=cob_por_sb.get(sb, Decimal("0")).quantize(Decimal("0.01")),
+        ))
+
+    owners_list = [{"id_owner": o.id_owner, "username": o.username or "", "sub_base": o.sub_base or ""} for o in db.scalars(select(Owner)).all()]
+
+    return DashboardAdminResponse(
+        cards=DashboardAdminCardsOut(
+            total_coletas=total_coletas,
+            total_saidas=total_saidas,
+            receita_admin=receita_admin_total,
+            owners_ativos=owners_ativos,
+        ),
+        volume_por_owner=volume_por_owner,
+        receita_por_owner=receita_por_owner,
+        performance_por_owner=performance_por_owner,
+        owners=owners_list,
     )
