@@ -12,8 +12,8 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, BasePreco, User, Saida
-from models import OwnerCobrancaItem  # Owner NÃO é mais necessário (valor vem do JWT)
+from models import Coleta, Entregador, BasePreco, User, Saida, Owner
+from models import OwnerCobrancaItem
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -231,8 +231,12 @@ def registrar_coleta_em_lote(
     else:
         sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
 
-    # 2) preços com cache TTL curto (valores de cobrança por pacote)
+    # 2) preços BasePreco para valores de entradas da coleta (valor_total e resumo)
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base)
+
+    # 3) valor de cobrança do admin ao owner: somente Owner.valor (nunca BasePreco como fallback)
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    valor_cobranca_owner = _decimal(getattr(owner, "valor", 0)) if owner else Decimal("0")
 
     # 4) Normaliza itens e detecta duplicados no próprio payload (zero DB)
     #    (você vai tratar duplicidade no front, mas aqui evita lixo óbvio e reduz queries)
@@ -299,20 +303,13 @@ def registrar_coleta_em_lote(
             db.add(saida)
             db.flush()
 
-            # Valor de cobrança por pacote conforme o tipo de serviço
-            if serv_key == "shopee":
-                valor_cob = p_shopee
-            elif serv_key == "mercado_livre":
-                valor_cob = p_ml
-            else:
-                valor_cob = p_avulso
-
+            # Cobrança do admin ao owner: somente Owner.valor por pacote (nunca BasePreco)
             db.add(
                 OwnerCobrancaItem(
                     sub_base=sub_base,
                     id_coleta=coleta.id_coleta,
                     id_saida=saida.id_saida,
-                    valor=valor_cob,
+                    valor=valor_cobranca_owner,
                 )
             )
 
