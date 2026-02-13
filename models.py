@@ -64,7 +64,7 @@ class User(Base):
 class Motoboy(Base):
     __tablename__ = "motoboys"
 
-    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, nullable=False)
     sub_base = Column(Text, nullable=True)
     documento = Column(Text, nullable=True)
     telefone = Column(Text, nullable=True)
