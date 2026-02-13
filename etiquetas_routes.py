@@ -1,0 +1,292 @@
+"""
+Rotas de Etiquetas
+POST /etiquetas/gerar — gera PDF de etiqueta 100x150mm (QR Code).
+Modo genérico (padrão). TODO: futuro - Shopee/ML com autenticação nas APIs.
+"""
+from __future__ import annotations
+
+import io
+import logging
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from db import get_db
+from auth import get_current_user
+from models import User
+
+router = APIRouter(prefix="/etiquetas", tags=["Etiquetas"])
+logger = logging.getLogger(__name__)
+
+# TODO: Exportação ZPL
+# TODO: Impressão direta Zebra
+# TODO: Tabela etiquetas_logs
+# TODO: Geração automática ao registrar saída
+
+
+# ============================================================
+# SCHEMAS
+# ============================================================
+
+class EtiquetaGerarPayload(BaseModel):
+    codigo: str = Field(min_length=1, description="Código de rastreio/pedido")
+    # modo: str = Field(default="generic", description="generic | shopee | ml")  # TODO: futuro - Shopee/ML
+
+
+# ============================================================
+# HELPERS — Resolução de dados externos (fallback em erro)
+# ============================================================
+
+# def _normalizar_modo(modo: str) -> str:
+#     m = (modo or "").strip().lower()
+#     if m in ("shopee", "shp"):
+#         return "shopee"
+#     if m in ("ml", "mercado livre", "mercadolivre"):
+#         return "ml"
+#     return "generic"
+
+
+# TODO: Futuro - autenticação APIs Shopee e Mercado Livre para enriquecer etiquetas
+# def _buscar_dados_shopee(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
+#     """Tenta obter dados do envio na Shopee. Retorna None em qualquer falha."""
+#     try:
+#         from shopee_token_service import (
+#             get_valid_shopee_access_token,
+#             get_latest_shopee_token,
+#             _get_shopee_config,
+#             _sign_api,
+#         )
+#         import requests
+#         import time
+#
+#         token = get_latest_shopee_token(db)
+#         if not token:
+#             return None
+#         access_token = get_valid_shopee_access_token(db, shop_id=token.shop_id)
+#         host, partner_id, partner_key = _get_shopee_config()
+#         path = "/api/v2/order/get_order_list"
+#         timestamp = int(time.time())
+#         sign = _sign_api(partner_id, partner_key, path, timestamp, token.shop_id, access_token)
+#         url = f"{host}{path}"
+#         params = {
+#             "partner_id": partner_id,
+#             "timestamp": timestamp,
+#             "sign": sign,
+#             "shop_id": token.shop_id,
+#         }
+#         body = {"order_status": "READY_TO_SHIP", "page_size": 50}
+#         resp = requests.post(url, params=params, json=body)
+#         if resp.status_code != 200:
+#             return None
+#         data = resp.json()
+#         orders = data.get("response", {}).get("order_list", []) or []
+#         for o in orders:
+#             tracking = (o.get("tracking_no") or "").strip()
+#             if tracking and codigo.upper() in tracking.upper():
+#                 addr = o.get("recipient_address", {}) or {}
+#                 return {
+#                     "destinatario": addr.get("name") or "",
+#                     "cidade": addr.get("city") or "",
+#                     "cep": addr.get("zipcode") or "",
+#                 }
+#         return None
+#     except Exception as e:
+#         logger.warning("Shopee etiqueta: %s", e)
+#         return None
+#
+#
+# def _buscar_dados_ml(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
+#     """Tenta obter dados do shipment no ML. Retorna None em qualquer falha."""
+#     try:
+#         from ml_token_service import get_valid_ml_access_token
+#         import requests
+#         access_token = get_valid_ml_access_token(db)
+#         headers = {"Authorization": f"Bearer {access_token}"}
+#         url = "https://api.mercadolibre.com/shipments/search"
+#         resp = requests.get(url, headers=headers, params={"tracking_number": codigo})
+#         if resp.status_code != 200:
+#             return None
+#         data = resp.json()
+#         results = data.get("results") or []
+#         if not results:
+#             return None
+#         shipment = results[0]
+#         shipment_id = shipment.get("id")
+#         receiver = shipment.get("receiver_address") or {}
+#         if shipment_id:
+#             url2 = f"https://api.mercadolibre.com/marketplace/shipments/{shipment_id}"
+#             resp2 = requests.get(url2, headers={**headers, "x-format-new": "true"})
+#             if resp2.status_code == 200:
+#                 d2 = resp2.json()
+#                 dest = d2.get("destination") or {}
+#                 receiver = dest.get("receiver_address") or receiver
+#         return {
+#             "destinatario": receiver.get("receiver_name") or receiver.get("name") or "",
+#             "cidade": receiver.get("city", {}).get("name") if isinstance(receiver.get("city"), dict) else (receiver.get("city") or ""),
+#             "cep": receiver.get("zip_code") or receiver.get("zipcode") or "",
+#         }
+#     except Exception as e:
+#         logger.warning("ML etiqueta: %s", e)
+#         return None
+
+
+# ============================================================
+# GERADOR DE PDF — Layout profissional para impressão térmica
+# ============================================================
+
+def _gerar_pdf_etiqueta(
+    codigo: str,
+    modo_final: str,
+    dados_extras: Optional[Dict[str, Any]] = None,
+) -> bytes:
+    """
+    Gera PDF 100x150mm com layout limpo e profissional.
+    Foco total no QR Code. Sem código de barras.
+    """
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    import qrcode
+
+    dados = dados_extras or {}
+
+    # Dimensões da página
+    largura_pag = 100 * mm
+    altura_pag = 150 * mm
+    margin = 8 * mm
+    area_util_w = largura_pag - 2 * margin
+    area_util_h = altura_pag - 2 * margin
+
+    # Tamanho do QR Code (ideal 60x60mm)
+    qr_size = 60 * mm
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(largura_pag, altura_pag))
+    c.setPageSize((largura_pag, altura_pag))
+
+    # Helper: centralizar elemento horizontalmente
+    def center_x(elem_width: float) -> float:
+        return (largura_pag - elem_width) / 2
+
+    y = altura_pag - margin
+
+    # ─────────────────────────────────────────────────────────
+    # TOPO — Nome do sistema/marketplace (centralizado)
+    # ─────────────────────────────────────────────────────────
+    titulo = "TRACKING SAÍDAS"
+    if modo_final == "shopee":
+        titulo = "SHOPEE ENTREGA"
+    elif modo_final == "ml":
+        titulo = "MERCADO ENVIOS"
+
+    c.setFont("Helvetica", 8)
+    tw = c.stringWidth(titulo, "Helvetica", 8)
+    c.drawString(center_x(tw), y, titulo)
+    y -= 6 * mm
+
+    # ─────────────────────────────────────────────────────────
+    # CORPO PRINCIPAL — QR Code (elemento dominante)
+    # ─────────────────────────────────────────────────────────
+    qr_x = center_x(qr_size)
+    qr_y = y - qr_size
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,  # Alta correção
+        box_size=12,   # Alta definição para impressão térmica
+        border=1,      # Quiet zone mínima
+    )
+    qr.add_data(codigo)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white")
+    qr_buf = io.BytesIO()
+    qr_img.save(qr_buf, format="PNG")
+    qr_buf.seek(0)
+    c.drawImage(ImageReader(qr_buf), qr_x, qr_y, width=qr_size, height=qr_size)
+
+    y = qr_y - 4 * mm
+
+    # ─────────────────────────────────────────────────────────
+    # ABAIXO DO QR — Código de rastreio em texto grande e bold
+    # ─────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 14)
+    tw = c.stringWidth(codigo, "Helvetica-Bold", 14)
+    # Quebra se ultrapassar área útil
+    if tw > area_util_w:
+        c.setFont("Helvetica-Bold", 10)
+        tw = c.stringWidth(codigo, "Helvetica-Bold", 10)
+    c.drawString(center_x(tw), y, codigo)
+    y -= 8 * mm
+
+    # ─────────────────────────────────────────────────────────
+    # BLOCO DE INFORMAÇÕES — Somente se houver dados
+    # ─────────────────────────────────────────────────────────
+    dest = dados.get("destinatario") or ""
+    cidade = dados.get("cidade") or ""
+    cep = dados.get("cep") or ""
+
+    if dest or cidade or cep:
+        c.setFont("Helvetica", 7)
+        linhas = []
+        if dest:
+            linhas.append(str(dest)[:40])
+        if cidade or cep:
+            linhas.append(f"{cidade} {cep}".strip()[:40])
+        for i, linha in enumerate(linhas[:3]):  # Máx. 3 linhas
+            if linha:
+                c.drawString(margin, y, linha)
+                y -= 4 * mm
+
+    # ─────────────────────────────────────────────────────────
+    # RODAPÉ — Discreto e centralizado
+    # ─────────────────────────────────────────────────────────
+    rodape = "Etiqueta logística — Tracking Saídas"
+    c.setFont("Helvetica", 6)
+    rw = c.stringWidth(rodape, "Helvetica", 6)
+    c.drawString(center_x(rw), margin, rodape)
+
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ============================================================
+# ROTA
+# ============================================================
+
+@router.post("/gerar")
+def gerar_etiqueta(
+    payload: EtiquetaGerarPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Gera etiqueta PDF 100x150mm.
+    Modo generic: sempre funciona.
+    Modo shopee/ml: tenta enriquecer com dados da API; em falha usa generic.
+    """
+    codigo = (payload.codigo or "").strip()
+    if not codigo:
+        raise HTTPException(400, "Código obrigatório.")
+
+    # Sempre modo genérico. TODO: futuro - Shopee/ML com autenticação nas APIs
+    modo_final = "generic"
+    dados_extras: Optional[Dict[str, Any]] = None
+
+    try:
+        pdf_bytes = _gerar_pdf_etiqueta(codigo, modo_final, dados_extras)
+    except Exception as e:
+        logger.exception("Erro ao gerar PDF etiqueta: %s", e)
+        raise HTTPException(500, "Falha ao gerar PDF.")
+
+    filename = f"etiqueta_{codigo[:30]}_{modo_final}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )

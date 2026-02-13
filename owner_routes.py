@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -12,35 +12,31 @@ from db import get_db
 from auth import get_current_user
 from models import Owner, User, OwnerCobrancaItem
 
-
-# ============================================================
-# ROTAS DO OWNER — Gestão do dono da sub_base
-# ============================================================
-
 router = APIRouter(prefix="/owner", tags=["Owner"])
-
 
 # ============================================================
 # SCHEMAS
 # ============================================================
 
 class OwnerCreate(BaseModel):
-    """Criar um Owner para uma sub_base específica"""
     email: Optional[str] = None
     username: Optional[str] = None
-    valor: Optional[float] = Field(default=None, description="Valor unitário por operação coletada")
-    sub_base: Optional[str] = Field(default=None, description="Código da sub_base (único por Owner)")
+    valor: Optional[float] = Field(default=None)
+    sub_base: Optional[str] = None
     contato: Optional[str] = None
+    teste: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class OwnerUpdate(BaseModel):
-    """Atualizar dados do Owner"""
     email: Optional[str] = None
     username: Optional[str] = None
     valor: Optional[float] = None
     contato: Optional[str] = None
+    ativo: Optional[bool] = None
+    ignorar_coleta: Optional[bool] = None
+    teste: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -54,6 +50,8 @@ class OwnerOut(BaseModel):
     contato: Optional[str]
     ativo: bool
     ignorar_coleta: bool
+    teste: bool
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -69,16 +67,12 @@ def _get_owner_by_sub_base(db: Session, sub_base: str) -> Optional[Owner]:
 # CREATE OWNER
 # ============================================================
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("/", status_code=201)
 def create_owner(
     body: OwnerCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Cria um Owner para a sub_base selecionada.
-    Sub_base deve ser única — apenas um Owner por sub_base.
-    """
     email = body.email or current_user.email
     username = body.username or current_user.username
 
@@ -95,7 +89,9 @@ def create_owner(
         valor=body.valor or 0.0,
         sub_base=body.sub_base,
         contato=body.contato,
-        ativo=True
+        ativo=True,
+        ignorar_coleta=False,
+        teste=bool(body.teste) if body.teste is not None else False,
     )
     db.add(obj)
     db.commit()
@@ -113,9 +109,6 @@ def get_owner_for_current_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Retorna o Owner responsável pela sub_base do usuário logado.
-    """
     if not current_user.sub_base:
         raise HTTPException(404, "Usuário não possui sub_base associada.")
 
@@ -135,17 +128,14 @@ def list_owners(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Lista todos os owners (apenas admin)"""
-    
     if current_user.role != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
 
-    rows = db.scalars(select(Owner)).all()
-    return rows
+    return db.scalars(select(Owner)).all()
 
 
 # ============================================================
-# ATUALIZAR OWNER
+# UPDATE (PATCH ÚNICO)
 # ============================================================
 
 @router.patch("/{id_owner}", response_model=OwnerOut)
@@ -155,9 +145,6 @@ def update_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Edita dados básicos do Owner.
-    """
     owner = db.get(Owner, id_owner)
     if not owner:
         raise HTTPException(404, "Owner não encontrado.")
@@ -165,6 +152,7 @@ def update_owner(
     if current_user.role != 0:
         raise HTTPException(403, "Apenas administradores podem editar Owner.")
 
+    # Campos editáveis
     if body.email is not None:
         owner.email = body.email
 
@@ -177,47 +165,44 @@ def update_owner(
     if body.contato is not None:
         owner.contato = body.contato
 
+    # 🔥 Campos adicionados agora
+    if body.ativo is not None:
+        owner.ativo = body.ativo
+
+    if body.ignorar_coleta is not None:
+        owner.ignorar_coleta = body.ignorar_coleta
+
+    if body.teste is not None:
+        owner.teste = body.teste
+
     db.commit()
     db.refresh(owner)
-
     return owner
 
 
 # ============================================================
-# ATIVAR / DESATIVAR OWNER
+# ENDPOINTS DE ATIVAR/DESATIVAR (opcionais)
 # ============================================================
 
 @router.patch("/{id_owner}/ativar")
-def ativar_owner(
-    id_owner: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+def ativar_owner(id_owner: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     owner = db.get(Owner, id_owner)
     if not owner:
-        raise HTTPException(404, "Owner não encontrado.")
-
+        raise HTTPException(404)
     if current_user.role != 0:
-        raise HTTPException(403, "Apenas administradores podem ativar Owner.")
-
+        raise HTTPException(403)
     owner.ativo = True
     db.commit()
-    return {"ok": True, "ativo": True}
+    return {"ok": True}
 
 
 @router.patch("/{id_owner}/desativar")
-def desativar_owner(
-    id_owner: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+def desativar_owner(id_owner: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     owner = db.get(Owner, id_owner)
     if not owner:
-        raise HTTPException(404, "Owner não encontrado.")
-
+        raise HTTPException(404)
     if current_user.role != 0:
-        raise HTTPException(403, "Apenas administradores podem desativar Owner.")
-
+        raise HTTPException(403)
     owner.ativo = False
     db.commit()
-    return {"ok": True, "ativo": False}
+    return {"ok": True}

@@ -46,7 +46,7 @@ class User(Base):
     # PERFIL DE COLETADOR (NOVO)
     coletador = Column(Boolean, nullable=False, server_default=text("false"))
     username_entregador = Column(Text, nullable=True)  # espelha o username do entregador quando aplicável
-    role = Column(Integer, nullable=False, server_default="2") 
+    role = Column(Integer, nullable=False, server_default="2")
 
     # Relacionamento 1:1 com Motoboy (role = 4)
     motoboy = relationship("Motoboy", uselist=False, back_populates="user")
@@ -87,7 +87,6 @@ class Motoboy(Base):
 # ==========================
 # Tabela: owner
 # ==========================
-
 class Owner(Base):
     __tablename__ = "owner"
 
@@ -100,11 +99,11 @@ class Owner(Base):
 
     ativo = Column(Boolean, nullable=False, server_default=text("true"))
     ignorar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
-
+     # Flag para owners de teste (não considerados em dashboards/admin)
+    teste = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
-
 
 
 # ==========================
@@ -116,18 +115,23 @@ class Coleta(Base):
     id_coleta = Column(BigInteger, primary_key=True, autoincrement=True)
 
     timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
-    sub_base  = Column(Text, nullable=True)
-    base      = Column(Text, nullable=True)
+    sub_base = Column(Text, nullable=True)
+    base = Column(Text, nullable=True)
     username_entregador = Column(Text, nullable=True)
 
-    shopee         = Column(Integer, nullable=False, server_default=text("0"))
-    mercado_livre  = Column(Integer, nullable=False, server_default=text("0"))
-    avulso         = Column(Integer, nullable=False, server_default=text("0"))
+    shopee = Column(Integer, nullable=False, server_default=text("0"))
+    mercado_livre = Column(Integer, nullable=False, server_default=text("0"))
+    avulso = Column(Integer, nullable=False, server_default=text("0"))
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
 
+    saidas = relationship("Saida", back_populates="coleta")
+
     def __repr__(self) -> str:
-        return f"<Coleta id_coleta={self.id_coleta} sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
+        return (
+            f"<Coleta id_coleta={self.id_coleta} "
+            f"sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
+        )
 
 
 # ==========================
@@ -136,15 +140,15 @@ class Coleta(Base):
 class BasePreco(Base):
     __tablename__ = "base"
 
-    id_base   = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_base = Column(BigInteger, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
-    base      = Column(Text, nullable=True)
-    sub_base  = Column(Text, nullable=True)
-    username  = Column(Text, nullable=True)
+    base = Column(Text, nullable=True)
+    sub_base = Column(Text, nullable=True)
+    username = Column(Text, nullable=True)
 
     shopee = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
-    ml     = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ml = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     avulso = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     ativo = Column(Boolean, nullable=False, server_default=text("false"))
 
@@ -163,7 +167,7 @@ class Saida(Base):
     data = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
 
     sub_base = Column(Text, nullable=True)
-    base = Column(Text, nullable=True)              # NOVA COLUNA (de onde veio a mercadoria)
+    base = Column(Text, nullable=True)  # de onde veio a mercadoria
     username = Column(Text, nullable=True)
     entregador_id = Column(BigInteger, nullable=True)
     entregador = Column(Text, nullable=True)
@@ -171,6 +175,9 @@ class Saida(Base):
     codigo = Column(Text, nullable=True)
     servico = Column(Text, nullable=True, server_default=text("'padrao'::text"))
     status = Column(Text, nullable=True, server_default=text("'saiu'::text"))
+    id_coleta = Column(BigInteger, ForeignKey("coletas.id_coleta"), nullable=True)
+
+    coleta = relationship("Coleta", back_populates="saidas")
 
     def __repr__(self) -> str:
         return f"<Saida id_saida={self.id_saida} data={self.data} servico={self.servico!r}>"
@@ -186,7 +193,7 @@ class Entregador(Base):
     )
 
     id_entregador = Column(BigInteger, primary_key=True)
-    sub_base = Column(Text, nullable=True)          # base herdada do solicitante
+    sub_base = Column(Text, nullable=True)  # base herdada do solicitante
 
     # dados do entregador
     nome = Column(Text, nullable=False)
@@ -208,8 +215,60 @@ class Entregador(Base):
     coletador = Column(Boolean, nullable=False, server_default=text("false"))
     username_entregador = Column(Text, nullable=True)
 
+    preco = relationship("EntregadorPreco", uselist=False, back_populates="entregador")
+
     def __repr__(self) -> str:
         return f"<Entregador id_entregador={self.id_entregador} nome={self.nome!r} coletador={self.coletador}>"
+
+
+# ==========================
+# Tabela: entregador_preco_global
+# ==========================
+class EntregadorPrecoGlobal(Base):
+    __tablename__ = "entregador_preco_global"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False, unique=True)
+
+    shopee_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ml_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    avulso_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<EntregadorPrecoGlobal id={self.id} sub_base={self.sub_base!r}>"
+
+
+# ==========================
+# Tabela: entregador_preco
+# ==========================
+class EntregadorPreco(Base):
+    __tablename__ = "entregador_preco"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_entregador = Column(
+        BigInteger,
+        ForeignKey("entregador.id_entregador"),
+        nullable=False,
+        unique=True,
+    )
+
+    shopee_valor = Column(Numeric(12, 2), nullable=True)
+    ml_valor = Column(Numeric(12, 2), nullable=True)
+    avulso_valor = Column(Numeric(12, 2), nullable=True)
+
+    usa_preco_global = Column(Boolean, nullable=False, server_default=text("true"))
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    entregador = relationship("Entregador", back_populates="preco")
+
+    def __repr__(self) -> str:
+        return f"<EntregadorPreco id={self.id} id_entregador={self.id_entregador}>"
+
 
 # ==========================
 # Tabela: mercado_livre_tokens
@@ -229,6 +288,25 @@ class MercadoLivreToken(Base):
 
 
 # ==========================
+# Tabela: shopee_tokens
+# ==========================
+class ShopeeToken(Base):
+    __tablename__ = "shopee_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    shop_id = Column(BigInteger, nullable=False)
+    main_account_id = Column(BigInteger, nullable=True)
+
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=True)
+    expires_at = Column(DateTime(timezone=False), nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<ShopeeToken id={self.id} shop_id={self.shop_id}>"
+
+
+# ==========================
 # Tabela: owner_cobranca_itens
 # ==========================
 class OwnerCobrancaItem(Base):
@@ -236,8 +314,8 @@ class OwnerCobrancaItem(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     sub_base = Column(Text, nullable=False)
-    id_coleta = Column(BigInteger, nullable=True, default=None)
-    id_saida = Column(BigInteger, nullable=True, default=None)
+    id_coleta = Column(BigInteger, nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
 
     valor = Column(Numeric(12, 2), nullable=False)
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
@@ -245,20 +323,57 @@ class OwnerCobrancaItem(Base):
     periodo_inicio = Column(Date, nullable=True)
     periodo_fim = Column(Date, nullable=True)
     fechado = Column(Boolean, nullable=False, server_default=text("false"))
+    cancelado = Column(Boolean, nullable=False, server_default=text("false"))
 
 
- # ==========================
- # Tabela: saidas_detail
- # ==========================       
+# ==========================
+# Tabela: entregador_fechamentos
+# ==========================
+class EntregadorFechamento(Base):
+    __tablename__ = "entregador_fechamentos"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base", "id_entregador", "periodo_inicio", "periodo_fim",
+            name="uq_entregador_fechamento_periodo",
+        ),
+    )
+
+    id_fechamento = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    id_entregador = Column(BigInteger, nullable=False)
+    username_entregador = Column(Text, nullable=False)
+
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+
+    valor_base = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_adicao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_adicao = Column(Text, nullable=True)
+    valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_subtracao = Column(Text, nullable=True)
+
+    valor_final = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    status = Column(Text, nullable=False, server_default=text("'fechado'::text"))
+
+    criado_em = Column(DateTime(timezone=False), server_default=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<EntregadorFechamento id_fechamento={self.id_fechamento} "
+            f"id_entregador={self.id_entregador} status={self.status!r}>"
+        )
+
+
+# ==========================
+# Tabela: saidas_detail
+# ==========================
 class SaidaDetail(Base):
     __tablename__ = "saidas_detail"
 
     id_detail = Column(BigInteger, primary_key=True, autoincrement=True)
 
     id_saida = Column(BigInteger, nullable=False)
-
-    id_entregador = Column(BigInteger, nullable=False)
- # entregador responsável pela entrega
+    id_entregador = Column(BigInteger, nullable=False)  # entregador responsável pela entrega
 
     status = Column(Text, nullable=False, server_default=text("'Em Rota'"))
     tentativa = Column(Integer, nullable=False, server_default=text("1"))
@@ -288,3 +403,69 @@ class SaidaDetail(Base):
 
     def __repr__(self):
         return f"<SaidaDetail id_detail={self.id_detail} id_saida={self.id_saida}>"
+
+
+@event.listens_for(Saida, "after_update")
+def saida_after_update(mapper, connection, target: Saida):
+    """
+    Recalcula automaticamente a coleta sempre que uma saída for alterada.
+    """
+    if not target.id_coleta:
+        return
+
+    # Cria sessão vinculada a essa conexão
+    db = Session(bind=connection)
+
+    try:
+        # Import atrasado para evitar circular import
+        from coletas import recalcular_coleta
+
+        recalcular_coleta(db, target.id_coleta)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+# ==========================
+# Tabela: logs_leitura
+# ==========================
+class LogLeitura(Base):
+    __tablename__ = "logs_leitura"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # escopo / auditoria
+    sub_base = Column(Text, nullable=False, index=True)
+    username = Column(Text, nullable=False, index=True)
+
+    # contexto da leitura
+    origem = Column(Text, nullable=False)   # camera | teclado
+    tipo = Column(Text, nullable=False)     # saida | coleta
+
+    codigo = Column(Text, nullable=True, index=True)
+
+    # resultado final
+    resultado = Column(Text, nullable=False)
+
+    # métricas antigas (mantidas)
+    delta_from_last_read_ms = Column(Numeric(12, 3), nullable=True)
+    delta_read_to_send_ms = Column(Numeric(12, 3), nullable=True)
+    delta_send_to_response_ms = Column(Numeric(12, 3), nullable=True)
+
+    # timestamps
+    ts_read = Column(Numeric(16, 6), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    # métrica backend (header X-Backend-Process-Time)
+    backend_processing_ms = Column(Numeric(12, 3), nullable=True)
+
+    # contexto do device
+    network_status = Column(Text, nullable=True)
+    device_type = Column(Text, nullable=True)
+    os = Column(Text, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<LogLeitura id={self.id} tipo={self.tipo} "
+            f"origem={self.origem} resultado={self.resultado}>"
+        )
