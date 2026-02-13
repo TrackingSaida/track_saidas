@@ -240,11 +240,23 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
 
 
 # ============================================================
-# GET /users/me
+# GET /users/me — usuário logado (role sempre na resposta para telas de config)
 # ============================================================
 
 @router.get("/me", response_model=UserFull)
-def read_current_user(current_user: User = Depends(get_current_user)):
+def read_current_user(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # Garantir que role sempre venha como int (frontend exige para Configurações = só admin/root)
+    role = getattr(current_user, "role", None)
+    if role is None:
+        # Token antigo ou sem role: buscar no banco
+        u = db.get(User, current_user.id)
+        role = int(u.role) if u and u.role is not None else 2
+    else:
+        role = int(role)
+    current_user.role = role
     return current_user
 
 
