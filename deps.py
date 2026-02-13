@@ -22,7 +22,7 @@ def _coerce_role_from_user(user: User) -> int:
     """
     try:
         value = int(getattr(user, "role", 3) or 3)
-        if value not in (1, 2, 3):
+        if value not in (0, 1, 2, 3, 4):
             return 3
         return value
     except Exception:
@@ -43,7 +43,7 @@ def allow(*tipos_permitidos: int) -> Callable:
     """
     Guard (RBAC) para usar nas rotas.
     """
-    permitidos = tuple(x for x in tipos_permitidos if x in (1, 2, 3))
+    permitidos = tuple(x for x in tipos_permitidos if x in (0, 1, 2, 3, 4))
     if not permitidos:
         permitidos = (0,)
 

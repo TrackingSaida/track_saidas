@@ -11,8 +11,10 @@ from sqlalchemy import (
     Boolean,
     text,
     UniqueConstraint,
+    ForeignKey,
 )
 from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
 
 from db import Base
 
@@ -46,11 +48,41 @@ class User(Base):
     username_entregador = Column(Text, nullable=True)  # espelha o username do entregador quando aplicável
     role = Column(Integer, nullable=False, server_default="2") 
 
+    # Relacionamento 1:1 com Motoboy (role = 4)
+    motoboy = relationship("Motoboy", uselist=False, back_populates="user")
+
     def __repr__(self) -> str:
         return (
             f"<User id={self.id} email={self.email!r} username={self.username!r} "
             f"coletador={self.coletador} sub_base={self.sub_base!r}>"
         )
+
+
+# ==========================
+# Tabela: motoboys
+# ==========================
+class Motoboy(Base):
+    __tablename__ = "motoboys"
+
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    sub_base = Column(Text, nullable=True)
+    documento = Column(Text, nullable=True)
+    telefone = Column(Text, nullable=True)
+    rua = Column(Text, nullable=True)
+    numero = Column(Text, nullable=True)
+    complemento = Column(Text, nullable=True)
+    bairro = Column(Text, nullable=True)
+    cidade = Column(Text, nullable=True)
+    estado = Column(Text, nullable=True)
+    cep = Column(Text, nullable=True)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    data_cadastro = Column(Date, nullable=False, server_default=text("CURRENT_DATE"))
+
+    user = relationship("User", back_populates="motoboy")
+
+    def __repr__(self) -> str:
+        return f"<Motoboy user_id={self.user_id}>"
+
 
 # ==========================
 # Tabela: owner

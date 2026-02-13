@@ -5,13 +5,14 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import get_db
 from auth import get_current_user, get_password_hash, verify_password
-from models import User, Owner
+from models import User, Owner, Motoboy
+from deps import allow
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -22,6 +23,36 @@ logger = logging.getLogger("routes.users")
 # Schemas
 # =========================
 
+ROLE_MOTOBOY = 4
+
+
+class MotoboyCreate(BaseModel):
+    """Dados do motoboy para criação/edição (role = 4)."""
+    documento: str = Field(min_length=1, description="CPF ou RG")
+    telefone: Optional[str] = None
+    rua: str = Field(min_length=1)
+    numero: str = Field(min_length=1)
+    complemento: Optional[str] = None
+    bairro: str = Field(min_length=1)
+    cidade: str = Field(min_length=1)
+    estado: Optional[str] = None
+    cep: str = Field(min_length=1)
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MotoboyOut(BaseModel):
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
+    cep: Optional[str] = None
+    documento: Optional[str] = None
+    telefone: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=4, description="Senha em claro; será hasheada")
@@ -31,9 +62,13 @@ class UserCreate(BaseModel):
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
     status: Optional[bool] = True
+    role: Optional[int] = 2
 
     # Agora obrigatório
     sub_base: str = Field(min_length=1, description="sub_base deve já existir e ter Owner")
+
+    # Para role = 4 (Motoboy): obrigatório
+    motoboy: Optional[MotoboyCreate] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -43,12 +78,12 @@ class UserOut(BaseModel):
     email: EmailStr
     username: str
     contato: str
-
+    role: Optional[int] = None
     status: Optional[bool] = None
     sub_base: Optional[str] = None
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
-
+    motoboy: Optional[MotoboyOut] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -61,6 +96,7 @@ class UserFull(BaseModel):
     sobrenome: Optional[str] = None
     sub_base: Optional[str] = None
     status: Optional[bool] = None
+    role: Optional[int] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -69,6 +105,18 @@ class UserUpdatePayload(BaseModel):
     sobrenome: Optional[str] = Field(default=None)
     contato: Optional[str] = Field(default=None)
     email: Optional[EmailStr] = Field(default=None)
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserUpdateAdminPayload(BaseModel):
+    """Payload para edição de usuário por admin (PATCH /users/{id})."""
+    nome: Optional[str] = Field(default=None)
+    sobrenome: Optional[str] = Field(default=None)
+    contato: Optional[str] = Field(default=None)
+    email: Optional[EmailStr] = Field(default=None)
+    status: Optional[bool] = Field(default=None)
+    role: Optional[int] = Field(default=None)
+    motoboy: Optional[MotoboyCreate] = Field(default=None)
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -82,11 +130,29 @@ class PasswordChangePayload(BaseModel):
 # POST /users — CRIAR USUÁRIO
 # =========================
 
+def _validate_motoboy_endereco(m: MotoboyCreate) -> None:
+    """Exige endereço completo para motoboy. Levanta HTTP 422 se incompleto."""
+    if not m:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Para perfil Motoboy é obrigatório informar os dados do motoboy (documento e endereço completo).",
+        )
+    campos = [m.rua, m.numero, m.bairro, m.cidade, m.cep]
+    if not all(campos):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Para perfil Motoboy são obrigatórios: documento, rua, número, bairro, cidade e CEP.",
+        )
+
+
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_user(body: UserCreate, db: Session = Depends(get_db)):
-    """Cria um novo usuário garantindo a existência de Owner na sub_base."""
+    """Cria um novo usuário. Se role=4 (Motoboy), cria também registro em motoboys."""
 
-    # Log seguro
+    role = body.role if body.role is not None else 2
+    if role == ROLE_MOTOBOY:
+        _validate_motoboy_endereco(body.motoboy)
+
     try:
         payload_log = body.model_dump(exclude={"password"})
         payload_log["password"] = "***"
@@ -94,7 +160,6 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
         payload_log = "erro ao processar payload"
     logger.info("POST /users payload=%s", payload_log)
 
-    # Unicidade de email
     exists_email = db.scalars(select(User).where(User.email == body.email)).first()
     if exists_email:
         raise HTTPException(
@@ -102,7 +167,6 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
             detail="endereço de email já existente"
         )
 
-    # Unicidade de username
     exists_username = db.scalars(select(User).where(User.username == body.username)).first()
     if exists_username:
         raise HTTPException(
@@ -110,25 +174,18 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
             detail="username já existe"
         )
 
-    # ###############################
-    # 🔒 VALIDAÇÃO NOVA — OWNER OBRIGATÓRIO
-    # ###############################
     owner = db.scalar(select(Owner).where(Owner.sub_base == body.sub_base))
     if not owner:
         raise HTTPException(
             status_code=400,
             detail=f"Não existe Owner cadastrado para a sub_base '{body.sub_base}'."
         )
-
     if owner.ativo is False:
         raise HTTPException(
             status_code=403,
             detail=f"O Owner da sub_base '{body.sub_base}' está inativo."
         )
 
-    # ===============================
-    # Criar usuário
-    # ===============================
     try:
         hashed_password = get_password_hash(body.password)
         obj = User(
@@ -140,20 +197,40 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
             sobrenome=body.sobrenome,
             status=True if body.status is None else body.status,
             sub_base=body.sub_base,
+            role=role,
         )
         db.add(obj)
         db.commit()
         db.refresh(obj)
 
-        logger.info("User criado com sucesso id=%s", obj.id)
+        if role == ROLE_MOTOBOY and body.motoboy:
+            m = body.motoboy
+            motoboy = Motoboy(
+                user_id=obj.id,
+                sub_base=body.sub_base,
+                documento=m.documento.strip() or None,
+                telefone=m.telefone.strip() if m.telefone else None,
+                rua=m.rua.strip(),
+                numero=m.numero.strip(),
+                complemento=m.complemento.strip() if m.complemento else None,
+                bairro=m.bairro.strip(),
+                cidade=m.cidade.strip(),
+                estado=m.estado.strip() if m.estado else None,
+                cep=m.cep.strip(),
+            )
+            db.add(motoboy)
+            db.commit()
 
+        logger.info("User criado com sucesso id=%s", obj.id)
         return {"ok": True, "action": "created", "id": obj.id}
 
     except SQLAlchemyError as e:
         db.rollback()
         logger.exception("SQLAlchemyError ao criar user: %s", e)
         raise
-
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         logger.exception("Erro inesperado ao criar user: %s", e)
@@ -169,17 +246,62 @@ def read_current_user(current_user: User = Depends(get_current_user)) -> UserFul
 
 
 # =========================
+# GET /users/all — lista todos (admin)
+# =========================
+@router.get("/all")
+def list_users(
+    db: Session = Depends(get_db),
+    _: User = Depends(allow(0, 1)),
+):
+    """Lista todos os usuários. Para role=4 inclui dados do motoboy."""
+    stmt = select(User).options(joinedload(User.motoboy)).order_by(User.id)
+    users = db.scalars(stmt).unique().all()
+    result = []
+    for u in users:
+        item = {
+            "id": u.id,
+            "email": u.email,
+            "username": u.username,
+            "contato": u.contato,
+            "nome": u.nome,
+            "sobrenome": u.sobrenome,
+            "sub_base": u.sub_base,
+            "status": u.status,
+            "role": int(u.role) if u.role is not None else 2,
+        }
+        if u.motoboy:
+            item["motoboy"] = MotoboyOut.model_validate(u.motoboy)
+        else:
+            item["motoboy"] = None
+        result.append(item)
+    return result
+
+
+# =========================
 # GET /users/{user_id}
 # =========================
 @router.get("/{user_id}", response_model=UserOut)
 def get_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.get(User, user_id)
+    stmt = select(User).where(User.id == user_id).options(joinedload(User.motoboy))
+    user = db.scalars(stmt).unique().one_or_none()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Usuário não encontrado"
         )
-    return user
+    out = {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "contato": user.contato,
+        "nome": user.nome,
+        "sobrenome": user.sobrenome,
+        "sub_base": user.sub_base,
+        "status": user.status,
+        "role": int(user.role) if user.role is not None else 2,
+        "motoboy": MotoboyOut.model_validate(user.motoboy) if user.motoboy else None,
+    }
+    return UserOut(**out)
 
 
 # =========================
@@ -219,6 +341,119 @@ def update_current_user(
     db.commit()
     db.refresh(current_user)
     return current_user
+
+
+# =========================
+# PATCH /users/{user_id} — edição por admin
+# =========================
+@router.patch("/{user_id}", response_model=UserOut)
+def update_user(
+    user_id: int,
+    payload: UserUpdateAdminPayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(allow(0, 1)),
+):
+    """Atualiza usuário (admin). Se role=4, atualiza também dados do motoboy."""
+    stmt = select(User).where(User.id == user_id).options(joinedload(User.motoboy))
+    user = db.scalars(stmt).unique().one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuário não encontrado")
+
+    if payload.nome is not None:
+        user.nome = payload.nome.strip() or None
+    if payload.sobrenome is not None:
+        user.sobrenome = payload.sobrenome.strip() or None
+    if payload.contato is not None:
+        contato = payload.contato.strip()
+        if contato:
+            other = db.scalars(select(User).where(User.contato == contato, User.id != user_id)).first()
+            if other:
+                raise HTTPException(409, "Já existe um usuário com esse contato.")
+            user.contato = contato
+    if payload.email is not None:
+        email = payload.email.strip()
+        if email:
+            other = db.scalars(select(User).where(User.email == email, User.id != user_id)).first()
+            if other:
+                raise HTTPException(409, "Já existe um usuário com esse e-mail.")
+            user.email = email
+    if payload.status is not None:
+        user.status = payload.status
+    if payload.role is not None:
+        user.role = payload.role
+
+    # Motoboy: se usuário é role 4 e veio payload.motoboy, atualizar ou criar
+    if (int(user.role) == ROLE_MOTOBOY or (payload.role is not None and payload.role == ROLE_MOTOBOY)) and payload.motoboy:
+        _validate_motoboy_endereco(payload.motoboy)
+        m = payload.motoboy
+        if user.motoboy:
+            user.motoboy.documento = m.documento.strip() or None
+            user.motoboy.telefone = m.telefone.strip() if m.telefone else None
+            user.motoboy.rua = m.rua.strip()
+            user.motoboy.numero = m.numero.strip()
+            user.motoboy.complemento = m.complemento.strip() if m.complemento else None
+            user.motoboy.bairro = m.bairro.strip()
+            user.motoboy.cidade = m.cidade.strip()
+            user.motoboy.estado = m.estado.strip() if m.estado else None
+            user.motoboy.cep = m.cep.strip()
+        else:
+            motoboy = Motoboy(
+                user_id=user.id,
+                sub_base=user.sub_base,
+                documento=m.documento.strip() or None,
+                telefone=m.telefone.strip() if m.telefone else None,
+                rua=m.rua.strip(),
+                numero=m.numero.strip(),
+                complemento=m.complemento.strip() if m.complemento else None,
+                bairro=m.bairro.strip(),
+                cidade=m.cidade.strip(),
+                estado=m.estado.strip() if m.estado else None,
+                cep=m.cep.strip(),
+            )
+            db.add(motoboy)
+    elif payload.role is not None and payload.role == ROLE_MOTOBOY and not payload.motoboy:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Para perfil Motoboy são obrigatórios os dados do motoboy (documento e endereço completo).",
+        )
+
+    db.commit()
+    db.refresh(user)
+    if user.motoboy:
+        db.refresh(user.motoboy)
+    stmt2 = select(User).where(User.id == user_id).options(joinedload(User.motoboy))
+    user = db.scalars(stmt2).unique().one()
+    out = {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "contato": user.contato,
+        "nome": user.nome,
+        "sobrenome": user.sobrenome,
+        "sub_base": user.sub_base,
+        "status": user.status,
+        "role": int(user.role) if user.role is not None else 2,
+        "motoboy": MotoboyOut.model_validate(user.motoboy) if user.motoboy else None,
+    }
+    return UserOut(**out)
+
+
+# =========================
+# DELETE /users/{user_id}
+# =========================
+@router.delete("/{user_id}")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(allow(0, 1)),
+):
+    """Remove usuário. ON DELETE CASCADE remove registro em motoboys se existir."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuário não encontrado")
+    db.delete(user)
+    db.commit()
+    return {"ok": True, "message": "Usuário excluído"}
 
 
 # =========================
