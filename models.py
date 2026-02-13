@@ -12,9 +12,10 @@ from sqlalchemy import (
     text,
     UniqueConstraint,
     ForeignKey,
+    event,
 )
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, Session
 
 from db import Base
 
