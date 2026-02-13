@@ -189,10 +189,11 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
 
 
 # ======================================================
-# Usuário logado — FAST PATH (SEM BANCO)
+# Usuário logado — token obrigatório; owner_ativo conferido no token ou no banco
 # ======================================================
 async def get_current_user(
     request: Request,
+    db: Session = Depends(get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> User:
 
@@ -209,8 +210,23 @@ async def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
-    if not payload.get("owner_ativo", False):
-        raise HTTPException(status_code=403, detail="Operação bloqueada")
+    role = payload.get("role")
+    owner_ativo_no_token = payload.get("owner_ativo", False)
+
+    # Root (role 0) nunca bloqueado por owner
+    if role == 0:
+        pass
+    elif owner_ativo_no_token:
+        # Token já indica owner ativo
+        pass
+    else:
+        # Token antigo ou owner desativado após login: conferir estado atual no banco
+        sub_base = payload.get("sub_base")
+        if not sub_base:
+            raise HTTPException(status_code=403, detail="Operação bloqueada")
+        owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        if not owner or not owner.ativo:
+            raise HTTPException(status_code=403, detail="Operação bloqueada")
 
     # policy disponível para as rotas
     request.state.ignorar_coleta = payload.get("ignorar_coleta", False)
