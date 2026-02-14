@@ -51,8 +51,8 @@ MENU_DEFS = [
         "icon": "ri-money-dollar-circle-line",
         "roles": [0, 1],
         "items": [
-            {"label": "Resumo de Coletas", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True},
-            {"label": "Resumo por Entregador", "href": "tracking-entregadores-resumo.html", "roles": [0, 1]},
+            {"label": "Fechamento Bases", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True},
+            {"label": "Fechamento Motoboys (Entregador)", "href": "tracking-entregadores-resumo.html", "roles": [0, 1]},
             {"label": "Contabilidade", "href": "tracking-contabilidade.html", "roles": [0, 1]},
         ]
     },
@@ -70,15 +70,22 @@ MENU_DEFS = [
     },
 
     {
-        "section": "Configurações",
-        "icon": "ri-settings-3-line",
-        "roles": [0, 1, 2],  # root tem tudo
+        "section": "Cadastros",
+        "icon": "ri-user-settings-line",
+        "roles": [0, 1],
         "items": [
-            {"label": "Entregadores", "href": "tracking-entregador.html", "roles": [0, 1, 2]},
-            {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1]},
+            {"label": "Entregadores", "href": "tracking-entregador.html", "roles": [0, 1]},
+            {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True},
             {"label": "Usuários",     "href": "tracking-usuarios.html",   "roles": [0, 1]},
-            {"label": "Valores de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
-            {"label": "Owners",       "href": "admin-owners.html",        "roles": [0]},  # exclusivo root
+            {"label": "Preços de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
+        ]
+    },
+    {
+        "section": "Configuração",
+        "icon": "ri-settings-3-line",
+        "roles": [0],
+        "items": [
+            {"label": "Owners", "href": "admin-owners.html", "roles": [0]},
         ]
     },
 ]

@@ -259,7 +259,7 @@ def _gerar_pdf_etiqueta(
     # ─────────────────────────────────────────────────────────
     # RODAPÉ — Discreto e centralizado
     # ─────────────────────────────────────────────────────────
-    rodape = "Etiqueta logística — Tracking Saídas"
+    rodape = "Tracking Saídas"
     c.setFont("Helvetica", 6)
     rw = c.stringWidth(rodape, "Helvetica", 6)
     c.drawString(center_x(rw), margin, rodape)
@@ -358,7 +358,10 @@ def gerar_etiqueta(
         logger.exception("Erro ao gerar PDF etiqueta: %s", e)
         raise HTTPException(500, "Falha ao gerar PDF.")
 
-    filename = f"etiqueta_{codigo[:30]}_{modo_final}.pdf"
+    id_part = str(payload.id_saida) if payload.id_saida else "0"
+    cod_safe = re.sub(r'[^\w\-.]', '', (codigo or "")[:40]) or "cod"
+    srv_safe = re.sub(r'[^\w\-.]', '', (modo_final or "generic")[:20]) or "generic"
+    filename = f"etq-tracking-{id_part}-{cod_safe}-{srv_safe}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
