@@ -148,6 +148,7 @@ class Saida(Base):
     servico = Column(Text, nullable=True, server_default=text("'padrao'::text"))
     status = Column(Text, nullable=True, server_default=text("'saiu'::text"))
     id_coleta = Column(BigInteger, ForeignKey("coletas.id_coleta"), nullable=True)
+    qr_payload_raw = Column(Text, nullable=True)  # Payload bruto do QR (ML) para gerar etiqueta reconhecível
 
     coleta = relationship("Coleta", back_populates="saidas")
 

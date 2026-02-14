@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import re
 import time
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple
@@ -28,6 +29,7 @@ class ItemLote(BaseModel):
         min_length=1,
         description="shopee | ml | mercado_livre | mercado livre | avulso"
     )
+    qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta
 
 
 class ColetaLoteIn(BaseModel):
@@ -91,6 +93,21 @@ def _normalize_servico(raw: str) -> Literal["shopee", "mercado_livre", "avulso"]
 
 def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) -> str:
     return "Mercado Livre" if s == "mercado_livre" else s
+
+
+def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
+    """Armazena qr_payload_raw somente para Mercado Livre com formato válido."""
+    if not qr_raw or not qr_raw.strip():
+        return False
+    s = (servico or "").strip().lower()
+    if "mercado" not in s and "ml" not in s and "flex" not in s:
+        return False
+    raw = qr_raw.strip()
+    if raw.startswith("{") and ("sender_id" in raw or "SENDER_ID" in raw or "hash_code" in raw):
+        return True
+    if re.search(r"4[5-9]\d{9}", raw):
+        return True
+    return False
 
 
 def _sub_base_from_token_or_422(user: User) -> str:
@@ -288,6 +305,8 @@ def registrar_coleta_em_lote(
         for item in payload.itens:
             serv_key = _normalize_servico(item.servico)
             codigo = item.codigo.strip()
+            qr_raw = getattr(item, "qr_payload_raw", None)
+            store_qr = _should_store_qr_payload_raw(_servico_label_for_saida(serv_key), qr_raw)
 
             saida = Saida(
                 sub_base=sub_base,
@@ -299,6 +318,7 @@ def registrar_coleta_em_lote(
                 servico=_servico_label_for_saida(serv_key),
                 status="coletado",
                 id_coleta=coleta.id_coleta,
+                qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
             )
             db.add(saida)
             db.flush()

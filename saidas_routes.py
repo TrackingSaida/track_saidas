@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Optional
 from datetime import datetime, date, timedelta
@@ -33,6 +34,7 @@ class SaidaCreate(BaseModel):
     codigo: str = Field(min_length=1)
     servico: str = Field(min_length=1)
     status: Optional[str] = None
+    qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
 
 
 class SaidaOut(BaseModel):
@@ -78,6 +80,7 @@ class SaidaLerIn(BaseModel):
     servico: str = Field(min_length=1)
     # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
     registrar_nao_coletado: bool = False
+    qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
 
 
 # ============================================================
@@ -165,6 +168,23 @@ def _check_delete_window_or_409(ts: datetime):
         )
 
 
+def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
+    """Armazena qr_payload_raw somente para Mercado Livre com formato válido."""
+    if not qr_raw or not qr_raw.strip():
+        return False
+    s = servico.strip().lower()
+    if "mercado" not in s and "ml" not in s and "flex" not in s:
+        return False
+    raw = qr_raw.strip()
+    # JSON com id, sender_id, hash_code
+    if raw.startswith("{") and ("sender_id" in raw or "SENDER_ID" in raw or "hash_code" in raw):
+        return True
+    # Formato antigo com dígitos ML (4[5-9]...)
+    if re.search(r"4[5-9]\d{9}", raw):
+        return True
+    return False
+
+
 # ============================================================
 # POST — REGISTRAR SAÍDA
 # ============================================================
@@ -224,6 +244,9 @@ def registrar_saida(
                 {"code": "COLETA_OBRIGATORIA", "message": "Este cliente exige coleta antes da saída."}
             )
 
+    qr_raw = getattr(payload, "qr_payload_raw", None)
+    store_qr = _should_store_qr_payload_raw(servico, qr_raw)
+
     try:
         row = Saida(
             sub_base=sub_base,
@@ -233,6 +256,7 @@ def registrar_saida(
             codigo=codigo,
             servico=servico,
             status=status_val,
+            qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
         )
         db.add(row)
         db.flush()
@@ -307,6 +331,8 @@ def ler_saida(
             )
         # status: "saiu" quando ignorar_coleta; "não coletado" quando usuário confirmou registrar mesmo assim
         status_inicial = "não coletado" if payload.registrar_nao_coletado else "saiu"
+        qr_raw = getattr(payload, "qr_payload_raw", None)
+        store_qr = _should_store_qr_payload_raw(servico, qr_raw)
         try:
             row = Saida(
                 sub_base=sub_base,
@@ -316,6 +342,7 @@ def ler_saida(
                 codigo=codigo,
                 servico=servico,
                 status=status_inicial,
+                qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
             )
             db.add(row)
             db.flush()
