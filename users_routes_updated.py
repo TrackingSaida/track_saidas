@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from db import get_db
 from auth import get_current_user, get_password_hash, verify_password
 from models import User, Owner
+from base import _resolve_user_sub_base
 
 router = APIRouter(prefix="/users", tags=["Users"])
 logger = logging.getLogger("routes.users")
@@ -160,12 +161,15 @@ def list_users(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-
+    """Lista usuários apenas da mesma sub_base do solicitante (sub_base obtida do banco)."""
     if current_user.role not in (0, 1):
         raise HTTPException(403, "Apenas admin podem listar usuários.")
 
+    sub_base = _resolve_user_sub_base(db, current_user)
+    if not sub_base or not str(sub_base).strip():
+        raise HTTPException(403, "Usuário sem sub_base definida. Faça login novamente.")
     return db.scalars(
-        select(User).where(User.sub_base == current_user.sub_base)
+        select(User).where(User.sub_base == sub_base)
     ).all()
 
 
