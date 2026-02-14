@@ -24,7 +24,8 @@ MENU_DEFS = [
                 "href": "tracking-coleta-leitura.html",
                 "roles": [0, 1, 2, 3],
                 "group": "leituras",
-                "coleta_only": True
+                "coleta_only": True,
+                "coleta_manual_ok": False
             },
             {
                 "label": "Registrar Saídas",
@@ -51,7 +52,7 @@ MENU_DEFS = [
         "icon": "ri-money-dollar-circle-line",
         "roles": [0, 1],
         "items": [
-            {"label": "Fechamento Bases", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True},
+            {"label": "Fechamento Bases", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
             {"label": "Fechamento Motoboys", "href": "tracking-entregadores-resumo.html", "roles": [0, 1]},
             {"label": "Contabilidade", "href": "tracking-contabilidade.html", "roles": [0, 1]},
         ]
@@ -63,7 +64,7 @@ MENU_DEFS = [
         "items": [
             {"label": "Admin", "href": "dashboard-admin.html", "roles": [0]},
             {"label": "Visão 360", "href": "dashboard-visao-360.html", "roles": [0, 1], "visao360_only": True},
-            {"label": "Coletas", "href": "dashboard-coletas.html", "roles": [0, 1], "coleta_only": True},
+            {"label": "Coletas", "href": "dashboard-coletas.html", "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
             {"label": "Saídas", "href": "dashboard-saidas.html", "roles": [0, 1]},
             {"label": "Financeiro", "href": "dashboard-financeiro.html", "roles": [0, 1]},
         ]
@@ -75,7 +76,7 @@ MENU_DEFS = [
         "roles": [0, 1],
         "items": [
             {"label": "Entregadores", "href": "tracking-entregador.html", "roles": [0, 1]},
-            {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True},
+            {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
             {"label": "Usuários",     "href": "tracking-usuarios.html",   "roles": [0, 1]},
             {"label": "Preços de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
         ]
@@ -95,21 +96,26 @@ MENU_DEFS = [
 # FUNÇÃO QUE MONTA MENU FINAL
 # =============================
 
-def menu_for_role(role: int, ignorar_coleta: bool = False):
+def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = "codigo"):
     visible_sections = []
 
     for section in MENU_DEFS:
         # Se o usuário pode ver a seção inteira
         if role in section["roles"]:
-            # Filtra os itens permitidos (role + ignorar_coleta)
-            # coleta_only: ocultar quando ignorar_coleta
-            # visao360_only: ocultar quando ignorar_coleta (mostrar só para ops com coleta ativa)
-            allowed_items = [
-                item for item in section["items"]
-                if ("roles" not in item or role in item["roles"])
-                and not (ignorar_coleta and item.get("coleta_only"))
-                and not (ignorar_coleta and item.get("visao360_only"))
-            ]
+            # Filtra os itens permitidos (role + ignorar_coleta + modo_operacao)
+            # coleta_only: ocultar quando ignorar_coleta, EXCETO se coleta_manual_ok e modo=coleta_manual
+            # visao360_only: sempre ocultar quando ignorar_coleta
+            allowed_items = []
+            for item in section["items"]:
+                if "roles" in item and role not in item["roles"]:
+                    continue
+                if ignorar_coleta and item.get("visao360_only"):
+                    continue
+                if ignorar_coleta and item.get("coleta_only"):
+                    if item.get("coleta_manual_ok") and modo_operacao == "coleta_manual":
+                        allowed_items.append(item)
+                    continue
+                allowed_items.append(item)
 
             if allowed_items:
                 visible_sections.append({
@@ -136,7 +142,8 @@ def get_menu(user: User = Depends(get_current_user)):
     """
     role = int(user.role)
     ignorar_coleta = bool(getattr(user, "ignorar_coleta", False))
-    menu = menu_for_role(role, ignorar_coleta)
+    modo_operacao = getattr(user, "modo_operacao", None) or "codigo"
+    menu = menu_for_role(role, ignorar_coleta, modo_operacao)
 
     return {
         "role": role,

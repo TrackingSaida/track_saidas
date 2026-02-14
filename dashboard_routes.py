@@ -607,11 +607,13 @@ def get_dashboard_coletas(
 ):
     """
     Dashboard de Coletas: promessa, origem e volume.
-    Acesso: owner ignorar_coleta=false, role 0 ou 1.
+    Acesso: owner ignorar_coleta=false OU (ignorar_coleta=true e modo_operacao=coleta_manual), role 0 ou 1.
     """
     ignorar_coleta = bool(getattr(request.state, "ignorar_coleta", True))
+    modo_operacao = getattr(current_user, "modo_operacao", None) or "codigo"
     role = int(getattr(current_user, "role", 99))
-    if ignorar_coleta:
+    coleta_ativa = not ignorar_coleta or (ignorar_coleta and modo_operacao == "coleta_manual")
+    if not coleta_ativa:
         raise HTTPException(
             status_code=403,
             detail="Dashboard de Coletas disponível apenas para operações com coleta ativa.",
