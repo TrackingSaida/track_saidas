@@ -71,7 +71,8 @@ class Owner(Base):
 
     ativo = Column(Boolean, nullable=False, server_default=text("true"))
     ignorar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
-     # Flag para owners de teste (não considerados em dashboards/admin)
+    modo_operacao = Column(Text, nullable=True, server_default=text("'codigo'"))
+    # Flag para owners de teste (não considerados em dashboards/admin)
     teste = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
@@ -96,6 +97,7 @@ class Coleta(Base):
     avulso = Column(Integer, nullable=False, server_default=text("0"))
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    origem = Column(Text, nullable=False, server_default=text("'codigo'"))
 
     saidas = relationship("Saida", back_populates="coleta")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import re
 import time
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple
 
@@ -47,6 +48,20 @@ class ResumoLote(BaseModel):
     total: str
 
 
+class ColetaManualCreate(BaseModel):
+    data: date
+    base: str = Field(min_length=1)
+    shopee: int = 0
+    mercado_livre: int = 0
+    avulso: int = 0
+
+
+class ColetaManualUpdate(BaseModel):
+    shopee: Optional[int] = None
+    mercado_livre: Optional[int] = None
+    avulso: Optional[int] = None
+
+
 class ColetaOut(BaseModel):
     id_coleta: int
     timestamp: datetime.datetime
@@ -57,6 +72,7 @@ class ColetaOut(BaseModel):
     mercado_livre: int
     avulso: int
     valor_total: Decimal
+    origem: str = "codigo"
     model_config = ConfigDict(from_attributes=True)
 
 ColetaOut.model_rebuild()
@@ -373,6 +389,103 @@ def registrar_coleta_em_lote(
 
 
 # ============================================================
+# POST /coletas/manual — Coleta Manual (somente quando modo_operacao == "coleta_manual")
+# ============================================================
+
+def _require_modo_coleta_manual(db: Session, sub_base: str) -> None:
+    """Valida que o owner está em modo coleta_manual. Levanta HTTPException 403 caso contrário."""
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    if not owner:
+        raise HTTPException(403, "Owner não encontrado para esta sub_base.")
+    modo = getattr(owner, "modo_operacao", None) or "codigo"
+    if modo != "coleta_manual":
+        raise HTTPException(
+            403,
+            f"Coleta manual disponível apenas quando modo_operacao == 'coleta_manual'. Atual: {modo!r}",
+        )
+
+
+@router.post("/manual", response_model=ColetaOut, status_code=201)
+def criar_coleta_manual(
+    payload: ColetaManualCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base_from_token_or_422(current_user)
+    _require_modo_coleta_manual(db, sub_base)
+
+    p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base.strip())
+
+    valor_total = (
+        _decimal(payload.shopee) * p_shopee
+        + _decimal(payload.mercado_livre) * p_ml
+        + _decimal(payload.avulso) * p_avulso
+    ).quantize(Decimal("0.01"))
+
+    username = getattr(current_user, "username", None) or "-"
+    timestamp = datetime.datetime.combine(payload.data, datetime.time.min)
+
+    coleta = Coleta(
+        sub_base=sub_base,
+        base=payload.base.strip(),
+        username_entregador=username,
+        shopee=payload.shopee,
+        mercado_livre=payload.mercado_livre,
+        avulso=payload.avulso,
+        valor_total=valor_total,
+        origem="manual",
+        timestamp=timestamp,
+    )
+    db.add(coleta)
+    db.commit()
+    db.refresh(coleta)
+
+    return ColetaOut.model_validate(coleta)
+
+
+# ============================================================
+# PATCH /coletas/manual/{id_coleta}
+# ============================================================
+
+@router.patch("/manual/{id_coleta}", response_model=ColetaOut)
+def atualizar_coleta_manual(
+    id_coleta: int,
+    payload: ColetaManualUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base_from_token_or_422(current_user)
+    _require_modo_coleta_manual(db, sub_base)
+
+    coleta = db.get(Coleta, id_coleta)
+    if not coleta or coleta.sub_base != sub_base:
+        raise HTTPException(404, "Coleta não encontrada.")
+
+    origem = getattr(coleta, "origem", "codigo")
+    if origem != "manual":
+        raise HTTPException(403, "Só é possível editar coletas com origem 'manual'.")
+
+    if payload.shopee is not None:
+        coleta.shopee = payload.shopee
+    if payload.mercado_livre is not None:
+        coleta.mercado_livre = payload.mercado_livre
+    if payload.avulso is not None:
+        coleta.avulso = payload.avulso
+
+    p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
+    coleta.valor_total = (
+        _decimal(coleta.shopee) * p_shopee
+        + _decimal(coleta.mercado_livre) * p_ml
+        + _decimal(coleta.avulso) * p_avulso
+    ).quantize(Decimal("0.01"))
+
+    db.commit()
+    db.refresh(coleta)
+
+    return ColetaOut.model_validate(coleta)
+
+
+# ============================================================
 # GET /coletas
 # (REFATORADO: sub_base vem do JWT; remove 2-3 SELECTs por request)
 # ============================================================
@@ -441,6 +554,8 @@ class ResumoItem(BaseModel):
     valor_total: Decimal
     cancelados: int
     entregadores: str
+    id_coleta: Optional[int] = None
+    origem: Optional[str] = None
 
 
 class ResumoResponse(BaseModel):
@@ -522,32 +637,51 @@ def resumo_coletas(
         mapa_cancelados[key] = mapa_cancelados.get(key, 0) + 1
 
     # ----------------------------------------------------------
-    # Agrupar coletas por DIA + BASE
+    # Coletas manuais: uma linha por coleta (não agregar)
+    # Coletas codigo: agrupar por DIA + BASE
     # ----------------------------------------------------------
+    lista: List[ResumoItem] = []
     agrupado: Dict[str, Dict] = {}
+
     for r in rows:
         dia = r.timestamp.date().isoformat()
         baseKey = (r.base or "").strip().upper()
         key = f"{dia}_{baseKey}"
+        origem = getattr(r, "origem", None) or "codigo"
 
-        if key not in agrupado:
-            agrupado[key] = {
-                "data": dia,
-                "base": baseKey,
-                "shopee": 0,
-                "mercado_livre": 0,
-                "avulso": 0,
-                "valor_total": Decimal("0.00"),
-                "entregadores": set(),
-            }
+        if origem == "manual":
+            canc = mapa_cancelados.get(key, 0)
+            lista.append(
+                ResumoItem(
+                    data=dia,
+                    base=baseKey,
+                    shopee=r.shopee,
+                    mercado_livre=r.mercado_livre,
+                    avulso=r.avulso,
+                    valor_total=r.valor_total,
+                    cancelados=canc,
+                    entregadores=(r.username_entregador or "-"),
+                    id_coleta=r.id_coleta,
+                    origem="manual",
+                )
+            )
+        else:
+            if key not in agrupado:
+                agrupado[key] = {
+                    "data": dia,
+                    "base": baseKey,
+                    "shopee": 0,
+                    "mercado_livre": 0,
+                    "avulso": 0,
+                    "valor_total": Decimal("0.00"),
+                    "entregadores": set(),
+                }
+            agrupado[key]["shopee"] += r.shopee
+            agrupado[key]["mercado_livre"] += r.mercado_livre
+            agrupado[key]["avulso"] += r.avulso
+            agrupado[key]["valor_total"] += r.valor_total
+            agrupado[key]["entregadores"].add(r.username_entregador or "-")
 
-        agrupado[key]["shopee"] += r.shopee
-        agrupado[key]["mercado_livre"] += r.mercado_livre
-        agrupado[key]["avulso"] += r.avulso
-        agrupado[key]["valor_total"] += r.valor_total
-        agrupado[key]["entregadores"].add(r.username_entregador or "-")
-
-    lista: List[ResumoItem] = []
     for key, item in agrupado.items():
         canc = mapa_cancelados.get(key, 0)
         lista.append(
@@ -560,6 +694,8 @@ def resumo_coletas(
                 valor_total=item["valor_total"],
                 cancelados=canc,
                 entregadores=" | ".join(item["entregadores"]),
+                id_coleta=None,
+                origem=None,
             )
         )
 

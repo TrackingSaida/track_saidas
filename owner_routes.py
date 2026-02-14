@@ -25,6 +25,7 @@ class OwnerCreate(BaseModel):
     sub_base: Optional[str] = None
     contato: Optional[str] = None
     teste: Optional[bool] = None
+    modo_operacao: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -37,6 +38,7 @@ class OwnerUpdate(BaseModel):
     ativo: Optional[bool] = None
     ignorar_coleta: Optional[bool] = None
     teste: Optional[bool] = None
+    modo_operacao: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -51,6 +53,7 @@ class OwnerOut(BaseModel):
     ativo: bool
     ignorar_coleta: bool
     teste: bool
+    modo_operacao: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -83,6 +86,15 @@ def create_owner(
     if exists:
         raise HTTPException(409, "Já existe um Owner para esta sub_base.")
 
+    # Na criação, ignorar_coleta é sempre False — modo coleta_manual não permitido
+    ignorar_coleta = False
+    modo_operacao = body.modo_operacao if body.modo_operacao is not None else "codigo"
+    if modo_operacao == "coleta_manual":
+        raise HTTPException(
+            400,
+            "Para usar modo 'coleta_manual', defina primeiro 'Ignorar Coleta' ao editar o owner."
+        )
+
     obj = Owner(
         email=email,
         username=username,
@@ -90,8 +102,9 @@ def create_owner(
         sub_base=body.sub_base,
         contato=body.contato,
         ativo=True,
-        ignorar_coleta=False,
+        ignorar_coleta=ignorar_coleta,
         teste=bool(body.teste) if body.teste is not None else False,
+        modo_operacao=modo_operacao,
     )
     db.add(obj)
     db.commit()
@@ -174,6 +187,14 @@ def update_owner(
 
     if body.teste is not None:
         owner.teste = body.teste
+
+    if body.modo_operacao is not None:
+        if body.modo_operacao == "coleta_manual" and not (body.ignorar_coleta if body.ignorar_coleta is not None else owner.ignorar_coleta):
+            raise HTTPException(
+                400,
+                "Para usar modo 'coleta_manual', o campo 'Ignorar Coleta' deve estar ativo."
+            )
+        owner.modo_operacao = body.modo_operacao
 
     db.commit()
     db.refresh(owner)
