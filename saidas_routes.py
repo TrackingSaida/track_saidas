@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Optional
 from datetime import datetime, date, timedelta
@@ -33,6 +34,7 @@ class SaidaCreate(BaseModel):
     codigo: str = Field(min_length=1)
     servico: str = Field(min_length=1)
     status: Optional[str] = None
+    qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
 
 
 class SaidaOut(BaseModel):
@@ -76,6 +78,9 @@ class SaidaLerIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     servico: str = Field(min_length=1)
+    # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
+    registrar_nao_coletado: bool = False
+    qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
 
 
 # ============================================================
@@ -100,6 +105,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return "cancelado"
     if s in ("coletado", "coletada"):
         return "coletado"
+    if s in ("não coletado", "nao coletado", "não coletada", "nao coletada"):
+        return "não coletado"
     return s
 
 
@@ -161,6 +168,23 @@ def _check_delete_window_or_409(ts: datetime):
         )
 
 
+def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
+    """Armazena qr_payload_raw somente para Mercado Livre com formato válido."""
+    if not qr_raw or not qr_raw.strip():
+        return False
+    s = servico.strip().lower()
+    if "mercado" not in s and "ml" not in s and "flex" not in s:
+        return False
+    raw = qr_raw.strip()
+    # JSON com id, sender_id, hash_code
+    if raw.startswith("{") and ("sender_id" in raw or "SENDER_ID" in raw or "hash_code" in raw):
+        return True
+    # Formato antigo com dígitos ML (4[5-9]...)
+    if re.search(r"4[5-9]\d{9}", raw):
+        return True
+    return False
+
+
 # ============================================================
 # POST — REGISTRAR SAÍDA
 # ============================================================
@@ -220,6 +244,9 @@ def registrar_saida(
                 {"code": "COLETA_OBRIGATORIA", "message": "Este cliente exige coleta antes da saída."}
             )
 
+    qr_raw = getattr(payload, "qr_payload_raw", None)
+    store_qr = _should_store_qr_payload_raw(servico, qr_raw)
+
     try:
         row = Saida(
             sub_base=sub_base,
@@ -229,11 +256,13 @@ def registrar_saida(
             codigo=codigo,
             servico=servico,
             status=status_val,
+            qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
         )
         db.add(row)
         db.flush()
 
-        if ignorar_coleta:
+        # ignorar_coleta: cobrança apenas para status "saiu" (cancelado e outros não cobram)
+        if ignorar_coleta and status_val == "saiu":
             db.add(
                 OwnerCobrancaItem(
                     sub_base=sub_base,
@@ -293,13 +322,17 @@ def ler_saida(
     )
 
     if existente is None:
-        # Não existe: ignorar_coleta → INSERT; senão 422 (erro de negócio, sem retry)
-        if not ignorar_coleta:
+        # Não existe: ignorar_coleta ou registrar_nao_coletado → INSERT; senão 422 (erro de negócio, sem retry)
+        if not ignorar_coleta and not payload.registrar_nao_coletado:
             # JSONResponse direto para preservar código de erro sem passar pelo handler global.
             return JSONResponse(
                 status_code=422,
                 content={"code": "NAO_COLETADO", "message": "Código não coletado."},
             )
+        # status: "saiu" quando ignorar_coleta; "não coletado" quando usuário confirmou registrar mesmo assim
+        status_inicial = "não coletado" if payload.registrar_nao_coletado else "saiu"
+        qr_raw = getattr(payload, "qr_payload_raw", None)
+        store_qr = _should_store_qr_payload_raw(servico, qr_raw)
         try:
             row = Saida(
                 sub_base=sub_base,
@@ -308,7 +341,8 @@ def ler_saida(
                 entregador_id=entregador_id,
                 codigo=codigo,
                 servico=servico,
-                status="saiu",
+                status=status_inicial,
+                qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
             )
             db.add(row)
             db.flush()
@@ -357,7 +391,8 @@ def ler_saida(
         )
         if mesmo_ent:
             return SaidaOut.model_validate(existente)
-        # outro entregador → 409 para front acionar PATCH de troca (sem retry automático)
+        # outro entregador → 409 para front acionar PATCH de troca.
+        # Sem retry: front trata com Swal + PATCH, evita latência de retry em fluxo normal.
         return JSONResponse(
             status_code=409,
             content={
@@ -365,6 +400,7 @@ def ler_saida(
                 "id_saida": existente.id_saida,
                 "message": "Código já saiu com outro entregador.",
                 "entregador_atual": existente.entregador,
+                "username": existente.username,
             },
         )
 
@@ -398,9 +434,9 @@ def listar_saidas(
         stmt = stmt.where(func.unaccent(func.lower(Saida.base)) == func.unaccent(base_norm))
 
     if de:
-        stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
+        stmt = stmt.where(Saida.data >= de)
     if ate:
-        stmt = stmt.where(Saida.timestamp <= datetime.combine(ate, datetime.max.time()))
+        stmt = stmt.where(Saida.data <= ate)
 
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
         ent_norm = entregador.strip().lower()
@@ -501,7 +537,15 @@ def atualizar_saida(
         obj.entregador = entregador_nome
 
     if payload.status is not None:
-        obj.status = normalizar_status_saida(payload.status)
+        novo_status = normalizar_status_saida(payload.status)
+        obj.status = novo_status
+        # Se alterou para cancelado, marcar cobrança como cancelada (não contabilizada)
+        if novo_status == "cancelado":
+            itens = db.scalars(
+                select(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida == obj.id_saida)
+            ).all()
+            for item in itens:
+                item.cancelado = True
 
     if payload.servico is not None:
         obj.servico = payload.servico.strip().title()

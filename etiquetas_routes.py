@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User
+from models import User, Saida
 
 router = APIRouter(prefix="/etiquetas", tags=["Etiquetas"])
 logger = logging.getLogger(__name__)
@@ -27,13 +28,27 @@ logger = logging.getLogger(__name__)
 # TODO: Geração automática ao registrar saída
 
 
+def _is_ml_servico(s: Optional[str]) -> bool:
+    if not s:
+        return False
+    x = s.strip().lower()
+    return "mercado" in x or "ml" in x or "flex" in x
+
+
+def _is_ml_codigo(codigo: str) -> bool:
+    """Código ML: 11 dígitos começando com 4[5-9]."""
+    return bool(re.match(r"^4[5-9]\d{9}$", (codigo or "").strip()))
+
+
 # ============================================================
 # SCHEMAS
 # ============================================================
 
 class EtiquetaGerarPayload(BaseModel):
     codigo: str = Field(min_length=1, description="Código de rastreio/pedido")
-    # modo: str = Field(default="generic", description="generic | shopee | ml")  # TODO: futuro - Shopee/ML
+    id_saida: Optional[int] = None  # Busca qr_payload_raw para ML
+    servico: Optional[str] = None
+    qr_payload: Optional[str] = None  # Payload bruto para QR (ML JSON)
 
 
 # ============================================================
@@ -141,6 +156,7 @@ def _gerar_pdf_etiqueta(
     codigo: str,
     modo_final: str,
     dados_extras: Optional[Dict[str, Any]] = None,
+    qr_content: Optional[str] = None,
 ) -> bytes:
     """
     Gera PDF 100x150mm com layout limpo e profissional.
@@ -199,7 +215,7 @@ def _gerar_pdf_etiqueta(
         box_size=12,   # Alta definição para impressão térmica
         border=1,      # Quiet zone mínima
     )
-    qr.add_data(codigo)
+    qr.add_data(qr_content if qr_content else codigo)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white")
     qr_buf = io.BytesIO()
@@ -243,7 +259,7 @@ def _gerar_pdf_etiqueta(
     # ─────────────────────────────────────────────────────────
     # RODAPÉ — Discreto e centralizado
     # ─────────────────────────────────────────────────────────
-    rodape = "Etiqueta logística — Tracking Saídas"
+    rodape = "Tracking Saídas"
     c.setFont("Helvetica", 6)
     rw = c.stringWidth(rodape, "Helvetica", 6)
     c.drawString(center_x(rw), margin, rodape)
@@ -257,6 +273,48 @@ def _gerar_pdf_etiqueta(
 # ROTA
 # ============================================================
 
+def _resolve_qr_content(
+    codigo: str,
+    id_saida: Optional[int],
+    servico: Optional[str],
+    qr_payload: Optional[str],
+    sub_base: Optional[str],
+    db: Session,
+) -> Optional[str]:
+    """
+    Resolve o conteúdo do QR para etiqueta ML.
+    Ordem: 1) qr_payload explícito 2) id_saida com qr_payload_raw 3) experimental fabricado.
+    """
+    # 1. Payload explícito
+    if qr_payload and qr_payload.strip():
+        return qr_payload.strip()
+
+    # 2. Buscar por id_saida (mesma sub_base)
+    if id_saida and sub_base:
+        saida = db.get(Saida, id_saida)
+        if saida and saida.sub_base == sub_base and saida.qr_payload_raw:
+            return saida.qr_payload_raw
+
+    # 3. Experimental: fabricar JSON ML (hash_code vazio) — pode ser rejeitado pelo app
+    if _is_ml_servico(servico) or _is_ml_codigo(codigo):
+        try:
+            from ml_token_service import get_latest_ml_token
+            token = get_latest_ml_token(db)
+            if token:
+                import json
+                fake = {
+                    "id": codigo,
+                    "sender_id": token.user_id_ml,
+                    "hash_code": "",
+                    "security_digit": "0",
+                }
+                return json.dumps(fake, separators=(",", ":"))
+        except Exception as e:
+            logger.debug("Experimental ML QR fabricado: %s", e)
+
+    return None
+
+
 @router.post("/gerar")
 def gerar_etiqueta(
     payload: EtiquetaGerarPayload,
@@ -265,24 +323,45 @@ def gerar_etiqueta(
 ):
     """
     Gera etiqueta PDF 100x150mm.
-    Modo generic: sempre funciona.
-    Modo shopee/ml: tenta enriquecer com dados da API; em falha usa generic.
+    Para ML: usa qr_payload_raw se disponível; senão tenta JSON experimental.
     """
     codigo = (payload.codigo or "").strip()
     if not codigo:
         raise HTTPException(400, "Código obrigatório.")
 
-    # Sempre modo genérico. TODO: futuro - Shopee/ML com autenticação nas APIs
+    sub_base = getattr(current_user, "sub_base", None)
+    qr_content = _resolve_qr_content(
+        codigo=codigo,
+        id_saida=payload.id_saida,
+        servico=payload.servico,
+        qr_payload=payload.qr_payload,
+        sub_base=sub_base,
+        db=db,
+    )
+
     modo_final = "generic"
+    if _is_ml_servico(payload.servico) or (_is_ml_codigo(codigo) and qr_content):
+        modo_final = "ml"
+    elif codigo.upper().startswith("BR") and len(codigo) >= 14:
+        modo_final = "shopee"
+
     dados_extras: Optional[Dict[str, Any]] = None
 
     try:
-        pdf_bytes = _gerar_pdf_etiqueta(codigo, modo_final, dados_extras)
+        pdf_bytes = _gerar_pdf_etiqueta(
+            codigo=codigo,
+            modo_final=modo_final,
+            dados_extras=dados_extras,
+            qr_content=qr_content,
+        )
     except Exception as e:
         logger.exception("Erro ao gerar PDF etiqueta: %s", e)
         raise HTTPException(500, "Falha ao gerar PDF.")
 
-    filename = f"etiqueta_{codigo[:30]}_{modo_final}.pdf"
+    id_part = str(payload.id_saida) if payload.id_saida else "0"
+    cod_safe = re.sub(r'[^\w\-.]', '', (codigo or "")[:40]) or "cod"
+    srv_safe = re.sub(r'[^\w\-.]', '', (modo_final or "generic")[:20]) or "generic"
+    filename = f"etq-tracking-{id_part}-{cod_safe}-{srv_safe}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
