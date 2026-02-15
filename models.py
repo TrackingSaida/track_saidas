@@ -340,6 +340,69 @@ class EntregadorFechamento(Base):
 
 
 # ==========================
+# Tabela: base_fechamentos
+# ==========================
+class BaseFechamento(Base):
+    __tablename__ = "base_fechamentos"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base", "base", "periodo_inicio", "periodo_fim",
+            name="uq_base_fechamento_periodo",
+        ),
+    )
+
+    id_fechamento = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    base = Column(Text, nullable=False)
+
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+
+    valor_bruto = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_cancelados = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_final = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    status = Column(Text, nullable=False, server_default=text("'GERADO'"))
+
+    criado_em = Column(DateTime(timezone=False), server_default=func.now())
+
+    itens = relationship("BaseFechamentoItem", back_populates="fechamento", cascade="all, delete-orphan")
+
+    def __repr__(self) -> str:
+        return (
+            f"<BaseFechamento id_fechamento={self.id_fechamento} "
+            f"base={self.base!r} status={self.status!r}>"
+        )
+
+
+# ==========================
+# Tabela: base_fechamento_itens
+# ==========================
+class BaseFechamentoItem(Base):
+    __tablename__ = "base_fechamento_itens"
+    __table_args__ = (
+        UniqueConstraint("id_fechamento", "data", name="uq_base_fechamento_item_data"),
+    )
+
+    id_item = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_fechamento = Column(BigInteger, ForeignKey("base_fechamentos.id_fechamento", ondelete="CASCADE"), nullable=False)
+
+    data = Column(Date, nullable=False)
+
+    shopee = Column(Integer, nullable=False, server_default=text("0"))
+    mercado_livre = Column(Integer, nullable=False, server_default=text("0"))
+    avulso = Column(Integer, nullable=False, server_default=text("0"))
+
+    cancelados_shopee = Column(Integer, nullable=False, server_default=text("0"))
+    cancelados_ml = Column(Integer, nullable=False, server_default=text("0"))
+    cancelados_avulso = Column(Integer, nullable=False, server_default=text("0"))
+
+    fechamento = relationship("BaseFechamento", back_populates="itens")
+
+    def __repr__(self) -> str:
+        return f"<BaseFechamentoItem id_item={self.id_item} data={self.data}>"
+
+
+# ==========================
 # Tabela: saidas_detail
 # ==========================
 class SaidaDetail(Base):

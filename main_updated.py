@@ -109,6 +109,7 @@ from saidas_routes import router as saidas_router
 from owner_routes import router as owners_router
 from base import router as base_router
 from coletas import router as coletas_router
+from base_fechamento_routes import router as base_fechamento_router
 from routes_ui import router as ui_router
 from ml_routes import router as ml_router
 from entregador_entregas_routes import router as entregador_entregas_router
@@ -125,6 +126,7 @@ app.include_router(contabilidade_router, prefix=API_PREFIX)
 app.include_router(dashboard_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
+app.include_router(base_fechamento_router, prefix=f"{API_PREFIX}/coletas")
 app.include_router(users_router,        prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")

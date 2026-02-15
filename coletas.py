@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 import re
 import time
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple
 
@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, BasePreco, User, Saida, Owner
+from models import Coleta, Entregador, BasePreco, User, Saida, Owner, BaseFechamento
 from models import OwnerCobrancaItem
 
 
@@ -556,6 +556,8 @@ class ResumoItem(BaseModel):
     entregadores: str
     id_coleta: Optional[int] = None
     origem: Optional[str] = None
+    fechamento_status: Optional[str] = None
+    id_fechamento: Optional[int] = None
 
 
 class ResumoResponse(BaseModel):
@@ -570,6 +572,7 @@ class ResumoResponse(BaseModel):
     sumValor: Decimal
     sumCancelados: int
     sumTotalColetas: int
+    contextoFechamento: Optional[Dict] = None  # { id_fechamento, status, base, periodo_inicio, periodo_fim } quando base+periodo definidos
 
 
 @router.get("/resumo", response_model=ResumoResponse)
@@ -577,6 +580,7 @@ def resumo_coletas(
     base: Optional[str] = Query(None),
     data_inicio: Optional[datetime.date] = Query(None),
     data_fim: Optional[datetime.date] = Query(None),
+    fechamento_status: Optional[str] = Query(None),  # PENDENTE | GERADO | REAJUSTADO
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -701,6 +705,73 @@ def resumo_coletas(
 
     lista.sort(key=lambda x: x.data)
 
+    # ----------------------------------------------------------
+    # Enriquecer com fechamento_status e id_fechamento
+    # ----------------------------------------------------------
+    flt_status = (fechamento_status or "").strip().upper() if fechamento_status else None
+    if data_inicio and data_fim:
+        fechamentos = db.scalars(
+            select(BaseFechamento).where(
+                BaseFechamento.sub_base == sub_base_user,
+                BaseFechamento.periodo_fim >= data_inicio,
+                BaseFechamento.periodo_inicio <= data_fim,
+            )
+        ).all()
+        fech_por_key: Dict[tuple, BaseFechamento] = {}
+        for f in fechamentos:
+            base_f = (f.base or "").strip().upper()
+            delta = (f.periodo_fim - f.periodo_inicio).days
+            for d in range(delta + 1):
+                dia = (f.periodo_inicio + timedelta(days=d)).isoformat()
+                fech_por_key[(dia, base_f)] = f
+        for item in lista:
+            key = (item.data, item.base)
+            fech = fech_por_key.get(key)
+            if fech:
+                st = (fech.status or "GERADO").upper()
+                if st == "FECHADO":
+                    st = "GERADO"
+                item.fechamento_status = st
+                item.id_fechamento = fech.id_fechamento
+            else:
+                item.fechamento_status = "PENDENTE"
+                item.id_fechamento = None
+    else:
+        for item in lista:
+            item.fechamento_status = "PENDENTE"
+            item.id_fechamento = None
+
+    # Filtrar por fechamento_status se informado
+    if flt_status:
+        if flt_status == "PENDENTE":
+            lista = [i for i in lista if (i.fechamento_status or "PENDENTE") == "PENDENTE"]
+        else:
+            lista = [i for i in lista if (i.fechamento_status or "").upper() == flt_status]
+
+    # contextoFechamento: quando base + periodo definidos e há um único fechamento cobrindo
+    contexto = None
+    if base_norm and data_inicio and data_fim:
+        base_upper = base_norm.upper() if base_norm else ""
+        fech_unico = db.scalar(
+            select(BaseFechamento).where(
+                BaseFechamento.sub_base == sub_base_user,
+                func.upper(BaseFechamento.base) == base_upper,
+                BaseFechamento.periodo_inicio == data_inicio,
+                BaseFechamento.periodo_fim == data_fim,
+            )
+        )
+        if fech_unico:
+            st = (fech_unico.status or "GERADO").upper()
+            if st == "FECHADO":
+                st = "GERADO"
+            contexto = {
+                "id_fechamento": fech_unico.id_fechamento,
+                "status": st,
+                "base": fech_unico.base,
+                "periodo_inicio": fech_unico.periodo_inicio.isoformat(),
+                "periodo_fim": fech_unico.periodo_fim.isoformat(),
+            }
+
     sumShopee = sum(i.shopee for i in lista)
     sumMercado = sum(i.mercado_livre for i in lista)
     sumAvulso = sum(i.avulso for i in lista)
@@ -727,4 +798,5 @@ def resumo_coletas(
         sumValor=sumValor,
         sumCancelados=sumCancelados,
         sumTotalColetas=sumTotalColetas,
+        contextoFechamento=contexto,
     )
