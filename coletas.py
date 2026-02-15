@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import datetime
-import re
 import time
-from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple
 
@@ -14,8 +12,8 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, BasePreco, User, Saida, Owner, BaseFechamento
-from models import OwnerCobrancaItem
+from models import Coleta, Entregador, BasePreco, User, Saida
+from models import OwnerCobrancaItem  # Owner NÃO é mais necessário (valor vem do JWT)
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -30,13 +28,11 @@ class ItemLote(BaseModel):
         min_length=1,
         description="shopee | ml | mercado_livre | mercado livre | avulso"
     )
-    qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta
 
 
 class ColetaLoteIn(BaseModel):
     base: str = Field(min_length=1)
     itens: List[ItemLote] = Field(min_length=1)
-    entregador_id: Optional[int] = None
 
 
 class ResumoLote(BaseModel):
@@ -46,20 +42,6 @@ class ResumoLote(BaseModel):
     contagem: Dict[str, int]
     precos: Dict[str, str]
     total: str
-
-
-class ColetaManualCreate(BaseModel):
-    data: date
-    base: str = Field(min_length=1)
-    shopee: int = 0
-    mercado_livre: int = 0
-    avulso: int = 0
-
-
-class ColetaManualUpdate(BaseModel):
-    shopee: Optional[int] = None
-    mercado_livre: Optional[int] = None
-    avulso: Optional[int] = None
 
 
 class ColetaOut(BaseModel):
@@ -72,7 +54,6 @@ class ColetaOut(BaseModel):
     mercado_livre: int
     avulso: int
     valor_total: Decimal
-    origem: str = "codigo"
     model_config = ConfigDict(from_attributes=True)
 
 ColetaOut.model_rebuild()
@@ -109,21 +90,6 @@ def _normalize_servico(raw: str) -> Literal["shopee", "mercado_livre", "avulso"]
 
 def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) -> str:
     return "Mercado Livre" if s == "mercado_livre" else s
-
-
-def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
-    """Armazena qr_payload_raw somente para Mercado Livre com formato válido."""
-    if not qr_raw or not qr_raw.strip():
-        return False
-    s = (servico or "").strip().lower()
-    if "mercado" not in s and "ml" not in s and "flex" not in s:
-        return False
-    raw = qr_raw.strip()
-    if raw.startswith("{") and ("sender_id" in raw or "SENDER_ID" in raw or "hash_code" in raw):
-        return True
-    if re.search(r"4[5-9]\d{9}", raw):
-        return True
-    return False
 
 
 def _sub_base_from_token_or_422(user: User) -> str:
@@ -250,26 +216,14 @@ def registrar_coleta_em_lote(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # 1) Resolve sub_base + entregador: prioriza payload.entregador_id, senão JWT
-    sub_base = _sub_base_from_token_or_422(current_user)
-    if payload.entregador_id is not None:
-        ent = db.get(Entregador, payload.entregador_id)
-        if not ent or ent.sub_base != sub_base:
-            raise HTTPException(422, "Entregador não encontrado ou não pertence à sua base.")
-        if hasattr(ent, "ativo") and not ent.ativo:
-            raise HTTPException(403, "Entregador inativo.")
-        entregador_nome = (getattr(ent, "nome", None) or ent.username_entregador) or ""
-        username_entregador = ent.username_entregador or ""
-        entregador_id = ent.id_entregador
-    else:
-        sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
+    # 1) Resolve sub_base + entregador com no máximo 1 SELECT (Entregador) e sem fallback para User
+    sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
 
-    # 2) preços BasePreco para valores de entradas da coleta (valor_total e resumo)
+    # 2) valor unitário vem do JWT (sem SELECT em Owner)
+    valor_unit = Decimal(getattr(current_user, "owner_valor", "0"))
+
+    # 3) preços com cache TTL curto
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base)
-
-    # 3) valor de cobrança do admin ao owner: somente Owner.valor (nunca BasePreco como fallback)
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    valor_cobranca_owner = _decimal(getattr(owner, "valor", 0)) if owner else Decimal("0")
 
     # 4) Normaliza itens e detecta duplicados no próprio payload (zero DB)
     #    (você vai tratar duplicidade no front, mas aqui evita lixo óbvio e reduz queries)
@@ -302,6 +256,7 @@ def registrar_coleta_em_lote(
         raise HTTPException(409, f"Código '{dup}' já coletado.")
 
     created = 0
+    saidas_ids: List[int] = []
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
 
     try:
@@ -317,12 +272,10 @@ def registrar_coleta_em_lote(
         db.add(coleta)
         db.flush()
 
-        # 6) Inserção em loop, sem SELECTs dentro
+        # 6) Inserção em loop, mas sem SELECTs dentro
         for item in payload.itens:
             serv_key = _normalize_servico(item.servico)
             codigo = item.codigo.strip()
-            qr_raw = getattr(item, "qr_payload_raw", None)
-            store_qr = _should_store_qr_payload_raw(_servico_label_for_saida(serv_key), qr_raw)
 
             saida = Saida(
                 sub_base=sub_base,
@@ -334,20 +287,10 @@ def registrar_coleta_em_lote(
                 servico=_servico_label_for_saida(serv_key),
                 status="coletado",
                 id_coleta=coleta.id_coleta,
-                qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
             )
             db.add(saida)
             db.flush()
-
-            # Cobrança do admin ao owner: somente Owner.valor por pacote (nunca BasePreco)
-            db.add(
-                OwnerCobrancaItem(
-                    sub_base=sub_base,
-                    id_coleta=coleta.id_coleta,
-                    id_saida=saida.id_saida,
-                    valor=valor_cobranca_owner,
-                )
-            )
+            saidas_ids.append(saida.id_saida)
 
             count[serv_key] += 1
             created += 1
@@ -360,6 +303,19 @@ def registrar_coleta_em_lote(
             count["mercado_livre"] * p_ml +
             count["avulso"] * p_avulso
         ).quantize(Decimal("0.01"))
+
+        db.flush()
+
+        # 7) Cobrança: adiciona N itens, sem consultas
+        for id_saida in saidas_ids:
+            db.add(
+                OwnerCobrancaItem(
+                    sub_base=sub_base,
+                    id_coleta=coleta.id_coleta,
+                    id_saida=id_saida,
+                    valor=valor_unit
+                )
+            )
 
         db.commit()
         db.refresh(coleta)
@@ -389,103 +345,6 @@ def registrar_coleta_em_lote(
 
 
 # ============================================================
-# POST /coletas/manual — Coleta Manual (somente quando modo_operacao == "coleta_manual")
-# ============================================================
-
-def _require_modo_coleta_manual(db: Session, sub_base: str) -> None:
-    """Valida que o owner está em modo coleta_manual. Levanta HTTPException 403 caso contrário."""
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    if not owner:
-        raise HTTPException(403, "Owner não encontrado para esta sub_base.")
-    modo = getattr(owner, "modo_operacao", None) or "codigo"
-    if modo != "coleta_manual":
-        raise HTTPException(
-            403,
-            f"Coleta manual disponível apenas quando modo_operacao == 'coleta_manual'. Atual: {modo!r}",
-        )
-
-
-@router.post("/manual", response_model=ColetaOut, status_code=201)
-def criar_coleta_manual(
-    payload: ColetaManualCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    sub_base = _sub_base_from_token_or_422(current_user)
-    _require_modo_coleta_manual(db, sub_base)
-
-    p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base.strip())
-
-    valor_total = (
-        _decimal(payload.shopee) * p_shopee
-        + _decimal(payload.mercado_livre) * p_ml
-        + _decimal(payload.avulso) * p_avulso
-    ).quantize(Decimal("0.01"))
-
-    username = getattr(current_user, "username", None) or "-"
-    timestamp = datetime.datetime.combine(payload.data, datetime.time.min)
-
-    coleta = Coleta(
-        sub_base=sub_base,
-        base=payload.base.strip(),
-        username_entregador=username,
-        shopee=payload.shopee,
-        mercado_livre=payload.mercado_livre,
-        avulso=payload.avulso,
-        valor_total=valor_total,
-        origem="manual",
-        timestamp=timestamp,
-    )
-    db.add(coleta)
-    db.commit()
-    db.refresh(coleta)
-
-    return ColetaOut.model_validate(coleta)
-
-
-# ============================================================
-# PATCH /coletas/manual/{id_coleta}
-# ============================================================
-
-@router.patch("/manual/{id_coleta}", response_model=ColetaOut)
-def atualizar_coleta_manual(
-    id_coleta: int,
-    payload: ColetaManualUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    sub_base = _sub_base_from_token_or_422(current_user)
-    _require_modo_coleta_manual(db, sub_base)
-
-    coleta = db.get(Coleta, id_coleta)
-    if not coleta or coleta.sub_base != sub_base:
-        raise HTTPException(404, "Coleta não encontrada.")
-
-    origem = getattr(coleta, "origem", "codigo")
-    if origem != "manual":
-        raise HTTPException(403, "Só é possível editar coletas com origem 'manual'.")
-
-    if payload.shopee is not None:
-        coleta.shopee = payload.shopee
-    if payload.mercado_livre is not None:
-        coleta.mercado_livre = payload.mercado_livre
-    if payload.avulso is not None:
-        coleta.avulso = payload.avulso
-
-    p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
-    coleta.valor_total = (
-        _decimal(coleta.shopee) * p_shopee
-        + _decimal(coleta.mercado_livre) * p_ml
-        + _decimal(coleta.avulso) * p_avulso
-    ).quantize(Decimal("0.01"))
-
-    db.commit()
-    db.refresh(coleta)
-
-    return ColetaOut.model_validate(coleta)
-
-
-# ============================================================
 # GET /coletas
 # (REFATORADO: sub_base vem do JWT; remove 2-3 SELECTs por request)
 # ============================================================
@@ -510,10 +369,10 @@ def list_coletas(
         stmt = stmt.where(Coleta.username_entregador == username_entregador.strip())
 
     if data_inicio:
-        dt_start = datetime.datetime.combine(data_inicio, datetime.time.min)
-        stmt = stmt.where(Coleta.timestamp >= dt_start)
+        stmt = stmt.where(Coleta.timestamp >= data_inicio)
 
     if data_fim:
+        # inclui dia inteiro
         dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
         stmt = stmt.where(Coleta.timestamp <= dt_end)
 
@@ -554,10 +413,6 @@ class ResumoItem(BaseModel):
     valor_total: Decimal
     cancelados: int
     entregadores: str
-    id_coleta: Optional[int] = None
-    origem: Optional[str] = None
-    fechamento_status: Optional[str] = None
-    id_fechamento: Optional[int] = None
 
 
 class ResumoResponse(BaseModel):
@@ -572,7 +427,6 @@ class ResumoResponse(BaseModel):
     sumValor: Decimal
     sumCancelados: int
     sumTotalColetas: int
-    contextoFechamento: Optional[Dict] = None  # { id_fechamento, status, base, periodo_inicio, periodo_fim } quando base+periodo definidos
 
 
 @router.get("/resumo", response_model=ResumoResponse)
@@ -580,7 +434,6 @@ def resumo_coletas(
     base: Optional[str] = Query(None),
     data_inicio: Optional[datetime.date] = Query(None),
     data_fim: Optional[datetime.date] = Query(None),
-    fechamento_status: Optional[str] = Query(None),  # PENDENTE | GERADO | REAJUSTADO
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -590,10 +443,8 @@ def resumo_coletas(
 
     base_norm = base.strip().lower() if base else None
 
-    dt_start = None
+    # intervalo fim (incluindo dia inteiro)
     dt_end = None
-    if data_inicio:
-        dt_start = datetime.datetime.combine(data_inicio, datetime.time.min)
     if data_fim:
         dt_end = datetime.datetime.combine(data_fim, datetime.time(23, 59, 59))
 
@@ -605,8 +456,8 @@ def resumo_coletas(
     if base_norm:
         stmt = stmt.where(func.lower(Coleta.base) == base_norm)
 
-    if dt_start:
-        stmt = stmt.where(Coleta.timestamp >= dt_start)
+    if data_inicio:
+        stmt = stmt.where(Coleta.timestamp >= data_inicio)
 
     if dt_end:
         stmt = stmt.where(Coleta.timestamp <= dt_end)
@@ -626,10 +477,10 @@ def resumo_coletas(
         cancelados_stmt = cancelados_stmt.where(func.lower(Saida.base) == base_norm)
 
     if data_inicio:
-        cancelados_stmt = cancelados_stmt.where(Saida.data >= data_inicio)
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp >= data_inicio)
 
-    if data_fim:
-        cancelados_stmt = cancelados_stmt.where(Saida.data <= data_fim)
+    if dt_end:
+        cancelados_stmt = cancelados_stmt.where(Saida.timestamp <= dt_end)
 
     cancelados_rows = db.scalars(cancelados_stmt).all()
 
@@ -641,51 +492,32 @@ def resumo_coletas(
         mapa_cancelados[key] = mapa_cancelados.get(key, 0) + 1
 
     # ----------------------------------------------------------
-    # Coletas manuais: uma linha por coleta (não agregar)
-    # Coletas codigo: agrupar por DIA + BASE
+    # Agrupar coletas por DIA + BASE
     # ----------------------------------------------------------
-    lista: List[ResumoItem] = []
     agrupado: Dict[str, Dict] = {}
-
     for r in rows:
         dia = r.timestamp.date().isoformat()
         baseKey = (r.base or "").strip().upper()
         key = f"{dia}_{baseKey}"
-        origem = getattr(r, "origem", None) or "codigo"
 
-        if origem == "manual":
-            canc = mapa_cancelados.get(key, 0)
-            lista.append(
-                ResumoItem(
-                    data=dia,
-                    base=baseKey,
-                    shopee=r.shopee,
-                    mercado_livre=r.mercado_livre,
-                    avulso=r.avulso,
-                    valor_total=r.valor_total,
-                    cancelados=canc,
-                    entregadores=(r.username_entregador or "-"),
-                    id_coleta=r.id_coleta,
-                    origem="manual",
-                )
-            )
-        else:
-            if key not in agrupado:
-                agrupado[key] = {
-                    "data": dia,
-                    "base": baseKey,
-                    "shopee": 0,
-                    "mercado_livre": 0,
-                    "avulso": 0,
-                    "valor_total": Decimal("0.00"),
-                    "entregadores": set(),
-                }
-            agrupado[key]["shopee"] += r.shopee
-            agrupado[key]["mercado_livre"] += r.mercado_livre
-            agrupado[key]["avulso"] += r.avulso
-            agrupado[key]["valor_total"] += r.valor_total
-            agrupado[key]["entregadores"].add(r.username_entregador or "-")
+        if key not in agrupado:
+            agrupado[key] = {
+                "data": dia,
+                "base": baseKey,
+                "shopee": 0,
+                "mercado_livre": 0,
+                "avulso": 0,
+                "valor_total": Decimal("0.00"),
+                "entregadores": set(),
+            }
 
+        agrupado[key]["shopee"] += r.shopee
+        agrupado[key]["mercado_livre"] += r.mercado_livre
+        agrupado[key]["avulso"] += r.avulso
+        agrupado[key]["valor_total"] += r.valor_total
+        agrupado[key]["entregadores"].add(r.username_entregador or "-")
+
+    lista: List[ResumoItem] = []
     for key, item in agrupado.items():
         canc = mapa_cancelados.get(key, 0)
         lista.append(
@@ -698,79 +530,10 @@ def resumo_coletas(
                 valor_total=item["valor_total"],
                 cancelados=canc,
                 entregadores=" | ".join(item["entregadores"]),
-                id_coleta=None,
-                origem=None,
             )
         )
 
     lista.sort(key=lambda x: x.data)
-
-    # ----------------------------------------------------------
-    # Enriquecer com fechamento_status e id_fechamento
-    # ----------------------------------------------------------
-    flt_status = (fechamento_status or "").strip().upper() if fechamento_status else None
-    if data_inicio and data_fim:
-        fechamentos = db.scalars(
-            select(BaseFechamento).where(
-                BaseFechamento.sub_base == sub_base_user,
-                BaseFechamento.periodo_fim >= data_inicio,
-                BaseFechamento.periodo_inicio <= data_fim,
-            )
-        ).all()
-        fech_por_key: Dict[tuple, BaseFechamento] = {}
-        for f in fechamentos:
-            base_f = (f.base or "").strip().upper()
-            delta = (f.periodo_fim - f.periodo_inicio).days
-            for d in range(delta + 1):
-                dia = (f.periodo_inicio + timedelta(days=d)).isoformat()
-                fech_por_key[(dia, base_f)] = f
-        for item in lista:
-            key = (item.data, item.base)
-            fech = fech_por_key.get(key)
-            if fech:
-                st = (fech.status or "GERADO").upper()
-                if st == "FECHADO":
-                    st = "GERADO"
-                item.fechamento_status = st
-                item.id_fechamento = fech.id_fechamento
-            else:
-                item.fechamento_status = "PENDENTE"
-                item.id_fechamento = None
-    else:
-        for item in lista:
-            item.fechamento_status = "PENDENTE"
-            item.id_fechamento = None
-
-    # Filtrar por fechamento_status se informado
-    if flt_status:
-        if flt_status == "PENDENTE":
-            lista = [i for i in lista if (i.fechamento_status or "PENDENTE") == "PENDENTE"]
-        else:
-            lista = [i for i in lista if (i.fechamento_status or "").upper() == flt_status]
-
-    # contextoFechamento: quando base + periodo definidos e há um único fechamento cobrindo
-    contexto = None
-    if base_norm and data_inicio and data_fim:
-        base_upper = base_norm.upper() if base_norm else ""
-        fech_unico = db.scalar(
-            select(BaseFechamento).where(
-                BaseFechamento.sub_base == sub_base_user,
-                func.upper(BaseFechamento.base) == base_upper,
-                BaseFechamento.periodo_inicio == data_inicio,
-                BaseFechamento.periodo_fim == data_fim,
-            )
-        )
-        if fech_unico:
-            st = (fech_unico.status or "GERADO").upper()
-            if st == "FECHADO":
-                st = "GERADO"
-            contexto = {
-                "id_fechamento": fech_unico.id_fechamento,
-                "status": st,
-                "base": fech_unico.base,
-                "periodo_inicio": fech_unico.periodo_inicio.isoformat(),
-                "periodo_fim": fech_unico.periodo_fim.isoformat(),
-            }
 
     sumShopee = sum(i.shopee for i in lista)
     sumMercado = sum(i.mercado_livre for i in lista)
@@ -798,5 +561,4 @@ def resumo_coletas(
         sumValor=sumValor,
         sumCancelados=sumCancelados,
         sumTotalColetas=sumTotalColetas,
-        contextoFechamento=contexto,
     )

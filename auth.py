@@ -92,12 +92,10 @@ class UserResponse(BaseModel):
     id: int
     email: Optional[EmailStr]
     username: Optional[str]
-    nome: Optional[str] = None
     contato: Optional[str]
     role: Optional[int]
     sub_base: Optional[str]
     ignorar_coleta: bool = False
-    modo_operacao: Optional[str] = None
 
 
 # ======================================================
@@ -137,7 +135,6 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
         "sub_base": user.sub_base,
         "ignorar_coleta": bool(owner.ignorar_coleta),
         "owner_ativo": bool(owner.ativo),
-        "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
         # valor SEMPRE como string (Decimal-safe)
         "owner_valor": str(owner.valor or 0),
     }
@@ -159,7 +156,6 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     # flags/policies vindas do token
     u.ignorar_coleta = payload.get("ignorar_coleta", False)
     u.owner_valor = Decimal(payload.get("owner_valor", "0"))
-    u.modo_operacao = payload.get("modo_operacao", "codigo")
 
     return u
 
@@ -288,7 +284,6 @@ async def login_set_cookie(
             "role": user.role,
             "sub_base": user.sub_base,
             "ignorar_coleta": owner.ignorar_coleta,
-            "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
         },
     }
 
@@ -312,12 +307,10 @@ async def read_users_me(
         id=current_user.id,
         email=current_user.email,
         username=current_user.username,
-        nome=getattr(current_user, "nome", None),
         contato=current_user.contato,
         role=current_user.role,
         sub_base=current_user.sub_base,
         ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
-        modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
     )
 
 
