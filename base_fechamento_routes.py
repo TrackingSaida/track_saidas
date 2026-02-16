@@ -201,6 +201,48 @@ class FechamentoOut(BaseModel):
     status: str
     criado_em: Optional[datetime] = None
     itens: List[FechamentoItemOut]
+    divergencia_valor: Optional[bool] = None
+    valor_bruto_recalculado: Optional[Decimal] = None
+    valor_cancelados_recalculado: Optional[Decimal] = None
+    valor_final_recalculado: Optional[Decimal] = None
+
+
+# =========================================================
+# GET — Verificar se existe fechamento para base+período
+# =========================================================
+
+class VerificarOut(BaseModel):
+    existe: bool
+    id_fechamento: Optional[int] = None
+    status: Optional[str] = None
+
+
+@router.get("/verificar", response_model=VerificarOut)
+def verificar_fechamento_existente(
+    base: str = Query(..., min_length=1),
+    periodo_inicio: date = Query(...),
+    periodo_fim: date = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Retorna se já existe fechamento para base+período (para perguntar reajuste)."""
+    sub_base = _sub_base_from_token_or_422(current_user)
+    base_norm = base.strip()
+    base_key = base_norm.upper()
+    existente = db.scalar(
+        select(BaseFechamento).where(
+            BaseFechamento.sub_base == sub_base,
+            func.upper(BaseFechamento.base) == base_key,
+            BaseFechamento.periodo_inicio == periodo_inicio,
+            BaseFechamento.periodo_fim == periodo_fim,
+        )
+    )
+    if not existente:
+        return VerificarOut(existe=False)
+    st = (existente.status or "GERADO").upper()
+    if st == "FECHADO":
+        st = "GERADO"
+    return VerificarOut(existe=True, id_fechamento=existente.id_fechamento, status=st)
 
 
 # =========================================================
@@ -373,6 +415,15 @@ def obter_fechamento(
         for i in itens
     ]
 
+    # Recalcular para detectar divergência (coletas alteradas desde o fechamento)
+    divergencia = False
+    valor_bruto_rec = valor_cancelados_rec = valor_final_rec = None
+    itens_rec, valor_bruto_rec, valor_cancelados_rec, valor_final_rec = _build_itens_e_valores(
+        db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim
+    )
+    if valor_bruto_rec != fech.valor_bruto or valor_cancelados_rec != fech.valor_cancelados or valor_final_rec != fech.valor_final:
+        divergencia = True
+
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
         sub_base=fech.sub_base,
@@ -385,6 +436,10 @@ def obter_fechamento(
         status=fech.status,
         criado_em=fech.criado_em,
         itens=itens_out,
+        divergencia_valor=divergencia if divergencia else None,
+        valor_bruto_recalculado=valor_bruto_rec if divergencia else None,
+        valor_cancelados_recalculado=valor_cancelados_rec if divergencia else None,
+        valor_final_recalculado=valor_final_rec if divergencia else None,
     )
 
 

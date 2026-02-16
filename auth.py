@@ -93,6 +93,7 @@ class UserResponse(BaseModel):
     email: Optional[EmailStr]
     username: Optional[str]
     nome: Optional[str] = None
+    sobrenome: Optional[str] = None
     contato: Optional[str]
     role: Optional[int]
     sub_base: Optional[str]
@@ -303,16 +304,29 @@ async def logout(response: Response):
     return {"ok": True}
 
 
+def _nome_exibicao(user: User) -> tuple[Optional[str], Optional[str]]:
+    """Retorna (nome, sobrenome) para exibição. Quando ambos vazios, deriva do username."""
+    nome_val = (getattr(user, "nome", None) or "").strip()
+    sobrenome_val = (getattr(user, "sobrenome", None) or "").strip()
+    if not nome_val and not sobrenome_val and (user.username or "").strip():
+        # Fallback: formata username como nome (ex: joao.silva -> Joao Silva)
+        partes = (user.username or "").replace(".", " ").replace("_", " ").split()
+        nome_val = " ".join(p.capitalize() for p in partes) if partes else ""
+    return (nome_val or None, sobrenome_val or None)
+
+
 @router.get("/me", response_model=UserResponse)
 async def read_users_me(
     request: Request,
     current_user: User = Depends(get_current_user),
 ):
+    nome_val, sobrenome_val = _nome_exibicao(current_user)
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
         username=current_user.username,
-        nome=getattr(current_user, "nome", None),
+        nome=nome_val,
+        sobrenome=sobrenome_val,
         contato=current_user.contato,
         role=current_user.role,
         sub_base=current_user.sub_base,
