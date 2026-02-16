@@ -9,7 +9,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -421,6 +421,8 @@ def listar_saidas(
     entregador: Optional[str] = Query(None),
     status_: Optional[str] = Query(None, alias="status"),
     codigo: Optional[str] = Query(None),
+    servico: Optional[str] = Query(None),
+    localizar: Optional[str] = Query(None),
     limit: Optional[int] = Query(None),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -446,7 +448,22 @@ def listar_saidas(
         st_norm = status_.strip().lower()
         stmt = stmt.where(func.unaccent(func.lower(Saida.status)) == func.unaccent(st_norm))
 
-    if codigo and codigo.strip():
+    if servico and servico.strip() and servico.lower() != "(todos)":
+        srv_norm = servico.strip().lower()
+        stmt = stmt.where(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
+
+    if localizar and localizar.strip():
+        q = f"%{localizar.strip()}%"
+        or_conds = or_(
+            Saida.base.ilike(q),
+            Saida.username.ilike(q),
+            Saida.entregador.ilike(q),
+            Saida.codigo.ilike(q),
+            Saida.servico.ilike(q),
+            Saida.status.ilike(q),
+        )
+        stmt = stmt.where(or_conds)
+    elif codigo and codigo.strip():
         stmt = stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
 
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
