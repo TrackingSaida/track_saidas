@@ -131,22 +131,34 @@ class PasswordChangePayload(BaseModel):
 # ============================================================
 
 def _user_to_out(user: User) -> UserOut:
-    """Serializa User para UserOut incluindo motoboy quando role=4."""
+    """Serializa User para UserOut incluindo motoboy quando role=4.
+    Usa fallbacks para campos obrigatórios quando o registro vem da migração
+    ou tem dados incompletos, evitando 500 ao listar usuários."""
+    # Fallbacks para evitar quebra de serialização (ex.: usuários migrados com nulls)
+    email_val = (user.email or "").strip()
+    if not email_val or "@" not in email_val:
+        email_val = "sem-email@migrado.local"
+    username_val = (user.username or "").strip() or "—"
+    contato_val = (user.contato or "").strip() or "—"
+
     data: dict[str, Any] = {
         "id": user.id,
-        "email": user.email,
-        "username": user.username,
-        "contato": user.contato,
-        "status": user.status,
+        "email": email_val,
+        "username": username_val,
+        "contato": contato_val,
+        "status": getattr(user, "status", True),
         "sub_base": user.sub_base,
         "nome": user.nome,
         "sobrenome": user.sobrenome,
-        "role": user.role,
-        "coletador": user.coletador,
+        "role": getattr(user, "role", 2),
+        "coletador": getattr(user, "coletador", False),
         "motoboy": None,
     }
-    if user.role == 4 and hasattr(user, "motoboy") and user.motoboy:
-        data["motoboy"] = MotoboyOut.model_validate(user.motoboy)
+    if getattr(user, "role", None) == 4 and hasattr(user, "motoboy") and user.motoboy:
+        try:
+            data["motoboy"] = MotoboyOut.model_validate(user.motoboy)
+        except Exception:
+            logger.warning("Motoboy id=%s serialization skipped for user id=%s", getattr(user.motoboy, "id_motoboy", None), user.id)
     return UserOut(**data)
 
 
@@ -314,7 +326,7 @@ def list_users(
     current_user: User = Depends(get_current_user)
 ):
     """Lista usuários apenas da mesma sub_base do solicitante (sub_base obtida do banco)."""
-    if current_user.role not in (0, 1):
+    if getattr(current_user, "role", None) not in (0, 1):
         raise HTTPException(403, "Apenas admin podem listar usuários.")
 
     sub_base = _resolve_user_sub_base(db, current_user)
@@ -323,7 +335,17 @@ def list_users(
     users = db.scalars(
         select(User).options(joinedload(User.motoboy)).where(User.sub_base == sub_base)
     ).all()
-    return [_user_to_out(u) for u in users]
+    out = []
+    for u in users:
+        try:
+            out.append(_user_to_out(u))
+        except Exception as e:
+            logger.exception("list_users: falha ao serializar user id=%s email=%s", getattr(u, "id", None), getattr(u, "email", None))
+            raise HTTPException(
+                500,
+                f"Erro ao listar usuários: registro inválido (id={getattr(u, 'id', '?')}). Corrija os dados no banco ou contate o suporte."
+            ) from e
+    return out
 
 
 # ============================================================

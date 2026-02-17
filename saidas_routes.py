@@ -81,6 +81,7 @@ class SaidaLerIn(BaseModel):
     codigo: str = Field(min_length=1)
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
+    motoboy_id: Optional[int] = None  # Prioridade sobre entregador_id quando preenchido
     servico: str = Field(min_length=1)
     # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
     registrar_nao_coletado: bool = False
@@ -173,6 +174,17 @@ def _resolve_entregador(
         status_code=422,
         detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe entregador_id ou entregador (nome)."},
     )
+
+
+def _get_motoboy_nome(db: Session, motoboy: Motoboy) -> str:
+    """Retorna nome do motoboy (User) para exibição."""
+    if not motoboy or not motoboy.user_id:
+        return "Motoboy"
+    u = db.get(User, motoboy.user_id)
+    if not u:
+        return "Motoboy"
+    nome = f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or ""
+    return nome or f"Motoboy {motoboy.id_motoboy}"
 
 
 def _resolve_motoboy_for_subbase(db: Session, sub_base: str, motoboy_id: int) -> Motoboy:
@@ -352,11 +364,25 @@ def ler_saida(
     if not sub_base or not username:
         raise HTTPException(401, "Usuário inválido.")
 
-    entregador_id, entregador_nome = _resolve_entregador(
-        db, sub_base,
-        entregador_id=payload.entregador_id,
-        entregador_nome=payload.entregador,
-    )
+    motoboy_id: Optional[int] = None
+    entregador_id: Optional[int] = None
+    entregador_nome: str = ""
+
+    if payload.motoboy_id is not None:
+        motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        motoboy_id = motoboy.id_motoboy
+        entregador_nome = _get_motoboy_nome(db, motoboy)
+    elif payload.entregador_id is not None or (payload.entregador and payload.entregador.strip()):
+        entregador_id, entregador_nome = _resolve_entregador(
+            db, sub_base,
+            entregador_id=payload.entregador_id,
+            entregador_nome=payload.entregador,
+        )
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe motoboy_id ou entregador_id/entregador."},
+        )
 
     codigo = payload.codigo.strip()
     servico = payload.servico.strip().title()
@@ -378,7 +404,9 @@ def ler_saida(
                 content={"code": "NAO_COLETADO", "message": "Código não coletado."},
             )
         # status: "saiu" quando ignorar_coleta; "não coletado" quando usuário confirmou registrar mesmo assim
-        status_inicial = "não coletado" if payload.registrar_nao_coletado else "saiu"
+        status_inicial = "não coletado" if payload.registrar_nao_coletado else (
+            STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        )
         qr_raw = getattr(payload, "qr_payload_raw", None)
         store_qr = _should_store_qr_payload_raw(servico, qr_raw)
         try:
@@ -387,6 +415,7 @@ def ler_saida(
                 username=username,
                 entregador=entregador_nome,
                 entregador_id=entregador_id,
+                motoboy_id=motoboy_id,
                 codigo=codigo,
                 servico=servico,
                 status=status_inicial,
@@ -419,10 +448,12 @@ def ler_saida(
     status_norm = normalizar_status_saida(existente.status)
 
     if status_norm == "coletado":
-        # coletado → UPDATE para saiu
-        existente.status = "saiu"
+        # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
+        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
+        if motoboy_id is not None:
+            existente.motoboy_id = motoboy_id
         try:
             db.commit()
             db.refresh(existente)
@@ -432,11 +463,14 @@ def ler_saida(
             raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "saiu":
-        # mesmo entregador → 200 idempotente (sem 409)
-        mesmo_ent = (
-            (entregador_id is not None and existente.entregador_id == entregador_id)
-            or _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
-        )
+        # mesmo entregador/motoboy → 200 idempotente (sem 409)
+        mesmo_ent = False
+        if motoboy_id is not None:
+            mesmo_ent = existente.motoboy_id == motoboy_id
+        if not mesmo_ent and entregador_id is not None:
+            mesmo_ent = existente.entregador_id == entregador_id
+        if not mesmo_ent:
+            mesmo_ent = _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
         if mesmo_ent:
             return SaidaOut.model_validate(existente)
         # outro entregador → 409 para front acionar PATCH de troca.
@@ -605,6 +639,7 @@ def atualizar_saida(
     if payload.motoboy_id is not None:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         obj.motoboy_id = motoboy.id_motoboy
+        obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
         obj.status = STATUS_SAIU_PARA_ENTREGA
 
     if payload.status is not None:
