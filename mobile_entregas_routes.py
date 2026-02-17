@@ -55,6 +55,7 @@ class EntregaListItem(BaseModel):
     codigo: Optional[str]
     status: str
     exibicao: str  # "Pendente" | "Entregue" | "Ausente"
+    servico: Optional[str] = None  # Shopee | Mercado Livre | Flex | Avulso
     cliente: Optional[str] = None
     bairro: Optional[str] = None
     endereco: Optional[str] = None
@@ -111,6 +112,16 @@ def _get_detail_for_saida(db: Session, id_saida: int) -> Optional[SaidaDetail]:
     )
 
 
+def _servico_tipo(serv: Optional[str]) -> str:
+    """Retorna Shopee | Flex | Avulso para exibição."""
+    s = (serv or "").strip().lower()
+    if "shopee" in s:
+        return "Shopee"
+    if "mercado" in s or "ml" in s or "flex" in s:
+        return "Flex"
+    return "Avulso"
+
+
 def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
     endereco = None
     if detail and (detail.dest_rua or detail.dest_numero):
@@ -121,6 +132,7 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "codigo": s.codigo,
         "status": s.status or "",
         "exibicao": _status_exibicao(s.status),
+        "servico": s.servico,
         "cliente": detail.dest_nome if detail else None,
         "bairro": detail.dest_bairro if detail else None,
         "endereco": endereco,
@@ -376,6 +388,22 @@ def scan_codigo(
             "id_saida": saida.id_saida,
         },
     )
+
+
+# ============================================================
+# POST /mobile/entrega/{id}/desatribuir
+# ============================================================
+@router.post("/entrega/{id_saida}/desatribuir")
+def desatribuir_entrega(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Remove atribuição: motoboy_id = null. Apenas para entregas do próprio motoboy."""
+    s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    s.motoboy_id = None
+    db.commit()
+    return {"ok": True, "id_saida": id_saida}
 
 
 # ============================================================
