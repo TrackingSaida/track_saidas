@@ -202,6 +202,8 @@ class Saida(Base):
     username = Column(Text, nullable=True)
     entregador_id = Column(BigInteger, nullable=True)
     entregador = Column(Text, nullable=True)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="SET NULL"), nullable=True)
+    data_hora_entrega = Column(DateTime(timezone=False), nullable=True)
 
     codigo = Column(Text, nullable=True)
     servico = Column(Text, nullable=True, server_default=text("'padrao'::text"))
@@ -498,6 +500,39 @@ class SaidaDetail(Base):
 
     def __repr__(self):
         return f"<SaidaDetail id_detail={self.id_detail} id_saida={self.id_saida}>"
+
+
+# ==========================
+# Tabela: motivo_ausencia
+# ==========================
+class MotivoAusencia(Base):
+    __tablename__ = "motivo_ausencia"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    descricao = Column(Text, nullable=False)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+
+    def __repr__(self) -> str:
+        return f"<MotivoAusencia id={self.id} descricao={self.descricao!r}>"
+
+
+# ==========================
+# Tabela: saida_historico
+# ==========================
+class SaidaHistorico(Base):
+    __tablename__ = "saida_historico"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_saida = Column(BigInteger, nullable=False, index=True)
+    evento = Column(Text, nullable=False)
+    motoboy_id_anterior = Column(BigInteger, nullable=True)
+    motoboy_id_novo = Column(BigInteger, nullable=True)
+    user_id = Column(BigInteger, nullable=True)
+    timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    payload = Column(Text, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<SaidaHistorico id={self.id} id_saida={self.id_saida} evento={self.evento!r}>"
 
 
 @event.listens_for(Saida, "after_update")

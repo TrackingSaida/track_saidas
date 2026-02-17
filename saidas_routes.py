@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem
+from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase
 
 
 # ============================================================
@@ -44,6 +44,8 @@ class SaidaOut(BaseModel):
     sub_base: Optional[str]
     username: Optional[str]
     entregador: Optional[str]
+    motoboy_id: Optional[int] = None
+    data_hora_entrega: Optional[datetime] = None
     codigo: Optional[str]
     servico: Optional[str]
     status: Optional[str]
@@ -56,6 +58,7 @@ class SaidaGridItem(BaseModel):
     timestamp: datetime
     username: Optional[str]
     entregador: Optional[str]
+    motoboy_id: Optional[int] = None
     codigo: Optional[str]
     servico: Optional[str]
     status: Optional[str]
@@ -66,6 +69,7 @@ class SaidaGridItem(BaseModel):
 class SaidaUpdate(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
+    motoboy_id: Optional[int] = None
     status: Optional[str] = None
     codigo: Optional[str] = None
     servico: Optional[str] = None
@@ -94,19 +98,40 @@ def _normalizar_nome(s: str) -> str:
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 
+# Status canônicos do fluxo motoboy (armazenados em maiúsculas)
+STATUS_SAIU_PARA_ENTREGA = "SAIU_PARA_ENTREGA"
+STATUS_EM_ROTA = "EM_ROTA"
+STATUS_ENTREGUE = "ENTREGUE"
+STATUS_AUSENTE = "AUSENTE"
+STATUS_CANCELADO = "CANCELADO"
+
+
 def normalizar_status_saida(raw: Optional[str]) -> str:
-    """Status canônico em lowercase. Banco é fonte da verdade."""
-    s = (raw or "").strip().lower()
+    """Status canônico. Aceita novos status (motoboy) e legado (saiu, cancelado, etc.)."""
+    s = (raw or "").strip()
     if not s:
         return "saiu"
-    if s in ("saiu", "saiu para entrega", "saiu pra entrega"):
+    lower = s.lower()
+    # Legado
+    if lower in ("saiu", "saiu para entrega", "saiu pra entrega"):
         return "saiu"
-    if s in ("cancelado", "cancelada"):
-        return "cancelado"
-    if s in ("coletado", "coletada"):
+    if lower in ("cancelado", "cancelada"):
+        return STATUS_CANCELADO
+    if lower in ("coletado", "coletada"):
         return "coletado"
-    if s in ("não coletado", "nao coletado", "não coletada", "nao coletada"):
+    if lower in ("não coletado", "nao coletado", "não coletada", "nao coletada"):
         return "não coletado"
+    # Novos status motoboy (aceitar em maiúsculas ou lowercase)
+    if lower in ("saiu_para_entrega", "saiu para entrega"):
+        return STATUS_SAIU_PARA_ENTREGA
+    if lower == "em_rota":
+        return STATUS_EM_ROTA
+    if lower == "entregue":
+        return STATUS_ENTREGUE
+    if lower == "ausente":
+        return STATUS_AUSENTE
+    if lower == "cancelado":
+        return STATUS_CANCELADO
     return s
 
 
@@ -148,6 +173,29 @@ def _resolve_entregador(
         status_code=422,
         detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe entregador_id ou entregador (nome)."},
     )
+
+
+def _resolve_motoboy_for_subbase(db: Session, sub_base: str, motoboy_id: int) -> Motoboy:
+    """Retorna o Motoboy se existir e estiver vinculado à sub_base. Levanta 422 caso contrário."""
+    motoboy = db.get(Motoboy, motoboy_id)
+    if not motoboy:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "MOTOBOY_NAO_ENCONTRADO", "message": "Motoboy não encontrado."},
+        )
+    vinculado = db.scalar(
+        select(MotoboySubBase).where(
+            MotoboySubBase.motoboy_id == motoboy_id,
+            MotoboySubBase.sub_base == sub_base,
+            MotoboySubBase.ativo.is_(True),
+        )
+    )
+    if not vinculado:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "MOTOBOY_NAO_VINCULADO", "message": "Motoboy não vinculado a esta sub_base."},
+        )
+    return motoboy
 
 
 def _get_owned_saida(db: Session, sub_base: str, id_saida: int) -> Saida:
@@ -507,6 +555,7 @@ def listar_saidas(
                 "timestamp": r.timestamp,
                 "username": r.username,
                 "entregador": r.entregador,
+                "motoboy_id": getattr(r, "motoboy_id", None),
                 "codigo": r.codigo,
                 "servico": r.servico,
                 "status": r.status,
@@ -552,6 +601,11 @@ def atualizar_saida(
         )
         obj.entregador_id = entregador_id
         obj.entregador = entregador_nome
+
+    if payload.motoboy_id is not None:
+        motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        obj.motoboy_id = motoboy.id_motoboy
+        obj.status = STATUS_SAIU_PARA_ENTREGA
 
     if payload.status is not None:
         novo_status = normalizar_status_saida(payload.status)
