@@ -31,7 +31,9 @@ from saidas_routes import (
     STATUS_ENTREGUE,
     STATUS_AUSENTE,
     STATUS_CANCELADO,
+    _should_store_qr_payload_raw,
 )
+from codigo_normalizer import normalize_codigo
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 
@@ -345,12 +347,17 @@ def scan_codigo(
     """
     Escaneia código: se saída não tem motoboy -> atribui ao logado e retorna 200.
     Se já tem outro motoboy -> retorna 409 com conflito: true, motoboy_atual.
+    Normaliza o código bruto (JSON Shopee, ML, etc.) antes do lookup.
     """
-    codigo = body.codigo.strip()
+    raw = body.codigo.strip()
     sub_base = user.sub_base
     motoboy_id = user.motoboy_id
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    codigo, servico, qr_payload_raw = normalize_codigo(raw)
+    if codigo is None:
+        raise HTTPException(status_code=422, detail="Código inválido.")
 
     saida = db.scalar(
         select(Saida).where(
@@ -360,6 +367,11 @@ def scan_codigo(
     )
     if not saida:
         raise HTTPException(status_code=404, detail="Código não encontrado.")
+
+    # Atualiza qr_payload_raw para ML/Flex quando vazio (etiqueta)
+    if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
+        if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
+            saida.qr_payload_raw = qr_payload_raw.strip()
 
     if saida.motoboy_id is None:
         saida.motoboy_id = motoboy_id
