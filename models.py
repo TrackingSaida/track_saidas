@@ -49,6 +49,13 @@ class User(Base):
     username_entregador = Column(Text, nullable=True)  # espelha o username do entregador quando aplicável
     role = Column(Integer, nullable=False, server_default="2")
 
+    motoboy = relationship(
+        "Motoboy",
+        uselist=False,
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
     def __repr__(self) -> str:
         return (
             f"<User id={self.id} email={self.email!r} username={self.username!r} "
@@ -77,6 +84,56 @@ class Owner(Base):
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
+
+
+# ==========================
+# Tabela: motoboys
+# ==========================
+class Motoboy(Base):
+    __tablename__ = "motoboys"
+
+    id_motoboy = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+
+    sub_base = Column(Text)
+    documento = Column(Text)
+
+    rua = Column(Text, nullable=False)
+    numero = Column(Text, nullable=False)
+    complemento = Column(Text)
+    bairro = Column(Text, nullable=False)
+    cidade = Column(Text, nullable=False)
+    estado = Column(Text)
+    cep = Column(Text, nullable=False)
+
+    ativo = Column(Boolean, default=True)
+    data_cadastro = Column(Date)
+
+    pode_ler_coleta = Column(Boolean, default=False, nullable=False)
+    pode_ler_saida = Column(Boolean, default=True, nullable=False)
+
+    user = relationship("User", back_populates="motoboy")
+    sub_bases = relationship("MotoboySubBase", back_populates="motoboy", cascade="all, delete-orphan")
+
+    def __repr__(self) -> str:
+        return f"<Motoboy id_motoboy={self.id_motoboy} user_id={self.user_id}>"
+
+
+# ==========================
+# Tabela: motoboy_sub_base
+# ==========================
+class MotoboySubBase(Base):
+    __tablename__ = "motoboy_sub_base"
+
+    id = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    ativo = Column(Boolean, default=True)
+
+    motoboy = relationship("Motoboy", back_populates="sub_bases")
+
+    def __repr__(self) -> str:
+        return f"<MotoboySubBase id={self.id} motoboy_id={self.motoboy_id} sub_base={self.sub_base!r}>"
 
 
 # ==========================

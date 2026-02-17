@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from typing import Optional
+from datetime import date
+from typing import Optional, List, Any
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import get_db
 from auth import get_current_user, get_password_hash, verify_password
-from models import User, Owner
+from models import User, Owner, Motoboy, MotoboySubBase
 from base import _resolve_user_sub_base
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -22,6 +23,21 @@ logger = logging.getLogger("routes.users")
 # Schemas
 # ============================================================
 
+class MotoboyOut(BaseModel):
+    documento: Optional[str] = None
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
+    cep: Optional[str] = None
+    pode_ler_coleta: bool = False
+    pode_ler_saida: bool = True
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=4)
@@ -31,8 +47,20 @@ class UserCreate(BaseModel):
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
 
-    # frontend só permite: admin=1, operador=2, coletador=3
+    # admin=1, operador=2, coletador=3 (legado), motoboy=4
     role: int = Field(default=2)
+
+    # Campos obrigatórios quando role=4
+    documento: Optional[str] = None
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
+    cep: Optional[str] = None
+    pode_ler_coleta: Optional[bool] = None
+    pode_ler_saida: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -49,12 +77,13 @@ class UserOut(BaseModel):
     sobrenome: Optional[str] = None
     role: Optional[int] = None
     coletador: Optional[bool] = None
+    motoboy: Optional[MotoboyOut] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class UserFull(UserOut):
-    pass
+    ignorar_coleta: Optional[bool] = None  # para desabilitar checkbox no frontend
 
 
 class AdminUserUpdate(BaseModel):
@@ -64,7 +93,19 @@ class AdminUserUpdate(BaseModel):
     contato: Optional[str] = None
     email: Optional[EmailStr] = None
     status: Optional[bool] = None
-    role: Optional[int] = None  # 1,2 ou 3
+    role: Optional[int] = None  # 1, 2, 3 ou 4
+
+    # Campos motoboy (quando role=4)
+    documento: Optional[str] = None
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
+    cep: Optional[str] = None
+    pode_ler_coleta: Optional[bool] = None
+    pode_ler_saida: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -85,6 +126,30 @@ class PasswordChangePayload(BaseModel):
 
 
 # ============================================================
+# Helpers
+# ============================================================
+
+def _user_to_out(user: User) -> UserOut:
+    """Serializa User para UserOut incluindo motoboy quando role=4."""
+    data: dict[str, Any] = {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "contato": user.contato,
+        "status": user.status,
+        "sub_base": user.sub_base,
+        "nome": user.nome,
+        "sobrenome": user.sobrenome,
+        "role": user.role,
+        "coletador": user.coletador,
+        "motoboy": None,
+    }
+    if user.role == 4 and hasattr(user, "motoboy") and user.motoboy:
+        data["motoboy"] = MotoboyOut.model_validate(user.motoboy)
+    return UserOut(**data)
+
+
+# ============================================================
 # POST /users — CRIAR USUÁRIO COM SUB_BASE AUTOMÁTICA
 # ============================================================
 
@@ -94,7 +159,7 @@ def create_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Cria usuário herdando sub_base e setando coletador baseado no role."""
+    """Cria usuário herdando sub_base e setando coletador baseado no role. Role 4 = Motoboy."""
 
     sub_base = current_user.sub_base
     if not sub_base:
@@ -114,7 +179,14 @@ def create_user(
     if db.scalar(select(User).where(User.username == body.username)):
         raise HTTPException(409, "Username já existe.")
 
-    # --- MAPEAR ROLE → COLETADOR ---
+    # --- ROLE 4 (Motoboy): validar obrigatórios ---
+    if body.role == 4:
+        obrigatorios = ["documento", "rua", "numero", "bairro", "cidade", "cep"]
+        faltando = [f for f in obrigatorios if not (getattr(body, f, None) or "").strip()]
+        if faltando:
+            raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
+
+    # --- MAPEAR ROLE → COLETADOR (legado) ---
     coletador = (body.role == 3)
 
     try:
@@ -132,6 +204,36 @@ def create_user(
         )
 
         db.add(new_user)
+        db.flush()
+
+        if body.role == 4:
+            pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else False
+            pode_ler_saida = body.pode_ler_saida if body.pode_ler_saida is not None else True
+            if owner.ignorar_coleta:
+                pode_ler_coleta = False
+
+            motoboy = Motoboy(
+                user_id=new_user.id,
+                sub_base=sub_base,
+                documento=(body.documento or "").strip(),
+                rua=(body.rua or "").strip(),
+                numero=(body.numero or "").strip(),
+                complemento=(body.complemento or "").strip() or None,
+                bairro=(body.bairro or "").strip(),
+                cidade=(body.cidade or "").strip(),
+                estado=(body.estado or "").strip() or None,
+                cep=(body.cep or "").strip(),
+                ativo=True,
+                data_cadastro=date.today(),
+                pode_ler_coleta=pode_ler_coleta,
+                pode_ler_saida=pode_ler_saida,
+            )
+            db.add(motoboy)
+            db.flush()
+
+            sb = MotoboySubBase(motoboy_id=motoboy.id_motoboy, sub_base=sub_base, ativo=True)
+            db.add(sb)
+
         db.commit()
         db.refresh(new_user)
 
@@ -148,8 +250,22 @@ def create_user(
 # ============================================================
 
 @router.get("/me", response_model=UserFull)
-def read_current_user(current_user: User = Depends(get_current_user)):
-    return current_user
+def read_current_user(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user = db.scalars(
+        select(User).options(joinedload(User.motoboy)).where(User.id == current_user.id)
+    ).first()
+    if not user:
+        raise HTTPException(404, "Usuário não encontrado")
+    out = _user_to_out(user)
+    full = UserFull.model_validate(out)
+    if user.sub_base:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
+        if owner:
+            full.ignorar_coleta = bool(owner.ignorar_coleta)
+    return full
 
 
 # ============================================================
@@ -168,9 +284,10 @@ def list_users(
     sub_base = _resolve_user_sub_base(db, current_user)
     if not sub_base or not str(sub_base).strip():
         raise HTTPException(403, "Usuário sem sub_base definida. Faça login novamente.")
-    return db.scalars(
-        select(User).where(User.sub_base == sub_base)
+    users = db.scalars(
+        select(User).options(joinedload(User.motoboy)).where(User.sub_base == sub_base)
     ).all()
+    return [_user_to_out(u) for u in users]
 
 
 # ============================================================
@@ -183,14 +300,16 @@ def get_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    user = db.get(User, user_id)
+    user = db.scalars(
+        select(User).options(joinedload(User.motoboy)).where(User.id == user_id)
+    ).first()
     if not user:
         raise HTTPException(404, "Usuário não encontrado")
 
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
 
-    return user
+    return _user_to_out(user)
 
 
 # ============================================================
@@ -207,29 +326,76 @@ def admin_update_user(
     if current_user.role not in (0, 1):
         raise HTTPException(403, "Acesso negado.")
 
-    user = db.get(User, user_id)
+    user = db.scalars(
+        select(User).options(joinedload(User.motoboy)).where(User.id == user_id)
+    ).first()
     if not user:
         raise HTTPException(404, "Usuário não encontrado")
 
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
 
+    owner = db.scalar(select(Owner).where(Owner.sub_base == current_user.sub_base))
     updates = payload.model_dump(exclude_unset=True)
 
-    # ROLE → define COLETADOR
+    # ROLE → define COLETADOR (legado)
     if "role" in updates:
         user.role = updates["role"]
         user.coletador = (updates["role"] == 3)
 
-    # outros campos
+    # Campos User
+    user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role"}
     for field, value in updates.items():
-        if field == "role":
-            continue
-        setattr(user, field, value)
+        if field in user_fields:
+            setattr(user, field, value)
+
+    # Campos Motoboy (role=4)
+    motoboy_fields = {
+        "documento", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
+        "pode_ler_coleta", "pode_ler_saida"
+    }
+    sub_base = current_user.sub_base or ""
+    if user.role == 4:
+        if user.motoboy:
+            for field in motoboy_fields:
+                if field in updates:
+                    val = updates[field]
+                    if field == "pode_ler_coleta" and owner and owner.ignorar_coleta:
+                        val = False
+                    setattr(user.motoboy, field, val)
+        else:
+            # Criar Motoboy ao mudar role para 4
+            obrigatorios = ["documento", "rua", "numero", "bairro", "cidade", "cep"]
+            faltando = [f for f in obrigatorios if not (updates.get(f) or "").strip()]
+            if faltando:
+                raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
+            pode_ler_coleta = updates.get("pode_ler_coleta", False) or False
+            pode_ler_saida = updates.get("pode_ler_saida", True) if updates.get("pode_ler_saida") is not None else True
+            if owner and owner.ignorar_coleta:
+                pode_ler_coleta = False
+            motoboy = Motoboy(
+                user_id=user.id,
+                sub_base=sub_base,
+                documento=(updates.get("documento") or "").strip(),
+                rua=(updates.get("rua") or "").strip(),
+                numero=(updates.get("numero") or "").strip(),
+                complemento=(updates.get("complemento") or "").strip() or None,
+                bairro=(updates.get("bairro") or "").strip(),
+                cidade=(updates.get("cidade") or "").strip(),
+                estado=(updates.get("estado") or "").strip() or None,
+                cep=(updates.get("cep") or "").strip(),
+                ativo=True,
+                data_cadastro=date.today(),
+                pode_ler_coleta=pode_ler_coleta,
+                pode_ler_saida=pode_ler_saida,
+            )
+            db.add(motoboy)
+            db.flush()
+            db.add(MotoboySubBase(motoboy_id=motoboy.id_motoboy, sub_base=sub_base, ativo=True))
 
     db.commit()
     db.refresh(user)
-    return user
+    return _user_to_out(user)
 
 
 # ============================================================

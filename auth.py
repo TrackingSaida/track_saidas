@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, or_
 
 from db import get_db
-from models import User, Owner
+from models import User, Owner, Motoboy, MotoboySubBase
 
 
 # ======================================================
@@ -88,6 +88,17 @@ class UserLogin(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class MotoboyLogin(BaseModel):
+    identifier: str = Field(min_length=1, description="Email, username ou contato")
+    password: str
+
+
+class MotoboySelectSubBase(BaseModel):
+    identifier: str = Field(min_length=1)
+    password: str
+    sub_base: str = Field(min_length=1)
+
+
 class UserResponse(BaseModel):
     id: int
     email: Optional[EmailStr]
@@ -140,6 +151,29 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
         "owner_ativo": bool(owner.ativo),
         "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
         # valor SEMPRE como string (Decimal-safe)
+        "owner_valor": str(owner.valor or 0),
+    }
+
+
+def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -> Dict[str, Any]:
+    """Claims para JWT de motoboy (role=4)."""
+    pode_ler_coleta = motoboy.pode_ler_coleta
+    if owner.ignorar_coleta:
+        pode_ler_coleta = False
+    return {
+        "sub": _subject(user),
+        "uid": user.id,
+        "username": user.username,
+        "email": user.email,
+        "contato": user.contato,
+        "role": 4,
+        "motoboy_id": motoboy.id_motoboy,
+        "sub_base": sub_base,
+        "pode_ler_coleta": bool(pode_ler_coleta),
+        "pode_ler_saida": bool(motoboy.pode_ler_saida),
+        "ignorar_coleta": bool(owner.ignorar_coleta),
+        "owner_ativo": bool(owner.ativo),
+        "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
         "owner_valor": str(owner.valor or 0),
     }
 
@@ -302,6 +336,91 @@ async def logout(response: Response):
         domain=COOKIE_DOMAIN,
     )
     return {"ok": True}
+
+
+# ======================================================
+# LOGIN MOTOBOY (role=4) — mobile
+# ======================================================
+
+@router.post("/motoboy-login")
+async def motoboy_login(
+    body: MotoboyLogin,
+    db: Session = Depends(get_db),
+):
+    """
+    Login para motoboy (role=4).
+    Se tiver 1 sub_base: retorna token.
+    Se tiver múltiplas: retorna multiple_sub_base=true e lista para seleção.
+    """
+    user = authenticate_user(db, body.identifier, body.password)
+    if not user:
+        raise HTTPException(401, "Login ou senha incorretos")
+
+    if user.role != 4:
+        raise HTTPException(403, "Acesso restrito a motoboys.")
+
+    motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == user.id))
+    if not motoboy:
+        raise HTTPException(404, "Perfil de motoboy não encontrado.")
+
+    sub_bases_rows = db.scalars(
+        select(MotoboySubBase.sub_base).where(
+            MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+            MotoboySubBase.ativo.is_(True),
+        )
+    ).all()
+    sub_bases = [s for s in sub_bases_rows if s]
+
+    if len(sub_bases) > 1:
+        return {"multiple_sub_base": True, "sub_bases": sub_bases}
+
+    if len(sub_bases) == 0:
+        raise HTTPException(403, "Motoboy sem sub_base ativa vinculada.")
+
+    sub_base = sub_bases[0]
+    owner = _owner_for_sub_base(db, sub_base)
+    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token(_claims_motoboy(user, motoboy, owner, sub_base), expires)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@router.post("/motoboy-select-subbase", response_model=Token)
+async def motoboy_select_subbase(
+    body: MotoboySelectSubBase,
+    db: Session = Depends(get_db),
+):
+    """
+    Após motoboy-login com multiple_sub_base, o app envia
+    identifier + password + sub_base escolhida para obter o token.
+    """
+    user = authenticate_user(db, body.identifier, body.password)
+    if not user:
+        raise HTTPException(401, "Login ou senha incorretos")
+
+    if user.role != 4:
+        raise HTTPException(403, "Acesso restrito a motoboys.")
+
+    motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == user.id))
+    if not motoboy:
+        raise HTTPException(404, "Perfil de motoboy não encontrado.")
+
+    existe = db.scalar(
+        select(MotoboySubBase).where(
+            MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+            MotoboySubBase.sub_base == body.sub_base.strip(),
+            MotoboySubBase.ativo.is_(True),
+        )
+    )
+    if not existe:
+        raise HTTPException(400, "Sub_base inválida ou inativa para este motoboy.")
+
+    owner = _owner_for_sub_base(db, body.sub_base.strip())
+    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token(
+        _claims_motoboy(user, motoboy, owner, body.sub_base.strip()),
+        expires,
+    )
+    return {"access_token": token, "token_type": "bearer"}
 
 
 def _nome_exibicao(user: User) -> tuple[Optional[str], Optional[str]]:
