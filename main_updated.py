@@ -112,13 +112,13 @@ from coletas import router as coletas_router
 from base_fechamento_routes import router as base_fechamento_router
 from routes_ui import router as ui_router
 from ml_routes import router as ml_router
-from entregador_entregas_routes import router as entregador_entregas_router
 from signup_routes import router as signup_router
 from shopee_routes import router as shopee_router
 from logs import router as logs_router
 from contabilidade_routes import router as contabilidade_router
 from etiquetas_routes import router as etiquetas_router
 from dashboard_routes import router as dashboard_router
+from mobile_entregas_routes import router as mobile_entregas_router
 
 app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
@@ -132,9 +132,9 @@ app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
+app.include_router(mobile_entregas_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
-app.include_router(entregador_entregas_router, prefix=API_PREFIX)
 app.include_router(signup_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)

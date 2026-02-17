@@ -24,6 +24,7 @@ logger = logging.getLogger("routes.users")
 # ============================================================
 
 class MotoboyOut(BaseModel):
+    id_motoboy: Optional[int] = None
     documento: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
@@ -266,6 +267,41 @@ def read_current_user(
         if owner:
             full.ignorar_coleta = bool(owner.ignorar_coleta)
     return full
+
+
+# ============================================================
+# LISTAR MOTOBOYS (role=4) — para combo de atribuição no painel
+# ============================================================
+
+class MotoboyItem(BaseModel):
+    id_motoboy: int
+    nome: str
+
+
+@router.get("/motoboys", response_model=list[MotoboyItem])
+def list_motoboys(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Lista motoboys (usuários role=4) da mesma sub_base. Uso: atribuição de saídas no painel."""
+    if getattr(current_user, "role", 0) not in (0, 1, 2):
+        raise HTTPException(403, "Acesso negado.")
+    sub_base = _resolve_user_sub_base(db, current_user)
+    if not sub_base or not str(sub_base).strip():
+        raise HTTPException(403, "Sub_base não definida.")
+    users = db.scalars(
+        select(User).options(joinedload(User.motoboy)).where(
+            User.sub_base == sub_base,
+            User.role == 4,
+            User.status.is_(True),
+        )
+    ).all()
+    out = []
+    for u in users:
+        if u.motoboy and u.motoboy.id_motoboy:
+            nome = f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or ""
+            out.append(MotoboyItem(id_motoboy=u.motoboy.id_motoboy, nome=nome or f"Motoboy {u.motoboy.id_motoboy}"))
+    return out
 
 
 # ============================================================

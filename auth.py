@@ -190,6 +190,7 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.contato = payload.get("contato")
     u.role = payload.get("role")
     u.sub_base = payload.get("sub_base")
+    u.motoboy_id = payload.get("motoboy_id") if payload.get("role") == 4 else None
 
     # flags/policies vindas do token
     u.ignorar_coleta = payload.get("ignorar_coleta", False)
