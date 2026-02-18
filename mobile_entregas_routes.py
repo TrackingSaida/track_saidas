@@ -32,6 +32,8 @@ from saidas_routes import (
     STATUS_AUSENTE,
     STATUS_CANCELADO,
     _should_store_qr_payload_raw,
+    normalizar_status_saida,
+    _get_motoboy_nome,
 )
 from codigo_normalizer import normalize_codigo
 
@@ -336,8 +338,15 @@ def listar_motivos_ausencia(
 
 
 # ============================================================
-# POST /mobile/scan
+# POST /mobile/scan — leituras sequenciais (igual web): INSERT novo ou atribui existente
 # ============================================================
+def _nome_motoboy_atual(db: Session, saida: Saida) -> str:
+    if not saida or not saida.motoboy_id:
+        return "Motoboy"
+    motoboy = db.get(Motoboy, saida.motoboy_id)
+    return _get_motoboy_nome(db, motoboy) if motoboy else "Motoboy"
+
+
 @router.post("/scan")
 def scan_codigo(
     body: ScanBody,
@@ -345,9 +354,9 @@ def scan_codigo(
     user: User = Depends(get_current_motoboy),
 ):
     """
-    Escaneia código: se saída não tem motoboy -> atribui ao logado e retorna 200.
-    Se já tem outro motoboy -> retorna 409 com conflito: true, motoboy_atual.
-    Normaliza o código bruto (JSON Shopee, ML, etc.) antes do lookup.
+    Leituras sequenciais (igual web): se código não existe -> INSERT novo e atribui ao motoboy.
+    Se existe: valida status (não permite cancelado, entregue, em_rota de outro).
+    Retorna status na resposta de erro quando bloqueia por status.
     """
     raw = body.codigo.strip()
     sub_base = user.sub_base
@@ -357,7 +366,10 @@ def scan_codigo(
 
     codigo, servico, qr_payload_raw = normalize_codigo(raw)
     if codigo is None:
-        raise HTTPException(status_code=422, detail="Código inválido.")
+        raise HTTPException(
+            status_code=422,
+            detail="Código inválido. Verifique o formato do QR/código de barras.",
+        )
 
     saida = db.scalar(
         select(Saida).where(
@@ -365,41 +377,78 @@ def scan_codigo(
             Saida.sub_base == sub_base,
         )
     )
-    if not saida:
-        raise HTTPException(status_code=404, detail="Código não encontrado.")
 
-    # Atualiza qr_payload_raw para ML/Flex quando vazio (etiqueta)
+    # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
+    if not saida:
+        motoboy = db.get(Motoboy, motoboy_id)
+        entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Motoboy")
+        servico_val = (servico or "Avulso").strip().title()
+        qr_raw = qr_payload_raw.strip() if (qr_payload_raw and _should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
+        try:
+            nova = Saida(
+                sub_base=sub_base,
+                username=user.username,
+                entregador=entregador_nome,
+                entregador_id=None,
+                motoboy_id=motoboy_id,
+                codigo=codigo,
+                servico=servico_val,
+                status=STATUS_SAIU_PARA_ENTREGA,
+                qr_payload_raw=qr_raw or None,
+            )
+            db.add(nova)
+            db.commit()
+            db.refresh(nova)
+            detail = _get_detail_for_saida(db, nova.id_saida)
+            return {"ok": True, "conflito": False, "entrega": _saida_to_item(nova, detail)}
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Erro ao registrar leitura: {e}")
+
+    # ——— Existe: validar status (não permitir cancelado, entregue, em_rota de outro) ———
+    status_norm = normalizar_status_saida(saida.status)
+
+    if status_norm == STATUS_CANCELADO:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pedido cancelado. Não é possível registrar leitura. Status: {STATUS_CANCELADO}.",
+        )
+
+    if status_norm == STATUS_ENTREGUE:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pedido já entregue. Não é possível registrar leitura. Status: {STATUS_ENTREGUE}.",
+        )
+
+    # Em rota / saiu com outro motoboy -> conflito (perguntar se quer assumir)
+    if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
+        if saida.motoboy_id == motoboy_id:
+            if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
+                if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
+                    saida.qr_payload_raw = qr_payload_raw.strip()
+                    db.commit()
+            detail = _get_detail_for_saida(db, saida.id_saida)
+            return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
+        nome_atual = _nome_motoboy_atual(db, saida)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "conflito": True,
+                "motoboy_atual": nome_atual,
+                "id_saida": saida.id_saida,
+            },
+        )
+
+    # Coletado ou outro: atribuir ao motoboy logado
     if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
         if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
             saida.qr_payload_raw = qr_payload_raw.strip()
-
-    if saida.motoboy_id is None:
-        saida.motoboy_id = motoboy_id
-        saida.status = STATUS_SAIU_PARA_ENTREGA
-        db.commit()
-        db.refresh(saida)
-        detail = _get_detail_for_saida(db, saida.id_saida)
-        return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
-
-    if saida.motoboy_id == motoboy_id:
-        detail = _get_detail_for_saida(db, saida.id_saida)
-        return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
-
-    motoboy_atual = db.get(Motoboy, saida.motoboy_id)
-    nome_atual = "Motoboy"
-    if motoboy_atual and motoboy_atual.user_id:
-        from models import User as UserModel
-        u = db.get(UserModel, motoboy_atual.user_id)
-        if u:
-            nome_atual = f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or nome_atual
-    return JSONResponse(
-        status_code=409,
-        content={
-            "conflito": True,
-            "motoboy_atual": nome_atual,
-            "id_saida": saida.id_saida,
-        },
-    )
+    saida.motoboy_id = motoboy_id
+    saida.status = STATUS_SAIU_PARA_ENTREGA
+    db.commit()
+    db.refresh(saida)
+    detail = _get_detail_for_saida(db, saida.id_saida)
+    return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
 
 
 # ============================================================
@@ -427,10 +476,21 @@ def assumir_entrega(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Reatribui a entrega para o motoboy logado (após conflito no scan)."""
+    """Reatribui a entrega para o motoboy logado (após conflito no scan). Não permite se cancelado/entregue."""
     s = db.get(Saida, id_saida)
     if not s or s.sub_base != user.sub_base:
         raise HTTPException(status_code=404, detail="Entrega não encontrada.")
+    status_norm = normalizar_status_saida(s.status)
+    if status_norm == STATUS_CANCELADO:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pedido cancelado. Não é possível assumir. Status: {STATUS_CANCELADO}.",
+        )
+    if status_norm == STATUS_ENTREGUE:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pedido já entregue. Não é possível assumir. Status: {STATUS_ENTREGUE}.",
+        )
     if s.motoboy_id == user.motoboy_id:
         return {"ok": True, "id_saida": id_saida}
 
