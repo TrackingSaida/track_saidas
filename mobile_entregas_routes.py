@@ -5,6 +5,7 @@ Requer JWT de motoboy (role=4, motoboy_id no token).
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, date
 from typing import Optional, List
 
@@ -367,6 +368,11 @@ def atualizar_endereco(
         coords = geocode_address(endereco_formatado)
         if coords:
             lat, lon = coords
+        else:
+            logging.getLogger(__name__).warning(
+                "Endereço salvo sem coordenadas (geocoding falhou ou sem resultado): id_saida=%s",
+                id_saida,
+            )
 
     if detail:
         detail.dest_nome = body.destinatario.strip()
