@@ -496,6 +496,11 @@ class SaidaDetail(Base):
     dest_cep = Column(Text, nullable=True)
     dest_contato = Column(Text, nullable=True)
 
+    latitude = Column(Numeric(12, 8), nullable=True)
+    longitude = Column(Numeric(12, 8), nullable=True)
+    endereco_formatado = Column(Text, nullable=True)
+    endereco_origem = Column(Text, nullable=True)  # manual | ocr | voz
+
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
     def __repr__(self):

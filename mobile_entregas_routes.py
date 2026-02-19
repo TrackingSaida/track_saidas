@@ -66,6 +66,11 @@ class EntregaListItem(BaseModel):
     contato: Optional[str] = None
     data: Optional[date] = None
     data_hora_entrega: Optional[datetime] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    endereco_formatado: Optional[str] = None
+    endereco_origem: Optional[str] = None  # manual | ocr | voz
+    possui_endereco: bool = False
 
 
 class ScanBody(BaseModel):
@@ -75,6 +80,24 @@ class ScanBody(BaseModel):
 class AusenteBody(BaseModel):
     motivo_id: int
     observacao: Optional[str] = None
+
+
+class EnderecoBody(BaseModel):
+    destinatario: str = Field(min_length=1)
+    rua: str = Field(min_length=1)
+    numero: str = Field(min_length=1)
+    complemento: Optional[str] = None
+    bairro: str = Field(min_length=1)
+    cidade: str = Field(min_length=1)
+    estado: str = Field(min_length=1)
+    cep: str = Field(min_length=8)
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    origem: str = "manual"  # manual | ocr | voz
+
+
+class IniciarRotaBody(BaseModel):
+    delivery_ids: Optional[List[int]] = None  # se enviado, só esses id_saida vão para EM_ROTA
 
 
 class MotivoAusenciaOut(BaseModel):
@@ -126,11 +149,21 @@ def _servico_tipo(serv: Optional[str]) -> str:
     return "Avulso"
 
 
+def _possui_endereco(detail: Optional[SaidaDetail]) -> bool:
+    if not detail:
+        return False
+    if detail.endereco_formatado and detail.endereco_formatado.strip():
+        return True
+    return bool((detail.dest_rua or "").strip() and (detail.dest_numero or "").strip())
+
+
 def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
     endereco = None
     if detail and (detail.dest_rua or detail.dest_numero):
         parts = [p for p in [detail.dest_rua, detail.dest_numero, detail.dest_complemento] if p]
         endereco = ", ".join(parts) if parts else None
+    lat = float(detail.latitude) if detail and detail.latitude is not None else None
+    lon = float(detail.longitude) if detail and detail.longitude is not None else None
     return {
         "id_saida": s.id_saida,
         "codigo": s.codigo,
@@ -143,6 +176,11 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "contato": detail.dest_contato if detail else None,
         "data": s.data,
         "data_hora_entrega": s.data_hora_entrega,
+        "latitude": lat,
+        "longitude": lon,
+        "endereco_formatado": (detail.endereco_formatado or "").strip() or None if detail else None,
+        "endereco_origem": (detail.endereco_origem or "").strip() or None if detail else None,
+        "possui_endereco": _possui_endereco(detail),
     }
 
 
@@ -252,23 +290,36 @@ def resumo_entregas(
 # ============================================================
 @router.post("/iniciar-rota")
 def iniciar_rota(
+    body: Optional[IniciarRotaBody] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Atualiza todas SAIU_PARA_ENTREGA do motoboy para EM_ROTA."""
+    """Atualiza SAIU_PARA_ENTREGA para EM_ROTA. Se body.delivery_ids for enviado, só esses id_saida; senão, todas do motoboy."""
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
 
-    result = db.execute(
-        select(Saida).where(
-            Saida.sub_base == sub_base,
-            Saida.motoboy_id == motoboy_id,
-            Saida.status == STATUS_SAIU_PARA_ENTREGA,
+    if body and body.delivery_ids:
+        ids = body.delivery_ids
+        result = db.execute(
+            select(Saida).where(
+                Saida.id_saida.in_(ids),
+                Saida.sub_base == sub_base,
+                Saida.motoboy_id == motoboy_id,
+                Saida.status == STATUS_SAIU_PARA_ENTREGA,
+            )
         )
-    )
-    rows = result.scalars().all()
+        rows = result.scalars().all()
+    else:
+        result = db.execute(
+            select(Saida).where(
+                Saida.sub_base == sub_base,
+                Saida.motoboy_id == motoboy_id,
+                Saida.status == STATUS_SAIU_PARA_ENTREGA,
+            )
+        )
+        rows = result.scalars().all()
     for s in rows:
         s.status = STATUS_EM_ROTA
     db.commit()
@@ -287,6 +338,64 @@ def detalhe_entrega(
     """Detalhe de uma entrega para o app."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     detail = _get_detail_for_saida(db, s.id_saida)
+    return _saida_to_item(s, detail)
+
+
+# ============================================================
+# PUT /mobile/entrega/{id_saida}/endereco
+# ============================================================
+@router.put("/entrega/{id_saida}/endereco", response_model=EntregaListItem)
+def atualizar_endereco(
+    id_saida: int,
+    body: EnderecoBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Atualiza endereço da entrega (SaidaDetail). Cria detail se não existir."""
+    s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    detail = _get_detail_for_saida(db, id_saida)
+    origem = (body.origem or "manual").strip().lower()
+    if origem not in ("manual", "ocr", "voz"):
+        origem = "manual"
+    parts = [body.rua, body.numero, body.complemento, body.bairro, body.cidade, body.estado, body.cep]
+    endereco_formatado = ", ".join(p for p in parts if p)
+    if detail:
+        detail.dest_nome = body.destinatario.strip()
+        detail.dest_rua = body.rua.strip()
+        detail.dest_numero = str(body.numero).strip()
+        detail.dest_complemento = (body.complemento or "").strip() or None
+        detail.dest_bairro = body.bairro.strip()
+        detail.dest_cidade = body.cidade.strip()
+        detail.dest_estado = body.estado.strip()
+        detail.dest_cep = body.cep.strip()
+        detail.endereco_formatado = endereco_formatado
+        detail.endereco_origem = origem
+        if body.latitude is not None:
+            detail.latitude = body.latitude
+        if body.longitude is not None:
+            detail.longitude = body.longitude
+    else:
+        detail = SaidaDetail(
+            id_saida=id_saida,
+            id_entregador=user.motoboy_id,
+            status=s.status or STATUS_EM_ROTA,
+            tentativa=1,
+            dest_nome=body.destinatario.strip(),
+            dest_rua=body.rua.strip(),
+            dest_numero=str(body.numero).strip(),
+            dest_complemento=(body.complemento or "").strip() or None,
+            dest_bairro=body.bairro.strip(),
+            dest_cidade=body.cidade.strip(),
+            dest_estado=body.estado.strip(),
+            dest_cep=body.cep.strip(),
+            endereco_formatado=endereco_formatado,
+            endereco_origem=origem,
+            latitude=body.latitude,
+            longitude=body.longitude,
+        )
+        db.add(detail)
+    db.commit()
+    db.refresh(detail)
     return _saida_to_item(s, detail)
 
 
