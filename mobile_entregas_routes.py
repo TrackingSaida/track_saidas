@@ -155,7 +155,9 @@ def listar_entregas(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Lista entregas do motoboy. status=pendente | finalizadas | ausentes."""
+    """Lista entregas do motoboy. status=pendente | finalizadas | ausentes.
+    Regra: pendentes e ausentes são listados SEM filtro por data; só somem com ação final (entregue/ausente/cancelado).
+    """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
@@ -189,7 +191,9 @@ def resumo_entregas(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Contadores: pendentes, finalizadas_hoje."""
+    """Contadores: pendentes, finalizadas_hoje, ausentes, atraso_d1.
+    Regra: pendentes e ausentes não usam filtro por 'hoje'; só finalizadas_hoje é por dia.
+    """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
@@ -218,11 +222,28 @@ def resumo_entregas(
             Saida.status == STATUS_SAIU_PARA_ENTREGA,
         )
     ) or 0
+    ausentes = db.scalar(
+        select(func.count(Saida.id_saida)).where(
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+            Saida.status == STATUS_AUSENTE,
+        )
+    ) or 0
+    atraso_d1 = db.scalar(
+        select(func.count(Saida.id_saida)).where(
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+            Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
+            Saida.data < hoje,
+        )
+    ) or 0
 
     return {
         "pendentes": pendentes,
         "finalizadas_hoje": finalizadas_hoje,
         "pode_iniciar_rota": tem_saiu_para_entrega > 0,
+        "ausentes": ausentes,
+        "atraso_d1": atraso_d1,
     }
 
 
@@ -278,8 +299,14 @@ def marcar_entregue(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Marca entrega como ENTREGUE e registra data_hora_entrega."""
+    """Marca entrega como ENTREGUE e registra data_hora_entrega. Só permite se status for EM_ROTA."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    status_norm = normalizar_status_saida(s.status)
+    if status_norm == STATUS_SAIU_PARA_ENTREGA:
+        raise HTTPException(
+            status_code=422,
+            detail="Inicie a rota antes de finalizar entregas.",
+        )
     s.status = STATUS_ENTREGUE
     s.data_hora_entrega = datetime.utcnow()
     db.commit()
@@ -296,8 +323,14 @@ def marcar_ausente(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Marca entrega como AUSENTE com motivo (e observação se motivo 'Outro')."""
+    """Marca entrega como AUSENTE com motivo. Só permite se status for EM_ROTA."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    status_norm = normalizar_status_saida(s.status)
+    if status_norm == STATUS_SAIU_PARA_ENTREGA:
+        raise HTTPException(
+            status_code=422,
+            detail="Inicie a rota antes de finalizar entregas.",
+        )
     motivo = db.get(MotivoAusencia, body.motivo_id)
     if not motivo or not motivo.ativo:
         raise HTTPException(status_code=422, detail="Motivo de ausência inválido.")
