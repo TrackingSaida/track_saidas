@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
+from geocode_utils import geocode_address
 from models import (
     User,
     Saida,
@@ -359,6 +360,14 @@ def atualizar_endereco(
         origem = "manual"
     parts = [body.rua, body.numero, body.complemento, body.bairro, body.cidade, body.estado, body.cep]
     endereco_formatado = ", ".join(p for p in parts if p)
+
+    lat = body.latitude
+    lon = body.longitude
+    if (lat is None or lon is None) and endereco_formatado.strip():
+        coords = geocode_address(endereco_formatado)
+        if coords:
+            lat, lon = coords
+
     if detail:
         detail.dest_nome = body.destinatario.strip()
         detail.dest_rua = body.rua.strip()
@@ -370,10 +379,10 @@ def atualizar_endereco(
         detail.dest_cep = body.cep.strip()
         detail.endereco_formatado = endereco_formatado
         detail.endereco_origem = origem
-        if body.latitude is not None:
-            detail.latitude = body.latitude
-        if body.longitude is not None:
-            detail.longitude = body.longitude
+        if lat is not None:
+            detail.latitude = lat
+        if lon is not None:
+            detail.longitude = lon
     else:
         detail = SaidaDetail(
             id_saida=id_saida,
@@ -390,8 +399,8 @@ def atualizar_endereco(
             dest_cep=body.cep.strip(),
             endereco_formatado=endereco_formatado,
             endereco_origem=origem,
-            latitude=body.latitude,
-            longitude=body.longitude,
+            latitude=lat,
+            longitude=lon,
         )
         db.add(detail)
     db.commit()
