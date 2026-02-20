@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, date
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
@@ -82,6 +82,14 @@ class ScanBody(BaseModel):
 class AusenteBody(BaseModel):
     motivo_id: int
     observacao: Optional[str] = None
+
+
+class EntregueBody(BaseModel):
+    tipo_recebedor: Optional[str] = None
+    nome_recebedor: Optional[str] = None
+    tipo_documento: Optional[str] = None
+    numero_documento: Optional[str] = None
+    observacao_entrega: Optional[str] = None
 
 
 class EnderecoBody(BaseModel):
@@ -420,10 +428,12 @@ def atualizar_endereco(
 @router.post("/entrega/{id_saida}/entregue")
 def marcar_entregue(
     id_saida: int,
+    body: Optional[EntregueBody] = Body(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Marca entrega como ENTREGUE e registra data_hora_entrega. Só permite se status for EM_ROTA."""
+    """Marca entrega como ENTREGUE e registra data_hora_entrega. Só permite se status for EM_ROTA.
+    Se body for enviado, preenche tipo_recebedor, nome_recebedor, tipo_documento, numero_documento, observacao_entrega em saidas_detail."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
     if status_norm == STATUS_SAIU_PARA_ENTREGA:
@@ -431,6 +441,33 @@ def marcar_entregue(
             status_code=422,
             detail="Inicie a rota antes de finalizar entregas.",
         )
+
+    if body:
+        def _set_if_present(detail: SaidaDetail) -> None:
+            if body.tipo_recebedor is not None:
+                detail.tipo_recebedor = (body.tipo_recebedor or "").strip() or None
+            if body.nome_recebedor is not None:
+                detail.nome_recebedor = (body.nome_recebedor or "").strip() or None
+            if body.tipo_documento is not None:
+                detail.tipo_documento = (body.tipo_documento or "").strip() or None
+            if body.numero_documento is not None:
+                detail.numero_documento = (body.numero_documento or "").strip() or None
+            if body.observacao_entrega is not None:
+                detail.observacao_entrega = (body.observacao_entrega or "").strip() or None
+
+        detail = _get_detail_for_saida(db, id_saida)
+        if detail:
+            _set_if_present(detail)
+        else:
+            detail = SaidaDetail(
+                id_saida=id_saida,
+                id_entregador=user.motoboy_id,
+                status=s.status or STATUS_EM_ROTA,
+                tentativa=1,
+            )
+            _set_if_present(detail)
+            db.add(detail)
+
     s.status = STATUS_ENTREGUE
     s.data_hora_entrega = datetime.utcnow()
     db.commit()
