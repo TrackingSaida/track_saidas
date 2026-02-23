@@ -540,6 +540,25 @@ class SaidaHistorico(Base):
         return f"<SaidaHistorico id={self.id} id_saida={self.id_saida} evento={self.evento!r}>"
 
 
+# ==========================
+# Tabela: rotas_motoboy
+# ==========================
+class RotasMotoboy(Base):
+    __tablename__ = "rotas_motoboy"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    data = Column(Date, nullable=False)
+    status = Column(Text, nullable=False, server_default=text("'ativa'"))  # preparando | ativa | finalizada | cancelada
+    ordem_json = Column(Text, nullable=False)  # JSON array de id_saida
+    parada_atual = Column(Integer, nullable=False, server_default=text("0"))
+    iniciado_em = Column(DateTime(timezone=False), nullable=True)
+    finalizado_em = Column(DateTime(timezone=False), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<RotasMotoboy id={self.id} motoboy_id={self.motoboy_id} status={self.status!r}>"
+
+
 @event.listens_for(Saida, "after_update")
 def saida_after_update(mapper, connection, target: Saida):
     """

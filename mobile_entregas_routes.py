@@ -5,6 +5,7 @@ Requer JWT de motoboy (role=4, motoboy_id no token).
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, date
 from typing import Optional, List
@@ -26,6 +27,7 @@ from models import (
     MotoboySubBase,
     MotivoAusencia,
     SaidaHistorico,
+    RotasMotoboy,
 )
 from saidas_routes import (
     STATUS_SAIU_PARA_ENTREGA,
@@ -113,6 +115,25 @@ class IniciarRotaBody(BaseModel):
 class MotivoAusenciaOut(BaseModel):
     id: int
     descricao: str
+
+
+class RotasIniciarBody(BaseModel):
+    ordem: List[int] = Field(..., min_length=1)
+
+
+class RotasIniciarOut(BaseModel):
+    rota_id: str
+
+
+class RotasAvancarOut(BaseModel):
+    parada_atual: int
+
+
+class RotasAtivaOut(BaseModel):
+    rota_id: str
+    ordem: List[int]
+    parada_atual: int
+    data: Optional[str] = None
 
 
 # ============================================================
@@ -334,6 +355,126 @@ def iniciar_rota(
         s.status = STATUS_EM_ROTA
     db.commit()
     return {"atualizados": len(rows)}
+
+
+# ============================================================
+# POST /mobile/rotas/iniciar
+# ============================================================
+@router.post("/rotas/iniciar", response_model=RotasIniciarOut)
+def rotas_iniciar(
+    body: RotasIniciarBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Cria rota ativa com a ordem enviada. Atualiza saidas para EM_ROTA e persiste a rota."""
+    motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    ids = body.ordem
+    result = db.execute(
+        select(Saida).where(
+            Saida.id_saida.in_(ids),
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+            Saida.status == STATUS_SAIU_PARA_ENTREGA,
+        )
+    )
+    rows = result.scalars().all()
+    if len(rows) != len(ids):
+        raise HTTPException(
+            status_code=400,
+            detail="Alguma entrega não pertence ao motoboy ou não está em SAIU_PARA_ENTREGA.",
+        )
+    for s in rows:
+        s.status = STATUS_EM_ROTA
+
+    hoje = date.today()
+    rota = RotasMotoboy(
+        motoboy_id=motoboy_id,
+        data=hoje,
+        status="ativa",
+        ordem_json=json.dumps(ids),
+        parada_atual=0,
+        iniciado_em=datetime.utcnow(),
+    )
+    db.add(rota)
+    db.commit()
+    db.refresh(rota)
+    return RotasIniciarOut(rota_id=str(rota.id))
+
+
+# ============================================================
+# GET /mobile/rotas/ativa
+# ============================================================
+@router.get("/rotas/ativa", response_model=Optional[RotasAtivaOut])
+def rotas_ativa(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Retorna a rota ativa do motoboy, se existir. Caso contrário 200 com null."""
+    motoboy_id = user.motoboy_id
+    hoje = date.today()
+    rota = db.scalar(
+        select(RotasMotoboy).where(
+            RotasMotoboy.motoboy_id == motoboy_id,
+            RotasMotoboy.status == "ativa",
+            RotasMotoboy.data == hoje,
+        ).order_by(RotasMotoboy.iniciado_em.desc()).limit(1)
+    )
+    if not rota:
+        return None
+    ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
+    return RotasAtivaOut(
+        rota_id=str(rota.id),
+        ordem=ordem,
+        parada_atual=rota.parada_atual,
+        data=rota.data.isoformat() if rota.data else None,
+    )
+
+
+# ============================================================
+# POST /mobile/rotas/{id}/avancar
+# ============================================================
+@router.post("/rotas/{rota_id}/avancar", response_model=RotasAvancarOut)
+def rotas_avancar(
+    rota_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Incrementa parada_atual da rota. A rota deve pertencer ao motoboy e estar ativa."""
+    motoboy_id = user.motoboy_id
+    rota = db.get(RotasMotoboy, rota_id)
+    if not rota or rota.motoboy_id != motoboy_id:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+    if rota.status != "ativa":
+        raise HTTPException(status_code=400, detail="Rota não está ativa.")
+    rota.parada_atual = rota.parada_atual + 1
+    db.commit()
+    db.refresh(rota)
+    return RotasAvancarOut(parada_atual=rota.parada_atual)
+
+
+# ============================================================
+# POST /mobile/rotas/{id}/finalizar
+# ============================================================
+@router.post("/rotas/{rota_id}/finalizar", status_code=204)
+def rotas_finalizar(
+    rota_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Marca a rota como finalizada."""
+    motoboy_id = user.motoboy_id
+    rota = db.get(RotasMotoboy, rota_id)
+    if not rota or rota.motoboy_id != motoboy_id:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+    if rota.status != "ativa":
+        raise HTTPException(status_code=400, detail="Rota não está ativa.")
+    rota.status = "finalizada"
+    rota.finalizado_em = datetime.utcnow()
+    db.commit()
 
 
 # ============================================================
