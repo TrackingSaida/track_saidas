@@ -503,7 +503,7 @@ def rotas_finalizar(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Marca a rota como finalizada."""
+    """Marca a rota como finalizada. Após commit, GET /rotas/ativa não a retorna (filtro status=ativa)."""
     motoboy_id = user.motoboy_id
     rota = db.get(RotasMotoboy, rota_id)
     if not rota or rota.motoboy_id != motoboy_id:
