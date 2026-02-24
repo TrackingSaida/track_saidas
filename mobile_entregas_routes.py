@@ -588,7 +588,10 @@ def atualizar_endereco(
     lat = body.latitude
     lon = body.longitude
     if (lat is None or lon is None) and endereco_formatado.strip():
-        coords = geocode_address(endereco_formatado)
+        # Query de geocoding com foco em rua, número, bairro, cidade e estado
+        geo_parts = [body.rua, body.numero, body.bairro, body.cidade, body.estado]
+        geo_query = ", ".join(p for p in geo_parts if p) or endereco_formatado
+        coords = geocode_address(geo_query)
         if coords:
             lat, lon = coords
         else:
