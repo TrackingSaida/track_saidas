@@ -77,6 +77,7 @@ class EntregaListItem(BaseModel):
     endereco_formatado: Optional[str] = None
     endereco_origem: Optional[str] = None  # manual | ocr | voz
     possui_endereco: bool = False
+    tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
 
 
 class ScanBody(BaseModel):
@@ -216,6 +217,7 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "endereco_formatado": (detail.endereco_formatado or "").strip() or None if detail else None,
         "endereco_origem": (detail.endereco_origem or "").strip() or None if detail else None,
         "possui_endereco": _possui_endereco(detail),
+        "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
     }
 
 
@@ -225,16 +227,18 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
 @router.get("/entregas", response_model=List[EntregaListItem])
 def listar_entregas(
     status: Optional[str] = None,
+    dia: Optional[str] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
     """Lista entregas do motoboy. status=pendente | finalizadas | ausentes.
-    Regra: pendentes e ausentes são listados SEM filtro por data; só somem com ação final (entregue/ausente/cancelado).
+    dia=hoje (opcional): para finalizadas filtra por data_hora_entrega hoje; para ausentes filtra por data hoje.
     """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
+    hoje = date.today()
 
     q = select(Saida).where(
         Saida.sub_base == sub_base,
@@ -244,8 +248,12 @@ def listar_entregas(
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
     elif status == "finalizadas":
         q = q.where(Saida.status == STATUS_ENTREGUE)
+        if dia == "hoje":
+            q = q.where(func.date(Saida.data_hora_entrega) == hoje)
     elif status == "ausentes":
         q = q.where(Saida.status == STATUS_AUSENTE)
+        if dia == "hoje":
+            q = q.where(Saida.data == hoje)
     q = q.order_by(Saida.data.desc(), Saida.timestamp.desc())
 
     rows = db.scalars(q).all()
@@ -662,6 +670,36 @@ def marcar_ausente(
 
 
 # ============================================================
+# POST /mobile/entrega/{id}/nova-tentativa
+# ============================================================
+@router.post("/entrega/{id_saida}/nova-tentativa")
+def nova_tentativa(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Coloca pedido AUSENTE de volta em SAIU_PARA_ENTREGA e incrementa tentativa."""
+    s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    status_norm = normalizar_status_saida(s.status)
+    if status_norm != STATUS_AUSENTE:
+        raise HTTPException(status_code=422, detail="Só é possível nova tentativa para entregas ausentes.")
+    s.status = STATUS_SAIU_PARA_ENTREGA
+    detail = _get_detail_for_saida(db, id_saida)
+    if detail:
+        detail.tentativa = (detail.tentativa or 1) + 1
+    else:
+        detail = SaidaDetail(
+            id_saida=id_saida,
+            id_entregador=user.motoboy_id,
+            status=STATUS_SAIU_PARA_ENTREGA,
+            tentativa=2,
+        )
+        db.add(detail)
+    db.commit()
+    return {"ok": True, "id_saida": id_saida, "tentativa": detail.tentativa}
+
+
+# ============================================================
 # GET /mobile/motivos-ausencia
 # ============================================================
 @router.get("/motivos-ausencia", response_model=List[MotivoAusenciaOut])
@@ -778,12 +816,25 @@ def scan_codigo(
             },
         )
 
-    # Coletado ou outro: atribuir ao motoboy logado
+    # Coletado ou AUSENTE ou outro: atribuir ao motoboy logado
     if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
         if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
             saida.qr_payload_raw = qr_payload_raw.strip()
     saida.motoboy_id = motoboy_id
     saida.status = STATUS_SAIU_PARA_ENTREGA
+    if status_norm == STATUS_AUSENTE:
+        detail = _get_detail_for_saida(db, saida.id_saida)
+        if detail:
+            detail.tentativa = (detail.tentativa or 1) + 1
+        else:
+            db.add(
+                SaidaDetail(
+                    id_saida=saida.id_saida,
+                    id_entregador=motoboy_id,
+                    status=STATUS_SAIU_PARA_ENTREGA,
+                    tentativa=2,
+                )
+            )
     db.commit()
     db.refresh(saida)
     detail = _get_detail_for_saida(db, saida.id_saida)
@@ -836,6 +887,19 @@ def assumir_entrega(
     antigo = s.motoboy_id
     s.motoboy_id = user.motoboy_id
     s.status = STATUS_SAIU_PARA_ENTREGA
+    if status_norm == STATUS_AUSENTE:
+        detail = _get_detail_for_saida(db, id_saida)
+        if detail:
+            detail.tentativa = (detail.tentativa or 1) + 1
+        else:
+            db.add(
+                SaidaDetail(
+                    id_saida=id_saida,
+                    id_entregador=user.motoboy_id,
+                    status=STATUS_SAIU_PARA_ENTREGA,
+                    tentativa=2,
+                )
+            )
     db.add(
         SaidaHistorico(
             id_saida=id_saida,
