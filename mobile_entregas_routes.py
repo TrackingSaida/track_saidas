@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from geocode_utils import geocode_address
+from geocode_utils import geocode_address_any
 from models import (
     User,
     Saida,
@@ -591,13 +591,14 @@ def atualizar_endereco(
         # Query de geocoding com foco em rua, número, bairro, cidade e estado
         geo_parts = [body.rua, body.numero, body.bairro, body.cidade, body.estado]
         geo_query = ", ".join(p for p in geo_parts if p) or endereco_formatado
-        coords = geocode_address(geo_query)
+        coords = geocode_address_any(geo_query)
         if coords:
             lat, lon = coords
         else:
             logging.getLogger(__name__).warning(
-                "Endereço salvo sem coordenadas (geocoding falhou ou sem resultado): id_saida=%s",
+                "Endereço salvo sem coordenadas (geocoding falhou ou sem resultado): id_saida=%s, endereco=%s",
                 id_saida,
+                geo_query[:80],
             )
 
     if detail:
