@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase
+from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
 
 
 # ============================================================
@@ -86,6 +86,66 @@ class SaidaLerIn(BaseModel):
     # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
     registrar_nao_coletado: bool = False
     qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
+
+
+class SaidaDetailOut(BaseModel):
+    """Campos de saidas_detail para GET /saidas/{id_saida}."""
+    id_saida: int
+    id_entregador: int
+    status: Optional[str] = None
+    tentativa: Optional[int] = None
+    motivo_ocorrencia: Optional[str] = None
+    observacao_ocorrencia: Optional[str] = None
+    tipo_recebedor: Optional[str] = None
+    nome_recebedor: Optional[str] = None
+    tipo_documento: Optional[str] = None
+    numero_documento: Optional[str] = None
+    observacao_entrega: Optional[str] = None
+    dest_nome: Optional[str] = None
+    dest_rua: Optional[str] = None
+    dest_numero: Optional[str] = None
+    dest_complemento: Optional[str] = None
+    dest_bairro: Optional[str] = None
+    dest_cidade: Optional[str] = None
+    dest_estado: Optional[str] = None
+    dest_cep: Optional[str] = None
+    dest_contato: Optional[str] = None
+    endereco_formatado: Optional[str] = None
+    endereco_origem: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SaidaDetalheCompletoOut(BaseModel):
+    """Resposta de GET /saidas/{id_saida}: saida + detail."""
+    id_saida: int
+    timestamp: datetime
+    data: date
+    sub_base: Optional[str] = None
+    username: Optional[str] = None
+    entregador: Optional[str] = None
+    motoboy_id: Optional[int] = None
+    data_hora_entrega: Optional[datetime] = None
+    codigo: Optional[str] = None
+    servico: Optional[str] = None
+    status: Optional[str] = None
+    base: Optional[str] = None
+    detail: Optional[SaidaDetailOut] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SaidaHistoricoItemOut(BaseModel):
+    """Um item do histórico para GET /saidas/{id_saida}/historico."""
+    id: int
+    id_saida: int
+    evento: str
+    timestamp: datetime
+    status_anterior: Optional[str] = None
+    status_novo: Optional[str] = None
+    user_id: Optional[int] = None
+    usuario_nome: Optional[str] = None
+    motoboy_id_anterior: Optional[int] = None
+    motoboy_id_novo: Optional[int] = None
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ============================================================
@@ -424,6 +484,14 @@ def ler_saida(
             db.add(row)
             db.flush()
             db.add(
+                SaidaHistorico(
+                    id_saida=row.id_saida,
+                    evento="lido",
+                    status_novo=status_inicial,
+                    user_id=getattr(current_user, "id", None),
+                )
+            )
+            db.add(
                 OwnerCobrancaItem(
                     sub_base=sub_base,
                     id_coleta=None,
@@ -449,11 +517,21 @@ def ler_saida(
 
     if status_norm == "coletado":
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
+        status_anterior = existente.status
         existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="lido",
+                status_anterior=status_anterior,
+                status_novo=existente.status,
+                user_id=getattr(current_user, "id", None),
+            )
+        )
         try:
             db.commit()
             db.refresh(existente)
@@ -578,6 +656,17 @@ def listar_saidas(
 
     rows = db.execute(stmt).scalars().all()
 
+    # Data/hora para exibição: primeiro evento do histórico ou fallback para saida.timestamp
+    first_ts_map = {}
+    if rows:
+        ids = [r.id_saida for r in rows]
+        hist_rows = db.execute(
+            select(SaidaHistorico.id_saida, func.min(SaidaHistorico.timestamp).label("ts"))
+            .where(SaidaHistorico.id_saida.in_(ids))
+            .group_by(SaidaHistorico.id_saida)
+        ).all()
+        first_ts_map = {row.id_saida: row.ts for row in hist_rows}
+
     return {
         "total": total,
         "sumShopee": sumShopee,
@@ -586,7 +675,7 @@ def listar_saidas(
         "items": [
             {
                 "id_saida": r.id_saida,
-                "timestamp": r.timestamp,
+                "timestamp": first_ts_map.get(r.id_saida) or r.timestamp,
                 "username": r.username,
                 "entregador": r.entregador,
                 "motoboy_id": getattr(r, "motoboy_id", None),
@@ -598,6 +687,106 @@ def listar_saidas(
             for r in rows
         ],
     }
+
+
+# ============================================================
+# GET — DETALHE COMPLETO (SAÍDA + SAIDAS_DETAIL)
+# ============================================================
+
+@router.get("/{id_saida}", response_model=SaidaDetalheCompletoOut)
+def get_saida_detalhe(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Retorna a saída com o detalhe (saidas_detail) para a tela de registros."""
+    sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+    obj = _get_owned_saida(db, sub_base, id_saida)
+    detail_row = db.scalar(
+        select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).limit(1)
+    )
+    detail_out = None
+    if detail_row:
+        detail_out = SaidaDetailOut(
+            id_saida=detail_row.id_saida,
+            id_entregador=detail_row.id_entregador,
+            status=detail_row.status,
+            tentativa=detail_row.tentativa,
+            motivo_ocorrencia=detail_row.motivo_ocorrencia,
+            observacao_ocorrencia=detail_row.observacao_ocorrencia,
+            tipo_recebedor=detail_row.tipo_recebedor,
+            nome_recebedor=detail_row.nome_recebedor,
+            tipo_documento=detail_row.tipo_documento,
+            numero_documento=detail_row.numero_documento,
+            observacao_entrega=detail_row.observacao_entrega,
+            dest_nome=detail_row.dest_nome,
+            dest_rua=detail_row.dest_rua,
+            dest_numero=detail_row.dest_numero,
+            dest_complemento=detail_row.dest_complemento,
+            dest_bairro=detail_row.dest_bairro,
+            dest_cidade=detail_row.dest_cidade,
+            dest_estado=detail_row.dest_estado,
+            dest_cep=detail_row.dest_cep,
+            dest_contato=detail_row.dest_contato,
+            endereco_formatado=detail_row.endereco_formatado,
+            endereco_origem=detail_row.endereco_origem,
+        )
+    return SaidaDetalheCompletoOut(
+        id_saida=obj.id_saida,
+        timestamp=obj.timestamp,
+        data=obj.data,
+        sub_base=obj.sub_base,
+        username=obj.username,
+        entregador=obj.entregador,
+        motoboy_id=obj.motoboy_id,
+        data_hora_entrega=obj.data_hora_entrega,
+        codigo=obj.codigo,
+        servico=obj.servico,
+        status=obj.status,
+        base=obj.base,
+        detail=detail_out,
+    )
+
+
+# ============================================================
+# GET — HISTÓRICO DA SAÍDA
+# ============================================================
+
+@router.get("/{id_saida}/historico", response_model=list[SaidaHistoricoItemOut])
+def get_saida_historico(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Lista eventos do histórico da saída (saida_historico), ordenados por timestamp. Inclui usuario_nome quando há user_id."""
+    sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+    _get_owned_saida(db, sub_base, id_saida)
+    rows = db.execute(
+        select(SaidaHistorico, User.username)
+        .outerjoin(User, SaidaHistorico.user_id == User.id)
+        .where(SaidaHistorico.id_saida == id_saida)
+        .order_by(SaidaHistorico.timestamp.asc())
+    ).all()
+    out = []
+    for row in rows:
+        h, username = row[0], row[1]
+        out.append(SaidaHistoricoItemOut(
+            id=h.id,
+            id_saida=h.id_saida,
+            evento=h.evento,
+            timestamp=h.timestamp,
+            status_anterior=h.status_anterior,
+            status_novo=h.status_novo,
+            user_id=h.user_id,
+            usuario_nome=username,
+            motoboy_id_anterior=h.motoboy_id_anterior,
+            motoboy_id_novo=h.motoboy_id_novo,
+        ))
+    return out
 
 
 # ============================================================

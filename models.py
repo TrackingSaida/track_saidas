@@ -203,6 +203,7 @@ class Saida(Base):
     entregador_id = Column(BigInteger, nullable=True)
     entregador = Column(Text, nullable=True)
     motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="SET NULL"), nullable=True)
+    # Deprecated: preferir evento "entregue" em saida_historico para data/hora; mantido em transição.
     data_hora_entrega = Column(DateTime(timezone=False), nullable=True)
 
     codigo = Column(Text, nullable=True)
@@ -530,6 +531,8 @@ class SaidaHistorico(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     id_saida = Column(BigInteger, nullable=False, index=True)
     evento = Column(Text, nullable=False)
+    status_anterior = Column(Text, nullable=True)
+    status_novo = Column(Text, nullable=True)
     motoboy_id_anterior = Column(BigInteger, nullable=True)
     motoboy_id_novo = Column(BigInteger, nullable=True)
     user_id = Column(BigInteger, nullable=True)

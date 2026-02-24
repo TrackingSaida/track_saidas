@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import Coleta, Entregador, BasePreco, User, Saida, Owner, BaseFechamento
-from models import OwnerCobrancaItem
+from models import OwnerCobrancaItem, SaidaHistorico
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -338,6 +338,14 @@ def registrar_coleta_em_lote(
             )
             db.add(saida)
             db.flush()
+            db.add(
+                SaidaHistorico(
+                    id_saida=saida.id_saida,
+                    evento="criado_coleta",
+                    status_novo="coletado",
+                    user_id=getattr(current_user, "id", None),
+                )
+            )
 
             # Cobrança do admin ao owner: somente Owner.valor por pacote (nunca BasePreco)
             db.add(
