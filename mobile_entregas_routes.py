@@ -382,14 +382,14 @@ def rotas_iniciar(
             Saida.id_saida.in_(ids),
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
-            Saida.status == STATUS_SAIU_PARA_ENTREGA,
+            Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
         )
     )
     rows = result.scalars().all()
     if len(rows) != len(ids):
         raise HTTPException(
             status_code=400,
-            detail="Alguma entrega não pertence ao motoboy ou não está em SAIU_PARA_ENTREGA.",
+            detail="Alguma entrega não pertence ao motoboy ou não está disponível para rota.",
         )
     for s in rows:
         s.status = STATUS_EM_ROTA
