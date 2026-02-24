@@ -282,18 +282,26 @@ def listar_entregas(
 # ============================================================
 @router.get("/entregas/resumo")
 def resumo_entregas(
+    data: Optional[str] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
     """Contadores: pendentes, finalizadas_hoje, ausentes, atraso_d1.
-    Regra: pendentes e ausentes não usam filtro por 'hoje'; só finalizadas_hoje é por dia.
+    data (opcional, YYYY-MM-DD): data local do app para 'hoje'; finalizadas_hoje e atraso_d1 usam essa data.
+    Sem data, usa date.today() do servidor.
     """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
 
-    hoje = date.today()
+    if data:
+        try:
+            hoje = date.fromisoformat(data.strip())
+        except ValueError:
+            hoje = date.today()
+    else:
+        hoje = date.today()
     pendentes = db.scalar(
         select(func.count(Saida.id_saida)).where(
             Saida.sub_base == sub_base,
