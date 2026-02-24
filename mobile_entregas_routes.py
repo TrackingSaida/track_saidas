@@ -449,11 +449,13 @@ def rotas_ativa(
             hoje = date.today()
     else:
         hoje = date.today()
+    # Só retorna rota realmente ativa: status=ativa, sem finalizado_em (evita dados manuais/desatualizados)
     rota = db.scalar(
         select(RotasMotoboy).where(
             RotasMotoboy.motoboy_id == motoboy_id,
             RotasMotoboy.status == "ativa",
             RotasMotoboy.data == hoje,
+            RotasMotoboy.finalizado_em.is_(None),
         ).order_by(RotasMotoboy.iniciado_em.desc()).limit(1)
     )
     if not rota:
