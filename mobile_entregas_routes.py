@@ -228,17 +228,25 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
 def listar_entregas(
     status: Optional[str] = None,
     dia: Optional[str] = None,
+    data: Optional[str] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
     """Lista entregas do motoboy. status=pendente | finalizadas | ausentes.
-    dia=hoje (opcional): para finalizadas filtra por data_hora_entrega hoje; para ausentes filtra por data hoje.
+    dia=hoje (opcional): para finalizadas filtra por data_hora_entrega; para ausentes por data.
+    data (opcional, YYYY-MM-DD): quando enviado com dia=hoje, usa essa data (ex.: data local do app).
     """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
-    hoje = date.today()
+    if dia == "hoje" and data:
+        try:
+            hoje = date.fromisoformat(data.strip())
+        except ValueError:
+            hoje = date.today()
+    else:
+        hoje = date.today()
 
     q = select(Saida).where(
         Saida.sub_base == sub_base,
@@ -422,12 +430,20 @@ def rotas_iniciar(
 # ============================================================
 @router.get("/rotas/ativa", response_model=Optional[RotasAtivaOut])
 def rotas_ativa(
+    data: Optional[str] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Retorna a rota ativa do motoboy, se existir. Caso contrário 200 com null."""
+    """Retorna a rota ativa do motoboy (status=ativa e data=hoje). Rotas finalizadas ou de outros dias não são retornadas.
+    data (opcional, YYYY-MM-DD): data local do app; quando enviado, só retorna rota desse dia."""
     motoboy_id = user.motoboy_id
-    hoje = date.today()
+    if data:
+        try:
+            hoje = date.fromisoformat(data.strip())
+        except ValueError:
+            hoje = date.today()
+    else:
+        hoje = date.today()
     rota = db.scalar(
         select(RotasMotoboy).where(
             RotasMotoboy.motoboy_id == motoboy_id,
@@ -438,6 +454,11 @@ def rotas_ativa(
     if not rota:
         return None
     ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
+    if not isinstance(ordem, list):
+        ordem = []
+    # Não retornar rota com todas as paradas já concluídas (evita exibir rota concluída do dia anterior)
+    if len(ordem) > 0 and rota.parada_atual >= len(ordem):
+        return None
     return RotasAtivaOut(
         rota_id=str(rota.id),
         ordem=ordem,
