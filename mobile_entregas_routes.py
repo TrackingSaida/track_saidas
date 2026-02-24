@@ -233,20 +233,25 @@ def listar_entregas(
     user: User = Depends(get_current_motoboy),
 ):
     """Lista entregas do motoboy. status=pendente | finalizadas | ausentes.
-    dia=hoje (opcional): para finalizadas filtra por data_hora_entrega; para ausentes por data.
-    data (opcional, YYYY-MM-DD): quando enviado com dia=hoje, usa essa data (ex.: data local do app).
+    dia=hoje + data (YYYY-MM-DD): filtra finalizadas por data_hora_entrega e ausentes por data.
+    Sem data, usa date.today() do servidor.
     """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
-    if dia == "hoje" and data:
-        try:
-            hoje = date.fromisoformat(data.strip())
-        except ValueError:
+    # Filtro por data: quando dia=hoje (ou data enviada) para finalizadas/ausentes
+    usar_filtro_hoje = (dia == "hoje") or (status in ("finalizadas", "ausentes") and data)
+    if usar_filtro_hoje:
+        if data:
+            try:
+                hoje = date.fromisoformat(data.strip())
+            except ValueError:
+                hoje = date.today()
+        else:
             hoje = date.today()
     else:
-        hoje = date.today()
+        hoje = None
 
     q = select(Saida).where(
         Saida.sub_base == sub_base,
@@ -256,11 +261,11 @@ def listar_entregas(
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
     elif status == "finalizadas":
         q = q.where(Saida.status == STATUS_ENTREGUE)
-        if dia == "hoje":
+        if hoje is not None:
             q = q.where(func.date(Saida.data_hora_entrega) == hoje)
     elif status == "ausentes":
         q = q.where(Saida.status == STATUS_AUSENTE)
-        if dia == "hoje":
+        if hoje is not None:
             q = q.where(Saida.data == hoje)
     q = q.order_by(Saida.data.desc(), Saida.timestamp.desc())
 
