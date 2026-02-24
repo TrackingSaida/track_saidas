@@ -13,7 +13,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func
+from sqlalchemy import select, func, exists
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -266,7 +266,13 @@ def listar_entregas(
     elif status == "ausentes":
         q = q.where(Saida.status == STATUS_AUSENTE)
         if hoje is not None:
-            q = q.where(Saida.data == hoje)
+            # Filtro "ausentes hoje": pelo evento ausente no histórico com data = hoje
+            subq_ausente = select(1).where(
+                SaidaHistorico.id_saida == Saida.id_saida,
+                SaidaHistorico.evento == "ausente",
+                func.date(SaidaHistorico.timestamp) == hoje,
+            )
+            q = q.where(exists(subq_ausente))
     q = q.order_by(Saida.data.desc(), Saida.timestamp.desc())
 
     rows = db.scalars(q).all()
@@ -386,6 +392,16 @@ def iniciar_rota(
         rows = result.scalars().all()
     for s in rows:
         s.status = STATUS_EM_ROTA
+    for s in rows:
+        db.add(
+            SaidaHistorico(
+                id_saida=s.id_saida,
+                evento="em_rota",
+                status_anterior=STATUS_SAIU_PARA_ENTREGA,
+                status_novo=STATUS_EM_ROTA,
+                user_id=user.id,
+            )
+        )
     db.commit()
     return {"atualizados": len(rows)}
 
@@ -422,6 +438,16 @@ def rotas_iniciar(
         )
     for s in rows:
         s.status = STATUS_EM_ROTA
+    for s in rows:
+        db.add(
+            SaidaHistorico(
+                id_saida=s.id_saida,
+                evento="em_rota",
+                status_anterior=STATUS_SAIU_PARA_ENTREGA,
+                status_novo=STATUS_EM_ROTA,
+                user_id=user.id,
+            )
+        )
 
     hoje = date.today()
     rota = RotasMotoboy(
@@ -658,7 +684,16 @@ def marcar_entregue(
             db.add(detail)
 
     s.status = STATUS_ENTREGUE
-    s.data_hora_entrega = datetime.utcnow()
+    s.data_hora_entrega = datetime.utcnow()  # deprecated: mantido em transição; ver saida_historico evento "entregue"
+    db.add(
+        SaidaHistorico(
+            id_saida=id_saida,
+            evento="entregue",
+            status_anterior=STATUS_EM_ROTA,
+            status_novo=STATUS_ENTREGUE,
+            user_id=user.id,
+        )
+    )
     db.commit()
     return {"ok": True, "id_saida": id_saida}
 
@@ -701,6 +736,15 @@ def marcar_ausente(
             observacao_ocorrencia=(body.observacao or "").strip() or None,
         )
         db.add(detail)
+    db.add(
+        SaidaHistorico(
+            id_saida=id_saida,
+            evento="ausente",
+            status_anterior=STATUS_EM_ROTA,
+            status_novo=STATUS_AUSENTE,
+            user_id=user.id,
+        )
+    )
     db.commit()
     return {"ok": True, "id_saida": id_saida}
 
@@ -731,6 +775,15 @@ def nova_tentativa(
             tentativa=2,
         )
         db.add(detail)
+    db.add(
+        SaidaHistorico(
+            id_saida=id_saida,
+            evento="nova_tentativa",
+            status_anterior=STATUS_AUSENTE,
+            status_novo=STATUS_SAIU_PARA_ENTREGA,
+            user_id=user.id,
+        )
+    )
     db.commit()
     return {"ok": True, "id_saida": id_saida, "tentativa": detail.tentativa}
 
@@ -810,6 +863,15 @@ def scan_codigo(
                 qr_payload_raw=qr_raw or None,
             )
             db.add(nova)
+            db.flush()
+            db.add(
+                SaidaHistorico(
+                    id_saida=nova.id_saida,
+                    evento="scan",
+                    status_novo=STATUS_SAIU_PARA_ENTREGA,
+                    user_id=user.id,
+                )
+            )
             db.commit()
             db.refresh(nova)
             detail = _get_detail_for_saida(db, nova.id_saida)
@@ -871,6 +933,15 @@ def scan_codigo(
                     tentativa=2,
                 )
             )
+    db.add(
+        SaidaHistorico(
+            id_saida=saida.id_saida,
+            evento="assumir",
+            status_anterior=status_norm,
+            status_novo=STATUS_SAIU_PARA_ENTREGA,
+            user_id=user.id,
+        )
+    )
     db.commit()
     db.refresh(saida)
     detail = _get_detail_for_saida(db, saida.id_saida)
@@ -940,6 +1011,8 @@ def assumir_entrega(
         SaidaHistorico(
             id_saida=id_saida,
             evento="reatribuicao",
+            status_anterior=status_norm,
+            status_novo=STATUS_SAIU_PARA_ENTREGA,
             motoboy_id_anterior=antigo,
             motoboy_id_novo=user.motoboy_id,
             user_id=user.id,
