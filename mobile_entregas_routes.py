@@ -67,6 +67,8 @@ class EntregaListItem(BaseModel):
     cliente: Optional[str] = None
     bairro: Optional[str] = None
     endereco: Optional[str] = None
+    numero: Optional[str] = None  # dest_numero (para agrupamento CEP+número)
+    cep: Optional[str] = None  # dest_cep (para agrupamento CEP+número)
     contato: Optional[str] = None
     data: Optional[date] = None
     data_hora_entrega: Optional[datetime] = None
@@ -204,6 +206,8 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "cliente": detail.dest_nome if detail else None,
         "bairro": detail.dest_bairro if detail else None,
         "endereco": endereco,
+        "numero": (detail.dest_numero or "").strip() or None if detail else None,
+        "cep": (detail.dest_cep or "").strip() or None if detail else None,
         "contato": detail.dest_contato if detail else None,
         "data": s.data,
         "data_hora_entrega": s.data_hora_entrega,
