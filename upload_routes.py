@@ -114,8 +114,8 @@ def upload_presign(
         ext = body.filename.rsplit(".", 1)[-1].lower()
         if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
             ext = "jpg"
-    # object_key: saidas/{id_saida}/{tipo}/{uuid}.ext (prefixo saidas/ obrigatório na Application Key)
-    object_key = f"saidas/{body.id_saida}/{body.tipo}/{uuid.uuid4().hex}.{ext}"
+    # object_key: saida/{id_saida}/{tipo}/{uuid}.ext (prefixo saida/ obrigatório na Application Key)
+    object_key = f"saida/{body.id_saida}/{body.tipo}/{uuid.uuid4().hex}.{ext}"
 
     client = _get_s3_client()
     params = {"Bucket": B2_BUCKET_NAME, "Key": object_key}
