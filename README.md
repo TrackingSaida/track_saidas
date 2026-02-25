@@ -49,7 +49,16 @@ Reinicie o servidor (uvicorn) após alterar o `.env`.
 3. Nome: ex. `tracking-saida-prod`.
 4. **Allow access to Bucket(s):** selecione o bucket `ts-prod-entregas-fotos`.
 5. **Type of Access:** Read and Write.
-6. **Restrict to file name prefix:** `saidas/` (obrigatório para o código).
+6. **Restrict to file name prefix:** `saida/` (obrigatório para o código).
 7. Crie a chave e copie o **keyID** e a **applicationKey** (a chave só é exibida uma vez).
 
 Use o **keyID** em `B2_ACCESS_KEY_ID` e a **applicationKey** em `B2_SECRET_ACCESS_KEY`.
+
+### Erro 403 "AccessDenied / not entitled" no upload (mobile)
+
+Se o app mostrar **"Upload recusado (403)"** com mensagem `AccessDenied` ou `not entitled`, o B2 está recusando o PUT na URL presigned. Corrija a Application Key:
+
+1. **Tipo de acesso:** use **Read and Write** (não use só "Write Only"; presigned PUT pode exigir Read and Write).
+2. **Bucket:** a chave deve ter acesso ao bucket `ts-prod-entregas-fotos` (ou o valor de `B2_BUCKET_NAME`).
+3. **Restrição de prefixo:** em "Restrict to file name prefix" use exatamente `saida/` (com a barra). As chaves geradas pelo backend são do tipo `saida/{id}/{tipo}/{uuid}.jpg`.
+4. Crie uma **nova** Application Key com essas opções, atualize `B2_ACCESS_KEY_ID` e `B2_SECRET_ACCESS_KEY` no ambiente (Render ou .env) e faça um novo deploy/reinício.
