@@ -12,3 +12,4 @@ requests
 reportlab
 qrcode[pil]
 python-barcode[images]
+boto3>=1.34.0

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 import unicodedata
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
@@ -112,6 +114,7 @@ class SaidaDetailOut(BaseModel):
     dest_contato: Optional[str] = None
     endereco_formatado: Optional[str] = None
     endereco_origem: Optional[str] = None
+    foto_urls: Optional[List[str]] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -709,6 +712,19 @@ def get_saida_detalhe(
     )
     detail_out = None
     if detail_row:
+        foto_urls_list: List[str] = []
+        if detail_row.foto_url:
+            raw = (detail_row.foto_url or "").strip()
+            if raw.startswith("["):
+                try:
+                    foto_urls_list = json.loads(raw)
+                    if not isinstance(foto_urls_list, list):
+                        foto_urls_list = [raw]
+                except (json.JSONDecodeError, TypeError):
+                    foto_urls_list = [raw]
+            else:
+                foto_urls_list = [raw]
+        foto_urls_list = [k for k in foto_urls_list if k][:3]
         detail_out = SaidaDetailOut(
             id_saida=detail_row.id_saida,
             id_entregador=detail_row.id_entregador,
@@ -732,6 +748,7 @@ def get_saida_detalhe(
             dest_contato=detail_row.dest_contato,
             endereco_formatado=detail_row.endereco_formatado,
             endereco_origem=detail_row.endereco_origem,
+            foto_urls=foto_urls_list or None,
         )
     return SaidaDetalheCompletoOut(
         id_saida=obj.id_saida,
@@ -748,6 +765,98 @@ def get_saida_detalhe(
         base=obj.base,
         detail=detail_out,
     )
+
+
+# ============================================================
+# PATCH — ADICIONAR FOTO (append até 3)
+# ============================================================
+
+class SaidaFotoPatchBody(BaseModel):
+    foto_url: str = Field(min_length=1)
+    status: str = Field(pattern="^(entregue|ausente)$")
+
+
+def _normalize_foto_url_to_key(foto_url: str) -> str:
+    """Se for URL completa, extrai object_key; senão retorna como está."""
+    s = (foto_url or "").strip()
+    if not s:
+        return s
+    if s.startswith("http://") or s.startswith("https://"):
+        bucket = os.getenv("B2_BUCKET_NAME", "ts-prod-entregas-fotos")
+        prefix = f"/{bucket}/"
+        idx = s.find(prefix)
+        if idx != -1:
+            return s[idx + len(prefix) :].split("?")[0]
+        return s.split("/")[-1].split("?")[0] or s
+    return s
+
+
+@router.patch("/{id_saida}/foto")
+def patch_saida_foto(
+    id_saida: int,
+    body: SaidaFotoPatchBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Append uma foto (object_key) à lista em saidas_detail; atualiza status da saída. Máx. 3 fotos."""
+    sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+    obj = _get_owned_saida(db, sub_base, id_saida)
+    detail_row = db.scalar(
+        select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).order_by(SaidaDetail.id_detail.desc()).limit(1)
+    )
+    key = _normalize_foto_url_to_key(body.foto_url)
+    if not key:
+        raise HTTPException(status_code=422, detail="foto_url inválida.")
+
+    status_canon = STATUS_ENTREGUE if body.status.lower() == "entregue" else STATUS_AUSENTE
+    current_list: List[str] = []
+    if detail_row and detail_row.foto_url:
+        raw = (detail_row.foto_url or "").strip()
+        if raw.startswith("["):
+            try:
+                current_list = json.loads(raw)
+                if not isinstance(current_list, list):
+                    current_list = [raw]
+            except (json.JSONDecodeError, TypeError):
+                current_list = [raw]
+        else:
+            current_list = [raw]
+    current_list = [k for k in current_list if k]
+
+    if len(current_list) >= 3:
+        raise HTTPException(status_code=422, detail="Máximo de 3 fotos por entrega.")
+
+    current_list.append(key)
+    payload = json.dumps(current_list)
+
+    if detail_row:
+        detail_row.foto_url = payload
+        detail_row.status = status_canon
+    else:
+        detail_row = SaidaDetail(
+            id_saida=id_saida,
+            id_entregador=getattr(obj, "motoboy_id", None) or 0,
+            status=status_canon,
+            tentativa=1,
+            foto_url=payload,
+        )
+        db.add(detail_row)
+
+    status_anterior = obj.status
+    obj.status = status_canon
+    db.add(
+        SaidaHistorico(
+            id_saida=id_saida,
+            evento=body.status.lower(),
+            status_anterior=status_anterior,
+            status_novo=status_canon,
+            user_id=current_user.id,
+        )
+    )
+    db.commit()
+    return {"ok": True, "foto_urls": current_list}
 
 
 # ============================================================
