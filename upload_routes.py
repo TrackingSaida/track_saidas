@@ -6,10 +6,13 @@ Prefixo: /upload. Auth: get_current_user (web e mobile).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
 from typing import Optional, List
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Body
 from pydantic import BaseModel, Field
@@ -128,6 +131,13 @@ def upload_presign(
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Erro ao gerar presigned URL: {e}")
 
+    logger.info(
+        "upload presign: id_saida=%s tipo=%s object_key=%s user_id=%s",
+        body.id_saida,
+        body.tipo,
+        object_key,
+        getattr(current_user, "id", None),
+    )
     return {
         "upload_url": upload_url,
         "object_key": object_key,

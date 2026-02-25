@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import unicodedata
 from typing import Optional, List
+
+logger = logging.getLogger(__name__)
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
@@ -856,6 +859,14 @@ def patch_saida_foto(
         )
     )
     db.commit()
+    logger.info(
+        "PATCH foto: id_saida=%s object_key=%s status=%s foto_urls_count=%s user_id=%s",
+        id_saida,
+        key,
+        body.status,
+        len(current_list),
+        getattr(current_user, "id", None),
+    )
     return {"ok": True, "foto_urls": current_list}
 
 
