@@ -30,7 +30,7 @@ def geocode_address(address: str) -> Optional[Tuple[float, float]]:
         r = requests.get(
             url,
             params={"q": query, "format": "json", "limit": 1},
-            headers={"User-Agent": "TrackSaidasBackend/1.0 (contato@seudominio.com)"},
+            headers={"User-Agent": "TrackSaidasApp/1.0 (https://github.com/track-saidas; contato@track-saidas.com)"},
             timeout=10,
         )
         r.raise_for_status()
@@ -39,8 +39,8 @@ def geocode_address(address: str) -> Optional[Tuple[float, float]]:
             logger.warning("Geocoding (OSM): nenhum resultado para %s", query[:80])
             return None
         first = data[0]
-        lat = first.get("lat")
-        lon = first.get("lon")
+        lat = first.get("lat") or first.get("latitude")
+        lon = first.get("lon") or first.get("longitude")
         if lat is not None and lon is not None:
             logger.info("Geocoding (OSM) ok: %s -> %s, %s", query[:50], lat, lon)
             return (float(lat), float(lon))
@@ -92,8 +92,8 @@ def _geocode_with_locationiq(address: str, api_key: str) -> Optional[Tuple[float
             logger.warning("Geocoding (locationiq): nenhum resultado para %s", address[:80])
             return None
         first = data[0]
-        lat = first.get("lat")
-        lon = first.get("lon")
+        lat = first.get("lat") or first.get("latitude")
+        lon = first.get("lon") or first.get("longitude")
         if lat is not None and lon is not None:
             logger.info("Geocoding (locationiq) ok: %s -> %s, %s", address[:50], lat, lon)
             return float(lat), float(lon)
@@ -103,13 +103,40 @@ def _geocode_with_locationiq(address: str, api_key: str) -> Optional[Tuple[float
         return None
 
 
+def _geocode_with_maps_co(address: str, api_key: str) -> Optional[Tuple[float, float]]:
+    """Geocoding via geocode.maps.co (OSM/Nominatim, plano gratuito com chave)."""
+    url = "https://geocode.maps.co/search"
+    try:
+        r = requests.get(
+            url,
+            params={"q": address, "format": "json", "limit": 1, "api_key": api_key},
+            headers={"User-Agent": "TrackSaidasBackend/1.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            logger.warning("Geocoding (maps.co): nenhum resultado para %s", address[:80])
+            return None
+        first = data[0]
+        lat = first.get("lat") or first.get("latitude")
+        lon = first.get("lon") or first.get("longitude")
+        if lat is not None and lon is not None:
+            logger.info("Geocoding (maps.co) ok: %s -> %s, %s", address[:50], lat, lon)
+            return float(lat), float(lon)
+        return None
+    except Exception as e:
+        logger.warning("Geocoding (maps.co) falhou para %s: %s", address[:80], e)
+        return None
+
+
 def geocode_address_any(address: str) -> Optional[Tuple[float, float]]:
     """
     Wrapper de alto nível: tenta provedor externo configurável e faz fallback para OSM.
 
     Configuração via ambiente:
-    - GEOCODER_PROVIDER: \"geoapify\" | \"locationiq\" (default: \"geoapify\")
-    - GEOCODER_API_KEY: chave do provedor externo (obrigatória para os dois)
+    - GEOCODER_PROVIDER: \"geoapify\" | \"locationiq\" | \"geocode_maps_co\" (default: \"geoapify\")
+    - GEOCODER_API_KEY: chave do provedor externo (obrigatória para geoapify/locationiq/maps_co)
     """
     addr = (address or "").strip()
     if not addr:
@@ -126,6 +153,10 @@ def geocode_address_any(address: str) -> Optional[Tuple[float, float]]:
                 return coords
         elif provider in ("locationiq", "lq"):
             coords = _geocode_with_locationiq(addr, api_key)
+            if coords:
+                return coords
+        elif provider in ("geocode_maps_co", "maps_co", "mapsco"):
+            coords = _geocode_with_maps_co(addr, api_key)
             if coords:
                 return coords
         else:

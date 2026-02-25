@@ -594,6 +594,10 @@ def atualizar_endereco(
         coords = geocode_address_any(geo_query)
         if coords:
             lat, lon = coords
+            logging.getLogger(__name__).info(
+                "Geocoding: salvando lat=%s, lon=%s para id_saida=%s (query=%s)",
+                lat, lon, id_saida, geo_query[:60],
+            )
         else:
             logging.getLogger(__name__).warning(
                 "Endereço salvo sem coordenadas (geocoding falhou ou sem resultado): id_saida=%s, endereco=%s",
