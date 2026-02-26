@@ -24,8 +24,8 @@ from entregador_routes import resolver_precos_entregador, _normalizar_servico
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
-# Status considerados "saiu para entrega" (válidos para taxa de sucesso)
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
+# Status considerados válidos (saiu/em rota/entregue/ausente — alinhado ao app mobile)
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
 STATUS_CANCELADO = "cancelado"
 STATUS_COLETADO = "coletado"
 

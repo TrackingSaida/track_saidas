@@ -31,8 +31,8 @@ router = APIRouter(prefix="", tags=["Fechamentos"])
 STATUS_GERADO = "GERADO"
 STATUS_REAJUSTADO = "REAJUSTADO"
 
-# Status válidos para saidas no cálculo
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
+# Status válidos para saidas no cálculo (alinhado ao app mobile)
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
 
 
 def _calcular_valor_base(

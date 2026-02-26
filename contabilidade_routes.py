@@ -22,7 +22,7 @@ from entregador_routes import resolver_precos_entregador, _normalizar_servico
 
 router = APIRouter(prefix="/contabilidade", tags=["Contabilidade"])
 
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue", "pendente"]
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "pendente"]
 STATUS_FECHAMENTO_CONTABIL = ("GERADO", "REAJUSTADO", "FECHADO")  # FECHADO = legado
 
 
