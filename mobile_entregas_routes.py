@@ -337,12 +337,13 @@ def resumo_entregas(
             Saida.status == STATUS_AUSENTE,
         )
     ) or 0
+    # Em atraso (D+1): só contabiliza criação antes de hoje (data de criação < hoje)
     atraso_d1 = db.scalar(
         select(func.count(Saida.id_saida)).where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
             Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
-            Saida.data < hoje,
+            func.date(Saida.timestamp) < hoje,
         )
     ) or 0
 
