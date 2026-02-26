@@ -24,7 +24,8 @@ def geocode_address(address: str) -> Optional[Tuple[float, float]]:
     """
     if not (address or "").strip():
         return None
-    query = f"{address.strip()}, Brasil"
+    addr = address.strip()
+    query = addr if addr.endswith("Brasil") else f"{addr}, Brasil"
     url = "https://nominatim.openstreetmap.org/search"
     try:
         r = requests.get(
@@ -164,3 +165,59 @@ def geocode_address_any(address: str) -> Optional[Tuple[float, float]]:
 
     # 2) Fallback para Nominatim/OpenStreetMap
     return geocode_address(addr)
+
+
+def geocode_address_with_fallbacks(
+    rua: Optional[str] = None,
+    numero: Optional[str] = None,
+    complemento: Optional[str] = None,
+    bairro: Optional[str] = None,
+    cidade: Optional[str] = None,
+    estado: Optional[str] = None,
+    cep: Optional[str] = None,
+    endereco_formatado: Optional[str] = None,
+) -> Optional[Tuple[float, float]]:
+    """
+    Tenta geocoding com várias variações da query para maximizar chance de obter coordenadas.
+    Ordem: endereço completo → sem complemento → sem número → cidade + estado.
+    """
+    def _try(*parts: Optional[str]) -> Optional[Tuple[float, float]]:
+        query = ", ".join(p for p in parts if p and str(p).strip()).strip()
+        if not query:
+            return None
+        if not query.endswith("Brasil"):
+            query = f"{query}, Brasil"
+        return geocode_address_any(query)
+
+    # 1) Endereço formatado completo (como veio do app)
+    if endereco_formatado and endereco_formatado.strip():
+        coords = _try(endereco_formatado.strip())
+        if coords:
+            return coords
+
+    # 2) Partes: rua, número, bairro, cidade, estado
+    coords = _try(rua, numero, bairro, cidade, estado)
+    if coords:
+        return coords
+
+    # 3) Sem número (às vezes o número atrapalha)
+    coords = _try(rua, bairro, cidade, estado)
+    if coords:
+        return coords
+
+    # 4) Rua, cidade, estado
+    coords = _try(rua, cidade, estado)
+    if coords:
+        return coords
+
+    # 5) Bairro, cidade, estado
+    coords = _try(bairro, cidade, estado)
+    if coords:
+        return coords
+
+    # 6) Cidade, estado (centro da cidade como último recurso)
+    coords = _try(cidade, estado)
+    if coords:
+        return coords
+
+    return None

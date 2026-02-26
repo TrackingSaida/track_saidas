@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from geocode_utils import geocode_address_any
+from geocode_utils import geocode_address_any, geocode_address_with_fallbacks
 from models import (
     User,
     Saida,
@@ -589,21 +589,31 @@ def atualizar_endereco(
     lat = body.latitude
     lon = body.longitude
     if (lat is None or lon is None) and endereco_formatado.strip():
-        # Query de geocoding com foco em rua, número, bairro, cidade e estado
-        geo_parts = [body.rua, body.numero, body.bairro, body.cidade, body.estado]
-        geo_query = ", ".join(p for p in geo_parts if p) or endereco_formatado
-        coords = geocode_address_any(geo_query)
+        coords = geocode_address_with_fallbacks(
+            rua=body.rua,
+            numero=body.numero,
+            complemento=body.complemento,
+            bairro=body.bairro,
+            cidade=body.cidade,
+            estado=body.estado,
+            cep=body.cep,
+            endereco_formatado=endereco_formatado,
+        )
         if coords:
             lat, lon = coords
             logging.getLogger(__name__).info(
-                "Geocoding: salvando lat=%s, lon=%s para id_saida=%s (query=%s)",
-                lat, lon, id_saida, geo_query[:60],
+                "Geocoding: salvando lat=%s, lon=%s para id_saida=%s",
+                lat, lon, id_saida,
             )
         else:
             logging.getLogger(__name__).warning(
-                "Endereço salvo sem coordenadas (geocoding falhou ou sem resultado): id_saida=%s, endereco=%s",
+                "Geocoding falhou após fallbacks: id_saida=%s, endereco=%s",
                 id_saida,
-                geo_query[:80],
+                endereco_formatado[:80],
+            )
+            raise HTTPException(
+                status_code=422,
+                detail="Não foi possível obter a localização deste endereço. Verifique o endereço (rua, número, bairro, cidade, estado) e tente novamente.",
             )
 
     if detail:
