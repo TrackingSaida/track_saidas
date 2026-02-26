@@ -438,17 +438,18 @@ def rotas_iniciar(
             detail="Alguma entrega não pertence ao motoboy ou não está disponível para rota.",
         )
     for s in rows:
+        status_antes = s.status
         s.status = STATUS_EM_ROTA
-    for s in rows:
-        db.add(
-            SaidaHistorico(
-                id_saida=s.id_saida,
-                evento="em_rota",
-                status_anterior=STATUS_SAIU_PARA_ENTREGA,
-                status_novo=STATUS_EM_ROTA,
-                user_id=user.id,
+        if status_antes == STATUS_SAIU_PARA_ENTREGA:
+            db.add(
+                SaidaHistorico(
+                    id_saida=s.id_saida,
+                    evento="em_rota",
+                    status_anterior=STATUS_SAIU_PARA_ENTREGA,
+                    status_novo=STATUS_EM_ROTA,
+                    user_id=user.id,
+                )
             )
-        )
 
     hoje = date.today()
     rota = RotasMotoboy(
