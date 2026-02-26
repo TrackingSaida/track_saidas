@@ -128,8 +128,7 @@ def acompanhamento_dia(
                 if ultima_entrega_dt is None or s.data_hora_entrega > ultima_entrega_dt:
                     ultima_entrega_dt = s.data_hora_entrega
 
-        denom = entregues + ausente_ou_ocorrencias
-        sla = round(100.0 * entregues / denom, 1) if denom > 0 else None
+        sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
 
         motoboy = db.get(Motoboy, mid)
         motoboy_nome = _get_motoboy_nome(db, motoboy) if motoboy else f"Motoboy {mid}"
@@ -154,8 +153,7 @@ def acompanhamento_dia(
         totais_em_rota += em_rota
         totais_ausente += ausente_ou_ocorrencias
 
-    denom_total = totais_entregues + totais_ausente
-    sla_total = round(100.0 * totais_entregues / denom_total, 1) if denom_total > 0 else None
+    sla_total = round(100.0 * totais_entregues / totais_pedidos, 1) if totais_pedidos > 0 else None
 
     return AcompanhamentoDiaResponse(
         items=items,
