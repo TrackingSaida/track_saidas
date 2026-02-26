@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, Saida, Motoboy, RotasMotoboy
+from models import User, Saida, SaidaDetail, Motoboy, RotasMotoboy
 from saidas_routes import (
     _get_motoboy_nome,
     normalizar_status_saida,
@@ -52,6 +52,71 @@ class AcompanhamentoTotais(BaseModel):
 class AcompanhamentoDiaResponse(BaseModel):
     items: List[AcompanhamentoItem]
     totais: AcompanhamentoTotais
+
+
+class AcompanhamentoMapaItem(BaseModel):
+    id_saida: int
+    latitude: float
+    longitude: float
+    status: Optional[str] = None
+    motoboy_id: Optional[int] = None
+    motoboy_nome: Optional[str] = None
+    codigo: Optional[str] = None
+    endereco_formatado: Optional[str] = None
+
+
+class AcompanhamentoMapaResponse(BaseModel):
+    items: List[AcompanhamentoMapaItem]
+
+
+@router.get("/mapa", response_model=AcompanhamentoMapaResponse)
+def acompanhamento_mapa(
+    data: date = Query(..., description="Data única (YYYY-MM-DD)"),
+    motoboy_id: Optional[int] = Query(None, description="Filtrar por motoboy"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Retorna saídas do dia com coordenadas (lat/long) para exibição no mapa.
+    Apenas registros com latitude e longitude preenchidos (SaidaDetail).
+    """
+    sub_base = getattr(current_user, "sub_base", None)
+    if not sub_base or not str(sub_base).strip():
+        raise HTTPException(status_code=403, detail="Sub_base não definida.")
+
+    stmt = (
+        select(Saida, SaidaDetail)
+        .join(SaidaDetail, Saida.id_saida == SaidaDetail.id_saida)
+        .where(Saida.sub_base == sub_base)
+        .where(Saida.data == data)
+        .where(SaidaDetail.latitude.isnot(None))
+        .where(SaidaDetail.longitude.isnot(None))
+    )
+    if motoboy_id is not None:
+        stmt = stmt.where(Saida.motoboy_id == motoboy_id)
+
+    rows = db.execute(stmt).all()
+    items = []
+    for saida, detail in rows:
+        motoboy = db.get(Motoboy, saida.motoboy_id) if saida.motoboy_id else None
+        motoboy_nome = _get_motoboy_nome(db, motoboy) if motoboy else None
+        lat = float(detail.latitude) if detail.latitude is not None else None
+        lon = float(detail.longitude) if detail.longitude is not None else None
+        if lat is None or lon is None:
+            continue
+        items.append(
+            AcompanhamentoMapaItem(
+                id_saida=saida.id_saida,
+                latitude=lat,
+                longitude=lon,
+                status=saida.status,
+                motoboy_id=saida.motoboy_id,
+                motoboy_nome=motoboy_nome,
+                codigo=saida.codigo,
+                endereco_formatado=detail.endereco_formatado,
+            )
+        )
+    return AcompanhamentoMapaResponse(items=items)
 
 
 @router.get("/dia", response_model=AcompanhamentoDiaResponse)
