@@ -120,6 +120,7 @@ from etiquetas_routes import router as etiquetas_router
 from dashboard_routes import router as dashboard_router
 from mobile_entregas_routes import router as mobile_entregas_router
 from upload_routes import router as upload_router
+from acompanhamento_routes import router as acompanhamento_router
 
 app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
@@ -133,6 +134,7 @@ app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
+app.include_router(acompanhamento_router, prefix=API_PREFIX)
 app.include_router(mobile_entregas_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)

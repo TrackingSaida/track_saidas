@@ -40,6 +40,12 @@ MENU_DEFS = [
                 "group": "registros"
             },
             {
+                "label": "Acompanhamento do Dia",
+                "href": "tracking-acompanhamento.html",
+                "roles": [0, 1, 2, 3],
+                "group": "registros"
+            },
+            {
                 "label": "Gerar Etiqueta",
                 "href": "tracking-etiquetas.html",
                 "roles": [0, 1, 2, 3],
