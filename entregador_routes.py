@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user, get_password_hash
-from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Saida, User
+from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, Saida, User
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
@@ -83,7 +83,8 @@ class EntregadorOut(BaseModel):
 
 class EntregadorResumoItem(BaseModel):
     data: str  # YYYY-MM-DD
-    entregador_id: int
+    entregador_id: Optional[int] = None
+    motoboy_id: Optional[int] = None
     entregador_nome: str
     shopee: Dict[str, Any]  # {qtde, valor_unit, total}
     flex: Dict[str, Any]
@@ -220,6 +221,24 @@ def resolver_precos_entregador(
 
     if global_row:
         return {"shopee_valor": shopee_global, "ml_valor": ml_global, "avulso_valor": avulso_global}
+    return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero}
+
+
+def resolver_precos_motoboy(db: Session, sub_base: str) -> Dict[str, Decimal]:
+    """
+    Retorna {shopee_valor, ml_valor, avulso_valor} para motoboy (preço global da sub_base).
+    Motoboys não têm preço individual; usam sempre EntregadorPrecoGlobal.
+    """
+    zero = Decimal("0.00")
+    global_row = db.scalars(
+        select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
+    ).first()
+    if global_row:
+        return {
+            "shopee_valor": global_row.shopee_valor or zero,
+            "ml_valor": global_row.ml_valor or zero,
+            "avulso_valor": global_row.avulso_valor or zero,
+        }
     return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero}
 
 
@@ -364,6 +383,18 @@ def _normalizar_servico(servico: Optional[str]) -> str:
     return "avulso"
 
 
+def _get_motoboy_nome(db: Session, motoboy_id: int) -> str:
+    """Nome do motoboy (User) para exibição no resumo."""
+    motoboy = db.get(Motoboy, motoboy_id)
+    if not motoboy or not motoboy.user_id:
+        return f"Motoboy {motoboy_id}"
+    u = db.get(User, motoboy.user_id)
+    if not u:
+        return f"Motoboy {motoboy_id}"
+    nome = (f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or "").strip()
+    return nome or f"Motoboy {motoboy_id}"
+
+
 def _calcular_valor_base_periodo(
     db: Session,
     sub_base_user: str,
@@ -385,6 +416,39 @@ def _calcular_valor_base_periodo(
     )
     rows = db.scalars(stmt).all()
     precos = resolver_precos_entregador(db, entregador_id, sub_base_user)
+    total = Decimal("0.00")
+    for saida in rows:
+        tipo = _normalizar_servico(saida.servico)
+        if tipo == "shopee":
+            total += precos["shopee_valor"]
+        elif tipo == "flex":
+            total += precos["ml_valor"]
+        else:
+            total += precos["avulso_valor"]
+    return total.quantize(Decimal("0.01"))
+
+
+def _calcular_valor_base_motoboy_periodo(
+    db: Session,
+    sub_base_user: str,
+    motoboy_id: int,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> Decimal:
+    """Calcula o valor_base a partir das saídas do motoboy no período (resumo/fechamento)."""
+    if periodo_inicio > periodo_fim:
+        return Decimal("0.00")
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base_user,
+        Saida.motoboy_id == motoboy_id,
+        Saida.codigo.isnot(None),
+        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
+        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
+        func.lower(Saida.status).in_(status_validos),
+    )
+    rows = db.scalars(stmt).all()
+    precos = resolver_precos_motoboy(db, sub_base_user)
     total = Decimal("0.00")
     for saida in rows:
         tipo = _normalizar_servico(saida.servico)
@@ -435,8 +499,8 @@ def resumo_entregadores(
 ):
     sub_base_user = _resolve_user_base(db, current_user)
 
-    # Inclui saída e entrega; exclui cancelados
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
+    # Inclui saída e entrega; exclui cancelados (alinhado a contabilidade/dashboard)
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.codigo.isnot(None),
@@ -444,6 +508,7 @@ def resumo_entregadores(
         or_(
             Saida.entregador_id.isnot(None),
             Saida.entregador.isnot(None),
+            Saida.motoboy_id.isnot(None),
         ),
     )
 
@@ -458,40 +523,75 @@ def resumo_entregadores(
 
     agrupado: Dict[str, Dict[str, Any]] = {}
     for saida in rows:
-        ent_id = saida.entregador_id
-        ent_nome = saida.entregador or "Sem nome"
-        if ent_id is None:
-            # fallback: usa hash do nome como "id" fictício para agrupamento
-            ent_id = -abs(hash(ent_nome))
-
         dia = saida.timestamp.date().isoformat()
-        key = f"{dia}_{ent_id}"
-        if key not in agrupado:
-            agrupado[key] = {
-                "data": dia,
-                "entregador_id": ent_id,
-                "entregador_nome": ent_nome,
-                "qtde_shopee": 0,
-                "qtde_flex": 0,
-                "qtde_avulso": 0,
-            }
+        if getattr(saida, "motoboy_id", None) is not None:
+            mid = saida.motoboy_id
+            key = f"{dia}_m_{mid}"
+            if key not in agrupado:
+                agrupado[key] = {
+                    "data": dia,
+                    "entregador_id": None,
+                    "motoboy_id": mid,
+                    "entregador_nome": _get_motoboy_nome(db, mid),
+                    "qtde_shopee": 0,
+                    "qtde_flex": 0,
+                    "qtde_avulso": 0,
+                }
+        else:
+            ent_id = saida.entregador_id
+            ent_nome = saida.entregador or "Sem nome"
+            if ent_id is None:
+                ent_id = -abs(hash(ent_nome))
+            key = f"{dia}_{ent_id}"
+            if key not in agrupado:
+                agrupado[key] = {
+                    "data": dia,
+                    "entregador_id": ent_id,
+                    "motoboy_id": None,
+                    "entregador_nome": ent_nome,
+                    "qtde_shopee": 0,
+                    "qtde_flex": 0,
+                    "qtde_avulso": 0,
+                }
         tipo = _normalizar_servico(saida.servico)
         agrupado[key][f"qtde_{tipo}"] += 1
 
-    cache_precos: Dict[int, Dict[str, Decimal]] = {}
+    cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
     cache_fechamento: Dict[tuple, Optional[EntregadorFechamento]] = {}
-    cache_valor_base: Dict[tuple, Decimal] = {}  # (eid, periodo_inicio, periodo_fim) -> valor_base
+    cache_valor_base: Dict[tuple, Decimal] = {}  # (eid, periodo_inicio, periodo_fim) ou (mid,) -> valor_base
 
-    def _get_fechamento(eid: int, data_str: str) -> tuple:
-        """Retorna (status, id_fechamento, fechamento ou None). Apenas entregadores reais (id > 0)."""
-        if eid <= 0:
-            return ("PENDENTE", None, None)
+    def _get_fechamento(eid: Optional[int], mid: Optional[int], data_str: str) -> tuple:
+        """Retorna (status, id_fechamento, fechamento ou None). Entregador (id > 0) ou motoboy."""
         from datetime import datetime as dt
         try:
             data_ref = dt.strptime(data_str, "%Y-%m-%d").date()
         except (ValueError, TypeError):
             return ("PENDENTE", None, None)
-        key_cache = (sub_base_user, eid, data_str)
+        if mid is not None:
+            key_cache = (sub_base_user, "m", mid, data_str)
+            if key_cache not in cache_fechamento:
+                if hasattr(EntregadorFechamento, "id_motoboy"):
+                    fech = db.scalars(
+                        select(EntregadorFechamento).where(
+                            EntregadorFechamento.sub_base == sub_base_user,
+                            EntregadorFechamento.id_motoboy == mid,
+                            EntregadorFechamento.periodo_inicio <= data_ref,
+                            EntregadorFechamento.periodo_fim >= data_ref,
+                        )
+                    ).first()
+                else:
+                    fech = None
+                cache_fechamento[key_cache] = fech
+            fech = cache_fechamento[key_cache]
+            if fech:
+                st = (fech.status or "").upper()
+                if st == "FECHADO":
+                    st = "GERADO"
+                return (st or "GERADO", fech.id_fechamento, fech)
+            return ("PENDENTE", None, None)
+        if eid is None or eid <= 0:
+            return ("PENDENTE", None, None)
+        key_cache = (sub_base_user, "e", eid, data_str)
         if key_cache not in cache_fechamento:
             fech = db.scalars(
                 select(EntregadorFechamento).where(
@@ -506,22 +606,29 @@ def resumo_entregadores(
         if fech:
             st = (fech.status or "").upper()
             if st == "FECHADO":
-                st = "GERADO"  # legado
+                st = "GERADO"
             return (st or "GERADO", fech.id_fechamento, fech)
         return ("PENDENTE", None, None)
 
     lista: List[EntregadorResumoItem] = []
     for key, item in agrupado.items():
         eid = item["entregador_id"]
-        if eid not in cache_precos:
-            cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base_user)
-        precos = cache_precos[eid]
+        mid = item.get("motoboy_id")
+        precos_key = ("m", mid) if mid is not None else ("e", eid)
+        if precos_key not in cache_precos:
+            if mid is not None:
+                cache_precos[precos_key] = resolver_precos_motoboy(db, sub_base_user)
+            elif eid is not None and eid > 0:
+                cache_precos[precos_key] = resolver_precos_entregador(db, eid, sub_base_user)
+            else:
+                cache_precos[precos_key] = resolver_precos_motoboy(db, sub_base_user)
+        precos = cache_precos[precos_key]
         valor_shopee = item["qtde_shopee"] * precos["shopee_valor"]
         valor_flex = item["qtde_flex"] * precos["ml_valor"]
         valor_avulso = item["qtde_avulso"] * precos["avulso_valor"]
         total_dia = valor_shopee + valor_flex + valor_avulso
 
-        fech_status, id_fech, fech = _get_fechamento(eid, item["data"])
+        fech_status, id_fech, fech = _get_fechamento(eid, mid, item["data"])
 
         pode_reajustar = None
         valor_base_atual = None
@@ -529,14 +636,23 @@ def resumo_entregadores(
         periodo_inicio_str = None
         periodo_fim_str = None
         if fech_status == "GERADO" and fech is not None and id_fech is not None:
-            key_vb = (eid, fech.periodo_inicio, fech.periodo_fim)
-            if key_vb not in cache_valor_base:
-                cache_valor_base[key_vb] = _calcular_valor_base_periodo(
-                    db, sub_base_user, eid, fech.periodo_inicio, fech.periodo_fim
-                )
-            valor_base_atual = cache_valor_base[key_vb]
+            if mid is not None:
+                key_vb = ("m", mid, fech.periodo_inicio, fech.periodo_fim)
+                if key_vb not in cache_valor_base and hasattr(EntregadorFechamento, "id_motoboy"):
+                    cache_valor_base[key_vb] = _calcular_valor_base_motoboy_periodo(
+                        db, sub_base_user, mid, fech.periodo_inicio, fech.periodo_fim
+                    )
+                valor_base_atual = cache_valor_base.get(key_vb)
+            else:
+                key_vb = (eid, fech.periodo_inicio, fech.periodo_fim)
+                if key_vb not in cache_valor_base:
+                    cache_valor_base[key_vb] = _calcular_valor_base_periodo(
+                        db, sub_base_user, eid, fech.periodo_inicio, fech.periodo_fim
+                    )
+                valor_base_atual = cache_valor_base[key_vb]
             valor_base_fechado = fech.valor_base
-            pode_reajustar = valor_base_atual != valor_base_fechado
+            if valor_base_atual is not None:
+                pode_reajustar = valor_base_atual != valor_base_fechado
             periodo_inicio_str = fech.periodo_inicio.isoformat() if hasattr(fech.periodo_inicio, "isoformat") else str(fech.periodo_inicio)
             periodo_fim_str = fech.periodo_fim.isoformat() if hasattr(fech.periodo_fim, "isoformat") else str(fech.periodo_fim)
         if fech is not None and id_fech is not None and periodo_inicio_str is None:
@@ -547,6 +663,7 @@ def resumo_entregadores(
             EntregadorResumoItem(
                 data=item["data"],
                 entregador_id=item["entregador_id"],
+                motoboy_id=item.get("motoboy_id"),
                 entregador_nome=item["entregador_nome"],
                 shopee={
                     "qtde": item["qtde_shopee"],

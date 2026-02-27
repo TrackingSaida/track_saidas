@@ -7,7 +7,7 @@ from __future__ import annotations
 import unicodedata
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -16,9 +16,9 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, EntregadorFechamento, Saida
+from models import Coleta, Entregador, EntregadorFechamento, Motoboy, Saida, User
 
-from entregador_routes import resolver_precos_entregador, _normalizar_servico
+from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
 
 router = APIRouter(prefix="/contabilidade", tags=["Contabilidade"])
 
@@ -40,16 +40,18 @@ def _normalizar_nome_entregador(s: str) -> str:
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 
-def _resolve_entregador_id_saida(db: Session, sub_base: str, saida: Saida) -> Optional[int]:
+def _resolve_actor_saida(db: Session, sub_base: str, saida: Saida) -> Tuple[Optional[int], Optional[int]]:
     """
-    Retorna o id_entregador efetivo da saída.
-    Se saida.entregador_id está preenchido, usa. Senão, tenta resolver pelo nome (saida.entregador).
+    Retorna (entregador_id, motoboy_id) da saída. Exatamente um preenchido ou ambos None.
+    Prioridade: motoboy_id (app mobile) -> entregador_id -> resolução por nome (saida.entregador).
     """
+    if getattr(saida, "motoboy_id", None) is not None:
+        return (None, saida.motoboy_id)
     if getattr(saida, "entregador_id", None) is not None:
-        return saida.entregador_id
+        return (saida.entregador_id, None)
     nome = (getattr(saida, "entregador", None) or "").strip()
     if not nome:
-        return None
+        return (None, None)
     nome_busca = _normalizar_nome_entregador(nome)
     ent = db.scalar(
         select(Entregador).where(
@@ -57,7 +59,19 @@ def _resolve_entregador_id_saida(db: Session, sub_base: str, saida: Saida) -> Op
             func.lower(func.unaccent(Entregador.nome)) == nome_busca,
         )
     )
-    return ent.id_entregador if ent else None
+    return (ent.id_entregador, None) if ent else (None, None)
+
+
+def _get_motoboy_nome(db: Session, motoboy_id: int) -> str:
+    """Nome do motoboy (User) para exibição na distribuição de despesas."""
+    motoboy = db.get(Motoboy, motoboy_id)
+    if not motoboy or not motoboy.user_id:
+        return f"Motoboy {motoboy_id}"
+    u = db.get(User, motoboy.user_id)
+    if not u:
+        return f"Motoboy {motoboy_id}"
+    nome = (f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or "").strip()
+    return nome or f"Motoboy {motoboy_id}"
 
 
 # --------------- Schemas ---------------
@@ -91,7 +105,8 @@ class BaseItem(BaseModel):
 
 
 class EntregadorDespesaItem(BaseModel):
-    id_entregador: int
+    id_entregador: Optional[int] = None
+    id_motoboy: Optional[int] = None
     nome: str
     saidas: int
     despesa: Decimal
@@ -229,32 +244,45 @@ def get_resumo_contabilidade(
     rows_fech = db.scalars(stmt_fech).all()
     despesas_confirmadas = sum(_decimal(f.valor_final) for f in rows_fech)
 
-    # Cache: (entregador_id, data) -> fechamento cobre
+    # Cache: (("e", entregador_id) ou ("m", motoboy_id), data) -> fechamento cobre
     cache_coberto: Dict[tuple, bool] = {}
     for f in rows_fech:
         d = f.periodo_inicio
         while d <= f.periodo_fim:
-            cache_coberto[(f.id_entregador, d)] = True
+            if getattr(f, "id_motoboy", None) is not None:
+                cache_coberto[(("m", f.id_motoboy), d)] = True
+            else:
+                cache_coberto[(("e", f.id_entregador), d)] = True
             d += timedelta(days=1)
 
     # ---- 3b) DESPESA PENDENTE (saídas não cobertas por fechamento) ----
-    # Usa entregador_id da saída; se NULL, resolve pelo nome para incluir registros antigos
-    cache_precos: Dict[int, Dict[str, Decimal]] = {}
+    # Ator = entregador ou motoboy; cache de preços por tipo para não colidir
+    cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
     despesas_pendentes = Decimal("0")
     despesa_pendente_por_ent: Dict[int, Decimal] = {}
+    despesa_pendente_por_motoboy: Dict[int, Decimal] = {}
     for s in rows_saidas:
-        eid = _resolve_entregador_id_saida(db, sub_base, s)
-        if eid is None:
+        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        if eid is None and mid is None:
             continue
         data_saida = s.timestamp.date()
-        if cache_coberto.get((eid, data_saida), False):
-            continue
-        if eid not in cache_precos:
+        if eid is not None:
+            if cache_coberto.get((("e", eid), data_saida), False):
+                continue
+            key = ("e", eid)
+        else:
+            if cache_coberto.get((("m", mid), data_saida), False):
+                continue
+            key = ("m", mid)
+        if key not in cache_precos:
             try:
-                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+                if eid is not None:
+                    cache_precos[key] = resolver_precos_entregador(db, eid, sub_base)
+                else:
+                    cache_precos[key] = resolver_precos_motoboy(db, sub_base)
             except Exception:
-                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
-        precos = cache_precos[eid]
+                cache_precos[key] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[key]
         tipo = _normalizar_servico(s.servico)
         valor = Decimal("0")
         if tipo == "shopee":
@@ -264,18 +292,28 @@ def get_resumo_contabilidade(
         else:
             valor = _decimal(precos.get("avulso_valor", 0))
         despesas_pendentes += valor
-        despesa_pendente_por_ent[eid] = despesa_pendente_por_ent.get(eid, Decimal("0")) + valor
+        if eid is not None:
+            despesa_pendente_por_ent[eid] = despesa_pendente_por_ent.get(eid, Decimal("0")) + valor
+        else:
+            despesa_pendente_por_motoboy[mid] = despesa_pendente_por_motoboy.get(mid, Decimal("0")) + valor
 
     despesas_pendentes = _decimal(despesas_pendentes).quantize(Decimal("0.01"))
     despesas_totais = _decimal(despesas_confirmadas + despesas_pendentes).quantize(Decimal("0.01"))
 
-    # Despesa por entregador (confirmada + pendente)
+    # Despesa por entregador e por motoboy (confirmada + pendente)
     despesa_por_ent: Dict[int, Decimal] = {}
+    despesa_por_motoboy: Dict[int, Decimal] = {}
     for f in rows_fech:
-        eid = f.id_entregador
-        despesa_por_ent[eid] = despesa_por_ent.get(eid, Decimal("0")) + _decimal(f.valor_final)
+        if getattr(f, "id_motoboy", None) is not None:
+            mid = f.id_motoboy
+            despesa_por_motoboy[mid] = despesa_por_motoboy.get(mid, Decimal("0")) + _decimal(f.valor_final)
+        else:
+            eid = f.id_entregador
+            despesa_por_ent[eid] = despesa_por_ent.get(eid, Decimal("0")) + _decimal(f.valor_final)
     for eid, val in despesa_pendente_por_ent.items():
         despesa_por_ent[eid] = despesa_por_ent.get(eid, Decimal("0")) + _decimal(val)
+    for mid, val in despesa_pendente_por_motoboy.items():
+        despesa_por_motoboy[mid] = despesa_por_motoboy.get(mid, Decimal("0")) + _decimal(val)
 
     # Despesa por serviço: rateio proporcional às saídas
     if total_saidas > 0:
@@ -366,17 +404,20 @@ def get_resumo_contabilidade(
     else:
         rentabilidade = [BaseItem(base=b, receita=_decimal(r), despesa=Decimal("0"), lucro=_decimal(r), margem=Decimal("0")) for b, r in sorted(base_receita.items())]
 
-    # ---- 8) Distribuição de despesas por entregador ----
+    # ---- 8) Distribuição de despesas por entregador e motoboy ----
     ent_ids = list(despesa_por_ent.keys())
     ent_nomes: Dict[int, str] = {}
     if ent_ids:
         for e in db.scalars(select(Entregador).where(Entregador.id_entregador.in_(ent_ids))).all():
             ent_nomes[e.id_entregador] = e.nome or ""
     saidas_por_ent: Dict[int, int] = {}
+    saidas_por_motoboy: Dict[int, int] = {}
     for s in rows_saidas:
-        eid = _resolve_entregador_id_saida(db, sub_base, s)
+        eid, mid = _resolve_actor_saida(db, sub_base, s)
         if eid is not None:
             saidas_por_ent[eid] = saidas_por_ent.get(eid, 0) + 1
+        elif mid is not None:
+            saidas_por_motoboy[mid] = saidas_por_motoboy.get(mid, 0) + 1
     dist_despesas = []
     desp_tot_dist = _decimal(despesas_totais)
     for eid, desp in despesa_por_ent.items():
@@ -385,8 +426,22 @@ def get_resumo_contabilidade(
         dist_despesas.append(
             EntregadorDespesaItem(
                 id_entregador=eid,
+                id_motoboy=None,
                 nome=ent_nomes.get(eid, "—"),
                 saidas=saidas_por_ent.get(eid, 0),
+                despesa=_decimal(desp_d).quantize(Decimal("0.01")),
+                percentual=pct,
+            )
+        )
+    for mid, desp in despesa_por_motoboy.items():
+        desp_d = _decimal(desp)
+        pct = (_decimal(desp_d) / desp_tot_dist * Decimal("100")).quantize(Decimal("0.01")) if desp_tot_dist else Decimal("0")
+        dist_despesas.append(
+            EntregadorDespesaItem(
+                id_entregador=None,
+                id_motoboy=mid,
+                nome=_get_motoboy_nome(db, mid),
+                saidas=saidas_por_motoboy.get(mid, 0),
                 despesa=_decimal(desp_d).quantize(Decimal("0.01")),
                 percentual=pct,
             )
@@ -412,17 +467,26 @@ def get_resumo_contabilidade(
             d += timedelta(days=1)
     for s in rows_saidas:
         data_saida = s.timestamp.date()
-        eid = _resolve_entregador_id_saida(db, sub_base, s)
-        if eid is None:
+        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        if eid is None and mid is None:
             continue
-        if cache_coberto.get((eid, data_saida), False):
-            continue
-        if eid not in cache_precos:
+        if eid is not None:
+            if cache_coberto.get((("e", eid), data_saida), False):
+                continue
+            key = ("e", eid)
+        else:
+            if cache_coberto.get((("m", mid), data_saida), False):
+                continue
+            key = ("m", mid)
+        if key not in cache_precos:
             try:
-                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+                if eid is not None:
+                    cache_precos[key] = resolver_precos_entregador(db, eid, sub_base)
+                else:
+                    cache_precos[key] = resolver_precos_motoboy(db, sub_base)
             except Exception:
-                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
-        precos = cache_precos[eid]
+                cache_precos[key] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[key]
         tipo = _normalizar_servico(s.servico)
         valor = Decimal("0")
         if tipo == "shopee":
