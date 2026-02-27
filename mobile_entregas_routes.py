@@ -262,7 +262,13 @@ def listar_entregas(
     elif status == "finalizadas":
         q = q.where(Saida.status == STATUS_ENTREGUE)
         if hoje is not None:
-            q = q.where(func.date(Saida.data_hora_entrega) == hoje)
+            # Filtro "finalizadas hoje": pelo evento entregue no histórico com data = hoje
+            subq_entregue = select(1).where(
+                SaidaHistorico.id_saida == Saida.id_saida,
+                SaidaHistorico.evento == "entregue",
+                func.date(SaidaHistorico.timestamp) == hoje,
+            )
+            q = q.where(exists(subq_entregue))
     elif status == "ausentes":
         q = q.where(Saida.status == STATUS_AUSENTE)
         if hoje is not None:
@@ -315,12 +321,20 @@ def resumo_entregas(
             Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
         )
     ) or 0
+    # Finalizadas hoje: baseia-se no evento "entregue" do histórico para alinhar com as telas de registros.
     finalizadas_hoje = db.scalar(
-        select(func.count(Saida.id_saida)).where(
+        select(func.count(Saida.id_saida))
+        .where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
             Saida.status == STATUS_ENTREGUE,
-            func.date(Saida.data_hora_entrega) == hoje,
+            exists(
+                select(1).where(
+                    SaidaHistorico.id_saida == Saida.id_saida,
+                    SaidaHistorico.evento == "entregue",
+                    func.date(SaidaHistorico.timestamp) == hoje,
+                )
+            ),
         )
     ) or 0
     tem_saiu_para_entrega = db.scalar(
