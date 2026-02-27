@@ -11,17 +11,19 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Saida
+from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 
 from entregador_routes import (
     _resolve_user_base,
     resolver_precos_entregador,
+    resolver_precos_motoboy,
+    _calcular_valor_base_motoboy_periodo,
     _normalizar_servico,
 )
 
@@ -33,6 +35,33 @@ STATUS_REAJUSTADO = "REAJUSTADO"
 
 # Status válidos para saidas no cálculo (alinhado ao app mobile)
 STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
+
+
+def _resolve_motoboy_subbase(db: Session, sub_base: str, motoboy_id: int) -> Motoboy:
+    """Retorna o Motoboy se existir e estiver vinculado à sub_base."""
+    motoboy = db.get(Motoboy, motoboy_id)
+    if not motoboy:
+        raise HTTPException(404, "Motoboy não encontrado.")
+    vinc = db.scalar(
+        select(MotoboySubBase).where(
+            MotoboySubBase.motoboy_id == motoboy_id,
+            MotoboySubBase.sub_base == sub_base,
+            MotoboySubBase.ativo.is_(True),
+        )
+    )
+    if not vinc:
+        raise HTTPException(422, "Motoboy não vinculado a esta sub_base.")
+    return motoboy
+
+
+def _get_motoboy_username(db: Session, motoboy: Motoboy) -> str:
+    """Username ou nome do User do motoboy para username_entregador."""
+    if not motoboy or not motoboy.user_id:
+        return f"Motoboy {motoboy.id_motoboy}"
+    u = db.get(User, motoboy.user_id)
+    if not u:
+        return f"Motoboy {motoboy.id_motoboy}"
+    return (u.username or f"{u.nome or ''} {u.sobrenome or ''}".strip() or f"Motoboy {motoboy.id_motoboy}").strip()
 
 
 def _calcular_valor_base(
@@ -94,13 +123,20 @@ def _buscar_fechamento_por_data(
 # =========================================================
 
 class FechamentoCreate(BaseModel):
-    id_entregador: int = Field(gt=0)
+    id_entregador: Optional[int] = Field(None, gt=0)
+    id_motoboy: Optional[int] = Field(None, gt=0)
     periodo_inicio: date
     periodo_fim: date
     valor_adicao: Optional[Decimal] = Decimal("0.00")
     motivo_adicao: Optional[str] = None
     valor_subtracao: Optional[Decimal] = Decimal("0.00")
     motivo_subtracao: Optional[str] = None
+
+    @model_validator(mode="after")
+    def check_actor(self):
+        if (self.id_entregador is None) == (self.id_motoboy is None):
+            raise ValueError("Informe exatamente um de id_entregador ou id_motoboy.")
+        return self
 
 
 class FechamentoUpdate(BaseModel):
@@ -114,8 +150,9 @@ class FechamentoUpdate(BaseModel):
 class FechamentoOut(BaseModel):
     id_fechamento: int
     sub_base: str
-    id_entregador: int
-    username_entregador: str
+    id_entregador: Optional[int] = None
+    id_motoboy: Optional[int] = None
+    username_entregador: Optional[str] = None
     periodo_inicio: date
     periodo_fim: date
     valor_base: Decimal
@@ -136,17 +173,35 @@ class FechamentoOut(BaseModel):
 
 @router.get("/fechamentos/calcular")
 def calcular_valor_base_preview(
-    entregador_id: int = Query(...),
+    entregador_id: Optional[int] = Query(None),
+    motoboy_id: Optional[int] = Query(None),
     periodo_inicio: date = Query(...),
     periodo_fim: date = Query(...),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Retorna valor_base calculado para o período (sem criar fechamento)."""
+    """Retorna valor_base calculado para o período (sem criar fechamento). Informe entregador_id ou motoboy_id."""
     sub_base = _resolve_user_base(db, current_user)
 
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+    if (entregador_id is None) == (motoboy_id is None):
+        raise HTTPException(400, "Informe exatamente um de entregador_id ou motoboy_id.")
+
+    if motoboy_id is not None:
+        motoboy = _resolve_motoboy_subbase(db, sub_base, motoboy_id)
+        valor_base = _calcular_valor_base_motoboy_periodo(
+            db, sub_base, motoboy_id, periodo_inicio, periodo_fim
+        )
+        executor_nome = _get_motoboy_username(db, motoboy)
+        return {
+            "valor_base": valor_base,
+            "entregador_id": None,
+            "motoboy_id": motoboy_id,
+            "entregador_nome": executor_nome,
+            "periodo_inicio": periodo_inicio.isoformat(),
+            "periodo_fim": periodo_fim.isoformat(),
+        }
 
     ent = db.get(Entregador, entregador_id)
     if not ent or ent.sub_base != sub_base:
@@ -159,7 +214,8 @@ def calcular_valor_base_preview(
     return {
         "valor_base": valor_base,
         "entregador_id": entregador_id,
-        "entregador_nome": ent.nome,
+        "motoboy_id": None,
+        "entregador_nome": ent.nome or "",
         "periodo_inicio": periodo_inicio.isoformat(),
         "periodo_fim": periodo_fim.isoformat(),
     }
@@ -180,33 +236,48 @@ def criar_fechamento(
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
 
-    # Validar entregador
-    ent = db.get(Entregador, payload.id_entregador)
-    if not ent or ent.sub_base != sub_base:
-        raise HTTPException(404, "Entregador não encontrado.")
-
-    username_ent = ent.username_entregador or ent.nome or ""
-
-    # Verificar duplicidade
-    existente = db.scalar(
-        select(EntregadorFechamento).where(
-            EntregadorFechamento.sub_base == sub_base,
-            EntregadorFechamento.id_entregador == payload.id_entregador,
-            EntregadorFechamento.periodo_inicio == payload.periodo_inicio,
-            EntregadorFechamento.periodo_fim == payload.periodo_fim,
+    if payload.id_motoboy is not None:
+        motoboy = _resolve_motoboy_subbase(db, sub_base, payload.id_motoboy)
+        username_ent = _get_motoboy_username(db, motoboy)
+        id_entregador_val = None
+        id_motoboy_val = payload.id_motoboy
+        existente = db.scalar(
+            select(EntregadorFechamento).where(
+                EntregadorFechamento.sub_base == sub_base,
+                EntregadorFechamento.id_motoboy == payload.id_motoboy,
+                EntregadorFechamento.periodo_inicio == payload.periodo_inicio,
+                EntregadorFechamento.periodo_fim == payload.periodo_fim,
+            )
         )
-    )
+        valor_base = _calcular_valor_base_motoboy_periodo(
+            db, sub_base, payload.id_motoboy,
+            payload.periodo_inicio, payload.periodo_fim,
+        )
+    else:
+        ent = db.get(Entregador, payload.id_entregador)
+        if not ent or ent.sub_base != sub_base:
+            raise HTTPException(404, "Entregador não encontrado.")
+        username_ent = ent.username_entregador or ent.nome or ""
+        id_entregador_val = payload.id_entregador
+        id_motoboy_val = None
+        existente = db.scalar(
+            select(EntregadorFechamento).where(
+                EntregadorFechamento.sub_base == sub_base,
+                EntregadorFechamento.id_entregador == payload.id_entregador,
+                EntregadorFechamento.periodo_inicio == payload.periodo_inicio,
+                EntregadorFechamento.periodo_fim == payload.periodo_fim,
+            )
+        )
+        valor_base = _calcular_valor_base(
+            db, sub_base, payload.id_entregador,
+            payload.periodo_inicio, payload.periodo_fim,
+        )
+
     if existente:
         raise HTTPException(
             409,
-            "Já existe fechamento para este entregador e período."
+            "Já existe fechamento para este executor e período."
         )
-
-    # Calcular valor_base
-    valor_base = _calcular_valor_base(
-        db, sub_base, payload.id_entregador,
-        payload.periodo_inicio, payload.periodo_fim,
-    )
 
     valor_ad = Decimal(str(payload.valor_adicao or 0)).quantize(Decimal("0.01"))
     valor_sub = Decimal(str(payload.valor_subtracao or 0)).quantize(Decimal("0.01"))
@@ -214,7 +285,8 @@ def criar_fechamento(
 
     fech = EntregadorFechamento(
         sub_base=sub_base,
-        id_entregador=payload.id_entregador,
+        id_entregador=id_entregador_val,
+        id_motoboy=id_motoboy_val,
         username_entregador=username_ent,
         periodo_inicio=payload.periodo_inicio,
         periodo_fim=payload.periodo_fim,
@@ -234,6 +306,7 @@ def criar_fechamento(
         id_fechamento=fech.id_fechamento,
         sub_base=fech.sub_base,
         id_entregador=fech.id_entregador,
+        id_motoboy=fech.id_motoboy,
         username_entregador=fech.username_entregador,
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
@@ -264,17 +337,23 @@ def obter_fechamento(
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
 
-    # Recalcular valor_base para detecção de divergência
-    valor_base_recalc = _calcular_valor_base(
-        db, sub_base, fech.id_entregador,
-        fech.periodo_inicio, fech.periodo_fim,
-    )
+    if getattr(fech, "id_motoboy", None) is not None:
+        valor_base_recalc = _calcular_valor_base_motoboy_periodo(
+            db, sub_base, fech.id_motoboy,
+            fech.periodo_inicio, fech.periodo_fim,
+        )
+    else:
+        valor_base_recalc = _calcular_valor_base(
+            db, sub_base, fech.id_entregador,
+            fech.periodo_inicio, fech.periodo_fim,
+        )
     divergencia = valor_base_recalc != fech.valor_base
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
         sub_base=fech.sub_base,
         id_entregador=fech.id_entregador,
+        id_motoboy=getattr(fech, "id_motoboy", None),
         username_entregador=fech.username_entregador,
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
@@ -313,13 +392,17 @@ def atualizar_fechamento(
             "Apenas fechamentos com status GERADO podem ser reajustados.",
         )
 
-    # Recalcular valor_base
-    valor_base_recalc = _calcular_valor_base(
-        db, sub_base, fech.id_entregador,
-        fech.periodo_inicio, fech.periodo_fim,
-    )
+    if getattr(fech, "id_motoboy", None) is not None:
+        valor_base_recalc = _calcular_valor_base_motoboy_periodo(
+            db, sub_base, fech.id_motoboy,
+            fech.periodo_inicio, fech.periodo_fim,
+        )
+    else:
+        valor_base_recalc = _calcular_valor_base(
+            db, sub_base, fech.id_entregador,
+            fech.periodo_inicio, fech.periodo_fim,
+        )
 
-    # Atualizar valor_base se confirmado
     if payload.atualizar_valor_base is True:
         fech.valor_base = valor_base_recalc
 
@@ -347,6 +430,7 @@ def atualizar_fechamento(
         id_fechamento=fech.id_fechamento,
         sub_base=fech.sub_base,
         id_entregador=fech.id_entregador,
+        id_motoboy=getattr(fech, "id_motoboy", None),
         username_entregador=fech.username_entregador,
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,

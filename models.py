@@ -367,16 +367,18 @@ class OwnerCobrancaItem(Base):
 class EntregadorFechamento(Base):
     __tablename__ = "entregador_fechamentos"
     __table_args__ = (
+        # Unicidade por executor: entregador (id_entregador) ou motoboy (id_motoboy)
         UniqueConstraint(
-            "sub_base", "id_entregador", "periodo_inicio", "periodo_fim",
+            "sub_base", "id_entregador", "id_motoboy", "periodo_inicio", "periodo_fim",
             name="uq_entregador_fechamento_periodo",
         ),
     )
 
     id_fechamento = Column(BigInteger, primary_key=True, autoincrement=True)
     sub_base = Column(Text, nullable=False)
-    id_entregador = Column(BigInteger, nullable=False)
-    username_entregador = Column(Text, nullable=False)
+    id_entregador = Column(BigInteger, nullable=True)  # FK lógico para entregador.id_entregador
+    id_motoboy = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=True)
+    username_entregador = Column(Text, nullable=True)  # nome/username do entregador ou do user do motoboy
 
     periodo_inicio = Column(Date, nullable=False)
     periodo_fim = Column(Date, nullable=False)
@@ -395,7 +397,7 @@ class EntregadorFechamento(Base):
     def __repr__(self) -> str:
         return (
             f"<EntregadorFechamento id_fechamento={self.id_fechamento} "
-            f"id_entregador={self.id_entregador} status={self.status!r}>"
+            f"id_entregador={self.id_entregador} id_motoboy={self.id_motoboy} status={self.status!r}>"
         )
 
 

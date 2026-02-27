@@ -17,10 +17,10 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from base import _resolve_user_sub_base
-from models import BasePreco, Coleta, Entregador, Owner, OwnerCobrancaItem, Saida, User
+from models import BasePreco, Coleta, Entregador, Motoboy, Owner, OwnerCobrancaItem, Saida, User
 
-from contabilidade_routes import _resolve_entregador_id_saida
-from entregador_routes import resolver_precos_entregador, _normalizar_servico
+from contabilidade_routes import _get_motoboy_nome as _contab_motoboy_nome, _resolve_actor_saida
+from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -924,7 +924,8 @@ class DashboardSaidasEvolucaoOut(BaseModel):
 
 
 class DashboardSaidasRankingEntregadorOut(BaseModel):
-    id_entregador: int
+    id_entregador: Optional[int] = None
+    id_motoboy: Optional[int] = None
     nome: str
     volume: int
     custo: Decimal
@@ -979,27 +980,33 @@ def get_dashboard_saidas(
     total_saidas = len(rows_validas)
     taxa_cancelamento = round((cancelamentos / (total_saidas + cancelamentos) * 100), 1) if (total_saidas + cancelamentos) > 0 else 0.0
 
-    # Entregadores ativos no período (que tiveram ao menos uma saída)
-    entregador_ids = set()
+    # Entregadores/motoboys ativos no período (que tiveram ao menos uma saída)
+    atores_ativos = set()  # ("e", eid) ou ("m", mid)
     for s in rows_validas:
-        eid = _resolve_entregador_id_saida(db, sub_base, s)
-        if eid:
-            entregador_ids.add(eid)
-    entregadores_ativos = len(entregador_ids)
+        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        if eid is not None:
+            atores_ativos.add(("e", eid))
+        elif mid is not None:
+            atores_ativos.add(("m", mid))
+    entregadores_ativos = len(atores_ativos)
 
-    # Custo por saída (usando precos entregador)
-    cache_precos: Dict[int, Dict[str, Decimal]] = {}
+    # Custo por saída (preço entregador ou preço global motoboy)
+    cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
     custo_total = Decimal("0")
     for s in rows_validas:
-        eid = _resolve_entregador_id_saida(db, sub_base, s)
-        if eid is None:
+        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        if eid is None and mid is None:
             continue
-        if eid not in cache_precos:
+        key = ("e", eid) if eid is not None else ("m", mid)
+        if key not in cache_precos:
             try:
-                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+                if eid is not None:
+                    cache_precos[key] = resolver_precos_entregador(db, eid, sub_base)
+                else:
+                    cache_precos[key] = resolver_precos_motoboy(db, sub_base)
             except Exception:
-                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
-        precos = cache_precos[eid]
+                cache_precos[key] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[key]
         tipo = _normalizar_servico(s.servico)
         if tipo == "shopee":
             custo_total += _decimal(precos.get("shopee_valor", 0))
@@ -1034,15 +1041,19 @@ def get_dashboard_saidas(
         key = dt.isoformat()
         evolucao_map[key] = {"date": key, "shopee": 0, "mercado_livre": 0, "avulso": 0, "valor_total": Decimal("0")}
     for s in rows_validas:
-        eid = _resolve_entregador_id_saida(db, sub_base, s)
-        if eid is None:
+        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        if eid is None and mid is None:
             continue
-        if eid not in cache_precos:
+        key = ("e", eid) if eid is not None else ("m", mid)
+        if key not in cache_precos:
             try:
-                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+                if eid is not None:
+                    cache_precos[key] = resolver_precos_entregador(db, eid, sub_base)
+                else:
+                    cache_precos[key] = resolver_precos_motoboy(db, sub_base)
             except Exception:
-                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
-        precos = cache_precos[eid]
+                cache_precos[key] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[key]
         tipo = _normalizar_servico(s.servico)
         if tipo == "shopee":
             v = _decimal(precos.get("shopee_valor", 0))
@@ -1050,15 +1061,15 @@ def get_dashboard_saidas(
             v = _decimal(precos.get("ml_valor", 0))
         else:
             v = _decimal(precos.get("avulso_valor", 0))
-        key = (s.data or s.timestamp.date()).isoformat()
-        if key in evolucao_map:
+        date_key = (s.data or s.timestamp.date()).isoformat()
+        if date_key in evolucao_map:
             if _classify_servico(s.servico) == "shopee":
-                evolucao_map[key]["shopee"] += 1
+                evolucao_map[date_key]["shopee"] += 1
             elif _classify_servico(s.servico) == "mercado_livre":
-                evolucao_map[key]["mercado_livre"] += 1
+                evolucao_map[date_key]["mercado_livre"] += 1
             else:
-                evolucao_map[key]["avulso"] += 1
-            evolucao_map[key]["valor_total"] += v
+                evolucao_map[date_key]["avulso"] += 1
+            evolucao_map[date_key]["valor_total"] += v
     evolucao_diaria = [
         DashboardSaidasEvolucaoOut(
             date=v["date"],
@@ -1070,49 +1081,57 @@ def get_dashboard_saidas(
         for v in sorted(evolucao_map.values(), key=lambda x: x["date"])
     ]
 
-    # Ranking entregadores (volume, custo por entregador)
-    ent_vol: Dict[int, int] = {}
-    ent_custo: Dict[int, Decimal] = {}
-    ent_shopee: Dict[int, int] = {}
-    ent_ml: Dict[int, int] = {}
-    ent_avulso: Dict[int, int] = {}
+    # Ranking entregadores/motoboys (volume, custo por ator; chave = ("e", eid) ou ("m", mid))
+    ent_vol: Dict[tuple, int] = {}
+    ent_custo: Dict[tuple, Decimal] = {}
+    ent_shopee: Dict[tuple, int] = {}
+    ent_ml: Dict[tuple, int] = {}
+    ent_avulso: Dict[tuple, int] = {}
     for s in rows_validas:
-        eid = _resolve_entregador_id_saida(db, sub_base, s)
-        if eid is None:
+        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        if eid is None and mid is None:
             continue
-        ent_vol[eid] = ent_vol.get(eid, 0) + 1
-        if eid not in cache_precos:
+        actor_key = ("e", eid) if eid is not None else ("m", mid)
+        ent_vol[actor_key] = ent_vol.get(actor_key, 0) + 1
+        if actor_key not in cache_precos:
             try:
-                cache_precos[eid] = resolver_precos_entregador(db, eid, sub_base)
+                if eid is not None:
+                    cache_precos[actor_key] = resolver_precos_entregador(db, eid, sub_base)
+                else:
+                    cache_precos[actor_key] = resolver_precos_motoboy(db, sub_base)
             except Exception:
-                cache_precos[eid] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
-        precos = cache_precos[eid]
+                cache_precos[actor_key] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
+        precos = cache_precos[actor_key]
         tipo = _normalizar_servico(s.servico)
         if tipo == "shopee":
             v = _decimal(precos.get("shopee_valor", 0))
-            ent_shopee[eid] = ent_shopee.get(eid, 0) + 1
+            ent_shopee[actor_key] = ent_shopee.get(actor_key, 0) + 1
         elif tipo == "flex":
             v = _decimal(precos.get("ml_valor", 0))
-            ent_ml[eid] = ent_ml.get(eid, 0) + 1
+            ent_ml[actor_key] = ent_ml.get(actor_key, 0) + 1
         else:
             v = _decimal(precos.get("avulso_valor", 0))
-            ent_avulso[eid] = ent_avulso.get(eid, 0) + 1
-        ent_custo[eid] = ent_custo.get(eid, Decimal("0")) + v
-    ent_nomes: Dict[int, str] = {}
-    for eid in set(ent_vol.keys()):
-        ent = db.get(Entregador, eid)
-        ent_nomes[eid] = (ent.nome or f"ID {eid}") if ent else f"ID {eid}"
+            ent_avulso[actor_key] = ent_avulso.get(actor_key, 0) + 1
+        ent_custo[actor_key] = ent_custo.get(actor_key, Decimal("0")) + v
+    ent_nomes: Dict[tuple, str] = {}
+    for k in ent_vol:
+        if k[0] == "e":
+            ent = db.get(Entregador, k[1])
+            ent_nomes[k] = (ent.nome or f"ID {k[1]}") if ent else f"ID {k[1]}"
+        else:
+            ent_nomes[k] = _contab_motoboy_nome(db, k[1])
     ranking_entregadores = [
         DashboardSaidasRankingEntregadorOut(
-            id_entregador=eid,
-            nome=ent_nomes.get(eid, f"ID {eid}"),
-            volume=ent_vol[eid],
-            custo=ent_custo[eid].quantize(Decimal("0.01")),
-            shopee=ent_shopee.get(eid, 0),
-            mercado_livre=ent_ml.get(eid, 0),
-            avulso=ent_avulso.get(eid, 0),
+            id_entregador=actor_key[1] if actor_key[0] == "e" else None,
+            id_motoboy=actor_key[1] if actor_key[0] == "m" else None,
+            nome=ent_nomes.get(actor_key, ""),
+            volume=ent_vol[actor_key],
+            custo=ent_custo[actor_key].quantize(Decimal("0.01")),
+            shopee=ent_shopee.get(actor_key, 0),
+            mercado_livre=ent_ml.get(actor_key, 0),
+            avulso=ent_avulso.get(actor_key, 0),
         )
-        for eid in sorted(ent_vol.keys(), key=lambda x: -ent_vol[x])
+        for actor_key in sorted(ent_vol.keys(), key=lambda x: -ent_vol[x])
     ][:15]
 
     # Ranking bases (por volume de saídas)
