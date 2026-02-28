@@ -18,6 +18,13 @@ router = APIRouter(prefix="/owner", tags=["Owner"])
 # SCHEMAS
 # ============================================================
 
+def _normalize_tipo_owner(value: Optional[str]) -> str:
+    v = (value or "subbase").strip().lower()
+    if v not in ("base", "subbase"):
+        return "subbase"
+    return v
+
+
 class OwnerCreate(BaseModel):
     email: Optional[str] = None
     username: Optional[str] = None
@@ -26,6 +33,7 @@ class OwnerCreate(BaseModel):
     contato: Optional[str] = None
     teste: Optional[bool] = None
     modo_operacao: Optional[str] = None
+    tipo_owner: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -39,6 +47,7 @@ class OwnerUpdate(BaseModel):
     ignorar_coleta: Optional[bool] = None
     teste: Optional[bool] = None
     modo_operacao: Optional[str] = None
+    tipo_owner: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -54,6 +63,7 @@ class OwnerOut(BaseModel):
     ignorar_coleta: bool
     teste: bool
     modo_operacao: Optional[str] = None
+    tipo_owner: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -95,6 +105,8 @@ def create_owner(
             "Modos 'saida' e 'coleta_manual' exigem 'Ignorar Coleta' ativo. Configure após criar o owner."
         )
 
+    tipo_owner = _normalize_tipo_owner(body.tipo_owner)
+
     obj = Owner(
         email=email,
         username=username,
@@ -105,6 +117,7 @@ def create_owner(
         ignorar_coleta=ignorar_coleta,
         teste=bool(body.teste) if body.teste is not None else False,
         modo_operacao=modo_operacao,
+        tipo_owner=tipo_owner,
     )
     db.add(obj)
     db.commit()
@@ -203,6 +216,9 @@ def update_owner(
                 "Modo 'codigo' requer 'Ignorar Coleta' desativado."
             )
         owner.modo_operacao = body.modo_operacao
+
+    if body.tipo_owner is not None:
+        owner.tipo_owner = _normalize_tipo_owner(body.tipo_owner)
 
     db.commit()
     db.refresh(owner)

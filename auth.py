@@ -111,6 +111,7 @@ class UserResponse(BaseModel):
     sub_base: Optional[str]
     ignorar_coleta: bool = False
     modo_operacao: Optional[str] = None
+    tipo_owner: Optional[str] = None
 
 
 # ======================================================
@@ -135,6 +136,13 @@ def _owner_for_sub_base(db: Session, sub_base: str) -> Owner:
     return owner
 
 
+def _tipo_owner_from_owner(owner: Owner) -> str:
+    v = (getattr(owner, "tipo_owner", None) or "subbase")
+    if isinstance(v, str):
+        v = v.strip().lower()
+    return "base" if v == "base" else "subbase"
+
+
 def _claims(user: User, owner: Owner) -> Dict[str, Any]:
     """
     Tudo que o backend precisa no caminho crítico
@@ -151,6 +159,7 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
         "ignorar_coleta": bool(owner.ignorar_coleta),
         "owner_ativo": bool(owner.ativo),
         "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
+        "tipo_owner": _tipo_owner_from_owner(owner),
         # valor SEMPRE como string (Decimal-safe)
         "owner_valor": str(owner.valor or 0),
     }
@@ -175,6 +184,7 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "ignorar_coleta": bool(owner.ignorar_coleta),
         "owner_ativo": bool(owner.ativo),
         "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
+        "tipo_owner": _tipo_owner_from_owner(owner),
         "owner_valor": str(owner.valor or 0),
     }
 
@@ -197,6 +207,9 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.ignorar_coleta = payload.get("ignorar_coleta", False)
     u.owner_valor = Decimal(payload.get("owner_valor", "0"))
     u.modo_operacao = payload.get("modo_operacao", "codigo")
+    u.tipo_owner = (payload.get("tipo_owner") or "subbase").strip().lower()
+    if u.tipo_owner not in ("base", "subbase"):
+        u.tipo_owner = "subbase"
 
     return u
 
@@ -326,6 +339,7 @@ async def login_set_cookie(
             "sub_base": user.sub_base,
             "ignorar_coleta": owner.ignorar_coleta,
             "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
+            "tipo_owner": _tipo_owner_from_owner(owner),
         },
     }
 
@@ -468,6 +482,7 @@ async def read_users_me(
         sub_base=current_user.sub_base,
         ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
         modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
+        tipo_owner=getattr(current_user, "tipo_owner", None) or "subbase",
     )
 
 

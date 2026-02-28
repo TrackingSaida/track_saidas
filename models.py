@@ -81,6 +81,8 @@ class Owner(Base):
     modo_operacao = Column(Text, nullable=True, server_default=text("'codigo'"))
     # Flag para owners de teste (não considerados em dashboards/admin)
     teste = Column(Boolean, nullable=False, server_default=text("false"))
+    # Tipo: "base" (Seller) ou "subbase" (Base) — afeta labels no menu e páginas
+    tipo_owner = Column(Text, nullable=False, server_default=text("'subbase'"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
