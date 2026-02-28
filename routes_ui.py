@@ -102,18 +102,35 @@ MENU_DEFS = [
 # FUNÇÃO QUE MONTA MENU FINAL
 # =============================
 
-def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = "codigo"):
+def _menu_label_for_owner(item_label: str, tipo_owner: str) -> str:
+    """Quando owner é BASE, troca labels Base -> Seller nas entradas do menu."""
+    if (tipo_owner or "").strip().lower() != "base":
+        return item_label
+    if item_label == "Bases":
+        return "Sellers"
+    if item_label == "Fechamento Bases":
+        return "Fechamento Seller"
+    return item_label
+
+
+def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = "codigo", tipo_owner: str = "subbase"):
     visible_sections = []
+    tipo_owner = (tipo_owner or "subbase").strip().lower()
+    if tipo_owner not in ("base", "subbase"):
+        tipo_owner = "subbase"
 
     for section in MENU_DEFS:
         # Se o usuário pode ver a seção inteira
         if role in section["roles"]:
-            # Filtra os itens permitidos (role + ignorar_coleta + modo_operacao)
+            # Filtra os itens permitidos (role + ignorar_coleta + modo_operacao + base_only)
             # coleta_only: ocultar quando ignorar_coleta, EXCETO se coleta_manual_ok e modo=coleta_manual
             # visao360_only: sempre ocultar quando ignorar_coleta
+            # base_only: mostrar só quando tipo_owner == "base"
             allowed_items = []
             for item in section["items"]:
                 if "roles" in item and role not in item["roles"]:
+                    continue
+                if item.get("base_only") and tipo_owner != "base":
                     continue
                 if ignorar_coleta and item.get("visao360_only"):
                     continue
@@ -121,7 +138,9 @@ def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = 
                     if item.get("coleta_manual_ok") and modo_operacao == "coleta_manual":
                         allowed_items.append(item)
                     continue
-                allowed_items.append(item)
+                # Aplica label por tipo (Base -> Seller quando tipo_owner == "base")
+                label = _menu_label_for_owner(item.get("label", ""), tipo_owner)
+                allowed_items.append({**item, "label": label})
 
             if allowed_items:
                 visible_sections.append({
@@ -143,15 +162,17 @@ router = APIRouter(prefix="/ui", tags=["UI"])
 @router.get("/menu")
 def get_menu(user: User = Depends(get_current_user)):
     """
-    Retorna o menu baseado no nível do usuário (role).
+    Retorna o menu baseado no nível do usuário (role) e tipo do owner (base/subbase).
     Usa get_current_user diretamente, garantindo compatibilidade com /auth/me.
     """
     role = int(user.role)
     ignorar_coleta = bool(getattr(user, "ignorar_coleta", False))
     modo_operacao = getattr(user, "modo_operacao", None) or "codigo"
-    menu = menu_for_role(role, ignorar_coleta, modo_operacao)
+    tipo_owner = getattr(user, "tipo_owner", None) or "subbase"
+    menu = menu_for_role(role, ignorar_coleta, modo_operacao, tipo_owner)
 
     return {
         "role": role,
+        "tipo_owner": tipo_owner,
         "menu": menu
     }
