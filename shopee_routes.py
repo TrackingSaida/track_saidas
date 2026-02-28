@@ -142,7 +142,7 @@ def shopee_callback(
 ):
     host, partner_id, partner_key, _, env = _get_shopee_config()
 
-    path = "/api/v2/auth/access_token/get"
+    path = "/api/v2/auth/token/get"
     timestamp = int(time.time())
 
     sign = _sign_api(
