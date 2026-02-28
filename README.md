@@ -1,5 +1,9 @@
 # track_saidas
 
+## Migrações de banco de dados
+
+As alterações de schema (colunas, tabelas) são aplicadas manualmente. Veja [migrations/README.md](migrations/README.md) para a lista de migrações e como executá-las (ex.: correção do erro `column entregador_fechamentos.id_motoboy does not exist`).
+
 ## Configuração do Backblaze B2 (fotos de entrega)
 
 O upload de fotos de entrega/ausente usa um bucket B2 privado. O backend só gera URLs presigned se as credenciais estiverem configuradas.

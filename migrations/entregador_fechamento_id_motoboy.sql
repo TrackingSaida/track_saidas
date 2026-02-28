@@ -1,6 +1,12 @@
 -- Migração: EntregadorFechamento suporta executor entregador OU motoboy
 -- Executar manualmente no banco antes de subir a nova versão.
 -- Exatamente um de id_entregador ou id_motoboy deve ser preenchido (validado na aplicação).
+--
+-- Pré-requisito: a tabela motoboys deve existir (ex.: migrations/motoboy_perfil.sql já aplicada).
+--
+-- Exemplo de execução (substitua CONNECTION_STRING pela URL do PostgreSQL, ex. do Render):
+--   psql "CONNECTION_STRING" -f migrations/entregador_fechamento_id_motoboy.sql
+--
 
 -- 1. Adicionar coluna id_motoboy (nullable, FK motoboys)
 ALTER TABLE entregador_fechamentos
