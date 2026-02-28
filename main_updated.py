@@ -42,6 +42,17 @@ app = FastAPI(
     redoc_url=f"{API_PREFIX}/redoc",
 )
 
+
+@app.api_route("/", methods=["GET", "HEAD"], tags=["Root"])
+def root():
+    """Responde na raiz para o health check do Render (GET ou HEAD) e ao acessar a URL do serviço."""
+    return {
+        "message": "API Track Saídas",
+        "docs": f"{API_PREFIX}/docs",
+        "health": f"{API_PREFIX}/health",
+    }
+
+
 # ──────────────────────────────────────────────────────────────────
 # CORS fallback (primeiro middleware = último na volta): garante que
 # toda resposta, inclusive de erro/500, tenha CORS quando houver Origin.
@@ -200,16 +211,6 @@ def startup_event():
         print(f"[ML] Erro durante renovação inicial: {e}")
     finally:
         db.close()
-
-# ──────────────────────────────────────────────────────────────────
-# Raiz (evita 404 ao acessar a URL do serviço no Render)
-@app.get("/", tags=["Root"])
-def root():
-    return {
-        "message": "API Track Saídas",
-        "docs": f"{API_PREFIX}/docs",
-        "health": f"{API_PREFIX}/health",
-    }
 
 # ──────────────────────────────────────────────────────────────────
 # Healthcheck
