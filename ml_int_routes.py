@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -39,9 +40,10 @@ def ml_int_connect(state: str = Query("", alias="state")):
     redirect_uri = ML_REDIRECT_URI_INT
     if not client_id or not redirect_uri:
         raise HTTPException(500, "ML_CLIENT_ID ou ML_REDIRECT_URI não configurados.")
-    params = f"response_type=code&client_id={client_id}&redirect_uri={redirect_uri}"
+    q = {"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri}
     if state:
-        params += f"&state={state}"
+        q["state"] = state
+    params = urlencode(q)
     return {"auth_url": f"{ML_AUTH_BASE}?{params}"}
 
 
