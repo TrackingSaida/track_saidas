@@ -150,7 +150,7 @@ def shopee_callback(
         partner_key=partner_key,
         path=path,
         timestamp=timestamp,
-        shop_id=shop_id,
+        shop_id=None,
     )
 
     url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
