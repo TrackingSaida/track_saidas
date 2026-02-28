@@ -37,7 +37,7 @@ def _get_shopee_config():
     else:
         # SANDBOX
         # (você confirmou que este host é o correto no seu ambiente)
-        host = "https://openplatform.sandbox.test-stable.shopee.sg"
+        host = "https://partner.test-stable.shopeemobile.com"
         partner_id = int(os.getenv("SHOPEE_TEST_PARTNER_ID", "0"))
         partner_key = os.getenv("SHOPEE_TEST_PARTNER_KEY", "")
 
