@@ -130,6 +130,7 @@ def gerar_auth_url():
 # -------------------------------------------------
 # 2) Callback: troca code por token e salva em shopee_tokens
 # -------------------------------------------------
+
 @router.get(
     "/callback",
     summary="Callback da Shopee (troca code por tokens)",
@@ -145,15 +146,21 @@ def shopee_callback(
     path = "/api/v2/auth/token/get"
     timestamp = int(time.time())
 
-    sign = _sign_api(
-        partner_id=partner_id,
-        partner_key=partner_key,
-        path=path,
-        timestamp=timestamp,
-        shop_id=shop_id,
-    )
+    # ✅ CORRETO: NÃO inclui shop_id na assinatura
+    base_string = f"{partner_id}{path}{timestamp}"
 
-    url = f"{host}{path}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}"
+    sign = hmac.new(
+        partner_key.encode("utf-8"),
+        base_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    url = (
+        f"{host}{path}"
+        f"?partner_id={partner_id}"
+        f"&timestamp={timestamp}"
+        f"&sign={sign}"
+    )
 
     payload = {
         "code": code,
@@ -161,9 +168,30 @@ def shopee_callback(
         "partner_id": partner_id,
     }
 
+    # -----------------------------
+    # 🔍 DEBUG COMPLETO
+    # -----------------------------
+    print("========== SHOPEE DEBUG ==========")
+    print("ENV:", env)
+    print("HOST:", host)
+    print("PATH:", path)
+    print("PARTNER_ID:", partner_id)
+    print("SHOP_ID:", shop_id)
+    print("TIMESTAMP:", timestamp)
+    print("BASE_STRING:", base_string)
+    print("SIGN:", sign)
+    print("URL:", url)
+    print("PAYLOAD:", payload)
+    print("===================================")
+
     try:
         resp = requests.post(url, json=payload, timeout=20)
+
+        print("STATUS CODE:", resp.status_code)
+        print("RESPONSE TEXT:", resp.text)
+
         data = resp.json()
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -210,7 +238,6 @@ def shopee_callback(
         db.add(token)
         db.commit()
 
-    # ✅ SUCESSO → REDIRECT PARA A LANDING
     return RedirectResponse(
         url="https://tracking-saidas.com.br/landing-tracking.html",
         status_code=302,
