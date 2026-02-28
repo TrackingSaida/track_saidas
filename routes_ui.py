@@ -81,7 +81,6 @@ MENU_DEFS = [
         "icon": "ri-user-settings-line",
         "roles": [0, 1],
         "items": [
-            {"label": "Entregadores", "href": "tracking-entregador.html", "roles": [0, 1]},
             {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
             {"label": "Usuários",     "href": "tracking-usuarios.html",   "roles": [0, 1]},
             {"label": "Preços de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
