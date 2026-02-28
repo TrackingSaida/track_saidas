@@ -19,6 +19,7 @@ ML_ORDERS_SEARCH_URL = "https://api.mercadolibre.com/orders/search"
 ML_ORDER_URL = "https://api.mercadolibre.com/orders"
 ML_SHIPMENTS_SEARCH_URL = "https://api.mercadolibre.com/shipments/search"
 ML_MARKETPLACE_SHIPMENT_URL = "https://api.mercadolibre.com/marketplace/shipments"
+ML_TEST_USER_URL = "https://api.mercadolibre.com/users/test_user"
 
 
 def _get_config() -> tuple[str, str, str]:
@@ -49,6 +50,26 @@ def exchange_code_for_token(code: str, redirect_uri: str) -> dict[str, Any]:
 def get_me(access_token: str) -> dict[str, Any]:
     """Obtém dados do usuário autenticado (GET /users/me)."""
     r = requests.get(ML_ME_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def create_ml_test_user(site_id: str = "MLB") -> dict[str, Any]:
+    """
+    Cria um usuário de teste no Mercado Livre (POST /users/test_user).
+    Usa o Access Token da aplicação (ML_CLIENT_SECRET das credenciais de teste).
+    site_id: MLB (Brasil), MLA (Argentina), etc. Ver API de Sites.
+    Retorna: id, nickname, password, site_status. Guarde nickname e password para login.
+    """
+    token = os.getenv("ML_CLIENT_SECRET")
+    if not token:
+        raise RuntimeError("ML_CLIENT_SECRET não configurado (necessário para criar usuário de teste).")
+    r = requests.post(
+        ML_TEST_USER_URL,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"site_id": site_id},
+        timeout=30,
+    )
     r.raise_for_status()
     return r.json()
 

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from auth import get_current_user
 from db import get_db
 from models import MLConexao, Saida, SaidaDetail, SaidaHistorico, User
 from ml_int_service import (
+    create_ml_test_user,
     exchange_code_for_token,
     fetch_order,
     fetch_orders_search,
@@ -97,6 +98,30 @@ def ml_int_callback(
     db.add(novo)
     db.commit()
     return RedirectResponse(url=f"{success_page}?ml=ok")
+
+
+# ---------- Usuário de teste ML (auth, apenas dev/test) ----------
+@router.post("/test-user")
+def ml_int_create_test_user(
+    user: User = Depends(get_current_user),
+    body: dict | None = Body(default=None),
+):
+    """
+    Cria um usuário de teste no Mercado Livre (Brasil por padrão).
+    Requer ML_CLIENT_SECRET (Access Token das credenciais de teste).
+    Retorna: id (user_id), nickname, password, site_status. Guarde nickname e senha para login.
+    Máximo 10 usuários de teste por aplicação; sem atividade por 60 dias são removidos.
+    """
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a root e admin.")
+    site_id = (body or {}).get("site_id", "MLB")
+    try:
+        data = create_ml_test_user(site_id=site_id)
+    except requests.HTTPError as e:
+        raise HTTPException(e.response.status_code, e.response.text or "Erro ao criar usuário de teste")
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return data
 
 
 # ---------- Sellers (auth, filtro por sub_base) ----------
