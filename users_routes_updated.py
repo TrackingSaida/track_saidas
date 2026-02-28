@@ -138,14 +138,58 @@ def _sanitize_sub_base(sub_base: str) -> str:
     return s if s else "migrado"
 
 
+def _sub_base_domain(sub_base: Optional[str]) -> str:
+    """Sub_base para domínio de email: sem espaços, minúsculo (ex.: Giro Express -> giroexpress)."""
+    return _sanitize_sub_base(sub_base or "").lower() or "migrado"
+
+
+def default_password_motoboy(sub_base: Optional[str]) -> str:
+    """Senha padrão para motoboy: {subbase}_trocar_senha em minúsculo (ex.: Giro Express -> giroexpress_trocar_senha)."""
+    norm = (sub_base or "").strip().replace(" ", "").lower()
+    return f"{norm}_trocar_senha" if norm else "migrado_trocar_senha"
+
+
+def _first_word(s: Optional[str]) -> str:
+    """Primeira palavra do texto, em minúsculo."""
+    parts = (s or "").strip().split()
+    return parts[0].lower() if parts else ""
+
+
+def _last_word(s: Optional[str]) -> str:
+    """Última palavra do texto, em minúsculo."""
+    parts = (s or "").strip().split()
+    return parts[-1].lower() if parts else ""
+
+
+def _placeholder_username_from_nome(nome: Optional[str]) -> str:
+    """Placeholder de username: primeiro nome + '.giro' (ex.: Abacate Matheus -> abacate.giro)."""
+    first = _first_word(nome)
+    return f"{first}.giro" if first else ""
+
+
+def _placeholder_email_from_nome_sobrenome(
+    nome: Optional[str], sobrenome: Optional[str], sub_base: Optional[str]
+) -> str:
+    """Placeholder de email: primeiro_nome-ultimo_sobrenome@subbase.com (ex.: abacate-silva@giroexpress.com)."""
+    first = _first_word(nome)
+    last = _last_word(sobrenome)
+    domain = _sub_base_domain(sub_base)
+    if first and last:
+        return f"{first}-{last}@{domain}.com"
+    return ""
+
+
 def _placeholder_email(user_id: int, sub_base: Optional[str]) -> str:
-    """Placeholder de email exibível: sem-email{id}@{sub_base}.migrado.local"""
-    return f"sem-email{user_id}@{_sanitize_sub_base(sub_base or '')}.migrado.local"
+    """Fallback quando não há nome/sobrenome: sem-email{id}@{sub_base}.migrado.com"""
+    return f"sem-email{user_id}@{_sanitize_sub_base(sub_base or '')}.migrado.com"
 
 
 def _is_email_safe_for_display(raw: str) -> bool:
-    """Retorna True se o valor é aceitável por EmailStr (sem espaço, formato básico)."""
+    """Retorna True se o valor é aceitável por EmailStr (sem espaço, formato básico, sem TLD reservado)."""
     if not raw or " " in raw or "@" not in raw:
+        return False
+    # .local é TLD reservado e falha na validação do Pydantic
+    if ".migrado.local" in raw.lower():
         return False
     parts = raw.split("@", 1)
     return len(parts) == 2 and len(parts[0]) >= 1 and "." in parts[1] and len(parts[1]) >= 4
@@ -157,10 +201,20 @@ def _user_to_out(user: User) -> UserOut:
     ou tem dados incompletos, evitando 500 ao listar usuários."""
     try:
         user_id = int(getattr(user, "id", 0))
+        sub_base = getattr(user, "sub_base", None)
+        nome = getattr(user, "nome", None)
+        sobrenome = getattr(user, "sobrenome", None)
+
         email_val = (user.email or "").strip()
         if not _is_email_safe_for_display(email_val):
-            email_val = _placeholder_email(user_id, getattr(user, "sub_base", None))
-        username_val = (user.username or "").strip() or "—"
+            email_val = _placeholder_email_from_nome_sobrenome(nome, sobrenome, sub_base) or _placeholder_email(user_id, sub_base)
+
+        username_val = (user.username or "").strip()
+        if not username_val or username_val.startswith("sem_username"):
+            username_val = _placeholder_username_from_nome(nome) or username_val or "—"
+        if not username_val:
+            username_val = "—"
+
         contato_val = (user.contato or "").strip() or "—"
 
         data: dict[str, Any] = {
@@ -185,10 +239,13 @@ def _user_to_out(user: User) -> UserOut:
     except Exception as e:
         logger.warning("_user_to_out fallback for user id=%s: %s", getattr(user, "id", None), e)
         user_id = int(getattr(user, "id", 0))
+        sub_base = getattr(user, "sub_base", None)
+        nome = getattr(user, "nome", None)
+        sobrenome = getattr(user, "sobrenome", None)
         return UserOut(
             id=user_id,
-            email=_placeholder_email(user_id, getattr(user, "sub_base", None)),
-            username="—",
+            email=_placeholder_email_from_nome_sobrenome(nome, sobrenome, sub_base) or _placeholder_email(user_id, sub_base),
+            username=_placeholder_username_from_nome(nome) or "—",
             contato="—",
             status=getattr(user, "status", True),
             sub_base=getattr(user, "sub_base", None),
@@ -223,15 +280,32 @@ def create_user(
     if not owner.ativo:
         raise HTTPException(403, "Owner desta sub_base está inativo.")
 
-    # Resolver email/username/senha (opcionais durante migração)
     _ts = str(int(time.time() * 1000))
-    # Placeholder temporário até ter o id; após flush será sem-email{id}@{sub_base}.migrado.local
-    email_val = (body.email or "").strip() or f"sem-email-{_ts}@{_sanitize_sub_base(sub_base)}.migrado.local"
-    username_val = (body.username or "").strip() or f"sem_username_{_ts}"
-    if (body.password or "").strip():
-        password_hash_val = get_password_hash((body.password or "").strip())
+
+    # Para role != 4 (não-motoboy): username, email e senha obrigatórios
+    if body.role != 4:
+        u = (body.username or "").strip()
+        e = (body.email or "").strip()
+        p = (body.password or "").strip()
+        if not u:
+            raise HTTPException(422, "Username é obrigatório para este perfil.")
+        if not e:
+            raise HTTPException(422, "E-mail é obrigatório para este perfil.")
+        if "@" not in e or "." not in e.split("@", 1)[-1]:
+            raise HTTPException(422, "E-mail inválido.")
+        if len(p) < 4:
+            raise HTTPException(422, "Senha deve ter no mínimo 4 caracteres para este perfil.")
+        username_val = u
+        email_val = e
+        password_hash_val = get_password_hash(p)
     else:
-        password_hash_val = get_password_hash("migrado_trocar_senha")
+        # Role 4 (motoboy): placeholders permitidos
+        username_val = (body.username or "").strip() or _placeholder_username_from_nome(body.nome) or f"sem_username_{_ts}"
+        email_val = (body.email or "").strip() or _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or f"sem-email-{_ts}@{_sub_base_domain(sub_base)}.com"
+        if (body.password or "").strip():
+            password_hash_val = get_password_hash((body.password or "").strip())
+        else:
+            password_hash_val = get_password_hash(default_password_motoboy(sub_base))
 
     # Emails e usernames únicos (só quando informados pelo usuário)
     if body.email and (body.email or "").strip():
@@ -263,9 +337,9 @@ def create_user(
         db.add(new_user)
         db.flush()
 
-        # Atualizar email placeholder para formato definitivo: sem-email{id}@{sub_base}.migrado.local
+        # Se email era placeholder, gravar formato definitivo (nome-sobrenome@subbase.com ou fallback)
         if not (body.email or "").strip():
-            new_user.email = _placeholder_email(new_user.id, sub_base)
+            new_user.email = _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or _placeholder_email(new_user.id, sub_base)
 
         if body.role == 4:
             pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else False
@@ -390,10 +464,13 @@ def list_users(
         except Exception as e:
             logger.warning("list_users: fallback para user id=%s: %s", getattr(u, "id", None), e)
             uid = int(getattr(u, "id", 0))
+            sub_base = getattr(u, "sub_base", None)
+            nome = getattr(u, "nome", None)
+            sobrenome = getattr(u, "sobrenome", None)
             out.append(UserOut(
                 id=uid,
-                email=_placeholder_email(uid, getattr(u, "sub_base", None)),
-                username="—",
+                email=_placeholder_email_from_nome_sobrenome(nome, sobrenome, sub_base) or _placeholder_email(uid, sub_base),
+                username=_placeholder_username_from_nome(nome) or "—",
                 contato="—",
                 status=getattr(u, "status", True),
                 sub_base=getattr(u, "sub_base", None),
