@@ -132,36 +132,72 @@ class PasswordChangePayload(BaseModel):
 # Helpers
 # ============================================================
 
+def _sanitize_sub_base(sub_base: str) -> str:
+    """Remove espaços para usar em email (ex.: 'Giro Express' -> 'GiroExpress')."""
+    s = (sub_base or "").strip().replace(" ", "")
+    return s if s else "migrado"
+
+
+def _placeholder_email(user_id: int, sub_base: Optional[str]) -> str:
+    """Placeholder de email exibível: sem-email{id}@{sub_base}.migrado.local"""
+    return f"sem-email{user_id}@{_sanitize_sub_base(sub_base or '')}.migrado.local"
+
+
+def _is_email_safe_for_display(raw: str) -> bool:
+    """Retorna True se o valor é aceitável por EmailStr (sem espaço, formato básico)."""
+    if not raw or " " in raw or "@" not in raw:
+        return False
+    parts = raw.split("@", 1)
+    return len(parts) == 2 and len(parts[0]) >= 1 and "." in parts[1] and len(parts[1]) >= 4
+
+
 def _user_to_out(user: User) -> UserOut:
     """Serializa User para UserOut incluindo motoboy quando role=4.
     Usa fallbacks para campos obrigatórios quando o registro vem da migração
     ou tem dados incompletos, evitando 500 ao listar usuários."""
-    # Fallbacks para evitar quebra de serialização (ex.: usuários migrados com nulls)
-    email_val = (user.email or "").strip()
-    if not email_val or "@" not in email_val:
-        email_val = "sem-email@migrado.local"
-    username_val = (user.username or "").strip() or "—"
-    contato_val = (user.contato or "").strip() or "—"
+    try:
+        user_id = int(getattr(user, "id", 0))
+        email_val = (user.email or "").strip()
+        if not _is_email_safe_for_display(email_val):
+            email_val = _placeholder_email(user_id, getattr(user, "sub_base", None))
+        username_val = (user.username or "").strip() or "—"
+        contato_val = (user.contato or "").strip() or "—"
 
-    data: dict[str, Any] = {
-        "id": user.id,
-        "email": email_val,
-        "username": username_val,
-        "contato": contato_val,
-        "status": getattr(user, "status", True),
-        "sub_base": user.sub_base,
-        "nome": user.nome,
-        "sobrenome": user.sobrenome,
-        "role": getattr(user, "role", 2),
-        "coletador": getattr(user, "coletador", False),
-        "motoboy": None,
-    }
-    if getattr(user, "role", None) == 4 and hasattr(user, "motoboy") and user.motoboy:
-        try:
-            data["motoboy"] = MotoboyOut.model_validate(user.motoboy)
-        except Exception:
-            logger.warning("Motoboy id=%s serialization skipped for user id=%s", getattr(user.motoboy, "id_motoboy", None), user.id)
-    return UserOut(**data)
+        data: dict[str, Any] = {
+            "id": user_id,
+            "email": email_val,
+            "username": username_val,
+            "contato": contato_val,
+            "status": getattr(user, "status", True),
+            "sub_base": user.sub_base,
+            "nome": user.nome,
+            "sobrenome": user.sobrenome,
+            "role": getattr(user, "role", 2),
+            "coletador": getattr(user, "coletador", False),
+            "motoboy": None,
+        }
+        if getattr(user, "role", None) == 4 and hasattr(user, "motoboy") and user.motoboy:
+            try:
+                data["motoboy"] = MotoboyOut.model_validate(user.motoboy)
+            except Exception:
+                logger.warning("Motoboy id=%s serialization skipped for user id=%s", getattr(user.motoboy, "id_motoboy", None), user.id)
+        return UserOut(**data)
+    except Exception as e:
+        logger.warning("_user_to_out fallback for user id=%s: %s", getattr(user, "id", None), e)
+        user_id = int(getattr(user, "id", 0))
+        return UserOut(
+            id=user_id,
+            email=_placeholder_email(user_id, getattr(user, "sub_base", None)),
+            username="—",
+            contato="—",
+            status=getattr(user, "status", True),
+            sub_base=getattr(user, "sub_base", None),
+            nome=getattr(user, "nome", None),
+            sobrenome=getattr(user, "sobrenome", None),
+            role=getattr(user, "role", 2),
+            coletador=getattr(user, "coletador", False),
+            motoboy=None,
+        )
 
 
 # ============================================================
@@ -189,7 +225,8 @@ def create_user(
 
     # Resolver email/username/senha (opcionais durante migração)
     _ts = str(int(time.time() * 1000))
-    email_val = (body.email or "").strip() or f"sem-email-{sub_base}-{_ts}@migrado.local"
+    # Placeholder temporário até ter o id; após flush será sem-email{id}@{sub_base}.migrado.local
+    email_val = (body.email or "").strip() or f"sem-email-{_ts}@{_sanitize_sub_base(sub_base)}.migrado.local"
     username_val = (body.username or "").strip() or f"sem_username_{_ts}"
     if (body.password or "").strip():
         password_hash_val = get_password_hash((body.password or "").strip())
@@ -204,12 +241,7 @@ def create_user(
         if db.scalar(select(User).where(User.username == (body.username or "").strip())):
             raise HTTPException(409, "Username já existe.")
 
-    # --- ROLE 4 (Motoboy): validar obrigatórios ---
-    if body.role == 4:
-        obrigatorios = ["documento", "rua", "numero", "bairro", "cidade", "cep"]
-        faltando = [f for f in obrigatorios if not (getattr(body, f, None) or "").strip()]
-        if faltando:
-            raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
+    # --- ROLE 4 (Motoboy): campos de endereço opcionais (motoboy provisório) ---
 
     # --- MAPEAR ROLE → COLETADOR (legado) ---
     coletador = (body.role == 3)
@@ -230,6 +262,10 @@ def create_user(
 
         db.add(new_user)
         db.flush()
+
+        # Atualizar email placeholder para formato definitivo: sem-email{id}@{sub_base}.migrado.local
+        if not (body.email or "").strip():
+            new_user.email = _placeholder_email(new_user.id, sub_base)
 
         if body.role == 4:
             pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else False
@@ -352,11 +388,21 @@ def list_users(
         try:
             out.append(_user_to_out(u))
         except Exception as e:
-            logger.exception("list_users: falha ao serializar user id=%s email=%s", getattr(u, "id", None), getattr(u, "email", None))
-            raise HTTPException(
-                500,
-                f"Erro ao listar usuários: registro inválido (id={getattr(u, 'id', '?')}). Corrija os dados no banco ou contate o suporte."
-            ) from e
+            logger.warning("list_users: fallback para user id=%s: %s", getattr(u, "id", None), e)
+            uid = int(getattr(u, "id", 0))
+            out.append(UserOut(
+                id=uid,
+                email=_placeholder_email(uid, getattr(u, "sub_base", None)),
+                username="—",
+                contato="—",
+                status=getattr(u, "status", True),
+                sub_base=getattr(u, "sub_base", None),
+                nome=getattr(u, "nome", None),
+                sobrenome=getattr(u, "sobrenome", None),
+                role=getattr(u, "role", 2),
+                coletador=getattr(u, "coletador", False),
+                motoboy=None,
+            ))
     return out
 
 
