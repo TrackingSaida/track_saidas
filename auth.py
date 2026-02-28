@@ -74,6 +74,7 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 class Token(BaseModel):
     access_token: str
     token_type: str
+    must_change_password: Optional[bool] = None
 
 
 class UserLogin(BaseModel):
@@ -343,6 +344,12 @@ async def logout(response: Response):
 # LOGIN MOTOBOY (role=4) — mobile
 # ======================================================
 
+def _default_password_motoboy(sub_base: Optional[str]) -> str:
+    """Senha padrão motoboy: {subbase}_trocar_senha em minúsculo (ex.: Giro Express -> giroexpress_trocar_senha)."""
+    norm = (sub_base or "").strip().replace(" ", "").lower()
+    return f"{norm}_trocar_senha" if norm else "migrado_trocar_senha"
+
+
 @router.post("/motoboy-login")
 async def motoboy_login(
     body: MotoboyLogin,
@@ -372,8 +379,14 @@ async def motoboy_login(
     ).all()
     sub_bases = [s for s in sub_bases_rows if s]
 
+    # Senha padrão (subbase_trocar_senha) exige troca no app
+    sub_for_check = (sub_bases[0] if sub_bases else None) or getattr(user, "sub_base", None)
+    must_change_password = verify_password(
+        _default_password_motoboy(sub_for_check), user.password_hash
+    )
+
     if len(sub_bases) > 1:
-        return {"multiple_sub_base": True, "sub_bases": sub_bases}
+        return {"multiple_sub_base": True, "sub_bases": sub_bases, "must_change_password": must_change_password}
 
     if len(sub_bases) == 0:
         raise HTTPException(403, "Motoboy sem sub_base ativa vinculada.")
@@ -382,7 +395,7 @@ async def motoboy_login(
     owner = _owner_for_sub_base(db, sub_base)
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = create_access_token(_claims_motoboy(user, motoboy, owner, sub_base), expires)
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": token, "token_type": "bearer", "must_change_password": must_change_password}
 
 
 @router.post("/motoboy-select-subbase", response_model=Token)
@@ -421,7 +434,10 @@ async def motoboy_select_subbase(
         _claims_motoboy(user, motoboy, owner, body.sub_base.strip()),
         expires,
     )
-    return {"access_token": token, "token_type": "bearer"}
+    must_change_password = verify_password(
+        _default_password_motoboy(body.sub_base.strip()), user.password_hash
+    )
+    return {"access_token": token, "token_type": "bearer", "must_change_password": must_change_password}
 
 
 def _nome_exibicao(user: User) -> tuple[Optional[str], Optional[str]]:
