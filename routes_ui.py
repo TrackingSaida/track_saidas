@@ -84,6 +84,7 @@ MENU_DEFS = [
             {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
             {"label": "Usuários",     "href": "tracking-usuarios.html",   "roles": [0, 1]},
             {"label": "Preços de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
+            {"label": "Autenticação", "href": "tracking-autenticacao.html", "roles": [0, 1], "base_only": True, "base_only_roles": [1]},
         ]
     },
     {
@@ -124,13 +125,15 @@ def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = 
             # Filtra os itens permitidos (role + ignorar_coleta + modo_operacao + base_only)
             # coleta_only: ocultar quando ignorar_coleta, EXCETO se coleta_manual_ok e modo=coleta_manual
             # visao360_only: sempre ocultar quando ignorar_coleta
-            # base_only: mostrar só quando tipo_owner == "base"
+            # base_only: mostrar só quando tipo_owner == "base"; base_only_roles: aplicar só a esses roles (ex.: [1] = só admin exige base)
             allowed_items = []
             for item in section["items"]:
                 if "roles" in item and role not in item["roles"]:
                     continue
                 if item.get("base_only") and tipo_owner != "base":
-                    continue
+                    roles_that_require_base = item.get("base_only_roles")
+                    if roles_that_require_base is None or role in roles_that_require_base:
+                        continue
                 if ignorar_coleta and item.get("visao360_only"):
                     continue
                 if ignorar_coleta and item.get("coleta_only"):

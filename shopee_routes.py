@@ -7,15 +7,16 @@ import hmac
 import hashlib
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from fastapi.responses import RedirectResponse
 
-
+from auth import get_current_user
 from db import get_db
-from models import ShopeeToken
+from models import ShopeeToken, User
 
 router = APIRouter(prefix="/shopee", tags=["Shopee"])
 
@@ -95,19 +96,26 @@ def _sign_api(
 
 
 # -------------------------------------------------
-# 1) Gerar URL de autorização da Shopee
+# 1) Gerar URL de autorização da Shopee (protegido: role 0 ou 1; redirect com sub_base)
 # -------------------------------------------------
 @router.get(
     "/auth-url",
     summary="Gera a URL para o seller autorizar a Shopee",
 )
-def gerar_auth_url():
+def gerar_auth_url(user: User = Depends(get_current_user)):
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a root e admin.")
     host, partner_id, partner_key, redirect_url, env = _get_shopee_config()
+
+    sub_base = getattr(user, "sub_base", None) or ""
+    if sub_base:
+        redirect_with_sub = f"{redirect_url}?sub_base={quote(sub_base, safe='')}"
+    else:
+        redirect_with_sub = redirect_url
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
 
-    # auth_partner: base = partner_id + path + timestamp
     sign = _sign_api(
         partner_id=partner_id,
         partner_key=partner_key,
@@ -122,7 +130,7 @@ def gerar_auth_url():
         f"?partner_id={partner_id}"
         f"&timestamp={timestamp}"
         f"&sign={sign}"
-        f"&redirect={redirect_url}"
+        f"&redirect={quote(redirect_with_sub, safe='')}"
     )
     return {"auth_url": auth_url}
 
@@ -139,6 +147,7 @@ def shopee_callback(
     code: str = Query(...),
     shop_id: int = Query(...),
     main_account_id: Optional[int] = Query(None),
+    sub_base: Optional[str] = Query(None, description="Sub-base passada no redirect"),
     db: Session = Depends(get_db),
 ):
     host, partner_id, partner_key, _, env = _get_shopee_config()
@@ -226,11 +235,13 @@ def shopee_callback(
         existente.refresh_token = refresh_token or existente.refresh_token
         existente.expires_at = expires_at
         existente.main_account_id = main_account_id
+        existente.sub_base = sub_base
         db.commit()
     else:
         token = ShopeeToken(
             shop_id=shop_id,
             main_account_id=main_account_id,
+            sub_base=sub_base,
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at=expires_at,
@@ -242,3 +253,36 @@ def shopee_callback(
         url="https://tracking-saidas.com.br/landing-tracking.html",
         status_code=302,
     )
+
+
+# -------------------------------------------------
+# 3) Listagem de sellers (tokens) filtrada por sub_base do usuário
+# -------------------------------------------------
+@router.get("/sellers")
+def shopee_sellers(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a root e admin.")
+    sub_base = getattr(user, "sub_base", None)
+    tokens = (
+        db.query(ShopeeToken)
+        .filter(ShopeeToken.sub_base == sub_base)
+        .order_by(ShopeeToken.criado_em.desc())
+        .all()
+    )
+    now = datetime.utcnow()
+    result = []
+    for tk in tokens:
+        status = "conectado" if (tk.expires_at and tk.expires_at > now) else "expirado"
+        result.append({
+            "id": tk.id,
+            "shop_id": tk.shop_id,
+            "main_account_id": tk.main_account_id,
+            "sub_base": tk.sub_base,
+            "platform": "shopee",
+            "status": status,
+            "criado_em": tk.criado_em.isoformat() if tk.criado_em else None,
+        })
+    return result

@@ -315,6 +315,7 @@ class MercadoLivreToken(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id_ml = Column(BigInteger, nullable=False)
+    sub_base = Column(Text, nullable=True)
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=False)
     expires_at = Column(DateTime(timezone=False), nullable=False)
@@ -333,6 +334,7 @@ class ShopeeToken(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     shop_id = Column(BigInteger, nullable=False)
     main_account_id = Column(BigInteger, nullable=True)
+    sub_base = Column(Text, nullable=True)
 
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=True)
