@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user, get_password_hash
-from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, Saida, User
+from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
@@ -56,6 +56,16 @@ class EntregadorUpdate(BaseModel):
     username_entregador: Optional[str] = None
     senha: Optional[str] = None
     ativo: Optional[bool] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ExecutorItem(BaseModel):
+    """Item para dropdown de Fechamento de Motoboys: entregador ou motoboy."""
+    id_entregador: Optional[int] = None
+    id_motoboy: Optional[int] = None
+    nome: str
+    tipo: str  # "entregador" | "motoboy"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -374,6 +384,53 @@ def list_entregadores(
     return db.scalars(stmt).all()
 
 
+@router.get("/executores", response_model=List[ExecutorItem])
+def list_executores(
+    status: Optional[str] = Query("ativo", description="Para entregadores: ativo, inativo ou todos"),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Lista executores (entregadores + motoboys) da sub_base para dropdown de Fechamento de Motoboys."""
+    sub_base_user = _resolve_user_base(db, current_user)
+    out: List[ExecutorItem] = []
+
+    # Entregadores
+    stmt_ent = select(Entregador).where(Entregador.sub_base == sub_base_user)
+    if status == "ativo":
+        stmt_ent = stmt_ent.where(Entregador.ativo.is_(True))
+    elif status == "inativo":
+        stmt_ent = stmt_ent.where(Entregador.ativo.is_(False))
+    stmt_ent = stmt_ent.order_by(Entregador.nome)
+    for ent in db.scalars(stmt_ent).all():
+        out.append(ExecutorItem(
+            id_entregador=ent.id_entregador,
+            id_motoboy=None,
+            nome=(ent.nome or f"Entregador {ent.id_entregador}").strip(),
+            tipo="entregador",
+        ))
+
+    # Motoboys vinculados à sub_base
+    stmt_mb = (
+        select(Motoboy)
+        .join(MotoboySubBase, MotoboySubBase.motoboy_id == Motoboy.id_motoboy)
+        .where(
+            MotoboySubBase.sub_base == sub_base_user,
+            MotoboySubBase.ativo.is_(True),
+        )
+        .order_by(Motoboy.id_motoboy)
+    )
+    for motoboy in db.scalars(stmt_mb).all():
+        nome = _get_motoboy_nome(db, motoboy.id_motoboy)
+        out.append(ExecutorItem(
+            id_entregador=None,
+            id_motoboy=motoboy.id_motoboy,
+            nome=nome,
+            tipo="motoboy",
+        ))
+
+    return out
+
+
 def _normalizar_servico(servico: Optional[str]) -> str:
     s = (servico or "").lower()
     if "shopee" in s:
@@ -491,6 +548,7 @@ def resumo_entregadores(
     data_inicio: Optional[date] = Query(None),
     data_fim: Optional[date] = Query(None),
     entregador_id: Optional[int] = Query(None),
+    motoboy_id: Optional[int] = Query(None),
     fechamento_status: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
@@ -498,6 +556,8 @@ def resumo_entregadores(
     current_user=Depends(get_current_user),
 ):
     sub_base_user = _resolve_user_base(db, current_user)
+    if entregador_id is not None and motoboy_id is not None:
+        raise HTTPException(400, "Informe apenas um de entregador_id ou motoboy_id.")
 
     # Inclui saída e entrega; exclui cancelados (alinhado a contabilidade/dashboard)
     status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
@@ -518,6 +578,8 @@ def resumo_entregadores(
         stmt = stmt.where(Saida.data <= data_fim)
     if entregador_id is not None:
         stmt = stmt.where(Saida.entregador_id == entregador_id)
+    if motoboy_id is not None:
+        stmt = stmt.where(Saida.motoboy_id == motoboy_id)
 
     rows = db.scalars(stmt).all()
 
