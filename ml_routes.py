@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from urllib.parse import quote
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -31,31 +30,22 @@ ML_ORDERS_SEARCH_URL = "https://api.mercadolibre.com/orders/search"
 
 
 # ============================================================
-# 1) Gera o link de autorização (protegido: role 0 ou 1; state = sub_base)
+# 1) Gera o link de autorização (sem enviar dados internos à plataforma)
 # ============================================================
 @router.get("/connect")
-def ml_connect(user: User = Depends(get_current_user)):
-    if user.role not in (0, 1):
-        raise HTTPException(403, "Acesso restrito a root e admin.")
+def ml_connect():
     if not ML_CLIENT_ID or not ML_REDIRECT_URI:
         raise HTTPException(500, "ML_CLIENT_ID ou ML_REDIRECT_URI não configurados.")
-    sub_base = getattr(user, "sub_base", None) or ""
-    state = quote(sub_base, safe="") if sub_base else ""
-    auth_url = f"{ML_AUTH_BASE}?response_type=code&client_id={ML_CLIENT_ID}&redirect_uri={ML_REDIRECT_URI}"
-    if state:
-        auth_url += f"&state={state}"
-    return {"auth_url": auth_url}
+    return {
+        "auth_url": f"{ML_AUTH_BASE}?response_type=code&client_id={ML_CLIENT_ID}&redirect_uri={ML_REDIRECT_URI}"
+    }
 
 
 # ============================================================
-# 2) Callback: troca o code por token e salva (state = sub_base)
+# 2) Callback: troca o code por token e salva (sub_base não enviado à plataforma)
 # ============================================================
 @router.get("/callback")
-def ml_callback(
-    code: str,
-    state: str | None = Query(None, description="Sub-base passada no link de autorização"),
-    db: Session = Depends(get_db),
-):
+def ml_callback(code: str, db: Session = Depends(get_db)):
     if not ML_CLIENT_ID or not ML_CLIENT_SECRET or not ML_REDIRECT_URI:
         raise HTTPException(500, "Variáveis do Mercado Livre não configuradas.")
 
@@ -86,17 +76,15 @@ def ml_callback(
         .filter(MercadoLivreToken.user_id_ml == user_id_ml)
         .first()
     )
+    base_url = (FRONTEND_AFTER_CALLBACK or "").rstrip("/")
+    success_page = f"{base_url}/autenticacao-sucesso.html"
+
     if existente:
-        if state is not None:
-            existente.sub_base = state or None
-            db.commit()
-        final_url = f"{FRONTEND_AFTER_CALLBACK}?ml=ja_existe"
-        return RedirectResponse(url=final_url)
+        return RedirectResponse(url=f"{success_page}?ml=ja_existe")
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
     novo = MercadoLivreToken(
         user_id_ml=user_id_ml,
-        sub_base=state or None,
         access_token=access_token,
         refresh_token=refresh_token,
         expires_at=expires_at,
@@ -104,7 +92,7 @@ def ml_callback(
     db.add(novo)
     db.commit()
 
-    return RedirectResponse(f"{FRONTEND_AFTER_CALLBACK}?ml=ok")
+    return RedirectResponse(url=f"{success_page}?ml=ok")
 
 
 # ============================================================

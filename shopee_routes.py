@@ -7,7 +7,6 @@ import hmac
 import hashlib
 from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import quote
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -96,22 +95,14 @@ def _sign_api(
 
 
 # -------------------------------------------------
-# 1) Gerar URL de autorização da Shopee (protegido: role 0 ou 1; redirect com sub_base)
+# 1) Gerar URL de autorização da Shopee (sem enviar dados internos à plataforma)
 # -------------------------------------------------
 @router.get(
     "/auth-url",
     summary="Gera a URL para o seller autorizar a Shopee",
 )
-def gerar_auth_url(user: User = Depends(get_current_user)):
-    if user.role not in (0, 1):
-        raise HTTPException(403, "Acesso restrito a root e admin.")
+def gerar_auth_url():
     host, partner_id, partner_key, redirect_url, env = _get_shopee_config()
-
-    sub_base = getattr(user, "sub_base", None) or ""
-    if sub_base:
-        redirect_with_sub = f"{redirect_url}?sub_base={quote(sub_base, safe='')}"
-    else:
-        redirect_with_sub = redirect_url
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
@@ -130,7 +121,7 @@ def gerar_auth_url(user: User = Depends(get_current_user)):
         f"?partner_id={partner_id}"
         f"&timestamp={timestamp}"
         f"&sign={sign}"
-        f"&redirect={quote(redirect_with_sub, safe='')}"
+        f"&redirect={redirect_url}"
     )
     return {"auth_url": auth_url}
 
@@ -147,7 +138,6 @@ def shopee_callback(
     code: str = Query(...),
     shop_id: int = Query(...),
     main_account_id: Optional[int] = Query(None),
-    sub_base: Optional[str] = Query(None, description="Sub-base passada no redirect"),
     db: Session = Depends(get_db),
 ):
     host, partner_id, partner_key, _, env = _get_shopee_config()
@@ -235,13 +225,11 @@ def shopee_callback(
         existente.refresh_token = refresh_token or existente.refresh_token
         existente.expires_at = expires_at
         existente.main_account_id = main_account_id
-        existente.sub_base = sub_base
         db.commit()
     else:
         token = ShopeeToken(
             shop_id=shop_id,
             main_account_id=main_account_id,
-            sub_base=sub_base,
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at=expires_at,
@@ -249,10 +237,9 @@ def shopee_callback(
         db.add(token)
         db.commit()
 
-    return RedirectResponse(
-        url="https://tracking-saidas.com.br/landing-tracking.html",
-        status_code=302,
-    )
+    frontend_base = (os.getenv("ML_AFTER_CALLBACK", "https://tracking-saidas.com.br/") or "").rstrip("/")
+    success_url = f"{frontend_base}/autenticacao-sucesso.html?shopee=ok"
+    return RedirectResponse(url=success_url, status_code=302)
 
 
 # -------------------------------------------------
