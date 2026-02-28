@@ -213,6 +213,8 @@ class Saida(Base):
     status = Column(Text, nullable=True, server_default=text("'saiu'::text"))
     id_coleta = Column(BigInteger, ForeignKey("coletas.id_coleta"), nullable=True)
     qr_payload_raw = Column(Text, nullable=True)  # Payload bruto do QR (ML) para gerar etiqueta reconhecível
+    ml_shipment_id = Column(BigInteger, nullable=True, index=True)  # vínculo envio ML (evita duplicata no auto-fill)
+    ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
 
     coleta = relationship("Coleta", back_populates="saidas")
 
@@ -323,6 +325,25 @@ class MercadoLivreToken(Base):
 
     def __repr__(self) -> str:
         return f"<MercadoLivreToken id={self.id} user_id_ml={self.user_id_ml}>"
+
+
+# ==========================
+# Tabela: ml_conexoes (ML Int - integração transportadora/seller)
+# ==========================
+class MLConexao(Base):
+    __tablename__ = "ml_conexoes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False, index=True)
+    user_id_ml = Column(BigInteger, nullable=False, index=True)
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=False)
+    expires_at = Column(DateTime(timezone=False), nullable=False)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<MLConexao id={self.id} user_id_ml={self.user_id_ml} sub_base={self.sub_base!r}>"
 
 
 # ==========================
@@ -477,7 +498,7 @@ class SaidaDetail(Base):
     id_detail = Column(BigInteger, primary_key=True, autoincrement=True)
 
     id_saida = Column(BigInteger, nullable=False)
-    id_entregador = Column(BigInteger, nullable=False)  # entregador responsável pela entrega
+    id_entregador = Column(BigInteger, nullable=True)  # null quando status = Aguardando coleta (ML auto-fill)
 
     status = Column(Text, nullable=False, server_default=text("'Em Rota'"))
     tentativa = Column(Integer, nullable=False, server_default=text("1"))

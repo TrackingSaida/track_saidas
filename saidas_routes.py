@@ -186,6 +186,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return STATUS_CANCELADO
     if lower in ("coletado", "coletada"):
         return "coletado"
+    if lower == "aguardando_coleta":
+        return "aguardando_coleta"
     if lower in ("não coletado", "nao coletado", "não coletada", "nao coletada"):
         return "não coletado"
     # Novos status motoboy (aceitar em maiúsculas ou lowercase)
@@ -520,6 +522,40 @@ def ler_saida(
 
     # Existe: decidir por status e entregador
     status_norm = normalizar_status_saida(existente.status)
+
+    if status_norm == "aguardando_coleta":
+        # Leitura em coleta: aguardando_coleta → coletado
+        status_anterior = existente.status
+        existente.status = "coletado"
+        existente.entregador_id = entregador_id
+        existente.entregador = entregador_nome
+        if motoboy_id is not None:
+            existente.motoboy_id = motoboy_id
+        detail = db.scalar(
+            select(SaidaDetail).where(SaidaDetail.id_saida == existente.id_saida).order_by(SaidaDetail.id_detail.desc()).limit(1)
+        )
+        if detail:
+            detail.status = "Coletado"
+            if entregador_id is not None:
+                detail.id_entregador = entregador_id
+            elif motoboy_id is not None:
+                detail.id_entregador = motoboy_id
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="lido",
+                status_anterior=status_anterior,
+                status_novo="coletado",
+                user_id=getattr(current_user, "id", None),
+            )
+        )
+        try:
+            db.commit()
+            db.refresh(existente)
+            return SaidaOut.model_validate(existente)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "coletado":
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
