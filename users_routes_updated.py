@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
+import time
 from datetime import date
 from typing import Optional, List, Any
-import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -40,9 +41,10 @@ class MotoboyOut(BaseModel):
 
 
 class UserCreate(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=4)
-    username: str = Field(min_length=3)
+    # Opcionais durante migração; placeholders são usados quando vazios (EmailStr não aceita "")
+    email: Optional[str] = None
+    password: Optional[str] = None
+    username: Optional[str] = None
     contato: str
 
     nome: Optional[str] = None
@@ -185,12 +187,22 @@ def create_user(
     if not owner.ativo:
         raise HTTPException(403, "Owner desta sub_base está inativo.")
 
-    # Emails e usernames únicos
-    if db.scalar(select(User).where(User.email == body.email)):
-        raise HTTPException(409, "Email já existe.")
+    # Resolver email/username/senha (opcionais durante migração)
+    _ts = str(int(time.time() * 1000))
+    email_val = (body.email or "").strip() or f"sem-email-{sub_base}-{_ts}@migrado.local"
+    username_val = (body.username or "").strip() or f"sem_username_{_ts}"
+    if (body.password or "").strip():
+        password_hash_val = get_password_hash((body.password or "").strip())
+    else:
+        password_hash_val = get_password_hash("migrado_trocar_senha")
 
-    if db.scalar(select(User).where(User.username == body.username)):
-        raise HTTPException(409, "Username já existe.")
+    # Emails e usernames únicos (só quando informados pelo usuário)
+    if body.email and (body.email or "").strip():
+        if db.scalar(select(User).where(User.email == (body.email or "").strip())):
+            raise HTTPException(409, "Email já existe.")
+    if body.username and (body.username or "").strip():
+        if db.scalar(select(User).where(User.username == (body.username or "").strip())):
+            raise HTTPException(409, "Username já existe.")
 
     # --- ROLE 4 (Motoboy): validar obrigatórios ---
     if body.role == 4:
@@ -204,9 +216,9 @@ def create_user(
 
     try:
         new_user = User(
-            email=body.email,
-            password_hash=get_password_hash(body.password),
-            username=body.username,
+            email=email_val,
+            password_hash=password_hash_val,
+            username=username_val,
             contato=body.contato,
             nome=body.nome,
             sobrenome=body.sobrenome,

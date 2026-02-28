@@ -9,12 +9,12 @@ from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, Saida, SaidaDetail, Motoboy, RotasMotoboy
+from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy, RotasMotoboy
 from saidas_routes import (
     _get_motoboy_nome,
     normalizar_status_saida,
@@ -145,6 +145,19 @@ def acompanhamento_dia(
 
     saidas = list(db.scalars(stmt).all())
 
+    # Cache: id_saida -> max(timestamp) do evento "entregue" em saida_historico (horário correto)
+    ids_saida = [s.id_saida for s in saidas]
+    cache_entregue: dict[int, object] = {}
+    if ids_saida:
+        stmt_entregue = (
+            select(SaidaHistorico.id_saida, func.max(SaidaHistorico.timestamp).label("ts"))
+            .where(SaidaHistorico.id_saida.in_(ids_saida))
+            .where(SaidaHistorico.evento == "entregue")
+            .group_by(SaidaHistorico.id_saida)
+        )
+        for row in db.execute(stmt_entregue).all():
+            cache_entregue[row.id_saida] = row.ts
+
     # Agrupar por motoboy_id
     by_motoboy: dict[int, list] = {}
     for s in saidas:
@@ -189,9 +202,10 @@ def acompanhamento_dia(
                 em_rota += 1
             elif st == STATUS_AUSENTE:
                 ausente_ou_ocorrencias += 1
-            if s.data_hora_entrega:
-                if ultima_entrega_dt is None or s.data_hora_entrega > ultima_entrega_dt:
-                    ultima_entrega_dt = s.data_hora_entrega
+            ts_entrega = cache_entregue.get(s.id_saida) if s.id_saida in cache_entregue else s.data_hora_entrega
+            if ts_entrega:
+                if ultima_entrega_dt is None or ts_entrega > ultima_entrega_dt:
+                    ultima_entrega_dt = ts_entrega
 
         sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
 
