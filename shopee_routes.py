@@ -143,7 +143,7 @@ def shopee_callback(
 ):
     host, partner_id, partner_key, _, env = _get_shopee_config()
 
-    path = "/api/v2/auth/access_token/get"
+    path = "/api/v2/auth/token/get"
     timestamp = int(time.time())
 
     # ✅ CORRETO: NÃO inclui shop_id na assinatura
