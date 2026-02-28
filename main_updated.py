@@ -202,6 +202,16 @@ def startup_event():
         db.close()
 
 # ──────────────────────────────────────────────────────────────────
+# Raiz (evita 404 ao acessar a URL do serviço no Render)
+@app.get("/", tags=["Root"])
+def root():
+    return {
+        "message": "API Track Saídas",
+        "docs": f"{API_PREFIX}/docs",
+        "health": f"{API_PREFIX}/health",
+    }
+
+# ──────────────────────────────────────────────────────────────────
 # Healthcheck
 @app.get(f"{API_PREFIX}/health", tags=["Health"])
 def health():
