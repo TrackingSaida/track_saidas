@@ -3,15 +3,16 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import select
 
+from auth import get_current_user
 from db import get_db
-from models import MercadoLivreToken
+from models import MercadoLivreToken, User
 
 router = APIRouter(prefix="/ml", tags=["Mercado Livre"])
 
@@ -30,22 +31,31 @@ ML_ORDERS_SEARCH_URL = "https://api.mercadolibre.com/orders/search"
 
 
 # ============================================================
-# 1) Gera o link de autorização
+# 1) Gera o link de autorização (protegido: role 0 ou 1; state = sub_base)
 # ============================================================
 @router.get("/connect")
-def ml_connect():
+def ml_connect(user: User = Depends(get_current_user)):
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a root e admin.")
     if not ML_CLIENT_ID or not ML_REDIRECT_URI:
         raise HTTPException(500, "ML_CLIENT_ID ou ML_REDIRECT_URI não configurados.")
-    return {
-        "auth_url": f"{ML_AUTH_BASE}?response_type=code&client_id={ML_CLIENT_ID}&redirect_uri={ML_REDIRECT_URI}"
-    }
+    sub_base = getattr(user, "sub_base", None) or ""
+    state = quote(sub_base, safe="") if sub_base else ""
+    auth_url = f"{ML_AUTH_BASE}?response_type=code&client_id={ML_CLIENT_ID}&redirect_uri={ML_REDIRECT_URI}"
+    if state:
+        auth_url += f"&state={state}"
+    return {"auth_url": auth_url}
 
 
 # ============================================================
-# 2) Callback: troca o code por token e salva
+# 2) Callback: troca o code por token e salva (state = sub_base)
 # ============================================================
 @router.get("/callback")
-def ml_callback(code: str, db: Session = Depends(get_db)):
+def ml_callback(
+    code: str,
+    state: str | None = Query(None, description="Sub-base passada no link de autorização"),
+    db: Session = Depends(get_db),
+):
     if not ML_CLIENT_ID or not ML_CLIENT_SECRET or not ML_REDIRECT_URI:
         raise HTTPException(500, "Variáveis do Mercado Livre não configuradas.")
 
@@ -77,12 +87,16 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
         .first()
     )
     if existente:
+        if state is not None:
+            existente.sub_base = state or None
+            db.commit()
         final_url = f"{FRONTEND_AFTER_CALLBACK}?ml=ja_existe"
         return RedirectResponse(url=final_url)
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
     novo = MercadoLivreToken(
         user_id_ml=user_id_ml,
+        sub_base=state or None,
         access_token=access_token,
         refresh_token=refresh_token,
         expires_at=expires_at,
@@ -91,6 +105,34 @@ def ml_callback(code: str, db: Session = Depends(get_db)):
     db.commit()
 
     return RedirectResponse(f"{FRONTEND_AFTER_CALLBACK}?ml=ok")
+
+
+# ============================================================
+# Listagem de sellers (tokens) filtrada por sub_base do usuário
+# ============================================================
+@router.get("/sellers")
+def ml_sellers(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a root e admin.")
+    sub_base = getattr(user, "sub_base", None)
+    q = db.query(MercadoLivreToken).filter(MercadoLivreToken.sub_base == sub_base)
+    tokens = q.order_by(MercadoLivreToken.criado_em.desc()).all()
+    now = datetime.utcnow()
+    result = []
+    for tk in tokens:
+        status = "conectado" if (tk.expires_at and tk.expires_at > now) else "expirado"
+        result.append({
+            "id": tk.id,
+            "user_id_ml": tk.user_id_ml,
+            "sub_base": tk.sub_base,
+            "platform": "mercado_livre",
+            "status": status,
+            "criado_em": tk.criado_em.isoformat() if tk.criado_em else None,
+        })
+    return result
 
 
 # ============================================================
