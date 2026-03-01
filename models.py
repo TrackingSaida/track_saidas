@@ -336,6 +336,7 @@ class MLConexao(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     sub_base = Column(Text, nullable=False, index=True)
     user_id_ml = Column(BigInteger, nullable=False, index=True)
+    user_nickname_ml = Column(Text, nullable=True)
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=False)
     expires_at = Column(DateTime(timezone=False), nullable=False)

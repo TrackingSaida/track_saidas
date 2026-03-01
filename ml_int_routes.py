@@ -78,12 +78,16 @@ def ml_int_callback(
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
     sub_base_value = (state or "").strip() or None
+    nickname = (user_me.get("nickname") or "").strip()
 
     def success_url() -> str:
-        qs = "ml=ok"
+        params = ["ml=ok"]
         if sub_base_value:
-            qs += "&sub_base=" + quote(sub_base_value, safe="")
-        return f"{success_page}?{qs}"
+            params.append("sub_base=" + quote(sub_base_value, safe=""))
+        if nickname:
+            params.append("seller_name=" + quote(nickname, safe=""))
+        params.append("v=2")
+        return f"{success_page}?{"&".join(params)}"
 
     if existente:
         existente.access_token = access_token
@@ -92,11 +96,14 @@ def ml_int_callback(
         existente.atualizado_em = datetime.utcnow()
         if sub_base_value is not None:
             existente.sub_base = sub_base_value
+        if nickname:
+            existente.user_nickname_ml = nickname
         db.commit()
         return RedirectResponse(url=success_url())
     novo = MLConexao(
         sub_base=sub_base_value or "",
         user_id_ml=user_id_ml,
+        user_nickname_ml=nickname or None,
         access_token=access_token,
         refresh_token=refresh_token,
         expires_at=expires_at,
@@ -123,6 +130,7 @@ def ml_int_sellers(
         {
             "id": c.id,
             "user_id_ml": c.user_id_ml,
+            "user_nickname_ml": c.user_nickname_ml,
             "sub_base": c.sub_base,
             "status": "conectado" if (c.expires_at and c.expires_at > now) else "expirado",
             "criado_em": c.criado_em.isoformat() if c.criado_em else None,
