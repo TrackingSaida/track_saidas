@@ -122,7 +122,6 @@ from base import router as base_router
 from coletas import router as coletas_router
 from base_fechamento_routes import router as base_fechamento_router
 from routes_ui import router as ui_router
-from ml_routes import router as ml_router
 from ml_int_routes import router as ml_int_router
 from signup_routes import router as signup_router
 from shopee_routes import router as shopee_router
@@ -134,7 +133,6 @@ from mobile_entregas_routes import router as mobile_entregas_router
 from upload_routes import router as upload_router
 from acompanhamento_routes import router as acompanhamento_router
 
-app.include_router(ml_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
 app.include_router(contabilidade_router, prefix=API_PREFIX)
@@ -201,17 +199,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ──────────────────────────────────────────────────────────────────
 # Rotina de startup — renova tokens ML e ML Int ao inicializar a API
 from db import SessionLocal
-from ml_token_service import refresh_all_ml_tokens
 from ml_int_service import refresh_all_ml_int_tokens
 
 @app.on_event("startup")
 def startup_event():
-    """Executa ao subir a API: renova tokens vencidos do Mercado Livre (legado e ML Int)."""
+    """Executa ao subir a API: renova tokens vencidos do Mercado Livre (ML Int)."""
     db = SessionLocal()
-    try:
-        refresh_all_ml_tokens(db)
-    except Exception as e:
-        print(f"[ML] Erro durante renovação inicial (legado): {e}")
     try:
         refresh_all_ml_int_tokens(db)
     except Exception as e:

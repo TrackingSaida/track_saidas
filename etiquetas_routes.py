@@ -112,40 +112,6 @@ class EtiquetaGerarPayload(BaseModel):
 #         logger.warning("Shopee etiqueta: %s", e)
 #         return None
 #
-#
-# def _buscar_dados_ml(db: Session, codigo: str) -> Optional[Dict[str, Any]]:
-#     """Tenta obter dados do shipment no ML. Retorna None em qualquer falha."""
-#     try:
-#         from ml_token_service import get_valid_ml_access_token
-#         import requests
-#         access_token = get_valid_ml_access_token(db)
-#         headers = {"Authorization": f"Bearer {access_token}"}
-#         url = "https://api.mercadolibre.com/shipments/search"
-#         resp = requests.get(url, headers=headers, params={"tracking_number": codigo})
-#         if resp.status_code != 200:
-#             return None
-#         data = resp.json()
-#         results = data.get("results") or []
-#         if not results:
-#             return None
-#         shipment = results[0]
-#         shipment_id = shipment.get("id")
-#         receiver = shipment.get("receiver_address") or {}
-#         if shipment_id:
-#             url2 = f"https://api.mercadolibre.com/marketplace/shipments/{shipment_id}"
-#             resp2 = requests.get(url2, headers={**headers, "x-format-new": "true"})
-#             if resp2.status_code == 200:
-#                 d2 = resp2.json()
-#                 dest = d2.get("destination") or {}
-#                 receiver = dest.get("receiver_address") or receiver
-#         return {
-#             "destinatario": receiver.get("receiver_name") or receiver.get("name") or "",
-#             "cidade": receiver.get("city", {}).get("name") if isinstance(receiver.get("city"), dict) else (receiver.get("city") or ""),
-#             "cep": receiver.get("zip_code") or receiver.get("zipcode") or "",
-#         }
-#     except Exception as e:
-#         logger.warning("ML etiqueta: %s", e)
-#         return None
 
 
 # ============================================================
@@ -294,23 +260,6 @@ def _resolve_qr_content(
         saida = db.get(Saida, id_saida)
         if saida and saida.sub_base == sub_base and saida.qr_payload_raw:
             return saida.qr_payload_raw
-
-    # 3. Experimental: fabricar JSON ML (hash_code vazio) — pode ser rejeitado pelo app
-    if _is_ml_servico(servico) or _is_ml_codigo(codigo):
-        try:
-            from ml_token_service import get_latest_ml_token
-            token = get_latest_ml_token(db)
-            if token:
-                import json
-                fake = {
-                    "id": codigo,
-                    "sender_id": token.user_id_ml,
-                    "hash_code": "",
-                    "security_digit": "0",
-                }
-                return json.dumps(fake, separators=(",", ":"))
-        except Exception as e:
-            logger.debug("Experimental ML QR fabricado: %s", e)
 
     return None
 
