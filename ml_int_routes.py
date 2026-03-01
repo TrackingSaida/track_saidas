@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlencode
 
@@ -87,6 +88,8 @@ def ml_int_callback(
         if nickname:
             params.append("seller_name=" + quote(nickname, safe=""))
         params.append("v=2")
+        # Cache-busting: evita que o redirect abra versão em cache da página
+        params.append("_t=" + str(int(time.time())))
         return f"{success_page}?{"&".join(params)}"
 
     if existente:
