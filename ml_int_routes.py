@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -79,6 +79,12 @@ def ml_int_callback(
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
     sub_base_value = (state or "").strip() or None
 
+    def success_url() -> str:
+        qs = "ml=ok"
+        if sub_base_value:
+            qs += "&sub_base=" + quote(sub_base_value, safe="")
+        return f"{success_page}?{qs}"
+
     if existente:
         existente.access_token = access_token
         existente.refresh_token = refresh_token
@@ -87,7 +93,7 @@ def ml_int_callback(
         if sub_base_value is not None:
             existente.sub_base = sub_base_value
         db.commit()
-        return RedirectResponse(url=f"{success_page}?ml=ok")
+        return RedirectResponse(url=success_url())
     novo = MLConexao(
         sub_base=sub_base_value or "",
         user_id_ml=user_id_ml,
@@ -97,7 +103,7 @@ def ml_int_callback(
     )
     db.add(novo)
     db.commit()
-    return RedirectResponse(url=f"{success_page}?ml=ok")
+    return RedirectResponse(url=success_url())
 
 
 # ---------- Sellers (auth, filtro por sub_base) ----------
