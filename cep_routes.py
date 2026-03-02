@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException
 router = APIRouter(prefix="/cep", tags=["CEP"])
 
 VIACEP_URL = "https://viacep.com.br/ws/{cep}/json/"
+# User-Agent evita bloqueio em alguns ambientes (ex.: Render / CDNs)
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TrackSaidas/1.0; +https://tracking-saidas.com.br)"}
 
 
 @router.get("/{cep}")
@@ -17,7 +19,11 @@ def get_cep(cep: str):
     if len(digits) != 8:
         raise HTTPException(status_code=400, detail="CEP deve ter 8 dígitos")
     try:
-        r = requests.get(VIACEP_URL.format(cep=digits), timeout=10)
+        r = requests.get(
+            VIACEP_URL.format(cep=digits),
+            headers=HEADERS,
+            timeout=15,
+        )
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and data.get("erro"):
