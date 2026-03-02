@@ -132,7 +132,9 @@ from dashboard_routes import router as dashboard_router
 from mobile_entregas_routes import router as mobile_entregas_router
 from upload_routes import router as upload_router
 from acompanhamento_routes import router as acompanhamento_router
+from cep_routes import router as cep_router
 
+app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
 app.include_router(contabilidade_router, prefix=API_PREFIX)
