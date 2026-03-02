@@ -154,9 +154,13 @@ def _sub_base_domain(sub_base: Optional[str]) -> str:
 
 
 def default_password_motoboy(sub_base: Optional[str]) -> str:
-    """Senha padrão para motoboy: {subbase}_trocar_senha em minúsculo (ex.: Giro Express -> giroexpress_trocar_senha)."""
-    norm = (sub_base or "").strip().replace(" ", "").lower()
-    return f"{norm}_trocar_senha" if norm else "migrado_trocar_senha"
+    """
+    Senha padrão para motoboy quando não informada explicitamente.
+    Mantemos a política de forçar troca de senha no primeiro acesso em outro lugar
+    (ex.: obrigando o usuário a alterar a senha após login), então aqui usamos
+    sempre '123456' como senha inicial fixa.
+    """
+    return "123456"
 
 
 def _first_word(s: Optional[str]) -> str:
@@ -329,13 +333,36 @@ def create_user(
         else:
             password_hash_val = get_password_hash(default_password_motoboy(sub_base))
 
-    # Emails e usernames únicos (só quando informados pelo usuário)
-    if body.email and (body.email or "").strip():
-        if db.scalar(select(User).where(User.email == (body.email or "").strip())):
+    # Emails e usernames únicos
+    email_raw = (body.email or "").strip()
+    if email_raw:
+        if db.scalar(select(User).where(User.email == email_raw)):
             raise HTTPException(409, "Email já existe.")
-    if body.username and (body.username or "").strip():
-        if db.scalar(select(User).where(User.username == (body.username or "").strip())):
-            raise HTTPException(409, "Username já existe.")
+
+    # Username único POR sub_base (permite mesmo username em sub_bases diferentes)
+    username_check = (username_val or "").strip()
+    if username_check:
+        exists_username = db.scalar(
+            select(User).where(
+                User.username == username_check,
+                User.sub_base == sub_base,
+            )
+        )
+        if exists_username:
+            raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+
+    # Contato único (telefone/celular) — mesma sub_base
+    contato_val = (body.contato or "").strip()
+    if not contato_val:
+        raise HTTPException(422, "Contato é obrigatório.")
+    exists_contato = db.scalar(
+        select(User).where(
+            User.contato == contato_val,
+            User.sub_base == sub_base,
+        )
+    )
+    if exists_contato:
+        raise HTTPException(409, "Contato já existe para esta sub_base.")
 
     # --- ROLE 4 (Motoboy): campos de endereço opcionais (motoboy provisório) ---
 
@@ -347,7 +374,7 @@ def create_user(
             email=email_val,
             password_hash=password_hash_val,
             username=username_val,
-            contato=body.contato,
+            contato=contato_val,
             nome=body.nome,
             sobrenome=body.sobrenome,
             status=True,
@@ -561,6 +588,21 @@ def admin_update_user(
 
     # Campos User
     user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role"}
+
+    # Validação de username único por sub_base ao editar
+    if "username" in updates and updates["username"]:
+        new_username = (updates["username"] or "").strip()
+        if new_username and new_username != (user.username or ""):
+            exists_username = db.scalar(
+                select(User).where(
+                    User.username == new_username,
+                    User.sub_base == user.sub_base,
+                    User.id != user.id,
+                )
+            )
+            if exists_username:
+                raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+
     for field, value in updates.items():
         if field in user_fields:
             setattr(user, field, value)
@@ -581,7 +623,7 @@ def admin_update_user(
                     setattr(user.motoboy, field, val)
         else:
             # Criar Motoboy ao mudar role para 4
-            obrigatorios = ["documento", "cnpj", "rua", "numero", "bairro", "cidade", "cep"]
+            obrigatorios = ["documento", "rua", "numero", "bairro", "cidade", "cep"]
             faltando = [f for f in obrigatorios if not (updates.get(f) or "").strip()]
             if faltando:
                 raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
