@@ -4,6 +4,7 @@ import logging
 import time
 from datetime import date
 from typing import Optional, List, Any
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -133,8 +134,14 @@ class PasswordChangePayload(BaseModel):
 # ============================================================
 
 def _sanitize_sub_base(sub_base: str) -> str:
-    """Remove espaços para usar em email (ex.: 'Giro Express' -> 'GiroExpress')."""
-    s = (sub_base or "").strip().replace(" ", "")
+    """
+    Normaliza a sub_base para uso em domínio/username:
+    - remove espaços
+    - remove qualquer caractere que não seja letra ou número
+    (ex.: 'Giro Express' -> 'GiroExpress', 'RUB_TEST1' -> 'RUBTEST1').
+    """
+    raw = (sub_base or "").strip().replace(" ", "")
+    s = re.sub(r"[^A-Za-z0-9]", "", raw)
     return s if s else "migrado"
 
 
@@ -161,10 +168,19 @@ def _last_word(s: Optional[str]) -> str:
     return parts[-1].lower() if parts else ""
 
 
-def _placeholder_username_from_nome(nome: Optional[str]) -> str:
-    """Placeholder de username: primeiro nome + '.giro' (ex.: Abacate Matheus -> abacate.giro)."""
+def _placeholder_username_from_nome(nome: Optional[str], sub_base: Optional[str] = None) -> str:
+    """
+    Placeholder de username: primeiro_nome.subbase (normalizada).
+    Ex.: nome='Abacate Matheus', sub_base='Giro Express' -> 'abacate.giroexpress'.
+    Quando não houver nome, usa apenas a sub_base normalizada.
+    """
     first = _first_word(nome)
-    return f"{first}.giro" if first else ""
+    base = _sanitize_sub_base(sub_base or "").lower()
+    if first and base:
+        return f"{first}.{base}"
+    if first:
+        return first
+    return base
 
 
 def _placeholder_email_from_nome_sobrenome(
@@ -185,14 +201,17 @@ def _placeholder_email(user_id: int, sub_base: Optional[str]) -> str:
 
 
 def _is_email_safe_for_display(raw: str) -> bool:
-    """Retorna True se o valor é aceitável por EmailStr (sem espaço, formato básico, sem TLD reservado)."""
-    if not raw or " " in raw or "@" not in raw:
+    """
+    Retorna True se o valor é aceitável por EmailStr.
+    Usa a própria validação do Pydantic para evitar 500 ao serializar.
+    """
+    if not raw:
         return False
-    # .local é TLD reservado e falha na validação do Pydantic
-    if ".migrado.local" in raw.lower():
+    try:
+        EmailStr.validate(raw)
+        return True
+    except Exception:
         return False
-    parts = raw.split("@", 1)
-    return len(parts) == 2 and len(parts[0]) >= 1 and "." in parts[1] and len(parts[1]) >= 4
 
 
 def _user_to_out(user: User) -> UserOut:
@@ -211,7 +230,7 @@ def _user_to_out(user: User) -> UserOut:
 
         username_val = (user.username or "").strip()
         if not username_val or username_val.startswith("sem_username"):
-            username_val = _placeholder_username_from_nome(nome) or username_val or "—"
+            username_val = _placeholder_username_from_nome(nome, sub_base) or username_val or "—"
         if not username_val:
             username_val = "—"
 
@@ -245,7 +264,7 @@ def _user_to_out(user: User) -> UserOut:
         return UserOut(
             id=user_id,
             email=_placeholder_email_from_nome_sobrenome(nome, sobrenome, sub_base) or _placeholder_email(user_id, sub_base),
-            username=_placeholder_username_from_nome(nome) or "—",
+            username=_placeholder_username_from_nome(nome, sub_base) or "—",
             contato="—",
             status=getattr(user, "status", True),
             sub_base=getattr(user, "sub_base", None),
@@ -300,7 +319,7 @@ def create_user(
         password_hash_val = get_password_hash(p)
     else:
         # Role 4 (motoboy): placeholders permitidos
-        username_val = (body.username or "").strip() or _placeholder_username_from_nome(body.nome) or f"sem_username_{_ts}"
+        username_val = (body.username or "").strip() or _placeholder_username_from_nome(body.nome, sub_base) or _sanitize_sub_base(sub_base or "") or f"sem_username_{_ts}"
         email_val = (body.email or "").strip() or _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or f"sem-email-{_ts}@{_sub_base_domain(sub_base)}.com"
         if (body.password or "").strip():
             password_hash_val = get_password_hash((body.password or "").strip())
