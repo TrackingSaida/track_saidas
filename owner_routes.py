@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -252,13 +252,18 @@ class SellerDadosOut(SellerDadosBase):
 @router.get("/{id_owner}/seller-dados", response_model=SellerDadosOut)
 def get_seller_dados(
     id_owner: int,
+    base_id: Optional[int] = Query(default=None, description="Filtrar dados do seller por id_base associado"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if current_user.role not in (0, 1):
         raise HTTPException(403, "Acesso negado.")
 
-    seller = db.scalar(select(BaseSellerDados).where(BaseSellerDados.owner_id == id_owner))
+    stmt = select(BaseSellerDados).where(BaseSellerDados.owner_id == id_owner)
+    if base_id is not None:
+        stmt = stmt.where(BaseSellerDados.base_id == base_id)
+
+    seller = db.scalar(stmt)
     if not seller:
         raise HTTPException(404, "Dados de seller não encontrados para este owner.")
     return seller
