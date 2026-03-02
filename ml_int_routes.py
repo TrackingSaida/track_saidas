@@ -172,6 +172,57 @@ def ml_int_volume_pendente(
     return {"total": total, "results": results, "seller_id": user_id_ml}
 
 
+# ---------- Vendas do seller (histórico via /orders/search) ----------
+@router.get("/sellers/{user_id_ml:int}/vendas")
+def ml_int_vendas_seller(
+    user_id_ml: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    order_status: str | None = Query(
+        None,
+        description="Filtro de status (ex.: paid, shipped, delivered). Se vazio, traz todos.",
+    ),
+    date_from: str | None = Query(
+        None,
+        description="Data inicial de criação do pedido (ISO 8601, ex.: 2026-03-01T00:00:00).",
+    ),
+    date_to: str | None = Query(
+        None,
+        description="Data final de criação do pedido (ISO 8601).",
+    ),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, le=100),
+):
+    """
+    Lista vendas do seller diretamente do /orders/search do Mercado Livre.
+    Permite filtrar por status e intervalo de datas.
+    """
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito.")
+    sub_base = getattr(user, "sub_base", None)
+    try:
+        token = get_valid_access_token(db, user_id_ml, sub_base)
+    except (LookupError, RuntimeError) as e:
+        raise HTTPException(404, str(e))
+    try:
+        data = fetch_orders_search(
+            token,
+            user_id_ml,
+            order_status=order_status,
+            date_from=date_from,
+            date_to=date_to,
+            offset=offset,
+            limit=limit,
+        )
+    except requests.HTTPError as e:
+        raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
+    return {
+        "seller_id": user_id_ml,
+        "paging": data.get("paging"),
+        "results": data.get("results") or [],
+    }
+
+
 # ---------- Envios do seller (tracking + destination) ----------
 @router.get("/sellers/{user_id_ml:int}/envios")
 def ml_int_envios_seller(
