@@ -28,6 +28,7 @@ logger = logging.getLogger("routes.users")
 class MotoboyOut(BaseModel):
     id_motoboy: Optional[int] = None
     documento: Optional[str] = None
+    cnpj: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -56,6 +57,7 @@ class UserCreate(BaseModel):
 
     # Campos obrigatórios quando role=4
     documento: Optional[str] = None
+    cnpj: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -101,6 +103,7 @@ class AdminUserUpdate(BaseModel):
 
     # Campos motoboy (quando role=4)
     documento: Optional[str] = None
+    cnpj: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -370,6 +373,7 @@ def create_user(
                 user_id=new_user.id,
                 sub_base=sub_base,
                 documento=(body.documento or "").strip(),
+                cnpj=(body.cnpj or "").strip(),
                 rua=(body.rua or "").strip(),
                 numero=(body.numero or "").strip(),
                 complemento=(body.complemento or "").strip() or None,
@@ -563,7 +567,7 @@ def admin_update_user(
 
     # Campos Motoboy (role=4)
     motoboy_fields = {
-        "documento", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
+        "documento", "cnpj", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
         "pode_ler_coleta", "pode_ler_saida"
     }
     sub_base = current_user.sub_base or ""
@@ -577,7 +581,7 @@ def admin_update_user(
                     setattr(user.motoboy, field, val)
         else:
             # Criar Motoboy ao mudar role para 4
-            obrigatorios = ["documento", "rua", "numero", "bairro", "cidade", "cep"]
+            obrigatorios = ["documento", "cnpj", "rua", "numero", "bairro", "cidade", "cep"]
             faltando = [f for f in obrigatorios if not (updates.get(f) or "").strip()]
             if faltando:
                 raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
@@ -589,6 +593,7 @@ def admin_update_user(
                 user_id=user.id,
                 sub_base=sub_base,
                 documento=(updates.get("documento") or "").strip(),
+                cnpj=(updates.get("cnpj") or "").strip(),
                 rua=(updates.get("rua") or "").strip(),
                 numero=(updates.get("numero") or "").strip(),
                 complemento=(updates.get("complemento") or "").strip() or None,

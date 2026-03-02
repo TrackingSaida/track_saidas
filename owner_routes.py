@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from db import get_db
 from auth import get_current_user
-from models import Owner, User, OwnerCobrancaItem
+from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
 
 router = APIRouter(prefix="/owner", tags=["Owner"])
 
@@ -223,6 +223,117 @@ def update_owner(
     db.commit()
     db.refresh(owner)
     return owner
+
+
+# ============================================================
+# DADOS DO SELLER (CNPJ/ENDEREÇO) POR OWNER
+# ============================================================
+
+
+class SellerDadosBase(BaseModel):
+    cnpj: Optional[str] = None
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
+    cep: Optional[str] = None
+    base_id: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SellerDadosOut(SellerDadosBase):
+    id_seller: int
+    owner_id: int
+
+
+@router.get("/{id_owner}/seller-dados", response_model=SellerDadosOut)
+def get_seller_dados(
+    id_owner: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+    seller = db.scalar(select(BaseSellerDados).where(BaseSellerDados.owner_id == id_owner))
+    if not seller:
+        raise HTTPException(404, "Dados de seller não encontrados para este owner.")
+    return seller
+
+
+@router.patch("/{id_owner}/seller-dados", response_model=SellerDadosOut)
+def upsert_seller_dados(
+    id_owner: int,
+    body: SellerDadosBase,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+    owner = db.get(Owner, id_owner)
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado.")
+
+    data = body.model_dump(exclude_unset=True)
+
+    seller = db.scalar(select(BaseSellerDados).where(BaseSellerDados.owner_id == id_owner))
+
+    if not seller:
+        # criação exige CNPJ e endereço mínimo
+        cnpj = (data.get("cnpj") or "").strip()
+        rua = (data.get("rua") or "").strip()
+        numero = (data.get("numero") or "").strip()
+        bairro = (data.get("bairro") or "").strip()
+        cidade = (data.get("cidade") or "").strip()
+        cep = (data.get("cep") or "").strip()
+        if not all([cnpj, rua, numero, bairro, cidade, cep]):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Campos obrigatórios para criar seller: cnpj, rua, numero, bairro, cidade, cep.",
+            )
+
+        seller = BaseSellerDados(
+            owner_id=id_owner,
+            base_id=data.get("base_id"),
+            cnpj=cnpj,
+            rua=rua,
+            numero=numero,
+            complemento=(data.get("complemento") or "").strip() or None,
+            bairro=bairro,
+            cidade=cidade,
+            estado=(data.get("estado") or "").strip() or None,
+            cep=cep,
+        )
+        db.add(seller)
+
+    else:
+        # atualização parcial
+        if "base_id" in data:
+            seller.base_id = data["base_id"]
+        if "cnpj" in data:
+            seller.cnpj = (data["cnpj"] or "").strip() or seller.cnpj
+        if "rua" in data:
+            seller.rua = (data["rua"] or "").strip() or seller.rua
+        if "numero" in data:
+            seller.numero = (data["numero"] or "").strip() or seller.numero
+        if "complemento" in data:
+            seller.complemento = (data["complemento"] or "").strip() or None
+        if "bairro" in data:
+            seller.bairro = (data["bairro"] or "").strip() or seller.bairro
+        if "cidade" in data:
+            seller.cidade = (data["cidade"] or "").strip() or seller.cidade
+        if "estado" in data:
+            seller.estado = (data["estado"] or "").strip() or None
+        if "cep" in data:
+            seller.cep = (data["cep"] or "").strip() or seller.cep
+
+    db.commit()
+    db.refresh(seller)
+    return seller
 
 
 # ============================================================

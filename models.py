@@ -89,6 +89,35 @@ class Owner(Base):
 
 
 # ==========================
+# Tabela: base_seller_dados (CNPJ/endereço do Seller/Base por owner)
+# ==========================
+class BaseSellerDados(Base):
+    __tablename__ = "base_seller_dados"
+
+    id_seller = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="CASCADE"), nullable=False)
+    base_id = Column(BigInteger, ForeignKey("base.id_base", ondelete="CASCADE"), nullable=True)
+
+    cnpj = Column(Text, nullable=False)
+    rua = Column(Text, nullable=False)
+    numero = Column(Text, nullable=False)
+    complemento = Column(Text, nullable=True)
+    bairro = Column(Text, nullable=False)
+    cidade = Column(Text, nullable=False)
+    estado = Column(Text, nullable=True)
+    cep = Column(Text, nullable=False)
+
+    owner = relationship("Owner", backref="seller_dados")
+    base = relationship("BasePreco", backref="seller_dados", uselist=False)
+
+    def __repr__(self) -> str:
+        return (
+            f"<BaseSellerDados id_seller={self.id_seller} "
+            f"owner_id={self.owner_id} base_id={self.base_id} cnpj={self.cnpj!r}>"
+        )
+
+
+# ==========================
 # Tabela: motoboys
 # ==========================
 class Motoboy(Base):
@@ -99,6 +128,7 @@ class Motoboy(Base):
 
     sub_base = Column(Text)
     documento = Column(Text)
+    cnpj = Column(Text)
 
     rua = Column(Text, nullable=False)
     numero = Column(Text, nullable=False)
