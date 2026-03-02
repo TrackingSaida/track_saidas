@@ -98,12 +98,26 @@ def refresh_ml_int_token(db: Session, conexao: MLConexao) -> Optional[MLConexao]
 
 
 def get_valid_access_token(db: Session, user_id_ml: int, sub_base: str) -> str:
-    """Retorna um access_token válido para a conexão (user_id_ml + sub_base). Renova se expirado."""
-    conexao = (
-        db.query(MLConexao)
-        .filter(MLConexao.user_id_ml == user_id_ml, MLConexao.sub_base == sub_base)
-        .first()
-    )
+    """
+    Retorna um access_token válido para a conexão do seller.
+    - Prioriza o par (user_id_ml + sub_base normalizada).
+    - Se não encontrar com a sub_base informada, cai para a conexão mais recente do seller.
+    """
+    normalized_sub_base = (sub_base or "").strip() or None
+
+    query = db.query(MLConexao).filter(MLConexao.user_id_ml == user_id_ml)
+    if normalized_sub_base is not None:
+        query = query.filter(MLConexao.sub_base == normalized_sub_base)
+
+    conexao = query.order_by(MLConexao.criado_em.desc()).first()
+    if not conexao:
+        # Fallback: alguma divergência de sub_base; usa a conexão mais recente do seller
+        conexao = (
+            db.query(MLConexao)
+            .filter(MLConexao.user_id_ml == user_id_ml)
+            .order_by(MLConexao.criado_em.desc())
+            .first()
+        )
     if not conexao:
         raise LookupError(f"Conexão ML não encontrada para user_id_ml={user_id_ml} sub_base={sub_base!r}")
     if conexao.expires_at and conexao.expires_at > datetime.utcnow():
