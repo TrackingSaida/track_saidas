@@ -100,6 +100,7 @@ class EntregadorResumoItem(BaseModel):
     flex: Dict[str, Any]
     avulso: Dict[str, Any]
     total_dia: Decimal
+    g_total: int = 0
     fechamento_status: Optional[str] = None  # PENDENTE | GERADO | REAJUSTADO
     id_fechamento: Optional[int] = None  # quando existe fechamento
     pode_reajustar: Optional[bool] = None  # True quando GERADO e valor_base atual != valor_base fechado
@@ -598,6 +599,7 @@ def resumo_entregadores(
                     "qtde_shopee": 0,
                     "qtde_flex": 0,
                     "qtde_avulso": 0,
+                    "g_total": 0,
                 }
         else:
             ent_id = saida.entregador_id
@@ -614,9 +616,12 @@ def resumo_entregadores(
                     "qtde_shopee": 0,
                     "qtde_flex": 0,
                     "qtde_avulso": 0,
+                    "g_total": 0,
                 }
         tipo = _normalizar_servico(saida.servico)
         agrupado[key][f"qtde_{tipo}"] += 1
+        if getattr(saida, "is_grande", False):
+            agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + 1
 
     cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
     cache_fechamento: Dict[tuple, Optional[EntregadorFechamento]] = {}
@@ -743,6 +748,7 @@ def resumo_entregadores(
                     "total": valor_avulso,
                 },
                 total_dia=total_dia,
+                g_total=item.get("g_total", 0),
                 fechamento_status=fech_status,
                 id_fechamento=id_fech,
                 pode_reajustar=pode_reajustar,

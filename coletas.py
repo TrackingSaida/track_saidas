@@ -641,23 +641,23 @@ def resumo_coletas(
     rows = db.scalars(stmt).all()
 
     # ----------------------------------------------------------
-    # Buscar cancelados — tabela SAIDAS (mantido)
+    # Buscar SAIDAS para cancelados e pacotes G
     # ----------------------------------------------------------
-    cancelados_stmt = select(Saida).where(
-        Saida.sub_base == sub_base_user,
-        func.lower(Saida.status) == "cancelado"
-    )
+    base_saidas_stmt = select(Saida).where(Saida.sub_base == sub_base_user)
 
     if base_norm:
-        cancelados_stmt = cancelados_stmt.where(func.lower(Saida.base) == base_norm)
+        base_saidas_stmt = base_saidas_stmt.where(func.lower(Saida.base) == base_norm)
 
     if data_inicio:
-        cancelados_stmt = cancelados_stmt.where(Saida.data >= data_inicio)
+        base_saidas_stmt = base_saidas_stmt.where(Saida.data >= data_inicio)
 
     if data_fim:
-        cancelados_stmt = cancelados_stmt.where(Saida.data <= data_fim)
+        base_saidas_stmt = base_saidas_stmt.where(Saida.data <= data_fim)
 
-    cancelados_rows = db.scalars(cancelados_stmt).all()
+    # Cancelados
+    cancelados_rows = db.scalars(
+        base_saidas_stmt.where(func.lower(Saida.status) == "cancelado")
+    ).all()
 
     mapa_cancelados: Dict[str, int] = {}
     for c in cancelados_rows:
@@ -665,6 +665,17 @@ def resumo_coletas(
         baseKey = (c.base or "").strip().upper()
         key = f"{dia}_{baseKey}"
         mapa_cancelados[key] = mapa_cancelados.get(key, 0) + 1
+
+    # Pacotes G (Saida.is_grande == True)
+    g_rows = db.scalars(
+        base_saidas_stmt.where(Saida.is_grande.is_(True))
+    ).all()
+    mapa_g_saidas: Dict[str, int] = {}
+    for s in g_rows:
+        dia = s.timestamp.date().isoformat()
+        baseKey = (s.base or "").strip().upper()
+        key = f"{dia}_{baseKey}"
+        mapa_g_saidas[key] = mapa_g_saidas.get(key, 0) + 1
 
     # ----------------------------------------------------------
     # Coletas manuais: uma linha por coleta (não agregar)
@@ -770,6 +781,13 @@ def resumo_coletas(
         for item in lista:
             item.fechamento_status = "PENDENTE"
             item.id_fechamento = None
+
+    # ----------------------------------------------------------
+    # Somar pacotes G vindos de SAIDAS (is_grande)
+    # ----------------------------------------------------------
+    for item in lista:
+        key_g = f"{item.data}_{item.base}"
+        item.pacotes_g += mapa_g_saidas.get(key_g, 0)
 
     # Filtrar por fechamento_status se informado
     if flt_status:
