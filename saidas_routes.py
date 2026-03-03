@@ -629,6 +629,7 @@ def listar_saidas(
     codigo: Optional[str] = Query(None),
     servico: Optional[str] = Query(None),
     localizar: Optional[str] = Query(None),
+    somente_g: Optional[bool] = Query(None),
     limit: Optional[int] = Query(None),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -657,6 +658,9 @@ def listar_saidas(
     if servico and servico.strip() and servico.lower() != "(todos)":
         srv_norm = servico.strip().lower()
         stmt = stmt.where(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
+
+    if somente_g:
+        stmt = stmt.where(Saida.is_grande.is_(True))
 
     if localizar and localizar.strip():
         q = f"%{localizar.strip()}%"
