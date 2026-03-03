@@ -9,24 +9,107 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import BaseFechamento, BaseFechamentoItem, Coleta, Saida, BasePreco
-from models import User
+from models import (
+    BaseFechamento,
+    BaseFechamentoItem,
+    BasePreco,
+    BaseSellerDados,
+    Coleta,
+    Owner,
+    Saida,
+    User,
+)
 
-from coletas import _sub_base_from_token_or_422, _get_precos_cached, _decimal
+from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
 
 router = APIRouter(prefix="/fechamentos", tags=["Fechamentos Bases"])
 
 STATUS_GERADO = "GERADO"
 STATUS_REAJUSTADO = "REAJUSTADO"
+
+
+def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[str, Any]]:
+    """
+    Retorna informações básicas do seller/base (nome, CNPJ e endereço completo)
+    quando existirem em BaseSellerDados. Nunca lança erro; em caso de falta de
+    dados retorna None.
+    """
+    base_norm = (base or "").strip()
+    if not base_norm:
+        return None
+
+    # 1) Localiza cadastro de preços da base na sub_base
+    preco = db.scalar(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base,
+            BasePreco.base == base_norm,
+        )
+    )
+    seller: Optional[BaseSellerDados] = None
+
+    # 2) Tenta primeiro pelo vínculo explícito base_id -> BaseSellerDados
+    if preco and getattr(preco, "id_base", None) is not None:
+        seller = db.scalar(
+            select(BaseSellerDados).where(BaseSellerDados.base_id == preco.id_base)
+        )
+
+    # 3) Fallback: tenta resolver pelo Owner (username/sub_base) -> BaseSellerDados.owner_id
+    if not seller and preco and getattr(preco, "username", None):
+        owner = db.scalar(
+            select(Owner).where(
+                Owner.username == preco.username,
+                Owner.sub_base == sub_base,
+            )
+        )
+        if owner:
+            seller = db.scalar(
+                select(BaseSellerDados).where(BaseSellerDados.owner_id == owner.id_owner)
+            )
+
+    if not seller:
+        return None
+
+    # Monta endereço completo de forma resiliente a campos vazios
+    partes_endereco: List[str] = []
+    if seller.rua:
+        rua_num = f"{seller.rua}".strip()
+        if seller.numero:
+            rua_num = f"{rua_num}, {seller.numero}".strip()
+        partes_endereco.append(rua_num)
+    if seller.complemento:
+        partes_endereco.append(str(seller.complemento).strip())
+    bairro_cidade: List[str] = []
+    if seller.bairro:
+        bairro_cidade.append(str(seller.bairro).strip())
+    if seller.cidade:
+        bairro_cidade.append(str(seller.cidade).strip())
+    if bairro_cidade:
+        partes_endereco.append(" - ".join(bairro_cidade))
+    uf_cep: List[str] = []
+    if seller.estado:
+        uf_cep.append(str(seller.estado).strip())
+    if seller.cep:
+        uf_cep.append(str(seller.cep).strip())
+    if uf_cep:
+        partes_endereco.append(" ".join(uf_cep))
+
+    endereco_completo = ", ".join([p for p in partes_endereco if p])
+
+    info: Dict[str, Any] = {
+        "nome_base": base_norm,
+        "cnpj": (seller.cnpj or "").strip() or None,
+        "endereco_completo": endereco_completo or None,
+    }
+    return info
 
 
 def _normalizar_servico_saida(serv: str) -> str:
@@ -213,6 +296,8 @@ class FechamentoCreate(BaseModel):
     motivo_adicao: Optional[str] = None
     valor_subtracao: Optional[Decimal] = None
     motivo_subtracao: Optional[str] = None
+    ajuste_g_valor: Optional[Decimal] = None
+    ajuste_g_motivo: Optional[str] = None
 
 
 class FechamentoUpdate(BaseModel):
@@ -230,12 +315,16 @@ class CalcularOut(BaseModel):
     valor_bruto: Decimal
     valor_cancelados: Decimal
     valor_final: Decimal
+    valor_final_com_ajuste_g: Optional[Decimal] = None
     itens: List[FechamentoItemOut]
     precos: dict
     total_g_shopee: int = 0
     total_g_ml: int = 0
     total_g_avulso: int = 0
     total_pacotes_g: int = 0
+    ajuste_g_valor: Optional[Decimal] = None
+    ajuste_g_motivo: Optional[str] = None
+    seller_info: Optional[Dict[str, Any]] = None
 
 
 class FechamentoOut(BaseModel):
@@ -262,6 +351,7 @@ class FechamentoOut(BaseModel):
     valor_bruto_recalculado: Optional[Decimal] = None
     valor_cancelados_recalculado: Optional[Decimal] = None
     valor_final_recalculado: Optional[Decimal] = None
+    seller_info: Optional[Dict[str, Any]] = None
 
 
 # =========================================================
@@ -311,6 +401,8 @@ def calcular_fechamento(
     base: str = Query(..., min_length=1),
     periodo_inicio: date = Query(...),
     periodo_fim: date = Query(...),
+    ajuste_g_valor: Optional[Decimal] = Query(None),
+    ajuste_g_motivo: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -332,6 +424,16 @@ def calcular_fechamento(
     total_g_avulso = sum(x.get("g_avulso", 0) for x in itens)
     total_pacotes_g = sum(x.get("pacotes_g", 0) for x in itens)
 
+    # Ajuste específico de pacotes G (preview apenas)
+    ajuste_g_val = _decimal(ajuste_g_valor) if ajuste_g_valor is not None else Decimal("0.00")
+    valor_final_com_ajuste_g: Optional[Decimal]
+    if ajuste_g_valor is not None:
+        valor_final_com_ajuste_g = (valor_final + ajuste_g_val).quantize(Decimal("0.01"))
+    else:
+        valor_final_com_ajuste_g = None
+
+    seller_info = _montar_seller_info(db, sub_base, base.strip())
+
     return CalcularOut(
         base=base.strip(),
         periodo_inicio=periodo_inicio.isoformat(),
@@ -339,12 +441,16 @@ def calcular_fechamento(
         valor_bruto=valor_bruto,
         valor_cancelados=valor_cancelados,
         valor_final=valor_final,
+        valor_final_com_ajuste_g=valor_final_com_ajuste_g,
         itens=[FechamentoItemOut(**x) for x in itens],
         precos=precos,
         total_g_shopee=total_g_shopee,
         total_g_ml=total_g_ml,
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
+        ajuste_g_valor=ajuste_g_valor,
+        ajuste_g_motivo=(ajuste_g_motivo or None),
+        seller_info=seller_info,
     )
 
 
@@ -396,8 +502,32 @@ def criar_fechamento(
         )
         itens_data = [FechamentoItemIn(**x) for x in itens_data]
 
-    valor_ad = _decimal(payload.valor_adicao).quantize(Decimal("0.01"))
-    valor_sub = _decimal(payload.valor_subtracao).quantize(Decimal("0.01"))
+    # Ajustes manuais genéricos
+    valor_ad_base = _decimal(payload.valor_adicao).quantize(Decimal("0.01"))
+    valor_sub_base = _decimal(payload.valor_subtracao).quantize(Decimal("0.01"))
+    motivo_ad_base = (payload.motivo_adicao or "").strip()
+    motivo_sub_base = (payload.motivo_subtracao or "").strip()
+
+    ajuste_g_val_raw = payload.ajuste_g_valor
+    ajuste_g_motivo_norm = (payload.ajuste_g_motivo or "").strip()
+    valor_ad = valor_ad_base
+    valor_sub = valor_sub_base
+    motivo_ad_final = motivo_ad_base
+    motivo_sub_final = motivo_sub_base
+
+    if ajuste_g_val_raw is not None:
+        ajuste_g_val = _decimal(ajuste_g_val_raw).quantize(Decimal("0.01"))
+        if ajuste_g_val != 0:
+            # Texto padronizado, já incluindo o valor para aparecer claramente no relatório
+            ajuste_label = f"[Pacotes G] Motivo: {ajuste_g_motivo_norm or 'Ajuste de pacotes G'}; Valor: R$ {abs(ajuste_g_val):.2f}"
+            if ajuste_g_val > 0:
+                valor_ad = (valor_ad_base + ajuste_g_val).quantize(Decimal("0.01"))
+                motivo_ad_final = " | ".join([m for m in [motivo_ad_base, ajuste_label] if m])
+            else:
+                incremento_sub = abs(ajuste_g_val)
+                valor_sub = (valor_sub_base + incremento_sub).quantize(Decimal("0.01"))
+                motivo_sub_final = " | ".join([m for m in [motivo_sub_base, ajuste_label] if m])
+
     valor_final = (valor_final_calc + valor_ad - valor_sub).quantize(Decimal("0.01"))
 
     fech = BaseFechamento(
@@ -408,9 +538,9 @@ def criar_fechamento(
         valor_bruto=valor_bruto,
         valor_cancelados=valor_cancelados,
         valor_adicao=valor_ad,
-        motivo_adicao=(payload.motivo_adicao or "").strip() or None,
+        motivo_adicao=(motivo_ad_final or None),
         valor_subtracao=valor_sub,
-        motivo_subtracao=(payload.motivo_subtracao or "").strip() or None,
+        motivo_subtracao=(motivo_sub_final or None),
         valor_final=valor_final,
         status=STATUS_GERADO,
     )
@@ -443,15 +573,24 @@ def criar_fechamento(
     total_g_avulso = sum(getattr(it, "g_avulso", 0) or 0 for it in itens_data)
     total_pacotes_g = sum(getattr(it, "pacotes_g", 0) or 0 for it in itens_data)
 
-    itens_out = [FechamentoItemOut(
-        data=it.data if isinstance(it.data, str) else it.data.isoformat(),
-        shopee=it.shopee, mercado_livre=it.mercado_livre, avulso=it.avulso,
-        cancelados_shopee=it.cancelados_shopee, cancelados_ml=it.cancelados_ml, cancelados_avulso=it.cancelados_avulso,
-        pacotes_g=getattr(it, "pacotes_g", 0) or 0,
-        g_shopee=getattr(it, "g_shopee", 0) or 0,
-        g_ml=getattr(it, "g_ml", 0) or 0,
-        g_avulso=getattr(it, "g_avulso", 0) or 0,
-    ) for it in itens_data]
+    itens_out = [
+        FechamentoItemOut(
+            data=it.data if isinstance(it.data, str) else it.data.isoformat(),
+            shopee=it.shopee,
+            mercado_livre=it.mercado_livre,
+            avulso=it.avulso,
+            cancelados_shopee=it.cancelados_shopee,
+            cancelados_ml=it.cancelados_ml,
+            cancelados_avulso=it.cancelados_avulso,
+            pacotes_g=getattr(it, "pacotes_g", 0) or 0,
+            g_shopee=getattr(it, "g_shopee", 0) or 0,
+            g_ml=getattr(it, "g_ml", 0) or 0,
+            g_avulso=getattr(it, "g_avulso", 0) or 0,
+        )
+        for it in itens_data
+    ]
+
+    seller_info = _montar_seller_info(db, sub_base, base_norm)
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
@@ -473,6 +612,7 @@ def criar_fechamento(
         total_g_ml=total_g_ml,
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
+        seller_info=seller_info,
     )
 
 
@@ -530,6 +670,8 @@ def obter_fechamento(
         divergencia = True
         valor_final_rec = (valor_bruto_rec - valor_cancelados_rec + (fech.valor_adicao or Decimal("0")) - (fech.valor_subtracao or Decimal("0"))).quantize(Decimal("0.01"))
 
+    seller_info = _montar_seller_info(db, sub_base, fech.base)
+
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
         sub_base=fech.sub_base,
@@ -554,6 +696,7 @@ def obter_fechamento(
         valor_bruto_recalculado=valor_bruto_rec if divergencia else None,
         valor_cancelados_recalculado=valor_cancelados_rec if divergencia else None,
         valor_final_recalculado=valor_final_rec if divergencia else None,
+        seller_info=seller_info,
     )
 
 
