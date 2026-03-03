@@ -9,7 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from db import get_db
-from auth import get_current_user, get_password_hash
+from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
@@ -354,6 +354,7 @@ def create_entregador(
                 coletador=True,
                 username_entregador=username_ent,
                 role=3,
+                must_change_password=True,
             )
             db.add(new_user)
 

@@ -111,7 +111,8 @@ def public_signup(
         status=True,
         role=1,         # admin
         coletador=False,
-        sub_base=sub_base_final
+        sub_base=sub_base_final,
+        must_change_password=True,
     )
 
     db.add(user)

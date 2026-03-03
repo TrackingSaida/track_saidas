@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from db import SessionLocal
 from models import Entregador, User, Motoboy, MotoboySubBase, Saida
-from auth import get_password_hash
+from auth import get_password_hash, DEFAULT_PASSWORD
 
 
 def _normalizar_nome(s: str) -> str:
@@ -46,7 +46,7 @@ def _normalizar_nome(s: str) -> str:
     return s
 
 
-def migrate(db: Session, dry_run: bool = False, senha_padrao: str = "migrado_trocar_senha") -> dict:
+def migrate(db: Session, dry_run: bool = False, senha_padrao: str = DEFAULT_PASSWORD) -> dict:
     """
     Migra entregadores para User + Motoboy e atualiza saidas.
     Retorna estatísticas: { criados_user, criados_motoboy, saidas_atualizadas, pulados, erros }
@@ -93,6 +93,7 @@ def migrate(db: Session, dry_run: bool = False, senha_padrao: str = "migrado_tro
                 coletador=bool(ent.coletador),
                 username_entregador=ent.username_entregador,
                 role=4,
+                must_change_password=True,
             )
             db.add(user)
             db.flush()

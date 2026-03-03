@@ -6,8 +6,11 @@ from typing import Optional, Dict, Any
 from decimal import Decimal
 
 from fastapi import (
-    APIRouter, Depends, HTTPException,
-    Request, Response
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.security import OAuth2PasswordBearer
@@ -45,6 +48,12 @@ REMEMBER_ME_EXPIRE_DAYS = int(os.getenv("REMEMBER_ME_EXPIRE_DAYS", "200"))
 ACCESS_COOKIE_NAME = os.getenv("ACCESS_COOKIE_NAME", "access_token")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() in ("1", "true", "yes")
 COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")  # normalmente vazio no Render
+
+
+# ======================================================
+# Senha padrão
+# ======================================================
+DEFAULT_PASSWORD = os.getenv("DEFAULT_PASSWORD", "123456")
 
 
 # ======================================================
@@ -112,6 +121,7 @@ class UserResponse(BaseModel):
     ignorar_coleta: bool = False
     modo_operacao: Optional[str] = None
     tipo_owner: Optional[str] = None
+    must_change_password: Optional[bool] = None
 
 
 # ======================================================
@@ -134,6 +144,21 @@ def _owner_for_sub_base(db: Session, sub_base: str) -> Owner:
     if owner.ativo is False:
         raise HTTPException(403, "owner_blocked")
     return owner
+
+
+def _must_change_password_from_user(user: User) -> bool:
+    """
+    Define se o usuário deve trocar a senha no próximo login.
+    Prioriza o flag persistido e, para compatibilidade, também verifica se a senha
+    atual ainda é a senha padrão DEFAULT_PASSWORD.
+    """
+    base_flag = bool(getattr(user, "must_change_password", False))
+    if base_flag:
+        return True
+    try:
+        return verify_password(DEFAULT_PASSWORD, user.password_hash)
+    except Exception:
+        return base_flag
 
 
 def _tipo_owner_from_owner(owner: Owner) -> str:
@@ -162,6 +187,7 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
         "tipo_owner": _tipo_owner_from_owner(owner),
         # valor SEMPRE como string (Decimal-safe)
         "owner_valor": str(owner.valor or 0),
+        "must_change_password": _must_change_password_from_user(user),
     }
 
 
@@ -186,6 +212,7 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
         "tipo_owner": _tipo_owner_from_owner(owner),
         "owner_valor": str(owner.valor or 0),
+        "must_change_password": _must_change_password_from_user(user),
     }
 
 
@@ -210,6 +237,9 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.tipo_owner = (payload.get("tipo_owner") or "subbase").strip().lower()
     if u.tipo_owner not in ("base", "subbase"):
         u.tipo_owner = "subbase"
+
+    # flags de senha vindas do token (podem ser sobrescritas por leitura direta em /auth/me)
+    u.must_change_password = payload.get("must_change_password", None)
 
     return u
 
@@ -291,7 +321,9 @@ async def login_for_access_token(
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = create_access_token(_claims(user, owner), expires)
 
-    return {"access_token": token, "token_type": "bearer"}
+    must_change = _must_change_password_from_user(user)
+
+    return {"access_token": token, "token_type": "bearer", "must_change_password": must_change}
 
 
 @router.post("/login")
@@ -317,6 +349,8 @@ async def login_set_cookie(
 
     token = create_access_token(_claims(user, owner), expires)
 
+    must_change = _must_change_password_from_user(user)
+
     response.set_cookie(
         key=ACCESS_COOKIE_NAME,
         value=token,
@@ -340,6 +374,7 @@ async def login_set_cookie(
             "ignorar_coleta": owner.ignorar_coleta,
             "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
             "tipo_owner": _tipo_owner_from_owner(owner),
+            "must_change_password": must_change,
         },
     }
 
@@ -393,11 +428,8 @@ async def motoboy_login(
     ).all()
     sub_bases = [s for s in sub_bases_rows if s]
 
-    # Senha padrão (subbase_trocar_senha) exige troca no app
-    sub_for_check = (sub_bases[0] if sub_bases else None) or getattr(user, "sub_base", None)
-    must_change_password = verify_password(
-        _default_password_motoboy(sub_for_check), user.password_hash
-    )
+    # Política de troca obrigatória de senha baseada em flag persistido + senha padrão
+    must_change_password = _must_change_password_from_user(user)
 
     if len(sub_bases) > 1:
         return {"multiple_sub_base": True, "sub_bases": sub_bases, "must_change_password": must_change_password}
@@ -448,9 +480,7 @@ async def motoboy_select_subbase(
         _claims_motoboy(user, motoboy, owner, body.sub_base.strip()),
         expires,
     )
-    must_change_password = verify_password(
-        _default_password_motoboy(body.sub_base.strip()), user.password_hash
-    )
+    must_change_password = _must_change_password_from_user(user)
     return {"access_token": token, "token_type": "bearer", "must_change_password": must_change_password}
 
 
@@ -468,8 +498,13 @@ def _nome_exibicao(user: User) -> tuple[Optional[str], Optional[str]]:
 @router.get("/me", response_model=UserResponse)
 async def read_users_me(
     request: Request,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    db_user = db.get(User, current_user.id)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
     nome_val, sobrenome_val = _nome_exibicao(current_user)
     return UserResponse(
         id=current_user.id,
@@ -483,6 +518,7 @@ async def read_users_me(
         ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
         modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
         tipo_owner=getattr(current_user, "tipo_owner", None) or "subbase",
+        must_change_password=bool(getattr(db_user, "must_change_password", False)),
     )
 
 
@@ -501,6 +537,9 @@ async def reset_password(payload: ResetPasswordPayload, db: Session = Depends(ge
         raise HTTPException(404, "Usuário não encontrado")
 
     user.password_hash = get_password_hash(payload.new_password)
+    # Reset de senha via identifier define uma nova senha definitiva; não exige troca imediata
+    if hasattr(user, "must_change_password"):
+        user.must_change_password = False
     db.commit()
 
     return {"ok": True, "message": "Senha redefinida com sucesso"}

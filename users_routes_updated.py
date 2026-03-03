@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import get_db
-from auth import get_current_user, get_password_hash, verify_password
+from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD
 from models import User, Owner, Motoboy, MotoboySubBase
 from base import _resolve_user_sub_base
 
@@ -84,6 +84,8 @@ class UserOut(BaseModel):
     role: Optional[int] = None
     coletador: Optional[bool] = None
     motoboy: Optional[MotoboyOut] = None
+
+    must_change_password: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -160,7 +162,7 @@ def default_password_motoboy(sub_base: Optional[str]) -> str:
     (ex.: obrigando o usuário a alterar a senha após login), então aqui usamos
     sempre '123456' como senha inicial fixa.
     """
-    return "123456"
+    return DEFAULT_PASSWORD
 
 
 def _first_word(s: Optional[str]) -> str:
@@ -255,6 +257,7 @@ def _user_to_out(user: User) -> UserOut:
             "role": getattr(user, "role", 2),
             "coletador": getattr(user, "coletador", False),
             "motoboy": None,
+            "must_change_password": getattr(user, "must_change_password", None),
         }
         if getattr(user, "role", None) == 4 and hasattr(user, "motoboy") and user.motoboy:
             try:
@@ -280,6 +283,7 @@ def _user_to_out(user: User) -> UserOut:
             role=getattr(user, "role", 2),
             coletador=getattr(user, "coletador", False),
             motoboy=None,
+            must_change_password=getattr(user, "must_change_password", None),
         )
 
 
@@ -308,7 +312,7 @@ def create_user(
 
     _ts = str(int(time.time() * 1000))
 
-    # Para role != 4 (não-motoboy): username, email e senha obrigatórios
+    # Para role != 4 (não-motoboy): username e e-mail obrigatórios; senha opcional (usa padrão quando vazia)
     if body.role != 4:
         u = (body.username or "").strip()
         e = (body.email or "").strip()
@@ -319,11 +323,14 @@ def create_user(
             raise HTTPException(422, "E-mail é obrigatório para este perfil.")
         if "@" not in e or "." not in e.split("@", 1)[-1]:
             raise HTTPException(422, "E-mail inválido.")
-        if len(p) < 4:
+        if p and len(p) < 4:
             raise HTTPException(422, "Senha deve ter no mínimo 4 caracteres para este perfil.")
         username_val = u
         email_val = e
-        password_hash_val = get_password_hash(p)
+        if p:
+            password_hash_val = get_password_hash(p)
+        else:
+            password_hash_val = get_password_hash(DEFAULT_PASSWORD)
     else:
         # Role 4 (motoboy): placeholders permitidos
         username_val = (body.username or "").strip() or _placeholder_username_from_nome(body.nome, sub_base) or _sanitize_sub_base(sub_base or "") or f"sem_username_{_ts}"
@@ -380,7 +387,8 @@ def create_user(
             status=True,
             role=body.role,
             coletador=coletador,
-            sub_base=sub_base
+            sub_base=sub_base,
+            must_change_password=True,
         )
 
         db.add(new_user)
@@ -658,6 +666,33 @@ def admin_update_user(
 
 
 # ============================================================
+# POST /users/{id}/reset-password — Resetar para senha padrão
+# ============================================================
+
+@router.post("/{user_id}/reset-password")
+def admin_reset_password(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if getattr(current_user, "role", None) not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "Usuário não encontrado")
+
+    if user.sub_base != current_user.sub_base:
+        raise HTTPException(403, "Acesso negado.")
+
+    user.password_hash = get_password_hash(DEFAULT_PASSWORD)
+    user.must_change_password = True
+    db.commit()
+
+    return {"ok": True, "message": "Senha redefinida para a senha padrão."}
+
+
+# ============================================================
 # DELETE USER
 # ============================================================
 
@@ -737,5 +772,8 @@ def change_password(
         raise HTTPException(401, "Senha atual incorreta.")
 
     current_user.password_hash = get_password_hash(payload.new_password)
+    # Após troca de senha pelo próprio usuário, não é mais obrigatório trocar no próximo login
+    if hasattr(current_user, "must_change_password"):
+        current_user.must_change_password = False
     db.commit()
     return {"ok": True, "message": "Senha alterada com sucesso"}

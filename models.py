@@ -41,6 +41,9 @@ class User(Base):
     # status geral do usuário
     status = Column(Boolean, nullable=False, server_default=text("true"))
 
+    # política de senha
+    must_change_password = Column(Boolean, nullable=False, server_default=text("true"))
+
     # escopo/base
     sub_base = Column(Text, nullable=True)
 
