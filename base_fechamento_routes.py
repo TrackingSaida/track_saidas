@@ -99,8 +99,28 @@ def _build_itens_e_valores(
             mapa_canc[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
         mapa_canc[dia][tipo] = mapa_canc[dia].get(tipo, 0) + 1
 
-    # Dias únicos (coletas + cancelados)
-    dias_set = set(mapa_coletas.keys()) | set(mapa_canc.keys())
+    # Pacotes G: Saidas com is_grande, agrupar por data e serviço (como cancelados)
+    stmt_g = select(Saida).where(
+        Saida.sub_base == sub_base,
+        Saida.is_grande.is_(True),
+    )
+    if base_norm:
+        stmt_g = stmt_g.where(func.upper(Saida.base) == base_key)
+    stmt_g = stmt_g.where(
+        Saida.data >= periodo_inicio,
+        Saida.data <= periodo_fim,
+    )
+    rows_g = db.scalars(stmt_g).all()
+    mapa_g: dict[str, dict] = {}
+    for g in rows_g:
+        dia = (g.data or g.timestamp.date()).isoformat()
+        tipo = _normalizar_servico_saida(g.servico or "")
+        if dia not in mapa_g:
+            mapa_g[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
+        mapa_g[dia][tipo] = mapa_g[dia].get(tipo, 0) + 1
+
+    # Dias únicos (coletas + cancelados + G)
+    dias_set = set(mapa_coletas.keys()) | set(mapa_canc.keys()) | set(mapa_g.keys())
     if not dias_set:
         return [], Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
 
@@ -116,12 +136,17 @@ def _build_itens_e_valores(
     for dia in sorted(dias_set):
         c = mapa_coletas.get(dia, {})
         canc = mapa_canc.get(dia, {})
+        g_map = mapa_g.get(dia, {})
         shopee = c.get("shopee", 0)
         ml = c.get("mercado_livre", 0)
         avulso = c.get("avulso", 0)
         canc_s = canc.get("shopee", 0)
         canc_ml = canc.get("ml", 0)
         canc_a = canc.get("avulso", 0)
+        g_s = g_map.get("shopee", 0)
+        g_m = g_map.get("ml", 0)
+        g_a = g_map.get("avulso", 0)
+        pacotes_g = g_s + g_m + g_a
 
         v_bruto = (_decimal(shopee) * p_shopee + _decimal(ml) * p_ml + _decimal(avulso) * p_avulso).quantize(Decimal("0.01"))
         v_canc = (_decimal(canc_s) * p_shopee + _decimal(canc_ml) * p_ml + _decimal(canc_a) * p_avulso).quantize(Decimal("0.01"))
@@ -137,6 +162,10 @@ def _build_itens_e_valores(
             "cancelados_shopee": canc_s,
             "cancelados_ml": canc_ml,
             "cancelados_avulso": canc_a,
+            "pacotes_g": pacotes_g,
+            "g_shopee": g_s,
+            "g_ml": g_m,
+            "g_avulso": g_a,
         })
 
     valor_final = (valor_bruto - valor_cancelados).quantize(Decimal("0.01"))
@@ -155,6 +184,10 @@ class FechamentoItemIn(BaseModel):
     cancelados_shopee: int = 0
     cancelados_ml: int = 0
     cancelados_avulso: int = 0
+    pacotes_g: int = 0
+    g_shopee: int = 0
+    g_ml: int = 0
+    g_avulso: int = 0
 
 
 class FechamentoItemOut(BaseModel):
@@ -165,6 +198,10 @@ class FechamentoItemOut(BaseModel):
     cancelados_shopee: int
     cancelados_ml: int
     cancelados_avulso: int
+    pacotes_g: int = 0
+    g_shopee: int = 0
+    g_ml: int = 0
+    g_avulso: int = 0
 
 
 class FechamentoCreate(BaseModel):
@@ -172,10 +209,18 @@ class FechamentoCreate(BaseModel):
     periodo_inicio: date
     periodo_fim: date
     itens: Optional[List[FechamentoItemIn]] = None
+    valor_adicao: Optional[Decimal] = None
+    motivo_adicao: Optional[str] = None
+    valor_subtracao: Optional[Decimal] = None
+    motivo_subtracao: Optional[str] = None
 
 
 class FechamentoUpdate(BaseModel):
     itens: List[FechamentoItemIn]
+    valor_adicao: Optional[Decimal] = None
+    motivo_adicao: Optional[str] = None
+    valor_subtracao: Optional[Decimal] = None
+    motivo_subtracao: Optional[str] = None
 
 
 class CalcularOut(BaseModel):
@@ -187,6 +232,10 @@ class CalcularOut(BaseModel):
     valor_final: Decimal
     itens: List[FechamentoItemOut]
     precos: dict
+    total_g_shopee: int = 0
+    total_g_ml: int = 0
+    total_g_avulso: int = 0
+    total_pacotes_g: int = 0
 
 
 class FechamentoOut(BaseModel):
@@ -197,10 +246,18 @@ class FechamentoOut(BaseModel):
     periodo_fim: date
     valor_bruto: Decimal
     valor_cancelados: Decimal
+    valor_adicao: Decimal = Decimal("0.00")
+    motivo_adicao: Optional[str] = None
+    valor_subtracao: Decimal = Decimal("0.00")
+    motivo_subtracao: Optional[str] = None
     valor_final: Decimal
     status: str
     criado_em: Optional[datetime] = None
     itens: List[FechamentoItemOut]
+    total_g_shopee: int = 0
+    total_g_ml: int = 0
+    total_g_avulso: int = 0
+    total_pacotes_g: int = 0
     divergencia_valor: Optional[bool] = None
     valor_bruto_recalculado: Optional[Decimal] = None
     valor_cancelados_recalculado: Optional[Decimal] = None
@@ -270,6 +327,11 @@ def calcular_fechamento(
     except HTTPException:
         precos = {"shopee": 0, "ml": 0, "avulso": 0}
 
+    total_g_shopee = sum(x.get("g_shopee", 0) for x in itens)
+    total_g_ml = sum(x.get("g_ml", 0) for x in itens)
+    total_g_avulso = sum(x.get("g_avulso", 0) for x in itens)
+    total_pacotes_g = sum(x.get("pacotes_g", 0) for x in itens)
+
     return CalcularOut(
         base=base.strip(),
         periodo_inicio=periodo_inicio.isoformat(),
@@ -279,6 +341,10 @@ def calcular_fechamento(
         valor_final=valor_final,
         itens=[FechamentoItemOut(**x) for x in itens],
         precos=precos,
+        total_g_shopee=total_g_shopee,
+        total_g_ml=total_g_ml,
+        total_g_avulso=total_g_avulso,
+        total_pacotes_g=total_pacotes_g,
     )
 
 
@@ -323,12 +389,16 @@ def criar_fechamento(
             v_canc = _decimal(it.cancelados_shopee) * p_s + _decimal(it.cancelados_ml) * p_m + _decimal(it.cancelados_avulso) * p_a
             valor_bruto += v_bruto
             valor_cancelados += v_canc
-        valor_final = (valor_bruto - valor_cancelados).quantize(Decimal("0.01"))
+        valor_final_calc = (valor_bruto - valor_cancelados).quantize(Decimal("0.01"))
     else:
-        itens_data, valor_bruto, valor_cancelados, valor_final = _build_itens_e_valores(
+        itens_data, valor_bruto, valor_cancelados, valor_final_calc = _build_itens_e_valores(
             db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
         )
         itens_data = [FechamentoItemIn(**x) for x in itens_data]
+
+    valor_ad = _decimal(payload.valor_adicao).quantize(Decimal("0.01"))
+    valor_sub = _decimal(payload.valor_subtracao).quantize(Decimal("0.01"))
+    valor_final = (valor_final_calc + valor_ad - valor_sub).quantize(Decimal("0.01"))
 
     fech = BaseFechamento(
         sub_base=sub_base,
@@ -337,6 +407,10 @@ def criar_fechamento(
         periodo_fim=payload.periodo_fim,
         valor_bruto=valor_bruto,
         valor_cancelados=valor_cancelados,
+        valor_adicao=valor_ad,
+        motivo_adicao=(payload.motivo_adicao or "").strip() or None,
+        valor_subtracao=valor_sub,
+        motivo_subtracao=(payload.motivo_subtracao or "").strip() or None,
         valor_final=valor_final,
         status=STATUS_GERADO,
     )
@@ -354,16 +428,29 @@ def criar_fechamento(
             cancelados_shopee=it.cancelados_shopee,
             cancelados_ml=it.cancelados_ml,
             cancelados_avulso=it.cancelados_avulso,
+            pacotes_g=getattr(it, "pacotes_g", 0) or 0,
+            g_shopee=getattr(it, "g_shopee", 0) or 0,
+            g_ml=getattr(it, "g_ml", 0) or 0,
+            g_avulso=getattr(it, "g_avulso", 0) or 0,
         )
         db.add(item)
 
     db.commit()
     db.refresh(fech)
 
+    total_g_shopee = sum(getattr(it, "g_shopee", 0) or 0 for it in itens_data)
+    total_g_ml = sum(getattr(it, "g_ml", 0) or 0 for it in itens_data)
+    total_g_avulso = sum(getattr(it, "g_avulso", 0) or 0 for it in itens_data)
+    total_pacotes_g = sum(getattr(it, "pacotes_g", 0) or 0 for it in itens_data)
+
     itens_out = [FechamentoItemOut(
         data=it.data if isinstance(it.data, str) else it.data.isoformat(),
         shopee=it.shopee, mercado_livre=it.mercado_livre, avulso=it.avulso,
         cancelados_shopee=it.cancelados_shopee, cancelados_ml=it.cancelados_ml, cancelados_avulso=it.cancelados_avulso,
+        pacotes_g=getattr(it, "pacotes_g", 0) or 0,
+        g_shopee=getattr(it, "g_shopee", 0) or 0,
+        g_ml=getattr(it, "g_ml", 0) or 0,
+        g_avulso=getattr(it, "g_avulso", 0) or 0,
     ) for it in itens_data]
 
     return FechamentoOut(
@@ -374,10 +461,18 @@ def criar_fechamento(
         periodo_fim=fech.periodo_fim,
         valor_bruto=fech.valor_bruto,
         valor_cancelados=fech.valor_cancelados,
+        valor_adicao=fech.valor_adicao,
+        motivo_adicao=fech.motivo_adicao,
+        valor_subtracao=fech.valor_subtracao,
+        motivo_subtracao=fech.motivo_subtracao,
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
         itens=itens_out,
+        total_g_shopee=total_g_shopee,
+        total_g_ml=total_g_ml,
+        total_g_avulso=total_g_avulso,
+        total_pacotes_g=total_pacotes_g,
     )
 
 
@@ -411,9 +506,18 @@ def obter_fechamento(
             cancelados_shopee=i.cancelados_shopee,
             cancelados_ml=i.cancelados_ml,
             cancelados_avulso=i.cancelados_avulso,
+            pacotes_g=getattr(i, "pacotes_g", 0) or 0,
+            g_shopee=getattr(i, "g_shopee", 0) or 0,
+            g_ml=getattr(i, "g_ml", 0) or 0,
+            g_avulso=getattr(i, "g_avulso", 0) or 0,
         )
         for i in itens
     ]
+
+    total_g_shopee = sum(getattr(i, "g_shopee", 0) or 0 for i in itens)
+    total_g_ml = sum(getattr(i, "g_ml", 0) or 0 for i in itens)
+    total_g_avulso = sum(getattr(i, "g_avulso", 0) or 0 for i in itens)
+    total_pacotes_g = sum(getattr(i, "pacotes_g", 0) or 0 for i in itens)
 
     # Recalcular para detectar divergência (coletas alteradas desde o fechamento)
     divergencia = False
@@ -421,8 +525,10 @@ def obter_fechamento(
     itens_rec, valor_bruto_rec, valor_cancelados_rec, valor_final_rec = _build_itens_e_valores(
         db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim
     )
-    if valor_bruto_rec != fech.valor_bruto or valor_cancelados_rec != fech.valor_cancelados or valor_final_rec != fech.valor_final:
+    valor_final_esperado = (fech.valor_bruto - fech.valor_cancelados + (fech.valor_adicao or Decimal("0")) - (fech.valor_subtracao or Decimal("0"))).quantize(Decimal("0.01"))
+    if valor_bruto_rec != fech.valor_bruto or valor_cancelados_rec != fech.valor_cancelados:
         divergencia = True
+        valor_final_rec = (valor_bruto_rec - valor_cancelados_rec + (fech.valor_adicao or Decimal("0")) - (fech.valor_subtracao or Decimal("0"))).quantize(Decimal("0.01"))
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
@@ -432,10 +538,18 @@ def obter_fechamento(
         periodo_fim=fech.periodo_fim,
         valor_bruto=fech.valor_bruto,
         valor_cancelados=fech.valor_cancelados,
+        valor_adicao=getattr(fech, "valor_adicao", None) or Decimal("0.00"),
+        motivo_adicao=getattr(fech, "motivo_adicao", None),
+        valor_subtracao=getattr(fech, "valor_subtracao", None) or Decimal("0.00"),
+        motivo_subtracao=getattr(fech, "motivo_subtracao", None),
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
         itens=itens_out,
+        total_g_shopee=total_g_shopee,
+        total_g_ml=total_g_ml,
+        total_g_avulso=total_g_avulso,
+        total_pacotes_g=total_pacotes_g,
         divergencia_valor=divergencia if divergencia else None,
         valor_bruto_recalculado=valor_bruto_rec if divergencia else None,
         valor_cancelados_recalculado=valor_cancelados_rec if divergencia else None,
@@ -473,7 +587,19 @@ def atualizar_fechamento(
         v_canc = _decimal(it.cancelados_shopee) * p_s + _decimal(it.cancelados_ml) * p_m + _decimal(it.cancelados_avulso) * p_a
         valor_bruto += v_bruto
         valor_cancelados += v_canc
-    valor_final = (valor_bruto - valor_cancelados).quantize(Decimal("0.01"))
+
+    if payload.valor_adicao is not None:
+        fech.valor_adicao = Decimal(str(payload.valor_adicao)).quantize(Decimal("0.01"))
+    if payload.motivo_adicao is not None:
+        fech.motivo_adicao = (payload.motivo_adicao or "").strip() or None
+    if payload.valor_subtracao is not None:
+        fech.valor_subtracao = Decimal(str(payload.valor_subtracao)).quantize(Decimal("0.01"))
+    if payload.motivo_subtracao is not None:
+        fech.motivo_subtracao = (payload.motivo_subtracao or "").strip() or None
+
+    valor_ad = getattr(fech, "valor_adicao", None) or Decimal("0.00")
+    valor_sub = getattr(fech, "valor_subtracao", None) or Decimal("0.00")
+    valor_final = (valor_bruto - valor_cancelados + valor_ad - valor_sub).quantize(Decimal("0.01"))
 
     fech.valor_bruto = valor_bruto
     fech.valor_cancelados = valor_cancelados
@@ -496,6 +622,10 @@ def atualizar_fechamento(
             cancelados_shopee=it.cancelados_shopee,
             cancelados_ml=it.cancelados_ml,
             cancelados_avulso=it.cancelados_avulso,
+            pacotes_g=getattr(it, "pacotes_g", 0) or 0,
+            g_shopee=getattr(it, "g_shopee", 0) or 0,
+            g_ml=getattr(it, "g_ml", 0) or 0,
+            g_avulso=getattr(it, "g_avulso", 0) or 0,
         )
         db.add(item)
 
@@ -510,9 +640,17 @@ def atualizar_fechamento(
             data=i.data.isoformat(),
             shopee=i.shopee, mercado_livre=i.mercado_livre, avulso=i.avulso,
             cancelados_shopee=i.cancelados_shopee, cancelados_ml=i.cancelados_ml, cancelados_avulso=i.cancelados_avulso,
+            pacotes_g=getattr(i, "pacotes_g", 0) or 0,
+            g_shopee=getattr(i, "g_shopee", 0) or 0,
+            g_ml=getattr(i, "g_ml", 0) or 0,
+            g_avulso=getattr(i, "g_avulso", 0) or 0,
         )
         for i in itens
     ]
+    total_g_shopee = sum(getattr(i, "g_shopee", 0) or 0 for i in itens)
+    total_g_ml = sum(getattr(i, "g_ml", 0) or 0 for i in itens)
+    total_g_avulso = sum(getattr(i, "g_avulso", 0) or 0 for i in itens)
+    total_pacotes_g = sum(getattr(i, "pacotes_g", 0) or 0 for i in itens)
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
@@ -522,8 +660,16 @@ def atualizar_fechamento(
         periodo_fim=fech.periodo_fim,
         valor_bruto=fech.valor_bruto,
         valor_cancelados=fech.valor_cancelados,
+        valor_adicao=fech.valor_adicao,
+        motivo_adicao=fech.motivo_adicao,
+        valor_subtracao=fech.valor_subtracao,
+        motivo_subtracao=fech.motivo_subtracao,
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
         itens=itens_out,
+        total_g_shopee=total_g_shopee,
+        total_g_ml=total_g_ml,
+        total_g_avulso=total_g_avulso,
+        total_pacotes_g=total_pacotes_g,
     )

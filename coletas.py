@@ -31,6 +31,7 @@ class ItemLote(BaseModel):
         description="shopee | ml | mercado_livre | mercado livre | avulso"
     )
     qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta
+    is_grande: bool = False  # Marcar pacote como G (Grande) ao criar a saída
 
 
 class ColetaLoteIn(BaseModel):
@@ -54,12 +55,14 @@ class ColetaManualCreate(BaseModel):
     shopee: int = 0
     mercado_livre: int = 0
     avulso: int = 0
+    pacotes_g: int = 0
 
 
 class ColetaManualUpdate(BaseModel):
     shopee: Optional[int] = None
     mercado_livre: Optional[int] = None
     avulso: Optional[int] = None
+    pacotes_g: Optional[int] = None
 
 
 class ColetaOut(BaseModel):
@@ -73,14 +76,21 @@ class ColetaOut(BaseModel):
     avulso: int
     valor_total: Decimal
     origem: str = "codigo"
+    pacotes_g: int = 0
     model_config = ConfigDict(from_attributes=True)
 
 ColetaOut.model_rebuild()
 
 
+class SaidaCriadaLote(BaseModel):
+    codigo: str
+    id_saida: int
+
+
 class LoteResponse(BaseModel):
     coleta: ColetaOut
     resumo: ResumoLote
+    saidas_criadas: List[SaidaCriadaLote] = Field(default_factory=list)
 
 
 # ============================================================
@@ -303,6 +313,7 @@ def registrar_coleta_em_lote(
 
     created = 0
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
+    saidas_criadas: List[SaidaCriadaLote] = []
 
     try:
         coleta = Coleta(
@@ -335,6 +346,7 @@ def registrar_coleta_em_lote(
                 status="coletado",
                 id_coleta=coleta.id_coleta,
                 qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
+                is_grande=getattr(item, "is_grande", False),
             )
             db.add(saida)
             db.flush()
@@ -359,6 +371,7 @@ def registrar_coleta_em_lote(
 
             count[serv_key] += 1
             created += 1
+            saidas_criadas.append(SaidaCriadaLote(codigo=codigo, id_saida=saida.id_saida))
 
         coleta.shopee = count["shopee"]
         coleta.mercado_livre = count["mercado_livre"]
@@ -393,6 +406,7 @@ def registrar_coleta_em_lote(
             },
             total=_fmt_money(coleta.valor_total),
         ),
+        saidas_criadas=saidas_criadas,
     )
 
 
@@ -443,6 +457,7 @@ def criar_coleta_manual(
         valor_total=valor_total,
         origem="manual",
         timestamp=timestamp,
+        pacotes_g=getattr(payload, "pacotes_g", 0) or 0,
     )
     db.add(coleta)
     db.commit()
@@ -479,6 +494,8 @@ def atualizar_coleta_manual(
         coleta.mercado_livre = payload.mercado_livre
     if payload.avulso is not None:
         coleta.avulso = payload.avulso
+    if payload.pacotes_g is not None:
+        coleta.pacotes_g = payload.pacotes_g
 
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
     coleta.valor_total = (
@@ -562,6 +579,7 @@ class ResumoItem(BaseModel):
     valor_total: Decimal
     cancelados: int
     entregadores: str
+    pacotes_g: int = 0
     id_coleta: Optional[int] = None
     origem: Optional[str] = None
     fechamento_status: Optional[str] = None
@@ -673,6 +691,7 @@ def resumo_coletas(
                     valor_total=r.valor_total,
                     cancelados=canc,
                     entregadores=(r.username_entregador or "-"),
+                    pacotes_g=getattr(r, "pacotes_g", 0) or 0,
                     id_coleta=r.id_coleta,
                     origem="manual",
                 )
@@ -687,12 +706,14 @@ def resumo_coletas(
                     "avulso": 0,
                     "valor_total": Decimal("0.00"),
                     "entregadores": set(),
+                    "pacotes_g": 0,
                 }
             agrupado[key]["shopee"] += r.shopee
             agrupado[key]["mercado_livre"] += r.mercado_livre
             agrupado[key]["avulso"] += r.avulso
             agrupado[key]["valor_total"] += r.valor_total
             agrupado[key]["entregadores"].add(r.username_entregador or "-")
+            agrupado[key]["pacotes_g"] += getattr(r, "pacotes_g", 0) or 0
 
     for key, item in agrupado.items():
         canc = mapa_cancelados.get(key, 0)
@@ -706,6 +727,7 @@ def resumo_coletas(
                 valor_total=item["valor_total"],
                 cancelados=canc,
                 entregadores=" | ".join(item["entregadores"]),
+                pacotes_g=item.get("pacotes_g", 0),
                 id_coleta=None,
                 origem=None,
             )

@@ -184,6 +184,7 @@ class Coleta(Base):
     shopee = Column(Integer, nullable=False, server_default=text("0"))
     mercado_livre = Column(Integer, nullable=False, server_default=text("0"))
     avulso = Column(Integer, nullable=False, server_default=text("0"))
+    pacotes_g = Column(Integer, nullable=False, server_default=text("0"))  # quantidade de pacotes grandes na coleta
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     origem = Column(Text, nullable=False, server_default=text("'codigo'"))
@@ -245,6 +246,7 @@ class Saida(Base):
     qr_payload_raw = Column(Text, nullable=True)  # Payload bruto do QR (ML) para gerar etiqueta reconhecível
     ml_shipment_id = Column(BigInteger, nullable=True, index=True)  # vínculo envio ML (evita duplicata no auto-fill)
     ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
+    is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande) — única fonte da sinalização
 
     coleta = relationship("Coleta", back_populates="saidas")
 
@@ -478,6 +480,10 @@ class BaseFechamento(Base):
 
     valor_bruto = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     valor_cancelados = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_adicao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_adicao = Column(Text, nullable=True)
+    valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_subtracao = Column(Text, nullable=True)
     valor_final = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     status = Column(Text, nullable=False, server_default=text("'GERADO'"))
 
@@ -513,6 +519,10 @@ class BaseFechamentoItem(Base):
     cancelados_shopee = Column(Integer, nullable=False, server_default=text("0"))
     cancelados_ml = Column(Integer, nullable=False, server_default=text("0"))
     cancelados_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    pacotes_g = Column(Integer, nullable=False, server_default=text("0"))  # quantidade G no dia (agregado de Saida.is_grande)
+    g_shopee = Column(Integer, nullable=False, server_default=text("0"))
+    g_ml = Column(Integer, nullable=False, server_default=text("0"))
+    g_avulso = Column(Integer, nullable=False, server_default=text("0"))
 
     fechamento = relationship("BaseFechamento", back_populates="itens")
 

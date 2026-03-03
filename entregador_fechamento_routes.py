@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -35,6 +35,64 @@ STATUS_REAJUSTADO = "REAJUSTADO"
 
 # Status válidos para saidas no cálculo (alinhado ao app mobile)
 STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
+
+
+def _contar_g_por_servico_entregador(
+    db: Session,
+    sub_base: str,
+    id_entregador: int,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> dict:
+    """Conta saídas com is_grande no período por serviço (shopee, ml, avulso)."""
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base,
+        Saida.entregador_id == id_entregador,
+        Saida.is_grande.is_(True),
+        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
+        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
+    )
+    stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
+    rows = db.scalars(stmt).all()
+    g_shopee = g_ml = g_avulso = 0
+    for s in rows:
+        t = _normalizar_servico(s.servico)
+        if t == "shopee":
+            g_shopee += 1
+        elif t == "flex":
+            g_ml += 1
+        else:
+            g_avulso += 1
+    return {"shopee": g_shopee, "ml": g_ml, "avulso": g_avulso, "total": g_shopee + g_ml + g_avulso}
+
+
+def _contar_g_por_servico_motoboy(
+    db: Session,
+    sub_base: str,
+    motoboy_id: int,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> dict:
+    """Conta saídas com is_grande no período por serviço (shopee, ml, avulso)."""
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base,
+        Saida.motoboy_id == motoboy_id,
+        Saida.is_grande.is_(True),
+        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
+        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
+    )
+    stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
+    rows = db.scalars(stmt).all()
+    g_shopee = g_ml = g_avulso = 0
+    for s in rows:
+        t = _normalizar_servico(s.servico)
+        if t == "shopee":
+            g_shopee += 1
+        elif t == "flex":
+            g_ml += 1
+        else:
+            g_avulso += 1
+    return {"shopee": g_shopee, "ml": g_ml, "avulso": g_avulso, "total": g_shopee + g_ml + g_avulso}
 
 
 def _resolve_motoboy_subbase(db: Session, sub_base: str, motoboy_id: int) -> Motoboy:
@@ -194,6 +252,7 @@ def calcular_valor_base_preview(
             db, sub_base, motoboy_id, periodo_inicio, periodo_fim
         )
         executor_nome = _get_motoboy_username(db, motoboy)
+        g = _contar_g_por_servico_motoboy(db, sub_base, motoboy_id, periodo_inicio, periodo_fim)
         return {
             "valor_base": valor_base,
             "entregador_id": None,
@@ -201,6 +260,8 @@ def calcular_valor_base_preview(
             "entregador_nome": executor_nome,
             "periodo_inicio": periodo_inicio.isoformat(),
             "periodo_fim": periodo_fim.isoformat(),
+            "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
+            "g_total": g["total"],
         }
 
     ent = db.get(Entregador, entregador_id)
@@ -210,6 +271,7 @@ def calcular_valor_base_preview(
     valor_base = _calcular_valor_base(
         db, sub_base, entregador_id, periodo_inicio, periodo_fim
     )
+    g = _contar_g_por_servico_entregador(db, sub_base, entregador_id, periodo_inicio, periodo_fim)
 
     return {
         "valor_base": valor_base,
@@ -218,6 +280,8 @@ def calcular_valor_base_preview(
         "entregador_nome": ent.nome or "",
         "periodo_inicio": periodo_inicio.isoformat(),
         "periodo_fim": periodo_fim.isoformat(),
+        "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
+        "g_total": g["total"],
     }
 
 

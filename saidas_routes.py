@@ -55,6 +55,7 @@ class SaidaOut(BaseModel):
     servico: Optional[str]
     status: Optional[str]
     base: Optional[str] = None
+    is_grande: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -68,6 +69,7 @@ class SaidaGridItem(BaseModel):
     servico: Optional[str]
     status: Optional[str]
     base: Optional[str] = None
+    is_grande: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -79,6 +81,7 @@ class SaidaUpdate(BaseModel):
     codigo: Optional[str] = None
     servico: Optional[str] = None
     base: Optional[str] = None
+    is_grande: Optional[bool] = None  # apenas admin, root ou operador (role 0,1,2) podem alterar
 
 
 class SaidaLerIn(BaseModel):
@@ -135,6 +138,7 @@ class SaidaDetalheCompletoOut(BaseModel):
     servico: Optional[str] = None
     status: Optional[str] = None
     base: Optional[str] = None
+    is_grande: bool = False
     detail: Optional[SaidaDetailOut] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -725,6 +729,7 @@ def listar_saidas(
                 "servico": r.servico,
                 "status": r.status,
                 "base": r.base,
+                "is_grande": getattr(r, "is_grande", False) or False,
             }
             for r in rows
         ],
@@ -802,6 +807,7 @@ def get_saida_detalhe(
         servico=obj.servico,
         status=obj.status,
         base=obj.base,
+        is_grande=getattr(obj, "is_grande", False) or False,
         detail=detail_out,
     )
 
@@ -1003,6 +1009,15 @@ def atualizar_saida(
 
     if payload.base is not None:
         obj.base = payload.base.strip()
+
+    if payload.is_grande is not None:
+        role = getattr(current_user, "role", None)
+        if role not in (0, 1, 2):
+            raise HTTPException(
+                403,
+                "Apenas admin, root ou operador podem marcar ou desmarcar pacote como G (Grande).",
+            )
+        obj.is_grande = bool(payload.is_grande)
 
     try:
         db.commit()
