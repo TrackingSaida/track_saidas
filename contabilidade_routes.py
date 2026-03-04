@@ -26,6 +26,19 @@ STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rot
 STATUS_FECHAMENTO_CONTABIL = ("GERADO", "REAJUSTADO", "FECHADO")  # FECHADO = legado
 
 
+def _saida_conta_para_indicador(saida: Saida, modo_entregas: str) -> bool:
+    """
+    Define se a saída entra na contagem de indicadores/despesas conforme o modo.
+    modo 'saiu': status contendo "saiu" (comportamento legado).
+    modo 'entregue': apenas status exatamente "entregue" (app mobile).
+    """
+    st = (getattr(saida, "status", None) or "").strip().lower()
+    if modo_entregas == "entregue":
+        return st == "entregue"
+    # modo "saiu" ou default
+    return "saiu" in st
+
+
 def _decimal(v) -> Decimal:
     try:
         return Decimal(str(v or 0))
@@ -165,11 +178,15 @@ class ContabilidadeResumoResponse(BaseModel):
 def get_resumo_contabilidade(
     data_inicio: date = Query(..., description="Data inicial do período"),
     data_fim: date = Query(..., description="Data final do período"),
+    modo_entregas: str = Query("saiu", description="Base de contagem: 'saiu' (saiu para entrega) ou 'entregue' (status entregue app mobile)"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     if data_inicio > data_fim:
         raise HTTPException(400, "data_inicio deve ser menor ou igual a data_fim.")
+    modo = (modo_entregas or "saiu").strip().lower()
+    if modo not in ("saiu", "entregue"):
+        modo = "saiu"
 
     sub_base = getattr(current_user, "sub_base", None)
     if not sub_base:
@@ -223,7 +240,9 @@ def get_resumo_contabilidade(
             func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
         )
     )
-    rows_saidas = db.scalars(stmt_saidas).all()
+    rows_saidas_raw = db.scalars(stmt_saidas).all()
+    # Filtrar pelo modo de indicadores: só contam saídas que "entregaram" conforme modo (saiu vs entregue)
+    rows_saidas = [s for s in rows_saidas_raw if _saida_conta_para_indicador(s, modo)]
     total_saidas = len(rows_saidas)
 
     # Saídas por serviço
