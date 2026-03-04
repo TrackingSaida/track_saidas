@@ -176,28 +176,8 @@ def shopee_callback(
         "partner_id": partner_id,
     }
 
-    # -----------------------------
-    # 🔍 DEBUG COMPLETO
-    # -----------------------------
-    print("========== SHOPEE DEBUG ==========")
-    print("ENV:", env)
-    print("HOST:", host)
-    print("PATH:", path)
-    print("PARTNER_ID:", partner_id)
-    print("SHOP_ID:", shop_id)
-    print("TIMESTAMP:", timestamp)
-    print("BASE_STRING:", base_string)
-    print("SIGN:", sign)
-    print("URL:", url)
-    print("PAYLOAD:", payload)
-    print("===================================")
-
     try:
         resp = requests.post(url, json=payload, timeout=20)
-
-        print("STATUS CODE:", resp.status_code)
-        print("RESPONSE TEXT:", resp.text)
-
         data = resp.json()
 
     except Exception as e:
