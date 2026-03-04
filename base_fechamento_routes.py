@@ -62,8 +62,14 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
             select(BaseSellerDados).where(BaseSellerDados.base_id == preco.id_base)
         )
 
-    # 3) Fallback: tenta resolver pelo Owner (username/sub_base) -> BaseSellerDados.owner_id
-    if not seller and preco and getattr(preco, "username", None):
+    # 3) Fallback legado: tenta resolver pelo Owner (username/sub_base) -> BaseSellerDados.owner_id
+    #    Só é usado quando não há vínculo explícito por base_id (instalações antigas).
+    if (
+        not seller
+        and preco
+        and getattr(preco, "username", None)
+        and getattr(preco, "id_base", None) is None
+    ):
         owner = db.scalar(
             select(Owner).where(
                 Owner.username == preco.username,
