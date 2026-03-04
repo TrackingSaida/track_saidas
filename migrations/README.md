@@ -1,6 +1,14 @@
 # Migrações
 
-Execute no **banco do Render** (e em qualquer ambiente) após deploy que inclua a coluna `tipo_owner` no modelo Owner.
+Execute no **banco do Render** (e em qualquer ambiente) após deploy que inclua a coluna correspondente no modelo.
+
+## owner_nome_fantasia.sql
+
+Adiciona a coluna opcional `nome_fantasia` na tabela `owner` para o campo institucional "Emitido por" no relatório de fechamento. Não afeta registros nem índices existentes.
+
+```sql
+ALTER TABLE owner ADD COLUMN IF NOT EXISTS nome_fantasia TEXT NULL;
+```
 
 ## add_tipo_owner_to_owner.sql
 

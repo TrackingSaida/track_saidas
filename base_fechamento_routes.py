@@ -104,12 +104,37 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
 
     endereco_completo = ", ".join([p for p in partes_endereco if p])
 
+    cnpj_raw = (seller.cnpj or "").strip() or None
+    cnpj_fmt = cnpj_raw
+    if cnpj_raw:
+        try:
+            digits = "".join(c for c in cnpj_raw if c.isdigit())
+            if len(digits) == 14:
+                cnpj_fmt = f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+        except Exception:
+            cnpj_fmt = cnpj_raw
+
     info: Dict[str, Any] = {
         "nome_base": base_norm,
-        "cnpj": (seller.cnpj or "").strip() or None,
+        "cnpj": cnpj_fmt,
         "endereco_completo": endereco_completo or None,
     }
     return info
+
+
+def _emitido_por(db: Session, sub_base: str) -> str:
+    """
+    Retorna o texto para "Emitido por" no relatório: nome_fantasia do Owner ou sub_base.
+    Nunca lança erro; em caso de owner ausente ou campos vazios usa sub_base ou "Tracking Saídas".
+    """
+    sub = (sub_base or "").strip()
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub)) if sub else None
+    if not owner:
+        return sub or "Tracking Saídas"
+    nome = (getattr(owner, "nome_fantasia", None) or "").strip()
+    if nome:
+        return nome
+    return (owner.sub_base or "").strip() or "Tracking Saídas"
 
 
 def _normalizar_servico_saida(serv: str) -> str:
@@ -325,6 +350,7 @@ class CalcularOut(BaseModel):
     ajuste_g_valor: Optional[Decimal] = None
     ajuste_g_motivo: Optional[str] = None
     seller_info: Optional[Dict[str, Any]] = None
+    emitido_por: Optional[str] = None
 
 
 class FechamentoOut(BaseModel):
@@ -352,6 +378,7 @@ class FechamentoOut(BaseModel):
     valor_cancelados_recalculado: Optional[Decimal] = None
     valor_final_recalculado: Optional[Decimal] = None
     seller_info: Optional[Dict[str, Any]] = None
+    emitido_por: Optional[str] = None
 
 
 # =========================================================
@@ -451,6 +478,7 @@ def calcular_fechamento(
         ajuste_g_valor=ajuste_g_valor,
         ajuste_g_motivo=(ajuste_g_motivo or None),
         seller_info=seller_info,
+        emitido_por=_emitido_por(db, sub_base),
     )
 
 
@@ -613,6 +641,7 @@ def criar_fechamento(
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
         seller_info=seller_info,
+        emitido_por=_emitido_por(db, sub_base),
     )
 
 
@@ -697,6 +726,7 @@ def obter_fechamento(
         valor_cancelados_recalculado=valor_cancelados_rec if divergencia else None,
         valor_final_recalculado=valor_final_rec if divergencia else None,
         seller_info=seller_info,
+        emitido_por=_emitido_por(db, sub_base),
     )
 
 
@@ -815,4 +845,5 @@ def atualizar_fechamento(
         total_g_ml=total_g_ml,
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
+        emitido_por=_emitido_por(db, fech.sub_base),
     )
