@@ -243,6 +243,12 @@ def calcular_valor_base_preview(
 
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+    if periodo_fim >= date.today():
+        raise HTTPException(
+            400,
+            "Não é permitido calcular fechamento para período ainda em aberto. "
+            "Escolha um período cuja data final seja anterior à data de hoje.",
+        )
     if (entregador_id is None) == (motoboy_id is None):
         raise HTTPException(400, "Informe exatamente um de entregador_id ou motoboy_id.")
 
@@ -299,6 +305,12 @@ def criar_fechamento(
 
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+    if payload.periodo_fim >= date.today():
+        raise HTTPException(
+            400,
+            "Não é permitido criar fechamento para período ainda em aberto. "
+            "Escolha um período cuja data final seja anterior à data de hoje.",
+        )
 
     if payload.id_motoboy is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, payload.id_motoboy)

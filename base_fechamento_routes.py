@@ -373,6 +373,7 @@ class FechamentoOut(BaseModel):
     total_g_ml: int = 0
     total_g_avulso: int = 0
     total_pacotes_g: int = 0
+    ajuste_g_valor: Optional[Decimal] = None
     divergencia_valor: Optional[bool] = None
     valor_bruto_recalculado: Optional[Decimal] = None
     valor_cancelados_recalculado: Optional[Decimal] = None
@@ -436,6 +437,12 @@ def calcular_fechamento(
     sub_base = _sub_base_from_token_or_422(current_user)
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+    if periodo_fim >= date.today():
+        raise HTTPException(
+            400,
+            "Não é permitido calcular fechamento para período ainda em aberto. "
+            "Escolha um período cuja data final seja anterior à data de hoje.",
+        )
 
     itens, valor_bruto, valor_cancelados, valor_final = _build_itens_e_valores(
         db, sub_base, base, periodo_inicio, periodo_fim
@@ -495,6 +502,12 @@ def criar_fechamento(
     sub_base = _sub_base_from_token_or_422(current_user)
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+    if payload.periodo_fim >= date.today():
+        raise HTTPException(
+            400,
+            "Não é permitido criar fechamento para período ainda em aberto. "
+            "Escolha um período cuja data final seja anterior à data de hoje.",
+        )
 
     base_norm = payload.base.strip()
 
@@ -543,17 +556,16 @@ def criar_fechamento(
     motivo_ad_final = motivo_ad_base
     motivo_sub_final = motivo_sub_base
 
+    ajuste_g_val_normalizado: Optional[Decimal] = None
     if ajuste_g_val_raw is not None:
         ajuste_g_val = _decimal(ajuste_g_val_raw).quantize(Decimal("0.01"))
         if ajuste_g_val != 0:
+            ajuste_g_val_normalizado = ajuste_g_val
             # Texto padronizado, já incluindo o valor para aparecer claramente no relatório
             ajuste_label = f"[Pacotes G] Motivo: {ajuste_g_motivo_norm or 'Ajuste de pacotes G'}; Valor: R$ {abs(ajuste_g_val):.2f}"
             if ajuste_g_val > 0:
-                valor_ad = (valor_ad_base + ajuste_g_val).quantize(Decimal("0.01"))
                 motivo_ad_final = " | ".join([m for m in [motivo_ad_base, ajuste_label] if m])
             else:
-                incremento_sub = abs(ajuste_g_val)
-                valor_sub = (valor_sub_base + incremento_sub).quantize(Decimal("0.01"))
                 motivo_sub_final = " | ".join([m for m in [motivo_sub_base, ajuste_label] if m])
 
     valor_final = (valor_final_calc + valor_ad - valor_sub).quantize(Decimal("0.01"))
@@ -640,6 +652,7 @@ def criar_fechamento(
         total_g_ml=total_g_ml,
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
+        ajuste_g_valor=ajuste_g_val_normalizado,
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
     )
@@ -721,6 +734,7 @@ def obter_fechamento(
         total_g_ml=total_g_ml,
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
+        ajuste_g_valor=None,
         divergencia_valor=divergencia if divergencia else None,
         valor_bruto_recalculado=valor_bruto_rec if divergencia else None,
         valor_cancelados_recalculado=valor_cancelados_rec if divergencia else None,
@@ -845,5 +859,6 @@ def atualizar_fechamento(
         total_g_ml=total_g_ml,
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
+        ajuste_g_valor=None,
         emitido_por=_emitido_por(db, fech.sub_base),
     )
