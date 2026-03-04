@@ -7,6 +7,7 @@ import hmac
 import hashlib
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -101,8 +102,15 @@ def _sign_api(
     "/auth-url",
     summary="Gera a URL para o seller autorizar a Shopee",
 )
-def gerar_auth_url():
+def gerar_auth_url(state: Optional[str] = Query(None, alias="state")):
     host, partner_id, partner_key, redirect_url, env = _get_shopee_config()
+
+    # Se state (sub_base) vier preenchido, colocamos na URL de redirect para o callback receber
+    state_val = (state or "").strip()
+    if state_val:
+        redirect = redirect_url + ("&" if "?" in redirect_url else "?") + "state=" + quote(state_val, safe="")
+    else:
+        redirect = redirect_url
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
@@ -121,7 +129,7 @@ def gerar_auth_url():
         f"?partner_id={partner_id}"
         f"&timestamp={timestamp}"
         f"&sign={sign}"
-        f"&redirect={redirect_url}"
+        f"&redirect={quote(redirect, safe='')}"
     )
     return {"auth_url": auth_url}
 
@@ -138,6 +146,7 @@ def shopee_callback(
     code: str = Query(...),
     shop_id: int = Query(...),
     main_account_id: Optional[int] = Query(None),
+    state: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     host, partner_id, partner_key, _, env = _get_shopee_config()
@@ -220,16 +229,20 @@ def shopee_callback(
         .first()
     )
 
+    sub_base_val = (state or "").strip() or None
+
     if existente:
         existente.access_token = access_token
         existente.refresh_token = refresh_token or existente.refresh_token
         existente.expires_at = expires_at
         existente.main_account_id = main_account_id
+        existente.sub_base = sub_base_val
         db.commit()
     else:
         token = ShopeeToken(
             shop_id=shop_id,
             main_account_id=main_account_id,
+            sub_base=sub_base_val,
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at=expires_at,
