@@ -43,6 +43,7 @@ class OwnerUpdate(BaseModel):
     username: Optional[str] = None
     valor: Optional[float] = None
     contato: Optional[str] = None
+    nome_fantasia: Optional[str] = None
     ativo: Optional[bool] = None
     ignorar_coleta: Optional[bool] = None
     teste: Optional[bool] = None
@@ -57,6 +58,7 @@ class OwnerOut(BaseModel):
     email: Optional[str]
     username: Optional[str]
     valor: Optional[float]
+    nome_fantasia: Optional[str] = None
     sub_base: Optional[str]
     contato: Optional[str]
     ativo: bool
@@ -190,6 +192,9 @@ def update_owner(
 
     if body.contato is not None:
         owner.contato = body.contato
+
+    if body.nome_fantasia is not None:
+        owner.nome_fantasia = (body.nome_fantasia or "").strip() or None
 
     # 🔥 Campos adicionados agora
     if body.ativo is not None:
