@@ -134,6 +134,7 @@ def _fetch_shop_name(
                 "Shopee Get Shop Info falhou: shop_id=%s status=%s error=%s message=%s",
                 shop_id, resp.status_code, err, msg,
             )
+            print(f"[Shopee Get Shop Info] FALHOU shop_id={shop_id} status={resp.status_code} error={err!r} message={msg!r}", flush=True)
             return None
         # Resposta: pode vir em data["response"] (objeto com shop_name/name/username) ou direto em data
         info = data.get("response")
@@ -154,17 +155,20 @@ def _fetch_shop_name(
         result = (name or "").strip() or None
         if result:
             logger.info("Shopee Get Shop Info ok: shop_id=%s shop_name=%s", shop_id, result)
+            print(f"[Shopee Get Shop Info] OK shop_id={shop_id} shop_name={result!r}", flush=True)
         else:
             # Log das chaves disponíveis para ajustar extração
+            keys_top = list(data.keys()) if isinstance(data, dict) else []
+            keys_resp = list(info.keys()) if isinstance(info, dict) else []
             logger.info(
                 "Shopee Get Shop Info sem nome: shop_id=%s keys=%s response_keys=%s",
-                shop_id,
-                list(data.keys()) if isinstance(data, dict) else [],
-                list(info.keys()) if isinstance(info, dict) else [],
+                shop_id, keys_top, keys_resp,
             )
+            print(f"[Shopee Get Shop Info] SEM NOME shop_id={shop_id} data_keys={keys_top} response_keys={keys_resp}", flush=True)
         return result
     except Exception as e:
         logger.warning("Shopee Get Shop Info exception: shop_id=%s err=%s", shop_id, e)
+        print(f"[Shopee Get Shop Info] EXCEPTION shop_id={shop_id} err={e!r}", flush=True)
         return None
 
 
