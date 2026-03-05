@@ -411,19 +411,21 @@ def registrar_coleta_em_lote(
 
 
 # ============================================================
-# POST /coletas/manual — Coleta Manual (somente quando modo_operacao == "coleta_manual")
+# POST /coletas/manual — Coleta Manual (quando modo_operacao == "coleta_manual" OU ignorar_coleta == False)
 # ============================================================
 
-def _require_modo_coleta_manual(db: Session, sub_base: str) -> None:
-    """Valida que o owner está em modo coleta_manual. Levanta HTTPException 403 caso contrário."""
+def _require_coleta_manual_permitida(db: Session, sub_base: str) -> None:
+    """Permite coleta manual quando ignorar_coleta=False (coleta ativa) ou modo_operacao=coleta_manual. Levanta 403 caso contrário."""
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     if not owner:
         raise HTTPException(403, "Owner não encontrado para esta sub_base.")
     modo = getattr(owner, "modo_operacao", None) or "codigo"
-    if modo != "coleta_manual":
+    ignorar_coleta = bool(getattr(owner, "ignorar_coleta", True))
+    # Permitir quando: coleta ativa (ignorar_coleta=False) OU modo explícito coleta_manual
+    if ignorar_coleta and modo != "coleta_manual":
         raise HTTPException(
             403,
-            f"Coleta manual disponível apenas quando modo_operacao == 'coleta_manual'. Atual: {modo!r}",
+            "Coleta manual disponível apenas quando 'Ignorar Coleta' está desativado (coleta ativa) ou o modo de operação do owner é 'Coleta Manual'. Verifique as configurações do owner.",
         )
 
 
@@ -434,7 +436,7 @@ def criar_coleta_manual(
     current_user: User = Depends(get_current_user),
 ):
     sub_base = _sub_base_from_token_or_422(current_user)
-    _require_modo_coleta_manual(db, sub_base)
+    _require_coleta_manual_permitida(db, sub_base)
 
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base.strip())
 
@@ -478,7 +480,7 @@ def atualizar_coleta_manual(
     current_user: User = Depends(get_current_user),
 ):
     sub_base = _sub_base_from_token_or_422(current_user)
-    _require_modo_coleta_manual(db, sub_base)
+    _require_coleta_manual_permitida(db, sub_base)
 
     coleta = db.get(Coleta, id_coleta)
     if not coleta or coleta.sub_base != sub_base:
