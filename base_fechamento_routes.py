@@ -233,6 +233,16 @@ def _build_itens_e_valores(
             mapa_g[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
         mapa_g[dia][tipo] = mapa_g[dia].get(tipo, 0) + 1
 
+    # Pacotes G vindos de Coleta (coleta manual): Coleta.pacotes_g não tem breakdown por serviço → soma em avulso
+    for r in rows_coletas:
+        dia = r.timestamp.date().isoformat()
+        qtd = getattr(r, "pacotes_g", 0) or 0
+        if qtd <= 0:
+            continue
+        if dia not in mapa_g:
+            mapa_g[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
+        mapa_g[dia]["avulso"] = mapa_g[dia].get("avulso", 0) + qtd
+
     # Dias únicos (coletas + cancelados + G)
     dias_set = set(mapa_coletas.keys()) | set(mapa_canc.keys()) | set(mapa_g.keys())
     if not dias_set:

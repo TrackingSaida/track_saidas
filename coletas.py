@@ -438,7 +438,26 @@ def criar_coleta_manual(
     sub_base = _sub_base_from_token_or_422(current_user)
     _require_coleta_manual_permitida(db, sub_base)
 
-    p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base.strip())
+    base_norm = payload.base.strip()
+    # Impedir duplicata: um único lançamento manual por (data, base) na mesma sub_base
+    dt_day = datetime.datetime.combine(payload.data, datetime.time.min)
+    dt_next = dt_day + timedelta(days=1)
+    existente = db.scalar(
+        select(Coleta).where(
+            Coleta.sub_base == sub_base,
+            func.upper(Coleta.base) == base_norm.upper(),
+            Coleta.timestamp >= dt_day,
+            Coleta.timestamp < dt_next,
+            Coleta.origem == "manual",
+        )
+    )
+    if existente:
+        raise HTTPException(
+            409,
+            "Já existe um lançamento para essa mesma data e base. Use a opção Editar no registro existente.",
+        )
+
+    p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, base_norm)
 
     valor_total = (
         _decimal(payload.shopee) * p_shopee
@@ -451,7 +470,7 @@ def criar_coleta_manual(
 
     coleta = Coleta(
         sub_base=sub_base,
-        base=payload.base.strip(),
+        base=base_norm,
         username_entregador=username,
         shopee=payload.shopee,
         mercado_livre=payload.mercado_livre,
