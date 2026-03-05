@@ -191,12 +191,17 @@ def fetch_shipments_by_tracking(access_token: str, tracking_number: str) -> dict
     return r.json()
 
 
-def refresh_all_ml_int_tokens(db: Session) -> None:
-    """Varre ml_conexoes e renova tokens expirados (para startup da API)."""
+def refresh_all_ml_int_tokens(db: Session) -> int:
+    """Varre todas as ml_conexoes e renova tokens (agendamento a cada ~5h, antes de expirar em 6h). Retorna quantos foram renovados."""
     conexoes = db.query(MLConexao).all()
     if not conexoes:
-        return
-    now = datetime.utcnow()
+        return 0
+    n = 0
     for c in conexoes:
-        if c.expires_at and c.expires_at <= now:
-            refresh_ml_int_token(db, c)
+        try:
+            if refresh_ml_int_token(db, c) is not None:
+                n += 1
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("refresh_all_ml_int_tokens: falha user_id_ml=%s sub_base=%s: %s", c.user_id_ml, c.sub_base, e)
+    return n

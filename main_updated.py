@@ -199,18 +199,24 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # ──────────────────────────────────────────────────────────────────
-# Rotina de startup — renova tokens ML e ML Int ao inicializar a API
+# Rotina de startup — renova tokens ML Int e Shopee ao inicializar a API
 from db import SessionLocal
 from ml_int_service import refresh_all_ml_int_tokens
+from shopee_routes import refresh_all_shopee_tokens
 
 @app.on_event("startup")
 def startup_event():
-    """Executa ao subir a API: renova tokens vencidos do Mercado Livre (ML Int)."""
+    """Executa ao subir a API: renova todos os tokens ML Int e Shopee (agendamento)."""
     db = SessionLocal()
     try:
-        refresh_all_ml_int_tokens(db)
-    except Exception as e:
-        print(f"[ML Int] Erro durante renovação inicial: {e}")
+        try:
+            refresh_all_ml_int_tokens(db)
+        except Exception as e:
+            print(f"[ML Int] Erro durante renovação inicial: {e}")
+        try:
+            refresh_all_shopee_tokens(db)
+        except Exception as e:
+            print(f"[Shopee] Erro durante renovação inicial: {e}")
     finally:
         db.close()
 
@@ -219,6 +225,30 @@ def startup_event():
 @app.get(f"{API_PREFIX}/health", tags=["Health"])
 def health():
     return {"status": "ok"}
+
+# ──────────────────────────────────────────────────────────────────
+# Endpoint interno: refresh de tokens (Cron Render — a cada ~5h)
+@app.post(f"{API_PREFIX}/internal/refresh-tokens", tags=["Internal"])
+def internal_refresh_tokens(request: Request):
+    """
+    Renova tokens ML Int e Shopee. Protegido por header X-Cron-Secret (CRON_REFRESH_SECRET).
+    Uso: Cron Job no Render a cada 5h.
+    """
+    secret = os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_REFRESH_SECRET não configurado"})
+    received = request.headers.get("X-Cron-Secret") or request.query_params.get("key")
+    if received != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    db = SessionLocal()
+    try:
+        ml_count = refresh_all_ml_int_tokens(db)
+        shopee_count = refresh_all_shopee_tokens(db)
+        return {"status": "ok", "ml_refreshed": ml_count, "shopee_refreshed": shopee_count}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
 
 # ──────────────────────────────────────────────────────────────────
 # Execução local

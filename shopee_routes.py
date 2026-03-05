@@ -322,6 +322,74 @@ def shopee_callback(
 
 
 # -------------------------------------------------
+# RefreshAccessToken — renovação agendada (a cada ~5h)
+# -------------------------------------------------
+def refresh_shopee_token(db: Session, token: ShopeeToken) -> bool:
+    """
+    Renova access_token e refresh_token de um ShopeeToken via API RefreshAccessToken.
+    Atualiza access_token, refresh_token e expires_at no registro. Retorna True se ok, False em erro.
+    """
+    if not token.refresh_token:
+        return False
+    try:
+        host, partner_id, partner_key, _, _ = _get_shopee_config()
+    except RuntimeError as e:
+        logger.warning("refresh_shopee_token shop_id=%s: config falhou: %s", token.shop_id, e)
+        return False
+    path = "/api/v2/auth/access_token/get"
+    timestamp = int(time.time())
+    base_string = f"{partner_id}{path}{timestamp}"
+    sign = hmac.new(
+        partner_key.encode("utf-8"),
+        base_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    url = (
+        f"{host}{path}"
+        f"?partner_id={partner_id}"
+        f"&timestamp={timestamp}"
+        f"&sign={sign}"
+    )
+    payload = {
+        "shop_id": token.shop_id,
+        "refresh_token": token.refresh_token,
+        "partner_id": partner_id,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=20)
+        data = resp.json()
+    except Exception as e:
+        logger.warning("refresh_shopee_token shop_id=%s: request falhou: %s", token.shop_id, e)
+        return False
+    if resp.status_code != 200 or not data.get("access_token"):
+        logger.warning(
+            "refresh_shopee_token shop_id=%s: status=%s error=%s",
+            token.shop_id, resp.status_code, data.get("error") or data.get("message"),
+        )
+        return False
+    token.access_token = data["access_token"]
+    token.refresh_token = data.get("refresh_token") or token.refresh_token
+    expires_in = data.get("expire_in") or data.get("expires_in")
+    if expires_in is not None:
+        token.expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in))
+    db.commit()
+    return True
+
+
+def refresh_all_shopee_tokens(db: Session) -> int:
+    """Renova todos os ShopeeToken que tenham refresh_token (chamado no startup e pelo cron a cada ~5h). Retorna quantos foram renovados."""
+    tokens = db.query(ShopeeToken).filter(ShopeeToken.refresh_token.isnot(None)).all()
+    n = 0
+    for tk in tokens:
+        try:
+            if refresh_shopee_token(db, tk):
+                n += 1
+        except Exception as e:
+            logger.warning("refresh_all_shopee_tokens shop_id=%s: %s", tk.shop_id, e)
+    return n
+
+
+# -------------------------------------------------
 # 3) Listagem de sellers (tokens) filtrada por sub_base do usuário
 # -------------------------------------------------
 @router.get("/sellers")
