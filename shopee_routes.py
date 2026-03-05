@@ -17,9 +17,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from fastapi.responses import RedirectResponse
 
+from sqlalchemy import select
+
 from auth import get_current_user
 from db import get_db
-from models import ShopeeToken, User
+from models import Owner, ShopeeToken, User
 
 router = APIRouter(prefix="/shopee", tags=["Shopee"])
 
@@ -317,7 +319,17 @@ def shopee_callback(
         db.commit()
 
     frontend_base = (os.getenv("ML_AFTER_CALLBACK", "https://tracking-saidas.com.br/") or "").rstrip("/")
-    success_url = f"{frontend_base}/autenticacao-sucesso.html?shopee=ok"
+    success_page = f"{frontend_base}/autenticacao-sucesso.html"
+    params = ["shopee=ok"]
+    if sub_base_val:
+        params.append("sub_base=" + quote(sub_base_val, safe=""))
+        owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_val))
+        if owner:
+            nome_fantasia = (getattr(owner, "nome_fantasia", None) or "").strip()
+            if nome_fantasia:
+                params.append("nome_fantasia=" + quote(nome_fantasia, safe=""))
+    params.append("_t=" + str(int(time.time())))
+    success_url = success_page + "?" + "&".join(params)
     return RedirectResponse(url=success_url, status_code=302)
 
 

@@ -15,7 +15,7 @@ from sqlalchemy import select
 
 from auth import get_current_user
 from db import get_db
-from models import MLConexao, Saida, SaidaDetail, SaidaHistorico, User
+from models import MLConexao, Owner, Saida, SaidaDetail, SaidaHistorico, User
 from ml_int_service import (
     create_ml_test_user,
     exchange_code_for_token,
@@ -81,16 +81,24 @@ def ml_int_callback(
     sub_base_value = (state or "").strip() or None
     nickname = (user_me.get("nickname") or "").strip()
 
+    # Nome fantasia do owner para exibir na página de sucesso (prioridade sobre sub_base)
+    nome_fantasia = None
+    if sub_base_value:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_value))
+        if owner:
+            nome_fantasia = (getattr(owner, "nome_fantasia", None) or "").strip() or None
+
     def success_url() -> str:
         params = ["ml=ok"]
         if sub_base_value:
             params.append("sub_base=" + quote(sub_base_value, safe=""))
+        if nome_fantasia:
+            params.append("nome_fantasia=" + quote(nome_fantasia, safe=""))
         if nickname:
             params.append("seller_name=" + quote(nickname, safe=""))
         params.append("v=2")
-        # Cache-busting: evita que o redirect abra versão em cache da página
         params.append("_t=" + str(int(time.time())))
-        return f"{success_page}?{"&".join(params)}"
+        return success_page + "?" + "&".join(params)
 
     if existente:
         existente.access_token = access_token
