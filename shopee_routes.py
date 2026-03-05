@@ -1,6 +1,7 @@
 # shopee_routes.py
 from __future__ import annotations
 
+import logging
 import os
 import time
 import hmac
@@ -8,6 +9,8 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import quote
+
+logger = logging.getLogger(__name__)
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -93,6 +96,76 @@ def _sign_api(
         base_string.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+
+
+def _fetch_shop_name(
+    host: str,
+    partner_id: int,
+    partner_key: str,
+    shop_id: int,
+    access_token: str,
+) -> Optional[str]:
+    """Chama Get Shop Info e retorna o nome da loja, ou None em caso de erro."""
+    path = "/api/v2/shop/get_shop_info"
+    timestamp = int(time.time())
+    sign = _sign_api(
+        partner_id=partner_id,
+        partner_key=partner_key,
+        path=path,
+        timestamp=timestamp,
+        shop_id=shop_id,
+        access_token=access_token,
+    )
+    url = (
+        f"{host}{path}"
+        f"?partner_id={partner_id}"
+        f"&timestamp={timestamp}"
+        f"&sign={sign}"
+        f"&shop_id={shop_id}"
+        f"&access_token={quote(access_token, safe='')}"
+    )
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json() if resp.text else {}
+        err = data.get("error")
+        msg = data.get("message", "")
+        if resp.status_code != 200 or err:
+            logger.warning(
+                "Shopee Get Shop Info falhou: shop_id=%s status=%s error=%s message=%s",
+                shop_id, resp.status_code, err, msg,
+            )
+            return None
+        # Resposta: pode vir em data["response"] (objeto com shop_name/name/username) ou direto em data
+        info = data.get("response")
+        if isinstance(info, dict):
+            name = (
+                info.get("shop_name")
+                or info.get("name")
+                or info.get("shopname")
+                or info.get("username")  # sandbox às vezes retorna só username
+            )
+        else:
+            name = (
+                data.get("shop_name")
+                or data.get("name")
+                or data.get("shopname")
+                or data.get("username")
+            )
+        result = (name or "").strip() or None
+        if result:
+            logger.info("Shopee Get Shop Info ok: shop_id=%s shop_name=%s", shop_id, result)
+        else:
+            # Log das chaves disponíveis para ajustar extração
+            logger.info(
+                "Shopee Get Shop Info sem nome: shop_id=%s keys=%s response_keys=%s",
+                shop_id,
+                list(data.keys()) if isinstance(data, dict) else [],
+                list(info.keys()) if isinstance(info, dict) else [],
+            )
+        return result
+    except Exception as e:
+        logger.warning("Shopee Get Shop Info exception: shop_id=%s err=%s", shop_id, e)
+        return None
 
 
 # -------------------------------------------------
@@ -218,6 +291,7 @@ def shopee_callback(
         existente.main_account_id = main_account_id
         existente.sub_base = sub_base_val
         db.commit()
+        record = existente
     else:
         token = ShopeeToken(
             shop_id=shop_id,
@@ -228,6 +302,14 @@ def shopee_callback(
             expires_at=expires_at,
         )
         db.add(token)
+        db.commit()
+        db.refresh(token)
+        record = token
+
+    # Buscar nome da loja (Get Shop Info) para exibir no front como no ML
+    shop_name = _fetch_shop_name(host, partner_id, partner_key, shop_id, access_token)
+    if shop_name:
+        record.shop_name = shop_name
         db.commit()
 
     frontend_base = (os.getenv("ML_AFTER_CALLBACK", "https://tracking-saidas.com.br/") or "").rstrip("/")
@@ -254,14 +336,26 @@ def shopee_sellers(
     )
     now = datetime.utcnow()
     result = []
+    try:
+        host, partner_id, partner_key, _, _ = _get_shopee_config()
+    except RuntimeError:
+        host = partner_id = partner_key = None
     for tk in tokens:
         status = "conectado" if (tk.expires_at and tk.expires_at > now) else "expirado"
+        shop_name = tk.shop_name
+        # Preencher nome para tokens antigos que ainda não têm (token válido)
+        if not shop_name and status == "conectado" and host and partner_id and partner_key:
+            shop_name = _fetch_shop_name(host, partner_id, partner_key, tk.shop_id, tk.access_token)
+            if shop_name:
+                tk.shop_name = shop_name
+                db.commit()
         result.append({
             "id": tk.id,
             "shop_id": tk.shop_id,
             "main_account_id": tk.main_account_id,
             "sub_base": tk.sub_base,
             "platform": "shopee",
+            "user_nickname_shopee": shop_name,
             "status": status,
             "criado_em": tk.criado_em.isoformat() if tk.criado_em else None,
         })

@@ -394,6 +394,7 @@ class ShopeeToken(Base):
     shop_id = Column(BigInteger, nullable=False)
     main_account_id = Column(BigInteger, nullable=True)
     sub_base = Column(Text, nullable=True)
+    shop_name = Column(Text, nullable=True)  # nome da loja (Get Shop Info API)
 
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=True)
