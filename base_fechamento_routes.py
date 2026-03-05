@@ -233,15 +233,22 @@ def _build_itens_e_valores(
             mapa_g[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
         mapa_g[dia][tipo] = mapa_g[dia].get(tipo, 0) + 1
 
-    # Pacotes G vindos de Coleta (coleta manual): Coleta.pacotes_g não tem breakdown por serviço → soma em avulso
+    # Pacotes G vindos de Coleta (coleta manual): usar g_shopee, g_ml, g_avulso quando existirem; senão fallback em avulso
     for r in rows_coletas:
         dia = r.timestamp.date().isoformat()
-        qtd = getattr(r, "pacotes_g", 0) or 0
-        if qtd <= 0:
-            continue
+        g_s = getattr(r, "g_shopee", 0) or 0
+        g_m = getattr(r, "g_ml", 0) or 0
+        g_a = getattr(r, "g_avulso", 0) or 0
+        if g_s == 0 and g_m == 0 and g_a == 0:
+            qtd = getattr(r, "pacotes_g", 0) or 0
+            if qtd <= 0:
+                continue
+            g_a = qtd
         if dia not in mapa_g:
             mapa_g[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
-        mapa_g[dia]["avulso"] = mapa_g[dia].get("avulso", 0) + qtd
+        mapa_g[dia]["shopee"] = mapa_g[dia].get("shopee", 0) + g_s
+        mapa_g[dia]["ml"] = mapa_g[dia].get("ml", 0) + g_m
+        mapa_g[dia]["avulso"] = mapa_g[dia].get("avulso", 0) + g_a
 
     # Dias únicos (coletas + cancelados + G)
     dias_set = set(mapa_coletas.keys()) | set(mapa_canc.keys()) | set(mapa_g.keys())

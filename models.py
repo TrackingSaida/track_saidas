@@ -190,6 +190,9 @@ class Coleta(Base):
     mercado_livre = Column(Integer, nullable=False, server_default=text("0"))
     avulso = Column(Integer, nullable=False, server_default=text("0"))
     pacotes_g = Column(Integer, nullable=False, server_default=text("0"))  # quantidade de pacotes grandes na coleta
+    g_shopee = Column(Integer, nullable=False, server_default=text("0"))  # pacotes G da coleta manual por serviço
+    g_ml = Column(Integer, nullable=False, server_default=text("0"))
+    g_avulso = Column(Integer, nullable=False, server_default=text("0"))
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     origem = Column(Text, nullable=False, server_default=text("'codigo'"))

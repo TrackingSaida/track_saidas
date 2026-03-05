@@ -56,6 +56,9 @@ class ColetaManualCreate(BaseModel):
     mercado_livre: int = 0
     avulso: int = 0
     pacotes_g: int = 0
+    g_shopee: int = 0
+    g_ml: int = 0
+    g_avulso: int = 0
 
 
 class ColetaManualUpdate(BaseModel):
@@ -63,6 +66,9 @@ class ColetaManualUpdate(BaseModel):
     mercado_livre: Optional[int] = None
     avulso: Optional[int] = None
     pacotes_g: Optional[int] = None
+    g_shopee: Optional[int] = None
+    g_ml: Optional[int] = None
+    g_avulso: Optional[int] = None
 
 
 class ColetaOut(BaseModel):
@@ -77,6 +83,9 @@ class ColetaOut(BaseModel):
     valor_total: Decimal
     origem: str = "codigo"
     pacotes_g: int = 0
+    g_shopee: int = 0
+    g_ml: int = 0
+    g_avulso: int = 0
     model_config = ConfigDict(from_attributes=True)
 
 ColetaOut.model_rebuild()
@@ -468,6 +477,10 @@ def criar_coleta_manual(
     username = getattr(current_user, "username", None) or "-"
     timestamp = datetime.datetime.combine(payload.data, datetime.time.min)
 
+    pacotes_g_val = getattr(payload, "pacotes_g", 0) or 0
+    g_shopee_val = getattr(payload, "g_shopee", 0) or 0
+    g_ml_val = getattr(payload, "g_ml", 0) or 0
+    g_avulso_val = getattr(payload, "g_avulso", 0) or 0
     coleta = Coleta(
         sub_base=sub_base,
         base=base_norm,
@@ -478,7 +491,10 @@ def criar_coleta_manual(
         valor_total=valor_total,
         origem="manual",
         timestamp=timestamp,
-        pacotes_g=getattr(payload, "pacotes_g", 0) or 0,
+        pacotes_g=pacotes_g_val,
+        g_shopee=g_shopee_val,
+        g_ml=g_ml_val,
+        g_avulso=g_avulso_val,
     )
     db.add(coleta)
     db.commit()
@@ -517,6 +533,12 @@ def atualizar_coleta_manual(
         coleta.avulso = payload.avulso
     if payload.pacotes_g is not None:
         coleta.pacotes_g = payload.pacotes_g
+    if payload.g_shopee is not None:
+        coleta.g_shopee = payload.g_shopee
+    if payload.g_ml is not None:
+        coleta.g_ml = payload.g_ml
+    if payload.g_avulso is not None:
+        coleta.g_avulso = payload.g_avulso
 
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
     coleta.valor_total = (
