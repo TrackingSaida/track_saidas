@@ -728,6 +728,7 @@ def listar_saidas(
                 "timestamp": first_ts_map.get(r.id_saida) or r.timestamp,
                 "username": r.username,
                 "entregador": r.entregador,
+                "entregador_id": getattr(r, "entregador_id", None),
                 "motoboy_id": getattr(r, "motoboy_id", None),
                 "codigo": r.codigo,
                 "servico": r.servico,
@@ -983,13 +984,25 @@ def atualizar_saida(
         obj.codigo = novo
 
     if payload.entregador_id is not None or (payload.entregador is not None and payload.entregador.strip()):
-        entregador_id, entregador_nome = _resolve_entregador(
-            db, sub_base,
-            entregador_id=payload.entregador_id,
-            entregador_nome=payload.entregador,
-        )
-        obj.entregador_id = entregador_id
-        obj.entregador = entregador_nome
+        try:
+            entregador_id, entregador_nome = _resolve_entregador(
+                db, sub_base,
+                entregador_id=payload.entregador_id,
+                entregador_nome=payload.entregador,
+            )
+            obj.entregador_id = entregador_id
+            obj.entregador = entregador_nome
+        except HTTPException as e:
+            # Se não encontrou entregador pelo nome mas a saída já tem entregador/motoboy,
+            # manter o atual e aplicar só status/serviço/etc (evita falha ao editar só status ex.: cancelado)
+            detail = e.detail if isinstance(e.detail, dict) else {}
+            if e.status_code == 422 and detail.get("code") == "ENTREGADOR_NAO_ENCONTRADO":
+                if (getattr(obj, "entregador_id", None) is not None) or (getattr(obj, "motoboy_id", None) is not None):
+                    pass  # mantém entregador/motoboy atual
+                else:
+                    raise
+            else:
+                raise
 
     if payload.motoboy_id is not None:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
