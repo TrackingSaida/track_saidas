@@ -22,7 +22,8 @@ from entregador_routes import resolver_precos_entregador, resolver_precos_motobo
 
 router = APIRouter(prefix="/contabilidade", tags=["Contabilidade"])
 
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "pendente"]
+# Incluir "saiu_para_entrega" pois o app mobile grava SAIU_PARA_ENTREGA
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega", "em_rota", "entregue", "ausente", "pendente"]
 STATUS_FECHAMENTO_CONTABIL = ("GERADO", "REAJUSTADO", "FECHADO")  # FECHADO = legado
 
 

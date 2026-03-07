@@ -25,7 +25,8 @@ from entregador_routes import resolver_precos_entregador, resolver_precos_motobo
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 # Status considerados válidos (saiu/em rota/entregue/ausente — alinhado ao app mobile)
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
+# Incluir "saiu_para_entrega" pois o app mobile grava SAIU_PARA_ENTREGA
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega", "em_rota", "entregue", "ausente"]
 STATUS_CANCELADO = "cancelado"
 STATUS_COLETADO = "coletado"
 
