@@ -105,7 +105,7 @@ def criar_precos_base(
         shopee=payload.shopee,
         ml=payload.ml,
         avulso=payload.avulso,
-        ativo=bool(payload.ativo) if payload.ativo is not None else False,
+        ativo=bool(payload.ativo) if payload.ativo is not None else True,
     )
 
     db.add(obj)

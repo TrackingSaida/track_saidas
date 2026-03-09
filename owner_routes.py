@@ -289,8 +289,13 @@ def upsert_seller_dados(
         raise HTTPException(404, "Owner não encontrado.")
 
     data = body.model_dump(exclude_unset=True)
+    base_id = data.get("base_id")
 
-    seller = db.scalar(select(BaseSellerDados).where(BaseSellerDados.owner_id == id_owner))
+    # Buscar por (owner_id, base_id) para permitir um registro de seller por base
+    stmt = select(BaseSellerDados).where(BaseSellerDados.owner_id == id_owner)
+    if base_id is not None:
+        stmt = stmt.where(BaseSellerDados.base_id == base_id)
+    seller = db.scalar(stmt)
 
     if not seller:
         # criação exige CNPJ e endereço mínimo
@@ -308,7 +313,7 @@ def upsert_seller_dados(
 
         seller = BaseSellerDados(
             owner_id=id_owner,
-            base_id=data.get("base_id"),
+            base_id=base_id,
             cnpj=cnpj,
             rua=rua,
             numero=numero,
