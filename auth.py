@@ -149,16 +149,10 @@ def _owner_for_sub_base(db: Session, sub_base: str) -> Owner:
 def _must_change_password_from_user(user: User) -> bool:
     """
     Define se o usuário deve trocar a senha no próximo login.
-    Prioriza o flag persistido e, para compatibilidade, também verifica se a senha
-    atual ainda é a senha padrão DEFAULT_PASSWORD.
+    Usa apenas o flag persistido no banco (must_change_password).
+    Quando False, não obriga troca mesmo que a senha seja a padrão.
     """
-    base_flag = bool(getattr(user, "must_change_password", False))
-    if base_flag:
-        return True
-    try:
-        return verify_password(DEFAULT_PASSWORD, user.password_hash)
-    except Exception:
-        return base_flag
+    return bool(getattr(user, "must_change_password", False))
 
 
 def _tipo_owner_from_owner(owner: Owner) -> str:
