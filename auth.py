@@ -99,12 +99,20 @@ class UserLogin(BaseModel):
 
 
 class MotoboyLogin(BaseModel):
-    identifier: str = Field(min_length=1, description="Email, username ou contato")
+    # Mesmos aliases do UserLogin: RN/axios às vezes envia username/email no lugar de identifier.
+    identifier: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("email", "username", "contato"),
+        description="Email, username ou contato",
+    )
     password: str
 
 
 class MotoboySelectSubBase(BaseModel):
-    identifier: str = Field(min_length=1)
+    identifier: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("email", "username", "contato"),
+    )
     password: str
     sub_base: str = Field(min_length=1)
 
