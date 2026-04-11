@@ -139,6 +139,21 @@ class PasswordChangePayload(BaseModel):
 # Helpers
 # ============================================================
 
+
+def _db_user_from_token(db: Session, token_user: User) -> User:
+    """
+    get_current_user() devolve User montado só pelo JWT (_user_from_claims), fora da sessão.
+    Atribuir password_hash/nome/etc. a esse objeto não persiste no banco; é preciso carregar a linha.
+    """
+    uid = getattr(token_user, "id", None)
+    if uid is None:
+        raise HTTPException(401, "Token inválido")
+    row = db.get(User, uid)
+    if not row:
+        raise HTTPException(404, "Usuário não encontrado")
+    return row
+
+
 def _sanitize_sub_base(sub_base: str) -> str:
     """
     Normaliza a sub_base para uso em domínio/username:
@@ -728,35 +743,43 @@ def update_current_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    db_user = _db_user_from_token(db, current_user)
+
     if payload.nome is not None:
-        current_user.nome = payload.nome.strip() or None
+        db_user.nome = payload.nome.strip() or None
 
     if payload.sobrenome is not None:
-        current_user.sobrenome = payload.sobrenome.strip() or None
+        db_user.sobrenome = payload.sobrenome.strip() or None
 
     if payload.contato is not None:
         contato = payload.contato.strip()
         if not contato:
             raise HTTPException(400, "Contato não pode ser vazio.")
 
-        exists = db.query(User).filter(User.contato == contato, User.id != current_user.id).first()
+        exists = db.query(User).filter(User.contato == contato, User.id != db_user.id).first()
         if exists:
             raise HTTPException(409, "Contato já em uso.")
-        current_user.contato = contato
+        db_user.contato = contato
 
     if payload.email is not None:
         email = payload.email.strip()
         if not email:
             raise HTTPException(400, "Email não pode ser vazio.")
 
-        exists = db.query(User).filter(User.email == email, User.id != current_user.id).first()
+        exists = db.query(User).filter(User.email == email, User.id != db_user.id).first()
         if exists:
             raise HTTPException(409, "Email já em uso.")
-        current_user.email = email
+        db_user.email = email
 
     db.commit()
-    db.refresh(current_user)
-    return current_user
+    db.refresh(db_user)
+    out = _user_to_out(db_user)
+    full = UserFull.model_validate(out)
+    if db_user.sub_base:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == db_user.sub_base))
+        if owner:
+            full.ignorar_coleta = bool(owner.ignorar_coleta)
+    return full
 
 
 # ============================================================
@@ -769,17 +792,17 @@ def change_password(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    must_change = bool(getattr(current_user, "must_change_password", False))
+    db_user = _db_user_from_token(db, current_user)
+
+    must_change = bool(getattr(db_user, "must_change_password", False))
     if not must_change:
         cur = (payload.current_password or "").strip()
         if not cur:
             raise HTTPException(400, "Informe a senha atual.")
-        if not verify_password(cur, current_user.password_hash):
+        if not verify_password(cur, db_user.password_hash):
             raise HTTPException(401, "Senha atual incorreta.")
 
-    current_user.password_hash = get_password_hash(payload.new_password)
-    # Após troca de senha pelo próprio usuário, não é mais obrigatório trocar no próximo login
-    if hasattr(current_user, "must_change_password"):
-        current_user.must_change_password = False
+    db_user.password_hash = get_password_hash(payload.new_password)
+    db_user.must_change_password = False
     db.commit()
     return {"ok": True, "message": "Senha alterada com sucesso"}
