@@ -129,7 +129,8 @@ class UserUpdatePayload(BaseModel):
 
 
 class PasswordChangePayload(BaseModel):
-    current_password: str = Field(min_length=1)
+    """Troca voluntária exige current_password; troca obrigatória (must_change_password) pode omitir."""
+    current_password: Optional[str] = None
     new_password: str = Field(min_length=8)
     model_config = ConfigDict(from_attributes=True)
 
@@ -768,8 +769,13 @@ def change_password(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not verify_password(payload.current_password, current_user.password_hash):
-        raise HTTPException(401, "Senha atual incorreta.")
+    must_change = bool(getattr(current_user, "must_change_password", False))
+    if not must_change:
+        cur = (payload.current_password or "").strip()
+        if not cur:
+            raise HTTPException(400, "Informe a senha atual.")
+        if not verify_password(cur, current_user.password_hash):
+            raise HTTPException(401, "Senha atual incorreta.")
 
     current_user.password_hash = get_password_hash(payload.new_password)
     # Após troca de senha pelo próprio usuário, não é mais obrigatório trocar no próximo login
