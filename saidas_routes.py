@@ -208,6 +208,19 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
     return s
 
 
+def _status_ja_em_rota_ou_saida(status_norm: str) -> bool:
+    """
+    True quando o pacote já saiu / está em rota com um entregador.
+    Nesses estados, leitura por outro motoboy deve retornar 409 TROCA_ENTREGADOR
+    (o ramo legado só checava status_norm == 'saiu' e ignorava SAIU_PARA_ENTREGA / EM_ROTA).
+    """
+    if status_norm == "saiu":
+        return True
+    if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+        return True
+    return False
+
+
 def _resolve_entregador(
     db: Session,
     sub_base: str,
@@ -586,7 +599,7 @@ def ler_saida(
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
 
-    if status_norm == "saiu":
+    if _status_ja_em_rota_ou_saida(status_norm):
         # mesmo entregador/motoboy → 200 idempotente (sem 409)
         mesmo_ent = False
         if motoboy_id is not None:
