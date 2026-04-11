@@ -726,6 +726,7 @@ def listar_saidas(
             {
                 "id_saida": r.id_saida,
                 "timestamp": first_ts_map.get(r.id_saida) or r.timestamp,
+                "sub_base": r.sub_base,
                 "username": r.username,
                 "entregador": r.entregador,
                 "entregador_id": getattr(r, "entregador_id", None),
