@@ -89,9 +89,9 @@ class Token(BaseModel):
 class UserLogin(BaseModel):
     identifier: str = Field(
         min_length=1,
-        validation_alias=AliasChoices("email", "username", "contato"),
+        validation_alias=AliasChoices("identifier", "email", "username", "contato"),
         serialization_alias="email",
-        description="Aceita email, username ou contato"
+        description="Aceita identifier, email, username ou contato",
     )
     password: str
     remember: bool = False
@@ -99,11 +99,11 @@ class UserLogin(BaseModel):
 
 
 class MotoboyLogin(BaseModel):
-    # Mesmos aliases do UserLogin: RN/axios às vezes envia username/email no lugar de identifier.
+    # Mesmos aliases do UserLogin: app mobile envia identifier; RN/axios às vezes username/email.
     identifier: str = Field(
         min_length=1,
-        validation_alias=AliasChoices("email", "username", "contato"),
-        description="Email, username ou contato",
+        validation_alias=AliasChoices("identifier", "email", "username", "contato"),
+        description="identifier, email, username ou contato",
     )
     password: str
 
@@ -111,7 +111,7 @@ class MotoboyLogin(BaseModel):
 class MotoboySelectSubBase(BaseModel):
     identifier: str = Field(
         min_length=1,
-        validation_alias=AliasChoices("email", "username", "contato"),
+        validation_alias=AliasChoices("identifier", "email", "username", "contato"),
     )
     password: str
     sub_base: str = Field(min_length=1)
