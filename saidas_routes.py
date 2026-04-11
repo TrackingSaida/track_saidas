@@ -630,6 +630,7 @@ def listar_saidas(
     servico: Optional[str] = Query(None),
     localizar: Optional[str] = Query(None),
     somente_g: Optional[bool] = Query(None),
+    codigo_exato: bool = Query(False),
     limit: Optional[int] = Query(None),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -674,7 +675,13 @@ def listar_saidas(
         )
         stmt = stmt.where(or_conds)
     elif codigo and codigo.strip():
-        stmt = stmt.where(Saida.codigo.ilike(f"%{codigo.strip()}%"))
+        codigo_trim = codigo.strip()
+        if codigo_exato:
+            stmt = stmt.where(
+                func.lower(func.trim(Saida.codigo)) == func.lower(codigo_trim)
+            )
+        else:
+            stmt = stmt.where(Saida.codigo.ilike(f"%{codigo_trim}%"))
 
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
 
