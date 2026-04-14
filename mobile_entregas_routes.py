@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, date
-from typing import Optional, List
+from decimal import Decimal
+from typing import Optional, List, Dict, Tuple
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, exists
@@ -28,6 +29,7 @@ from models import (
     MotivoAusencia,
     SaidaHistorico,
     RotasMotoboy,
+    EntregadorPrecoGlobal,
 )
 from saidas_routes import (
     STATUS_SAIU_PARA_ENTREGA,
@@ -139,6 +141,25 @@ class RotasAtivaOut(BaseModel):
     data: Optional[str] = None
 
 
+class ExtratoDiaItem(BaseModel):
+    data: str
+    total_pacotes_associados: int
+    total_pacotes_filtrados: int
+    valor_dia: Decimal
+
+
+class ExtratoFinanceiroOut(BaseModel):
+    periodo_inicio: str
+    periodo_fim: str
+    status_filtro: str
+    valor_a_receber: Decimal
+    total_pacotes_associados: int
+    total_pacotes_filtrados: int
+    total_cancelados: int
+    resumo_por_servico: Dict[str, int]
+    dias: List[ExtratoDiaItem]
+
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -221,6 +242,50 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
     }
 
 
+def _parse_data_yyyy_mm_dd(raw: Optional[str]) -> Optional[date]:
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+
+
+def _periodo_quinzena_atual(ref: date) -> Tuple[date, date]:
+    if ref.day <= 15:
+        return date(ref.year, ref.month, 1), ref
+    return date(ref.year, ref.month, 16), ref
+
+
+def _status_normalizado_upper(status: Optional[str]) -> str:
+    if not status:
+        return ""
+    return normalizar_status_saida(status).strip().upper()
+
+
+def _carregar_precos_motoboy(db: Session, sub_base: str) -> Dict[str, Decimal]:
+    zero = Decimal("0.00")
+    global_row = db.scalars(
+        select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
+    ).first()
+    if not global_row:
+        return {"shopee": zero, "flex": zero, "avulso": zero}
+    return {
+        "shopee": global_row.shopee_valor or zero,
+        "flex": global_row.ml_valor or zero,
+        "avulso": global_row.avulso_valor or zero,
+    }
+
+
+def _valor_saida(precos: Dict[str, Decimal], saida: Saida) -> Decimal:
+    t = _servico_tipo(saida.servico)
+    if t == "Shopee":
+        return precos["shopee"]
+    if t == "Flex":
+        return precos["flex"]
+    return precos["avulso"]
+
+
 # ============================================================
 # GET /mobile/entregas
 # ============================================================
@@ -240,8 +305,8 @@ def listar_entregas(
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
-    # Filtro por data: quando dia=hoje (ou data enviada) para finalizadas/ausentes
-    usar_filtro_hoje = (dia == "hoje") or (status in ("finalizadas", "ausentes") and data)
+    # Filtro por data: quando dia=hoje (ou data enviada) para pendentes/finalizadas/ausentes
+    usar_filtro_hoje = (dia == "hoje") or (status in ("pendente", "finalizadas", "ausentes") and data)
     if usar_filtro_hoje:
         if data:
             try:
@@ -259,6 +324,8 @@ def listar_entregas(
     )
     if status == "pendente":
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
+        if hoje is not None:
+            q = q.where(Saida.data == hoje)
     elif status == "finalizadas":
         q = q.where(Saida.status == STATUS_ENTREGUE)
         if hoje is not None:
@@ -287,6 +354,120 @@ def listar_entregas(
         detail = _get_detail_for_saida(db, s.id_saida)
         out.append(_saida_to_item(s, detail))
     return out
+
+
+@router.get("/entregas/extrato", response_model=ExtratoFinanceiroOut)
+def extrato_financeiro_motoboy(
+    data_inicio: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    data_fim: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    status_filtro: str = Query("grupo_entregue", description="grupo_entregue | todos"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    hoje = date.today()
+    inicio_in = _parse_data_yyyy_mm_dd(data_inicio)
+    fim_in = _parse_data_yyyy_mm_dd(data_fim)
+    if inicio_in is None or fim_in is None:
+        periodo_inicio, periodo_fim = _periodo_quinzena_atual(hoje)
+    else:
+        periodo_inicio, periodo_fim = inicio_in, fim_in
+    if periodo_inicio > periodo_fim:
+        raise HTTPException(status_code=400, detail="data_inicio deve ser menor ou igual a data_fim.")
+
+    modo = (status_filtro or "grupo_entregue").strip().lower()
+    if modo not in ("grupo_entregue", "todos"):
+        modo = "grupo_entregue"
+
+    q = select(Saida).where(
+        Saida.sub_base == sub_base,
+        Saida.motoboy_id == motoboy_id,
+        Saida.codigo.isnot(None),
+        Saida.data >= periodo_inicio,
+        Saida.data <= periodo_fim,
+    ).order_by(Saida.data.desc(), Saida.timestamp.desc())
+    rows = db.scalars(q).all()
+
+    grupo_entregue = {STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, STATUS_ENTREGUE}
+    precos = _carregar_precos_motoboy(db, sub_base)
+    valor_total = Decimal("0.00")
+    total_associados = 0
+    total_filtrados = 0
+    total_cancelados = 0
+    por_servico = {"Shopee": 0, "Flex": 0, "Avulso": 0}
+    dias_map: Dict[str, Dict[str, Decimal | int]] = {}
+
+    for s in rows:
+        status_up = _status_normalizado_upper(s.status)
+        is_cancelado = status_up == STATUS_CANCELADO
+        is_grupo_entregue = status_up in grupo_entregue
+        passa_filtro = (modo == "todos") or is_grupo_entregue
+
+        d = s.data.isoformat() if s.data else ""
+        if d and d not in dias_map:
+            dias_map[d] = {
+                "total_pacotes_associados": 0,
+                "total_pacotes_filtrados": 0,
+                "valor_dia": Decimal("0.00"),
+            }
+
+        if is_cancelado:
+            total_cancelados += 1
+        else:
+            total_associados += 1
+            if d:
+                dias_map[d]["total_pacotes_associados"] += 1
+
+        if not passa_filtro:
+            continue
+        total_filtrados += 1
+        if d:
+            dias_map[d]["total_pacotes_filtrados"] += 1
+
+        tipo = _servico_tipo(s.servico)
+        if tipo in por_servico:
+            por_servico[tipo] += 1
+
+        if is_cancelado:
+            continue
+        valor = _valor_saida(precos, s)
+        valor_total += valor
+        if d:
+            dias_map[d]["valor_dia"] += valor
+
+    dias = []
+    for d, v in dias_map.items():
+        if int(v["total_pacotes_filtrados"]) <= 0:
+            continue
+        dias.append(
+            ExtratoDiaItem(
+                data=d,
+                total_pacotes_associados=int(v["total_pacotes_associados"]),
+                total_pacotes_filtrados=int(v["total_pacotes_filtrados"]),
+                valor_dia=Decimal(v["valor_dia"]).quantize(Decimal("0.01")),
+            )
+        )
+    dias.sort(key=lambda item: item.data, reverse=True)
+
+    return ExtratoFinanceiroOut(
+        periodo_inicio=periodo_inicio.isoformat(),
+        periodo_fim=periodo_fim.isoformat(),
+        status_filtro=modo,
+        valor_a_receber=valor_total.quantize(Decimal("0.01")),
+        total_pacotes_associados=total_associados,
+        total_pacotes_filtrados=total_filtrados,
+        total_cancelados=total_cancelados,
+        resumo_por_servico={
+            "shopee": por_servico["Shopee"],
+            "flex": por_servico["Flex"],
+            "avulso": por_servico["Avulso"],
+        },
+        dias=dias,
+    )
 
 
 # ============================================================
