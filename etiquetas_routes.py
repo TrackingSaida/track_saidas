@@ -1,6 +1,6 @@
 """
 Rotas de Etiquetas
-POST /etiquetas/gerar — gera PDF de etiqueta 100x150mm (QR Code).
+POST /etiquetas/gerar — gera etiqueta 100x150mm (QR Code) em PDF/PNG.
 Modo genérico (padrão). TODO: futuro - Shopee/ML com autenticação nas APIs.
 """
 from __future__ import annotations
@@ -49,6 +49,7 @@ class EtiquetaGerarPayload(BaseModel):
     id_saida: Optional[int] = None  # Busca qr_payload_raw para ML
     servico: Optional[str] = None
     qr_payload: Optional[str] = None  # Payload bruto para QR (ML JSON)
+    formato: Optional[str] = Field(default="pdf", description="pdf | png")
 
 
 # ============================================================
@@ -235,6 +236,90 @@ def _gerar_pdf_etiqueta(
     return buf.getvalue()
 
 
+def _gerar_png_etiqueta(
+    codigo: str,
+    modo_final: str,
+    dados_extras: Optional[Dict[str, Any]] = None,
+    qr_content: Optional[str] = None,
+) -> bytes:
+    """
+    Gera PNG com o mesmo conteúdo da etiqueta (foco em visualização e compartilhamento mobile).
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import qrcode
+
+    # 100x150mm em ~300DPI
+    largura, altura = 1181, 1772
+    margem = 94
+    qr_size = 708
+
+    img = Image.new("RGB", (largura, altura), "white")
+    draw = ImageDraw.Draw(img)
+
+    def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        try:
+            if bold:
+                return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=size)
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size=size)
+        except Exception:
+            return ImageFont.load_default()
+
+    def _center_x(text: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> int:
+        left, _, right, _ = draw.textbbox((0, 0), text, font=font)
+        w = right - left
+        return int((largura - w) / 2)
+
+    titulo = "TRACKING SAÍDAS"
+    if modo_final == "shopee":
+        titulo = "SHOPEE ENTREGA"
+    elif modo_final == "ml":
+        titulo = "MERCADO ENVIOS"
+
+    y = margem
+    font_titulo = _font(28)
+    draw.text((_center_x(titulo, font_titulo), y), titulo, fill="black", font=font_titulo)
+    y += 72
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=12,
+        border=1,
+    )
+    qr.add_data(qr_content if qr_content else codigo)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    qr_img = qr_img.resize((qr_size, qr_size))
+    qr_x = int((largura - qr_size) / 2)
+    img.paste(qr_img, (qr_x, y))
+    y += qr_size + 45
+
+    font_codigo = _font(58, bold=True)
+    draw.text((_center_x(codigo, font_codigo), y), codigo, fill="black", font=font_codigo)
+    y += 84
+
+    dados = dados_extras or {}
+    dest = str(dados.get("destinatario") or "").strip()
+    cidade = str(dados.get("cidade") or "").strip()
+    cep = str(dados.get("cep") or "").strip()
+    if dest or cidade or cep:
+        font_info = _font(24)
+        if dest:
+            draw.text((margem, y), dest[:40], fill="black", font=font_info)
+            y += 36
+        if cidade or cep:
+            draw.text((margem, y), f"{cidade} {cep}".strip()[:40], fill="black", font=font_info)
+
+    rodape = "Tracking Saídas"
+    font_rodape = _font(20)
+    draw.text((_center_x(rodape, font_rodape), altura - margem), rodape, fill="black", font=font_rodape)
+
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    out.seek(0)
+    return out.getvalue()
+
+
 # ============================================================
 # ROTA
 # ============================================================
@@ -271,8 +356,8 @@ def gerar_etiqueta(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Gera etiqueta PDF 100x150mm.
-    Para ML: usa qr_payload_raw se disponível; senão tenta JSON experimental.
+    Gera etiqueta 100x150mm.
+    Para ML: usa qr_payload_raw se disponível; senão cai para o código.
     """
     codigo = (payload.codigo or "").strip()
     if not codigo:
@@ -296,24 +381,40 @@ def gerar_etiqueta(
 
     dados_extras: Optional[Dict[str, Any]] = None
 
+    formato = (payload.formato or "pdf").strip().lower()
+    if formato not in ("pdf", "png"):
+        raise HTTPException(400, "Formato inválido. Use 'pdf' ou 'png'.")
+
     try:
-        pdf_bytes = _gerar_pdf_etiqueta(
-            codigo=codigo,
-            modo_final=modo_final,
-            dados_extras=dados_extras,
-            qr_content=qr_content,
-        )
+        if formato == "png":
+            content = _gerar_png_etiqueta(
+                codigo=codigo,
+                modo_final=modo_final,
+                dados_extras=dados_extras,
+                qr_content=qr_content,
+            )
+            media_type = "image/png"
+            ext = "png"
+        else:
+            content = _gerar_pdf_etiqueta(
+                codigo=codigo,
+                modo_final=modo_final,
+                dados_extras=dados_extras,
+                qr_content=qr_content,
+            )
+            media_type = "application/pdf"
+            ext = "pdf"
     except Exception as e:
-        logger.exception("Erro ao gerar PDF etiqueta: %s", e)
-        raise HTTPException(500, "Falha ao gerar PDF.")
+        logger.exception("Erro ao gerar etiqueta: %s", e)
+        raise HTTPException(500, "Falha ao gerar etiqueta.")
 
     id_part = str(payload.id_saida) if payload.id_saida else "0"
     cod_safe = re.sub(r'[^\w\-.]', '', (codigo or "")[:40]) or "cod"
     srv_safe = re.sub(r'[^\w\-.]', '', (modo_final or "generic")[:20]) or "generic"
-    filename = f"etq-tracking-{id_part}-{cod_safe}-{srv_safe}.pdf"
+    filename = f"etq-tracking-{id_part}-{cod_safe}-{srv_safe}.{ext}"
     return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
+        content=content,
+        media_type=media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
         },
