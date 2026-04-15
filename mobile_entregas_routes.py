@@ -146,6 +146,15 @@ class ExtratoDiaItem(BaseModel):
     total_pacotes_associados: int
     total_pacotes_filtrados: int
     valor_dia: Decimal
+    itens: List["ExtratoPedidoItem"]
+
+
+class ExtratoPedidoItem(BaseModel):
+    id_saida: int
+    codigo: Optional[str]
+    status: str
+    exibicao: str
+    servico: str
 
 
 class ExtratoFinanceiroOut(BaseModel):
@@ -399,7 +408,7 @@ def extrato_financeiro_motoboy(
     total_filtrados = 0
     total_cancelados = 0
     por_servico = {"Shopee": 0, "Flex": 0, "Avulso": 0}
-    dias_map: Dict[str, Dict[str, Decimal | int]] = {}
+    dias_map: Dict[str, Dict[str, Decimal | int | List[ExtratoPedidoItem]]] = {}
 
     for s in rows:
         status_up = _status_normalizado_upper(s.status)
@@ -413,6 +422,7 @@ def extrato_financeiro_motoboy(
                 "total_pacotes_associados": 0,
                 "total_pacotes_filtrados": 0,
                 "valor_dia": Decimal("0.00"),
+                "itens": [],
             }
 
         if is_cancelado:
@@ -427,6 +437,15 @@ def extrato_financeiro_motoboy(
         total_filtrados += 1
         if d:
             dias_map[d]["total_pacotes_filtrados"] += 1
+            dias_map[d]["itens"].append(
+                ExtratoPedidoItem(
+                    id_saida=s.id_saida,
+                    codigo=s.codigo,
+                    status=s.status or "",
+                    exibicao=_status_exibicao(s.status),
+                    servico=_servico_tipo(s.servico),
+                )
+            )
 
         tipo = _servico_tipo(s.servico)
         if tipo in por_servico:
@@ -449,6 +468,7 @@ def extrato_financeiro_motoboy(
                 total_pacotes_associados=int(v["total_pacotes_associados"]),
                 total_pacotes_filtrados=int(v["total_pacotes_filtrados"]),
                 valor_dia=Decimal(v["valor_dia"]).quantize(Decimal("0.01")),
+                itens=list(v["itens"]),
             )
         )
     dias.sort(key=lambda item: item.data, reverse=True)
