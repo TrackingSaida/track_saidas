@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import time
+import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
+logger = logging.getLogger("main")
 
 # ──────────────────────────────────────────────────────────────────
 # Config
@@ -64,6 +66,11 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except Exception as exc:
+            logger.exception(
+                "cors_fallback_exception method=%s path=%s",
+                request.method,
+                request.url.path,
+            )
             origin = request.headers.get("origin")
             headers = {}
             if origin:
@@ -193,6 +200,13 @@ async def global_exception_handler(request: Request, exc: Exception):
                 detail = d if isinstance(d, str) else str(d.get("message", d.get("detail", d)))
     except Exception:
         pass
+    logger.exception(
+        "unhandled_exception method=%s path=%s status=%s detail=%s",
+        request.method,
+        request.url.path,
+        status,
+        detail,
+    )
     body = {"detail": detail}
     headers = dict(_cors_headers_for_request(request))
     return JSONResponse(status_code=status, content=body, headers=headers)

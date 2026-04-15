@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import uuid
+import hashlib
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from decimal import Decimal
@@ -75,6 +78,31 @@ def get_password_hash(password: str) -> str:
 # ======================================================
 security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+logger = logging.getLogger("auth")
+
+
+def _identifier_mask(identifier: str) -> str:
+    raw = (identifier or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 4:
+        return "*" * len(raw)
+    return f"{raw[:2]}***{raw[-2:]}"
+
+
+def _identifier_hash(identifier: str) -> str:
+    raw = (identifier or "").strip().lower().encode("utf-8")
+    if not raw:
+        return ""
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+def _auth_attempt_meta(identifier: str) -> Dict[str, str]:
+    return {
+        "attempt_id": uuid.uuid4().hex[:12],
+        "identifier_mask": _identifier_mask(identifier),
+        "identifier_hash": _identifier_hash(identifier),
+    }
 
 
 # ======================================================
@@ -411,15 +439,33 @@ async def motoboy_login(
     Se tiver 1 sub_base: retorna token.
     Se tiver múltiplas: retorna multiple_sub_base=true e lista para seleção.
     """
+    meta = _auth_attempt_meta(body.identifier)
+    logger.info(
+        "motoboy_login_attempt attempt_id=%s identifier_mask=%s identifier_hash=%s",
+        meta["attempt_id"], meta["identifier_mask"], meta["identifier_hash"]
+    )
+
     user = authenticate_user(db, body.identifier, body.password)
     if not user:
+        logger.warning(
+            "motoboy_login_failed attempt_id=%s reason=invalid_credentials",
+            meta["attempt_id"]
+        )
         raise HTTPException(401, "Login ou senha incorretos")
 
     if user.role != 4:
+        logger.info(
+            "motoboy_login_fallback_candidate attempt_id=%s reason=non_motoboy_role user_id=%s role=%s",
+            meta["attempt_id"], user.id, user.role
+        )
         raise HTTPException(403, "Acesso restrito a motoboys.")
 
     motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == user.id))
     if not motoboy:
+        logger.warning(
+            "motoboy_login_failed attempt_id=%s reason=motoboy_profile_not_found user_id=%s",
+            meta["attempt_id"], user.id
+        )
         raise HTTPException(404, "Perfil de motoboy não encontrado.")
 
     sub_bases_rows = db.scalars(
@@ -434,15 +480,34 @@ async def motoboy_login(
     must_change_password = _must_change_password_from_user(user)
 
     if len(sub_bases) > 1:
+        logger.info(
+            "motoboy_login_multiple_sub_base attempt_id=%s user_id=%s motoboy_id=%s sub_base_count=%s must_change_password=%s",
+            meta["attempt_id"], user.id, motoboy.id_motoboy, len(sub_bases), must_change_password
+        )
         return {"multiple_sub_base": True, "sub_bases": sub_bases, "must_change_password": must_change_password}
 
     if len(sub_bases) == 0:
+        logger.warning(
+            "motoboy_login_failed attempt_id=%s reason=no_active_sub_base user_id=%s motoboy_id=%s",
+            meta["attempt_id"], user.id, motoboy.id_motoboy
+        )
         raise HTTPException(403, "Motoboy sem sub_base ativa vinculada.")
 
     sub_base = sub_bases[0]
-    owner = _owner_for_sub_base(db, sub_base)
+    try:
+        owner = _owner_for_sub_base(db, sub_base)
+    except HTTPException as exc:
+        logger.warning(
+            "motoboy_login_failed attempt_id=%s reason=owner_validation_error sub_base=%s status=%s detail=%s",
+            meta["attempt_id"], sub_base, exc.status_code, exc.detail
+        )
+        raise
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = create_access_token(_claims_motoboy(user, motoboy, owner, sub_base), expires)
+    logger.info(
+        "motoboy_login_success attempt_id=%s user_id=%s motoboy_id=%s sub_base=%s must_change_password=%s",
+        meta["attempt_id"], user.id, motoboy.id_motoboy, sub_base, must_change_password
+    )
     return {"access_token": token, "token_type": "bearer", "must_change_password": must_change_password}
 
 
@@ -455,34 +520,68 @@ async def motoboy_select_subbase(
     Após motoboy-login com multiple_sub_base, o app envia
     identifier + password + sub_base escolhida para obter o token.
     """
+    meta = _auth_attempt_meta(body.identifier)
+    selected_sub_base = body.sub_base.strip()
+    logger.info(
+        "motoboy_select_subbase_attempt attempt_id=%s identifier_mask=%s identifier_hash=%s sub_base=%s",
+        meta["attempt_id"], meta["identifier_mask"], meta["identifier_hash"], selected_sub_base
+    )
+
     user = authenticate_user(db, body.identifier, body.password)
     if not user:
+        logger.warning(
+            "motoboy_select_subbase_failed attempt_id=%s reason=invalid_credentials",
+            meta["attempt_id"]
+        )
         raise HTTPException(401, "Login ou senha incorretos")
 
     if user.role != 4:
+        logger.info(
+            "motoboy_select_subbase_fallback_candidate attempt_id=%s reason=non_motoboy_role user_id=%s role=%s",
+            meta["attempt_id"], user.id, user.role
+        )
         raise HTTPException(403, "Acesso restrito a motoboys.")
 
     motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == user.id))
     if not motoboy:
+        logger.warning(
+            "motoboy_select_subbase_failed attempt_id=%s reason=motoboy_profile_not_found user_id=%s",
+            meta["attempt_id"], user.id
+        )
         raise HTTPException(404, "Perfil de motoboy não encontrado.")
 
     existe = db.scalar(
         select(MotoboySubBase).where(
             MotoboySubBase.motoboy_id == motoboy.id_motoboy,
-            MotoboySubBase.sub_base == body.sub_base.strip(),
+            MotoboySubBase.sub_base == selected_sub_base,
             MotoboySubBase.ativo.is_(True),
         )
     )
     if not existe:
+        logger.warning(
+            "motoboy_select_subbase_failed attempt_id=%s reason=invalid_or_inactive_sub_base user_id=%s motoboy_id=%s sub_base=%s",
+            meta["attempt_id"], user.id, motoboy.id_motoboy, selected_sub_base
+        )
         raise HTTPException(400, "Sub_base inválida ou inativa para este motoboy.")
 
-    owner = _owner_for_sub_base(db, body.sub_base.strip())
+    try:
+        owner = _owner_for_sub_base(db, selected_sub_base)
+    except HTTPException as exc:
+        logger.warning(
+            "motoboy_select_subbase_failed attempt_id=%s reason=owner_validation_error sub_base=%s status=%s detail=%s",
+            meta["attempt_id"], selected_sub_base, exc.status_code, exc.detail
+        )
+        raise
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = create_access_token(
-        _claims_motoboy(user, motoboy, owner, body.sub_base.strip()),
+        _claims_motoboy(user, motoboy, owner, selected_sub_base),
         expires,
     )
     must_change_password = _must_change_password_from_user(user)
+    logger.info(
+        "motoboy_select_subbase_success attempt_id=%s user_id=%s motoboy_id=%s sub_base=%s must_change_password=%s",
+        meta["attempt_id"], user.id, motoboy.id_motoboy, selected_sub_base, must_change_password
+    )
     return {"access_token": token, "token_type": "bearer", "must_change_password": must_change_password}
 
 
