@@ -30,6 +30,8 @@ from models import (
     SaidaHistorico,
     RotasMotoboy,
     EntregadorPrecoGlobal,
+    Owner,
+    OwnerCobrancaItem,
 )
 from saidas_routes import (
     STATUS_SAIU_PARA_ENTREGA,
@@ -53,6 +55,16 @@ def get_current_motoboy(user: User = Depends(get_current_user)) -> User:
     if getattr(user, "role", 0) != 4:
         raise HTTPException(status_code=403, detail="Acesso restrito a motoboys.")
     if not getattr(user, "motoboy_id", None):
+        raise HTTPException(status_code=403, detail="Token inválido para motoboy.")
+    return user
+
+
+def get_current_mobile_scan_user(user: User = Depends(get_current_user)) -> User:
+    """Permite scan no mobile para motoboy e staff (admin/operação)."""
+    role = int(getattr(user, "role", 0) or 0)
+    if role not in (0, 1, 2, 3, 4):
+        raise HTTPException(status_code=403, detail="Perfil sem acesso ao scan mobile.")
+    if role == 4 and not getattr(user, "motoboy_id", None):
         raise HTTPException(status_code=403, detail="Token inválido para motoboy.")
     return user
 
@@ -1048,11 +1060,44 @@ def _nome_motoboy_atual(db: Session, saida: Saida) -> str:
     return _get_motoboy_nome(db, motoboy) if motoboy else "Motoboy"
 
 
+def _owner_valor_por_sub_base(db: Session, user: User, sub_base: str) -> Decimal:
+    raw = getattr(user, "owner_valor", Decimal("0")) or Decimal("0")
+    try:
+        valor = Decimal(str(raw))
+    except Exception:
+        valor = Decimal("0")
+    if valor > 0:
+        return valor
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    if not owner:
+        return Decimal("0")
+    return Decimal(getattr(owner, "valor", 0) or 0)
+
+
+def _garantir_cobranca_owner_saida(db: Session, saida: Saida, owner_valor: Decimal) -> None:
+    ja_cobrado = db.scalar(
+        select(exists().where(
+            OwnerCobrancaItem.id_saida == saida.id_saida,
+            OwnerCobrancaItem.cancelado.is_(False),
+        ))
+    )
+    if ja_cobrado:
+        return
+    db.add(
+        OwnerCobrancaItem(
+            sub_base=saida.sub_base or "",
+            id_coleta=None,
+            id_saida=saida.id_saida,
+            valor=owner_valor,
+        )
+    )
+
+
 @router.post("/scan")
 def scan_codigo(
     body: ScanBody,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_motoboy),
+    user: User = Depends(get_current_mobile_scan_user),
 ):
     """
     Leituras sequenciais (igual web): se código não existe -> INSERT novo e atribui ao motoboy.
@@ -1061,9 +1106,12 @@ def scan_codigo(
     """
     raw = body.codigo.strip()
     sub_base = user.sub_base
-    motoboy_id = user.motoboy_id
+    role = int(getattr(user, "role", 0) or 0)
+    motoboy_id = getattr(user, "motoboy_id", None) if role == 4 else None
+    status_scan = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
+    owner_valor = _owner_valor_por_sub_base(db, user, sub_base)
 
     codigo, servico, qr_payload_raw = normalize_codigo(raw)
     if codigo is None:
@@ -1076,13 +1124,13 @@ def scan_codigo(
         select(Saida).where(
             Saida.codigo == codigo,
             Saida.sub_base == sub_base,
-        )
+        ).with_for_update()
     )
 
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
     if not saida:
-        motoboy = db.get(Motoboy, motoboy_id)
-        entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Motoboy")
+        motoboy = db.get(Motoboy, motoboy_id) if motoboy_id else None
+        entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
         qr_raw = qr_payload_raw.strip() if (qr_payload_raw and _should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
         try:
@@ -1094,16 +1142,17 @@ def scan_codigo(
                 motoboy_id=motoboy_id,
                 codigo=codigo,
                 servico=servico_val,
-                status=STATUS_SAIU_PARA_ENTREGA,
+                status=status_scan,
                 qr_payload_raw=qr_raw or None,
             )
             db.add(nova)
             db.flush()
+            _garantir_cobranca_owner_saida(db, nova, owner_valor)
             db.add(
                 SaidaHistorico(
                     id_saida=nova.id_saida,
                     evento="scan",
-                    status_novo=STATUS_SAIU_PARA_ENTREGA,
+                    status_novo=status_scan,
                     user_id=user.id,
                 )
             )
@@ -1132,13 +1181,25 @@ def scan_codigo(
 
     # Em rota / saiu com outro motoboy -> conflito (perguntar se quer assumir)
     if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
+        if motoboy_id is None:
+            if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
+                if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
+                    saida.qr_payload_raw = qr_payload_raw.strip()
+            _garantir_cobranca_owner_saida(db, saida, owner_valor)
+            db.commit()
+            db.refresh(saida)
+            detail = _get_detail_for_saida(db, saida.id_saida)
+            return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id == motoboy_id:
             if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
                 if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
                     saida.qr_payload_raw = qr_payload_raw.strip()
-                    db.commit()
+            _garantir_cobranca_owner_saida(db, saida, owner_valor)
+            db.commit()
             detail = _get_detail_for_saida(db, saida.id_saida)
             return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
+        _garantir_cobranca_owner_saida(db, saida, owner_valor)
+        db.commit()
         nome_atual = _nome_motoboy_atual(db, saida)
         return JSONResponse(
             status_code=409,
@@ -1154,7 +1215,7 @@ def scan_codigo(
         if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
             saida.qr_payload_raw = qr_payload_raw.strip()
     saida.motoboy_id = motoboy_id
-    saida.status = STATUS_SAIU_PARA_ENTREGA
+    saida.status = status_scan
     if status_norm == STATUS_AUSENTE:
         detail = _get_detail_for_saida(db, saida.id_saida)
         if detail:
@@ -1164,16 +1225,17 @@ def scan_codigo(
                 SaidaDetail(
                     id_saida=saida.id_saida,
                     id_entregador=motoboy_id,
-                    status=STATUS_SAIU_PARA_ENTREGA,
+                    status=status_scan,
                     tentativa=2,
                 )
             )
+    _garantir_cobranca_owner_saida(db, saida, owner_valor)
     db.add(
         SaidaHistorico(
             id_saida=saida.id_saida,
             evento="assumir",
             status_anterior=status_norm,
-            status_novo=STATUS_SAIU_PARA_ENTREGA,
+            status_novo=status_scan,
             user_id=user.id,
         )
     )
@@ -1223,7 +1285,10 @@ def assumir_entrega(
             status_code=422,
             detail=f"Pedido já entregue. Não é possível assumir. Status: {STATUS_ENTREGUE}.",
         )
+    owner_valor = _owner_valor_por_sub_base(db, user, user.sub_base or "")
     if s.motoboy_id == user.motoboy_id:
+        _garantir_cobranca_owner_saida(db, s, owner_valor)
+        db.commit()
         return {"ok": True, "id_saida": id_saida}
 
     antigo = s.motoboy_id
@@ -1253,5 +1318,6 @@ def assumir_entrega(
             user_id=user.id,
         )
     )
+    _garantir_cobranca_owner_saida(db, s, owner_valor)
     db.commit()
     return {"ok": True, "id_saida": id_saida}
