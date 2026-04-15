@@ -33,6 +33,38 @@ def _is_codigo_shopee(codigo: str) -> bool:
     return bool(re.match(r"^BR(\d{13}|\d{12}[A-Z])$", c))
 
 
+def _extract_ml_codigo(value: str) -> Optional[str]:
+    """Extrai código Mercado Livre (45-49) normalizado para 11 dígitos."""
+    if not value:
+        return None
+    digits = re.sub(r"\D+", "", _to_ascii_digits(str(value)))
+    ml_run = re.search(r"4[5-9]\d{9,}", digits)
+    if not ml_run:
+        return None
+    return ml_run.group(0)[:11]
+
+
+def canonicalize_servico(servico: Optional[str]) -> str:
+    """Normaliza rótulo de serviço para Shopee | Mercado Livre | Avulso."""
+    s = (servico or "").strip().lower()
+    if "shopee" in s:
+        return "Shopee"
+    if "mercado" in s or "flex" in s or re.search(r"\bml\b", s):
+        return "Mercado Livre"
+    return "Avulso"
+
+
+def _classify_codigo_text(codigo_raw: str) -> tuple[str, str]:
+    """Classifica um código textual em serviço canônico."""
+    codigo = _to_ascii_digits(str(codigo_raw or "")).upper().strip()
+    if _is_codigo_shopee(codigo):
+        return codigo, "Shopee"
+    ml_codigo = _extract_ml_codigo(codigo)
+    if ml_codigo:
+        return ml_codigo, "Mercado Livre"
+    return codigo, "Avulso"
+
+
 def normalize_codigo(raw_input: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Normaliza código bruto (QR/barras) para formato de busca em Saida.codigo.
@@ -44,34 +76,39 @@ def normalize_codigo(raw_input: str) -> tuple[Optional[str], Optional[str], Opti
     raw_input_str = (raw_input or "").strip()
     raw = _to_ascii_digits(raw_input_str).upper().strip()
     all_digits = re.sub(r"\D+", "", raw)
+    json_obj = None
+    is_json_payload = raw_input_str.startswith("{") and raw_input_str.endswith("}")
 
-    # PRIORIDADE 0 — Mercado Livre JSON (id, sender_id, hash_code)
-    if raw_input_str.strip().startswith("{") and raw_input_str.strip().endswith("}"):
+    if is_json_payload:
         try:
-            obj = json.loads(raw_input_str)
-            if isinstance(obj.get("id"), str) and (obj.get("sender_id") is not None or obj.get("hash_code") is not None):
-                codigo = str(obj["id"]).strip()
-                return codigo, "Mercado Livre", raw_input_str
+            json_obj = json.loads(raw_input_str)
         except (json.JSONDecodeError, TypeError):
-            pass
+            json_obj = None
+
+    # PRIORIDADE 0 — Mercado Livre JSON (id e/ou marcadores sender/hash)
+    if isinstance(json_obj, dict):
+        raw_id = json_obj.get("id")
+        if raw_id is not None:
+            id_str = str(raw_id).strip()
+            ml_id = _extract_ml_codigo(id_str)
+            has_ml_markers = any(
+                json_obj.get(k) is not None
+                for k in ("sender_id", "SENDER_ID", "hash_code", "HASH_CODE")
+            )
+            if id_str and (has_ml_markers or ml_id):
+                return (ml_id or id_str), "Mercado Livre", raw_input_str
 
     # PRIORIDADE 1 — QRCode JSON com external_order_id (usa original para preservar keys)
-    if raw_input_str.strip().startswith("{") and raw_input_str.strip().endswith("}"):
-        try:
-            obj = json.loads(raw_input_str)
-            eoid = obj.get("external_order_id") or obj.get("EXTERNAL_ORDER_ID")
-            if isinstance(eoid, str):
-                codigo = eoid.upper().strip()
-                servico = "Shopee" if _is_codigo_shopee(codigo) else "Avulso"
-                return codigo, servico, None
-        except (json.JSONDecodeError, TypeError):
-            pass
+    if isinstance(json_obj, dict):
+        eoid = json_obj.get("external_order_id") or json_obj.get("EXTERNAL_ORDER_ID")
+        if isinstance(eoid, str):
+            codigo, servico = _classify_codigo_text(eoid)
+            return codigo, servico, None
 
     # PRIORIDADE 2 — external_order_id fora de JSON
     ext_match = re.search(r'external_order_id["\']?\s*[:=]\s*["\']?([\w-]+)', raw, re.I)
     if ext_match:
-        codigo = ext_match.group(1).upper()
-        servico = "Shopee" if _is_codigo_shopee(codigo) else "Avulso"
+        codigo, servico = _classify_codigo_text(ext_match.group(1))
         return codigo, servico, None
 
     # PRIORIDADE 3 — MAGALU (external_grouper_code)
@@ -93,9 +130,9 @@ def normalize_codigo(raw_input: str) -> tuple[Optional[str], Optional[str], Opti
         return sh_match.group(1).upper(), "Shopee", None
 
     # Mercado Livre (45–49 → 11 dígitos)
-    ml_run = re.search(r"4[5-9]\d{9,}", all_digits)
-    if ml_run:
-        codigo = ml_run.group(0)[:11]
+    ml_codigo = _extract_ml_codigo(all_digits)
+    if ml_codigo:
+        codigo = ml_codigo
         return codigo, "Mercado Livre", raw_input_str
 
     # AVULSO — CEP (8 dígitos)

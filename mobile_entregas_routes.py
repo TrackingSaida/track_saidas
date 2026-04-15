@@ -41,7 +41,7 @@ from saidas_routes import (
     normalizar_status_saida,
     _get_motoboy_nome,
 )
-from codigo_normalizer import normalize_codigo
+from codigo_normalizer import normalize_codigo, canonicalize_servico
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 
@@ -1083,7 +1083,7 @@ def scan_codigo(
     if not saida:
         motoboy = db.get(Motoboy, motoboy_id)
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Motoboy")
-        servico_val = (servico or "Avulso").strip().title()
+        servico_val = canonicalize_servico(servico)
         qr_raw = qr_payload_raw.strip() if (qr_payload_raw and _should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
         try:
             nova = Saida(

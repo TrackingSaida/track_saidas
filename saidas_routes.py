@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from codigo_normalizer import canonicalize_servico
 
 
 # ============================================================
@@ -330,6 +331,20 @@ def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
     return False
 
 
+def _servico_text_expr(expr):
+    """Normaliza expressão SQL de serviço para comparações semânticas."""
+    return func.coalesce(func.unaccent(func.lower(expr)), "")
+
+
+def _servico_is_shopee_expr(expr):
+    return _servico_text_expr(expr).like("%shopee%")
+
+
+def _servico_is_mercado_expr(expr):
+    srv = _servico_text_expr(expr)
+    return srv.like("%mercado%") | srv.like("%flex%") | srv.like("%ml%")
+
+
 # ============================================================
 # POST — REGISTRAR SAÍDA
 # ============================================================
@@ -359,7 +374,7 @@ def registrar_saida(
 
     # Normalização
     codigo = payload.codigo.strip()
-    servico = payload.servico.strip().title()
+    servico = canonicalize_servico(payload.servico)
     status_val = normalizar_status_saida(payload.status)
 
     # Duplicidade
@@ -470,7 +485,7 @@ def ler_saida(
         )
 
     codigo = payload.codigo.strip()
-    servico = payload.servico.strip().title()
+    servico = canonicalize_servico(payload.servico)
 
     # 1 SELECT por (sub_base, codigo) — índice existente, O(1)
     existente = db.scalar(
@@ -671,7 +686,17 @@ def listar_saidas(
 
     if servico and servico.strip() and servico.lower() != "(todos)":
         srv_norm = servico.strip().lower()
-        stmt = stmt.where(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
+        if srv_norm == "shopee":
+            stmt = stmt.where(_servico_is_shopee_expr(Saida.servico))
+        elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
+            stmt = stmt.where(_servico_is_mercado_expr(Saida.servico))
+        elif srv_norm == "avulso":
+            stmt = stmt.where(
+                (~_servico_is_shopee_expr(Saida.servico))
+                & (~_servico_is_mercado_expr(Saida.servico))
+            )
+        else:
+            stmt = stmt.where(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
 
     if somente_g:
         stmt = stmt.where(Saida.is_grande.is_(True))
@@ -699,22 +724,23 @@ def listar_saidas(
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
 
     subq = stmt.subquery()
+    servico_expr = subq.c.servico
 
     sumShopee = db.scalar(
         select(func.count()).select_from(subq)
-        .where(func.unaccent(func.lower(subq.c.servico)) == func.unaccent("shopee"))
+        .where(_servico_is_shopee_expr(servico_expr))
     ) or 0
 
     sumMercado = db.scalar(
         select(func.count()).select_from(subq)
-        .where(func.unaccent(func.lower(subq.c.servico)) == func.unaccent("mercado livre"))
+        .where(_servico_is_mercado_expr(servico_expr))
     ) or 0
 
     sumAvulso = db.scalar(
         select(func.count()).select_from(subq)
         .where(
-            (func.unaccent(func.lower(subq.c.servico)) != func.unaccent("shopee")) &
-            (func.unaccent(func.lower(subq.c.servico)) != func.unaccent("mercado livre"))
+            (~_servico_is_shopee_expr(servico_expr)) &
+            (~_servico_is_mercado_expr(servico_expr))
         )
     ) or 0
 
@@ -1043,7 +1069,7 @@ def atualizar_saida(
                 item.cancelado = True
 
     if payload.servico is not None:
-        obj.servico = payload.servico.strip().title()
+        obj.servico = canonicalize_servico(payload.servico)
 
     if payload.base is not None:
         obj.base = payload.base.strip()
