@@ -43,7 +43,11 @@ from saidas_routes import (
     normalizar_status_saida,
     _get_motoboy_nome,
 )
-from codigo_normalizer import normalize_codigo, canonicalize_servico
+from codigo_normalizer import (
+    normalize_codigo,
+    canonicalize_servico,
+    is_qr_like_scan_payload,
+)
 from entregador_routes import resolver_precos_motoboy
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
@@ -97,6 +101,7 @@ class EntregaListItem(BaseModel):
 
 class ScanBody(BaseModel):
     codigo: str = Field(min_length=1)
+    origem: str = "camera"  # camera | manual
 
 
 class AusenteBody(BaseModel):
@@ -1085,6 +1090,13 @@ def _garantir_cobranca_owner_saida(db: Session, saida: Saida, owner_valor: Decim
     )
 
 
+def _scan_origem(raw: Optional[str]) -> str:
+    origem = (raw or "camera").strip().lower()
+    if origem not in ("camera", "manual"):
+        return "camera"
+    return origem
+
+
 @router.post("/scan")
 def scan_codigo(
     body: ScanBody,
@@ -1105,11 +1117,23 @@ def scan_codigo(
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
     owner_valor = _owner_valor_por_sub_base(db, user, sub_base)
 
-    codigo, servico, qr_payload_raw = normalize_codigo(raw)
+    origem = _scan_origem(getattr(body, "origem", None))
+    strict_qr = origem == "camera"
+    if strict_qr and not is_qr_like_scan_payload(raw):
+        raise HTTPException(
+            status_code=422,
+            detail="Leitura inválida pela câmera. Use apenas QRCode da etiqueta.",
+        )
+
+    codigo, servico, qr_payload_raw = normalize_codigo(raw, strict_qr=strict_qr)
     if codigo is None:
         raise HTTPException(
             status_code=422,
-            detail="Código inválido. Verifique o formato do QR/código de barras.",
+            detail=(
+                "QRCode inválido. Leia novamente o QR da etiqueta."
+                if strict_qr
+                else "Código inválido. Verifique o formato do QR/código de barras."
+            ),
         )
 
     saida = db.scalar(

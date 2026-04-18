@@ -54,7 +54,40 @@ def canonicalize_servico(servico: Optional[str]) -> str:
     return "Avulso"
 
 
-def _classify_codigo_text(codigo_raw: str) -> tuple[str, str]:
+def is_qr_like_scan_payload(raw_input: str) -> bool:
+    """Sinaliza se o payload parece uma leitura de QR válida para o fluxo mobile."""
+    raw_input_str = (raw_input or "").strip()
+    if not raw_input_str:
+        return False
+    raw = _to_ascii_digits(raw_input_str).upper().strip()
+    all_digits = re.sub(r"\D+", "", raw)
+
+    if raw_input_str.startswith("{") and raw_input_str.endswith("}"):
+        try:
+            obj = json.loads(raw_input_str)
+            if isinstance(obj, dict):
+                if obj.get("external_order_id") or obj.get("EXTERNAL_ORDER_ID"):
+                    return True
+                if obj.get("id") is not None and (
+                    obj.get("sender_id") is not None
+                    or obj.get("SENDER_ID") is not None
+                    or obj.get("hash_code") is not None
+                    or obj.get("HASH_CODE") is not None
+                ):
+                    return True
+        except (json.JSONDecodeError, TypeError):
+            return False
+
+    if re.search(r'external_order_id["\']?\s*[:=]\s*["\']?([\w-]+)', raw, re.I):
+        return True
+    if re.search(r"(?:^|[^A-Z0-9])(BR(?:\d{13}|\d{12}[A-Z]))(?=$|[^A-Z0-9])", raw, re.I):
+        return True
+    if _extract_ml_codigo(all_digits):
+        return True
+    return False
+
+
+def _classify_codigo_text(codigo_raw: str, strict_qr: bool = False) -> tuple[Optional[str], Optional[str]]:
     """Classifica um código textual em serviço canônico."""
     codigo = _to_ascii_digits(str(codigo_raw or "")).upper().strip()
     if _is_codigo_shopee(codigo):
@@ -62,10 +95,12 @@ def _classify_codigo_text(codigo_raw: str) -> tuple[str, str]:
     ml_codigo = _extract_ml_codigo(codigo)
     if ml_codigo:
         return ml_codigo, "Mercado Livre"
+    if strict_qr:
+        return None, None
     return codigo, "Avulso"
 
 
-def normalize_codigo(raw_input: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def normalize_codigo(raw_input: str, strict_qr: bool = False) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Normaliza código bruto (QR/barras) para formato de busca em Saida.codigo.
     Retorna (codigo, servico, qr_payload_raw).
@@ -102,13 +137,17 @@ def normalize_codigo(raw_input: str) -> tuple[Optional[str], Optional[str], Opti
     if isinstance(json_obj, dict):
         eoid = json_obj.get("external_order_id") or json_obj.get("EXTERNAL_ORDER_ID")
         if isinstance(eoid, str):
-            codigo, servico = _classify_codigo_text(eoid)
+            codigo, servico = _classify_codigo_text(eoid, strict_qr=strict_qr)
+            if codigo is None:
+                return None, None, None
             return codigo, servico, None
 
     # PRIORIDADE 2 — external_order_id fora de JSON
     ext_match = re.search(r'external_order_id["\']?\s*[:=]\s*["\']?([\w-]+)', raw, re.I)
     if ext_match:
-        codigo, servico = _classify_codigo_text(ext_match.group(1))
+        codigo, servico = _classify_codigo_text(ext_match.group(1), strict_qr=strict_qr)
+        if codigo is None:
+            return None, None, None
         return codigo, servico, None
 
     # PRIORIDADE 3 — MAGALU (external_grouper_code)
@@ -134,6 +173,9 @@ def normalize_codigo(raw_input: str) -> tuple[Optional[str], Optional[str], Opti
     if ml_codigo:
         codigo = ml_codigo
         return codigo, "Mercado Livre", raw_input_str
+
+    if strict_qr:
+        return None, None, None
 
     # AVULSO — CEP (8 dígitos)
     if re.match(r"^\d{8}$", all_digits):
