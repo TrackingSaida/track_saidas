@@ -14,7 +14,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, case
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -701,7 +701,20 @@ def listar_saidas(
     if somente_g:
         stmt = stmt.where(Saida.is_grande.is_(True))
 
-    if localizar and localizar.strip():
+    if codigo and codigo.strip():
+        codigo_trim = codigo.strip().upper()
+        if codigo_exato:
+            # Caminho otimizado para busca por código exato (aproveita índice em saidas.codigo).
+            stmt = stmt.where(Saida.codigo == codigo_trim)
+        else:
+            # Fallback sem wildcard inicial para reduzir custo quando houver busca parcial.
+            stmt = stmt.where(
+                or_(
+                    Saida.codigo == codigo_trim,
+                    Saida.codigo.ilike(f"{codigo_trim}%"),
+                )
+            )
+    elif localizar and localizar.strip():
         q = f"%{localizar.strip()}%"
         or_conds = or_(
             Saida.base.ilike(q),
@@ -712,37 +725,40 @@ def listar_saidas(
             Saida.status.ilike(q),
         )
         stmt = stmt.where(or_conds)
-    elif codigo and codigo.strip():
-        codigo_trim = codigo.strip()
-        if codigo_exato:
-            stmt = stmt.where(
-                func.lower(func.trim(Saida.codigo)) == func.lower(codigo_trim)
-            )
-        else:
-            stmt = stmt.where(Saida.codigo.ilike(f"%{codigo_trim}%"))
-
-    total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
 
     subq = stmt.subquery()
     servico_expr = subq.c.servico
+    agg_row = db.execute(
+        select(
+            func.count().label("total"),
+            func.coalesce(
+                func.sum(case((_servico_is_shopee_expr(servico_expr), 1), else_=0)),
+                0,
+            ).label("sum_shopee"),
+            func.coalesce(
+                func.sum(case((_servico_is_mercado_expr(servico_expr), 1), else_=0)),
+                0,
+            ).label("sum_mercado"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            (~_servico_is_shopee_expr(servico_expr))
+                            & (~_servico_is_mercado_expr(servico_expr)),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("sum_avulso"),
+        ).select_from(subq)
+    ).one()
 
-    sumShopee = db.scalar(
-        select(func.count()).select_from(subq)
-        .where(_servico_is_shopee_expr(servico_expr))
-    ) or 0
-
-    sumMercado = db.scalar(
-        select(func.count()).select_from(subq)
-        .where(_servico_is_mercado_expr(servico_expr))
-    ) or 0
-
-    sumAvulso = db.scalar(
-        select(func.count()).select_from(subq)
-        .where(
-            (~_servico_is_shopee_expr(servico_expr)) &
-            (~_servico_is_mercado_expr(servico_expr))
-        )
-    ) or 0
+    total = int(agg_row.total or 0)
+    sumShopee = int(agg_row.sum_shopee or 0)
+    sumMercado = int(agg_row.sum_mercado or 0)
+    sumAvulso = int(agg_row.sum_avulso or 0)
 
     stmt = stmt.order_by(Saida.timestamp.desc())
     if limit:
