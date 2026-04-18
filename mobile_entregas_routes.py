@@ -29,7 +29,6 @@ from models import (
     MotivoAusencia,
     SaidaHistorico,
     RotasMotoboy,
-    EntregadorPrecoGlobal,
     Owner,
     OwnerCobrancaItem,
 )
@@ -44,6 +43,7 @@ from saidas_routes import (
     _get_motoboy_nome,
 )
 from codigo_normalizer import normalize_codigo, canonicalize_servico
+from entregador_routes import resolver_precos_motoboy
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 
@@ -284,20 +284,6 @@ def _status_normalizado_upper(status: Optional[str]) -> str:
     return normalizar_status_saida(status).strip().upper()
 
 
-def _carregar_precos_motoboy(db: Session, sub_base: str) -> Dict[str, Decimal]:
-    zero = Decimal("0.00")
-    global_row = db.scalars(
-        select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
-    ).first()
-    if not global_row:
-        return {"shopee": zero, "flex": zero, "avulso": zero}
-    return {
-        "shopee": global_row.shopee_valor or zero,
-        "flex": global_row.ml_valor or zero,
-        "avulso": global_row.avulso_valor or zero,
-    }
-
-
 def _valor_saida(precos: Dict[str, Decimal], saida: Saida) -> Decimal:
     t = _servico_tipo(saida.servico)
     if t == "Shopee":
@@ -414,7 +400,12 @@ def extrato_financeiro_motoboy(
     rows = db.scalars(q).all()
 
     grupo_entregue = {STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, STATUS_ENTREGUE}
-    precos = _carregar_precos_motoboy(db, sub_base)
+    precos = resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
+    precos_mobile = {
+        "shopee": precos["shopee_valor"],
+        "flex": precos["ml_valor"],
+        "avulso": precos["avulso_valor"],
+    }
     valor_total = Decimal("0.00")
     total_associados = 0
     total_filtrados = 0
@@ -465,7 +456,7 @@ def extrato_financeiro_motoboy(
 
         if is_cancelado:
             continue
-        valor = _valor_saida(precos, s)
+        valor = _valor_saida(precos_mobile, s)
         valor_total += valor
         if d:
             dias_map[d]["valor_dia"] += valor

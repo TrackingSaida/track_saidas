@@ -238,12 +238,49 @@ def resolver_precos_entregador(
     return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero}
 
 
-def resolver_precos_motoboy(db: Session, sub_base: str) -> Dict[str, Decimal]:
+def _resolver_entregador_principal_do_motoboy(
+    db: Session,
+    sub_base: str,
+    motoboy_id: int,
+) -> Optional[int]:
     """
-    Retorna {shopee_valor, ml_valor, avulso_valor} para motoboy (preço global da sub_base).
-    Motoboys não têm preço individual; usam sempre EntregadorPrecoGlobal.
+    Retorna o id_entregador mais provável para um motoboy da sub_base.
+    """
+    entregador_ids, _ = _resolve_executor_scope_ids(
+        db=db,
+        sub_base_user=sub_base,
+        motoboy_id=motoboy_id,
+    )
+    if not entregador_ids:
+        return None
+    return sorted(entregador_ids)[0]
+
+
+def resolver_precos_motoboy(
+    db: Session,
+    sub_base: str,
+    motoboy_id: Optional[int] = None,
+) -> Dict[str, Decimal]:
+    """
+    Retorna {shopee_valor, ml_valor, avulso_valor} para motoboy.
+    Regra:
+    1) quando houver motoboy_id, tenta mapear para entregador e usar exceção de entregador;
+    2) fallback para preço global da sub_base.
     """
     zero = Decimal("0.00")
+    if motoboy_id is not None:
+        entregador_id = _resolver_entregador_principal_do_motoboy(
+            db=db,
+            sub_base=sub_base,
+            motoboy_id=motoboy_id,
+        )
+        if entregador_id is not None:
+            return resolver_precos_entregador(
+                db=db,
+                id_entregador=entregador_id,
+                sub_base=sub_base,
+            )
+
     global_row = db.scalars(
         select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
     ).first()
@@ -600,7 +637,7 @@ def _calcular_valor_base_motoboy_periodo(
         func.lower(Saida.status).in_(status_validos),
     )
     rows = db.scalars(stmt).all()
-    precos = resolver_precos_motoboy(db, sub_base_user)
+    precos = resolver_precos_motoboy(db, sub_base_user, motoboy_id=motoboy_id)
     total = Decimal("0.00")
     for saida in rows:
         tipo = _normalizar_servico(saida.servico)
@@ -805,7 +842,11 @@ def resumo_entregadores(
         precos_key = ("m", mid) if mid is not None else ("e", eid)
         if precos_key not in cache_precos:
             if mid is not None:
-                cache_precos[precos_key] = resolver_precos_motoboy(db, sub_base_user)
+                cache_precos[precos_key] = resolver_precos_motoboy(
+                    db,
+                    sub_base_user,
+                    motoboy_id=mid,
+                )
             elif eid is not None and eid > 0:
                 cache_precos[precos_key] = resolver_precos_entregador(db, eid, sub_base_user)
             else:
