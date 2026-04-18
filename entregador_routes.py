@@ -66,6 +66,9 @@ class ExecutorItem(BaseModel):
     id_motoboy: Optional[int] = None
     nome: str
     tipo: str  # "entregador" | "motoboy"
+    executor_tipo: Optional[str] = None  # "e" | "m"
+    executor_id: Optional[int] = None
+    executor_key: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -409,6 +412,9 @@ def list_executores(
             id_motoboy=None,
             nome=(ent.nome or f"Entregador {ent.id_entregador}").strip(),
             tipo="entregador",
+            executor_tipo="e",
+            executor_id=ent.id_entregador,
+            executor_key=f"e_{ent.id_entregador}",
         ))
 
     # Motoboys vinculados à sub_base
@@ -428,6 +434,9 @@ def list_executores(
             id_motoboy=motoboy.id_motoboy,
             nome=nome,
             tipo="motoboy",
+            executor_tipo="m",
+            executor_id=motoboy.id_motoboy,
+            executor_key=f"m_{motoboy.id_motoboy}",
         ))
 
     return out
@@ -452,6 +461,90 @@ def _get_motoboy_nome(db: Session, motoboy_id: int) -> str:
         return f"Motoboy {motoboy_id}"
     nome = (f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or "").strip()
     return nome or f"Motoboy {motoboy_id}"
+
+
+def _resolve_executor_scope_ids(
+    db: Session,
+    sub_base_user: str,
+    entregador_id: Optional[int] = None,
+    motoboy_id: Optional[int] = None,
+) -> tuple[set[int], set[int]]:
+    """
+    Resolve IDs equivalentes de um mesmo profissional entre dados legados (entregador_id)
+    e modelo atual (motoboy_id), usando username/documento como vínculo.
+    """
+    entregador_ids: set[int] = set()
+    motoboy_ids: set[int] = set()
+    usernames: set[str] = set()
+    documentos: set[str] = set()
+
+    if entregador_id is not None and entregador_id > 0:
+        ent = db.get(Entregador, entregador_id)
+        if ent and ent.sub_base == sub_base_user:
+            entregador_ids.add(ent.id_entregador)
+            if (ent.username_entregador or "").strip():
+                usernames.add(ent.username_entregador.strip())
+            if (ent.documento or "").strip():
+                documentos.add(ent.documento.strip())
+
+    if motoboy_id is not None and motoboy_id > 0:
+        mb = db.get(Motoboy, motoboy_id)
+        if mb:
+            pertence_sub_base = bool(mb.sub_base == sub_base_user)
+            if not pertence_sub_base:
+                pertence_sub_base = db.scalar(
+                    select(func.count())
+                    .select_from(MotoboySubBase)
+                    .where(
+                        MotoboySubBase.motoboy_id == motoboy_id,
+                        MotoboySubBase.sub_base == sub_base_user,
+                    )
+                ) > 0
+            if pertence_sub_base:
+                motoboy_ids.add(mb.id_motoboy)
+                if (mb.documento or "").strip():
+                    documentos.add(mb.documento.strip())
+                if mb.user_id:
+                    u = db.get(User, mb.user_id)
+                    if u and u.sub_base == sub_base_user and (u.username or "").strip():
+                        usernames.add(u.username.strip())
+
+    if usernames or documentos:
+        stmt_ent = select(Entregador.id_entregador).where(Entregador.sub_base == sub_base_user)
+        conds_ent = []
+        if usernames:
+            conds_ent.append(Entregador.username_entregador.in_(sorted(usernames)))
+        if documentos:
+            conds_ent.append(Entregador.documento.in_(sorted(documentos)))
+        if conds_ent:
+            stmt_ent = stmt_ent.where(or_(*conds_ent))
+            for eid in db.scalars(stmt_ent).all():
+                if eid is not None:
+                    entregador_ids.add(int(eid))
+
+        stmt_mb = (
+            select(Motoboy.id_motoboy)
+            .join(User, User.id == Motoboy.user_id, isouter=True)
+            .outerjoin(MotoboySubBase, MotoboySubBase.motoboy_id == Motoboy.id_motoboy)
+            .where(
+                or_(
+                    Motoboy.sub_base == sub_base_user,
+                    MotoboySubBase.sub_base == sub_base_user,
+                )
+            )
+        )
+        conds_mb = []
+        if usernames:
+            conds_mb.append(User.username.in_(sorted(usernames)))
+        if documentos:
+            conds_mb.append(Motoboy.documento.in_(sorted(documentos)))
+        if conds_mb:
+            stmt_mb = stmt_mb.where(or_(*conds_mb))
+            for mid in db.scalars(stmt_mb).all():
+                if mid is not None:
+                    motoboy_ids.add(int(mid))
+
+    return entregador_ids, motoboy_ids
 
 
 def _calcular_valor_base_periodo(
@@ -551,6 +644,8 @@ def resumo_entregadores(
     data_fim: Optional[date] = Query(None),
     entregador_id: Optional[int] = Query(None),
     motoboy_id: Optional[int] = Query(None),
+    executor_tipo: Optional[str] = Query(None),
+    executor_id: Optional[int] = Query(None),
     fechamento_status: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
@@ -560,6 +655,19 @@ def resumo_entregadores(
     sub_base_user = _resolve_user_base(db, current_user)
     if entregador_id is not None and motoboy_id is not None:
         raise HTTPException(400, "Informe apenas um de entregador_id ou motoboy_id.")
+
+    if executor_id is not None and executor_tipo:
+        tipo = executor_tipo.strip().lower()
+        if tipo in ("e", "entregador"):
+            if motoboy_id is not None:
+                raise HTTPException(400, "Não combine executor_tipo=entregador com motoboy_id.")
+            entregador_id = executor_id
+        elif tipo in ("m", "motoboy"):
+            if entregador_id is not None:
+                raise HTTPException(400, "Não combine executor_tipo=motoboy com entregador_id.")
+            motoboy_id = executor_id
+        else:
+            raise HTTPException(400, "executor_tipo inválido. Use 'e' ou 'm'.")
 
     # Inclui saída e entrega; exclui cancelados (alinhado a contabilidade/dashboard)
     status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
@@ -578,10 +686,22 @@ def resumo_entregadores(
         stmt = stmt.where(Saida.data >= data_inicio)
     if data_fim is not None:
         stmt = stmt.where(Saida.data <= data_fim)
-    if entregador_id is not None:
-        stmt = stmt.where(Saida.entregador_id == entregador_id)
-    if motoboy_id is not None:
-        stmt = stmt.where(Saida.motoboy_id == motoboy_id)
+    if entregador_id is not None or motoboy_id is not None:
+        entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
+            db=db,
+            sub_base_user=sub_base_user,
+            entregador_id=entregador_id,
+            motoboy_id=motoboy_id,
+        )
+        conds_executor = []
+        if entregador_ids:
+            conds_executor.append(Saida.entregador_id.in_(sorted(entregador_ids)))
+        if motoboy_ids:
+            conds_executor.append(Saida.motoboy_id.in_(sorted(motoboy_ids)))
+        if not conds_executor:
+            stmt = stmt.where(Saida.id_saida == -1)
+        else:
+            stmt = stmt.where(or_(*conds_executor))
 
     rows = db.scalars(stmt).all()
 
