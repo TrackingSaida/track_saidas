@@ -38,6 +38,7 @@ from saidas_routes import (
     STATUS_ENTREGUE,
     STATUS_AUSENTE,
     STATUS_CANCELADO,
+    _check_delete_window_or_409,
     _should_store_qr_payload_raw,
     normalizar_status_saida,
     _get_motoboy_nome,
@@ -1150,7 +1151,7 @@ def scan_codigo(
             db.commit()
             db.refresh(nova)
             detail = _get_detail_for_saida(db, nova.id_saida)
-            return {"ok": True, "conflito": False, "entrega": _saida_to_item(nova, detail)}
+            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _saida_to_item(nova, detail)}
         except Exception as e:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Erro ao registrar leitura: {e}")
@@ -1180,7 +1181,7 @@ def scan_codigo(
             db.commit()
             db.refresh(saida)
             detail = _get_detail_for_saida(db, saida.id_saida)
-            return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
+            return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id == motoboy_id:
             if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
                 if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
@@ -1188,7 +1189,7 @@ def scan_codigo(
             _garantir_cobranca_owner_saida(db, saida, owner_valor)
             db.commit()
             detail = _get_detail_for_saida(db, saida.id_saida)
-            return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
+            return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         _garantir_cobranca_owner_saida(db, saida, owner_valor)
         db.commit()
         nome_atual = _nome_motoboy_atual(db, saida)
@@ -1233,7 +1234,31 @@ def scan_codigo(
     db.commit()
     db.refresh(saida)
     detail = _get_detail_for_saida(db, saida.id_saida)
-    return {"ok": True, "conflito": False, "entrega": _saida_to_item(saida, detail)}
+    return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+
+
+# ============================================================
+# DELETE /mobile/entrega/{id}
+# ============================================================
+@router.delete("/entrega/{id_saida}", status_code=204)
+def deletar_entrega_mobile(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """
+    Remove definitivamente a saída do próprio motoboy.
+    Reaproveita a mesma regra de janela de exclusão (24h) da web.
+    """
+    s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    _check_delete_window_or_409(s.timestamp)
+    try:
+        db.delete(s)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Erro ao deletar saída.")
+    return
 
 
 # ============================================================
