@@ -93,6 +93,15 @@ def _classify_servico(servico: Optional[str]) -> str:
     return "avulso"
 
 
+def _saida_conta_para_indicador(saida: Saida, modo_entregas: str) -> bool:
+    """Define elegibilidade de saída para indicadores conforme modo escolhido."""
+    st = (getattr(saida, "status", None) or "").strip().lower()
+    if modo_entregas == "entregue":
+        return st == "entregue"
+    # modo "saiu"/"operacional" (default): status operacionais válidos
+    return st in STATUS_SAIDAS_VALIDOS
+
+
 # --- Schemas de resposta ---
 
 
@@ -985,6 +994,7 @@ class DashboardSaidasResponse(BaseModel):
 def get_dashboard_saidas(
     data_inicio: Optional[date] = Query(None, description="Data inicial (YYYY-MM-DD)"),
     data_fim: Optional[date] = Query(None, description="Data final (YYYY-MM-DD)"),
+    modo_entregas: str = Query("saiu", description="Base de contagem: 'saiu'/'operacional' (status operacionais válidos) ou 'entregue'"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -999,6 +1009,9 @@ def get_dashboard_saidas(
         data_fim = today
     if data_inicio > data_fim:
         data_inicio, data_fim = data_fim, data_inicio
+    modo = (modo_entregas or "saiu").strip().lower()
+    if modo not in ("saiu", "operacional", "entregue"):
+        modo = "saiu"
     # Saídas válidas (saiu, entregue) e canceladas no período — por dia civil
     stmt_saidas = select(Saida).where(
         Saida.sub_base == sub_base,
@@ -1007,8 +1020,7 @@ def get_dashboard_saidas(
         Saida.codigo.isnot(None),
     )
     rows_saidas = db.execute(stmt_saidas).scalars().all()
-    status_lower = [s.lower() for s in STATUS_SAIDAS_VALIDOS]
-    rows_validas = [s for s in rows_saidas if (s.status or "").lower() in status_lower]
+    rows_validas = [s for s in rows_saidas if _saida_conta_para_indicador(s, modo)]
     cancelamentos = sum(1 for s in rows_saidas if (s.status or "").lower() in ("cancelado", "cancelada"))
     total_saidas = len(rows_validas)
     actor_por_saida: Dict[int, tuple] = {}
