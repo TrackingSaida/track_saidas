@@ -1,0 +1,85 @@
+---
+description: Fluxo de commits, PRs e releases do projeto TrackingSaida
+alwaysApply: true
+---
+
+# Fluxo de desenvolvimento do TrackingSaida
+
+Sempre que eu pedir ajuda para preparar commit, branch, PR ou release, siga estas regras.
+
+## Commits
+
+Use mensagens claras em português, seguindo este padrão:
+
+- feat: nova funcionalidade
+- fix: correção de bug
+- chore: manutenção técnica
+- docs: documentação
+- refactor: refatoração
+- release: preparação de versão
+
+Exemplos:
+
+- feat: adiciona tela de acompanhamento de saídas
+- fix: corrige erro no cálculo de totais
+- chore: adiciona workflow de release
+- docs: atualiza instruções de configuração
+- refactor: reorganiza chamadas da API
+
+## Branches
+
+Para novas funcionalidades, sugerir branches:
+
+- feature/nome-curto
+- fix/nome-curto
+- chore/nome-curto
+- release/vX.Y.Z
+
+Evitar commit direto na main, exceto correções emergenciais pequenas.
+
+## Pull Requests
+
+Quando eu pedir para preparar uma PR:
+
+1. Verificar as alterações feitas no projeto.
+2. Resumir o objetivo da alteração.
+3. Listar os principais arquivos alterados.
+4. Gerar uma descrição de PR em português seguindo o template do GitHub.
+5. Sugerir uma ou mais labels:
+   - feature
+   - bug
+   - fix
+   - chore
+   - documentation
+   - refactor
+   - breaking-change
+6. Informar riscos da alteração.
+7. Informar como testar.
+8. Não fazer push, merge ou release sem confirmação explícita.
+
+## Releases
+
+Quando eu pedir para preparar uma versão:
+
+1. Verificar o tipo de mudança:
+   - PATCH: correções pequenas
+   - MINOR: novas funcionalidades compatíveis
+   - MAJOR: breaking changes
+2. Sugerir a próxima versão usando SemVer.
+3. Preparar um resumo de release notes em português.
+4. Orientar a criação da tag usando os comandos:
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+5. Lembrar que a release oficial será criada automaticamente pelo GitHub Actions.
+
+## Segurança
+
+Antes de commit ou PR, verificar se não há:
+
+- arquivos .env
+- tokens
+- senhas
+- chaves privadas
+- dados sensíveis
+- credenciais de banco
+- credenciais de API
