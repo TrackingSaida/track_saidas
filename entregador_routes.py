@@ -611,14 +611,28 @@ def _calcular_valor_base_periodo(
     periodo_inicio: date,
     periodo_fim: date,
 ) -> Decimal:
-    """Calcula o valor_base a partir das saídas do entregador no período (para resumo e modal)."""
+    """Calcula valor_base por escopo equivalente do entregador (legacy + motoboy vinculado)."""
     if periodo_inicio > periodo_fim:
         return Decimal("0.00")
+
+    entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
+        db=db,
+        sub_base_user=sub_base_user,
+        entregador_id=entregador_id,
+    )
+    conds_executor = []
+    if entregador_ids:
+        conds_executor.append(Saida.entregador_id.in_(sorted(entregador_ids)))
+    if motoboy_ids:
+        conds_executor.append(Saida.motoboy_id.in_(sorted(motoboy_ids)))
+    if not conds_executor:
+        return Decimal("0.00")
+
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
-        Saida.entregador_id == entregador_id,
         Saida.codigo.isnot(None),
         func.lower(Saida.status).in_(STATUS_VALOR_BASE_VALIDOS),
+        or_(*conds_executor),
     )
     rows_raw = db.scalars(stmt).all()
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
