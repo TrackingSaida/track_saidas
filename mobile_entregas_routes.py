@@ -1109,9 +1109,12 @@ def listar_motivos_ausencia(
 # ============================================================
 def _nome_motoboy_atual(db: Session, saida: Saida) -> str:
     if not saida or not saida.motoboy_id:
-        return "Motoboy"
+        return ""
     motoboy = db.get(Motoboy, saida.motoboy_id)
-    return _get_motoboy_nome(db, motoboy) if motoboy else "Motoboy"
+    if not motoboy:
+        return ""
+    nome = (_get_motoboy_nome(db, motoboy) or "").strip()
+    return nome
 
 
 def _owner_valor_por_sub_base(db: Session, user: User, sub_base: str) -> Decimal:
@@ -1252,7 +1255,11 @@ def scan_codigo(
             detail=f"Pedido já entregue. Não é possível registrar leitura. Status: {STATUS_ENTREGUE}.",
         )
 
-    # Em rota / saiu com outro motoboy -> conflito (perguntar se quer assumir)
+    # Em rota / saiu:
+    # - staff segue sem conflito
+    # - mesmo motoboy segue sem conflito
+    # - sem titular (motoboy_id nulo) segue leitura normal (reatribui sem conflito)
+    # - outro motoboy titular: conflito 409 para confirmar assumir
     if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         if motoboy_id is None:
             if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
@@ -1271,22 +1278,25 @@ def scan_codigo(
             db.commit()
             detail = _get_detail_for_saida(db, saida.id_saida)
             return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
-        _garantir_cobranca_owner_saida(db, saida, owner_valor)
-        db.commit()
-        nome_atual = _nome_motoboy_atual(db, saida)
-        return JSONResponse(
-            status_code=409,
-            content={
-                "conflito": True,
-                "motoboy_atual": nome_atual,
-                "id_saida": saida.id_saida,
-            },
-        )
+        if saida.motoboy_id is not None:
+            _garantir_cobranca_owner_saida(db, saida, owner_valor)
+            db.commit()
+            nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "conflito": True,
+                    "motoboy_atual": nome_atual,
+                    "id_saida": saida.id_saida,
+                },
+            )
+        # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
 
     # Coletado ou AUSENTE ou outro: atribuir ao motoboy logado
     if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
         if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
             saida.qr_payload_raw = qr_payload_raw.strip()
+    motoboy_id_anterior = saida.motoboy_id
     if motoboy_id is not None:
         motoboy = db.get(Motoboy, motoboy_id)
         if motoboy:
@@ -1314,6 +1324,8 @@ def scan_codigo(
             evento="assumir",
             status_anterior=status_norm,
             status_novo=status_scan,
+            motoboy_id_anterior=motoboy_id_anterior,
+            motoboy_id_novo=motoboy_id,
             user_id=user.id,
         )
     )
