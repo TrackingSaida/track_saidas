@@ -420,10 +420,21 @@ def extrato_financeiro_motoboy(
         Saida.sub_base == sub_base,
         Saida.motoboy_id == motoboy_id,
         Saida.codigo.isnot(None),
-        Saida.data >= periodo_inicio,
-        Saida.data <= periodo_fim,
     ).order_by(Saida.data.desc(), Saida.timestamp.desc())
-    rows = db.scalars(q).all()
+    rows_all = db.scalars(q).all()
+    rows_periodo = list(rows_all)
+    op_ctx_map = carregar_contexto_operacional(db, [s.id_saida for s in rows_periodo])
+    rows: List[Saida] = []
+    for s in rows_periodo:
+        ctx = op_ctx_map.get(s.id_saida)
+        if ctx and (ctx.removido_sem_inicio_ativo or not ctx.leitura_valida):
+            continue
+        ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
+        if ts_op is None:
+            continue
+        if ts_op.date() < periodo_inicio or ts_op.date() > periodo_fim:
+            continue
+        rows.append(s)
 
     grupo_entregue = {STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, STATUS_ENTREGUE}
     precos = resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
@@ -445,7 +456,9 @@ def extrato_financeiro_motoboy(
         is_grupo_entregue = status_up in grupo_entregue
         passa_filtro = (modo == "todos") or is_grupo_entregue
 
-        d = s.data.isoformat() if s.data else ""
+        ctx = op_ctx_map.get(s.id_saida)
+        ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
+        d = ts_op.date().isoformat() if ts_op else ""
         if d and d not in dias_map:
             dias_map[d] = {
                 "total_pacotes_associados": 0,
