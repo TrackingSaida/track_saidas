@@ -6,7 +6,7 @@ GET /entregadores/fechamentos/{id_fechamento} — obter um (para modal)
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
