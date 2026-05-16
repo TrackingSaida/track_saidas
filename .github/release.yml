@@ -1,0 +1,27 @@
+changelog:
+  categories:
+    - title: 🚀 Novidades e melhorias
+      labels:
+        - feature
+
+    - title: 🐛 Correções
+      labels:
+        - bug
+        - fix
+
+    - title: 🧰 Manutenção técnica
+      labels:
+        - chore
+        - refactor
+
+    - title: 📚 Documentação
+      labels:
+        - documentation
+
+    - title: ⚠️ Mudanças incompatíveis
+      labels:
+        - breaking-change
+
+    - title: Outras alterações
+      labels:
+        - "*"
