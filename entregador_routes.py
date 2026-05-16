@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import date, datetime, time
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
+from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
 router = APIRouter(prefix="/entregadores", tags=["Entregadores"])
 
@@ -103,6 +104,11 @@ class EntregadorResumoItem(BaseModel):
     flex: Dict[str, Any]
     avulso: Dict[str, Any]
     total_dia: Decimal
+    total_feitos: int = 0
+    total_cancelado: int = 0
+    valor_feitos: Decimal = Decimal("0.00")
+    valor_cancelados: Decimal = Decimal("0.00")
+    valor_total: Decimal = Decimal("0.00")
     g_total: int = 0
     fechamento_status: Optional[str] = None  # PENDENTE | GERADO | REAJUSTADO
     id_fechamento: Optional[int] = None  # quando existe fechamento
@@ -124,6 +130,7 @@ class EntregadorResumoResponse(BaseModel):
     sumAvulso: int
     sumValor: Decimal
     sumTotalEntregas: int
+    sumTotalCancelado: int
 
 
 class PrecoGlobalOut(BaseModel):
@@ -594,26 +601,29 @@ def _calcular_valor_base_periodo(
     """Calcula o valor_base a partir das saídas do entregador no período (para resumo e modal)."""
     if periodo_inicio > periodo_fim:
         return Decimal("0.00")
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue"]
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue", "cancelado", "cancelados"]
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.entregador_id == entregador_id,
         Saida.codigo.isnot(None),
-        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
-        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
         func.lower(Saida.status).in_(status_validos),
     )
-    rows = db.scalars(stmt).all()
+    rows_raw = db.scalars(stmt).all()
+    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     precos = resolver_precos_entregador(db, entregador_id, sub_base_user)
     total = Decimal("0.00")
     for saida in rows:
+        status_norm = (saida.status or "").strip().lower()
+        is_cancelado = "cancel" in status_norm
         tipo = _normalizar_servico(saida.servico)
+        delta = Decimal("0.00")
         if tipo == "shopee":
-            total += precos["shopee_valor"]
+            delta = precos["shopee_valor"]
         elif tipo == "flex":
-            total += precos["ml_valor"]
+            delta = precos["ml_valor"]
         else:
-            total += precos["avulso_valor"]
+            delta = precos["avulso_valor"]
+        total += (-delta if is_cancelado else delta)
     return total.quantize(Decimal("0.01"))
 
 
@@ -627,26 +637,29 @@ def _calcular_valor_base_motoboy_periodo(
     """Calcula o valor_base a partir das saídas do motoboy no período (resumo/fechamento)."""
     if periodo_inicio > periodo_fim:
         return Decimal("0.00")
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "cancelado", "cancelados"]
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.motoboy_id == motoboy_id,
         Saida.codigo.isnot(None),
-        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
-        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
         func.lower(Saida.status).in_(status_validos),
     )
-    rows = db.scalars(stmt).all()
+    rows_raw = db.scalars(stmt).all()
+    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     precos = resolver_precos_motoboy(db, sub_base_user, motoboy_id=motoboy_id)
     total = Decimal("0.00")
     for saida in rows:
+        status_norm = (saida.status or "").strip().lower()
+        is_cancelado = "cancel" in status_norm
         tipo = _normalizar_servico(saida.servico)
+        delta = Decimal("0.00")
         if tipo == "shopee":
-            total += precos["shopee_valor"]
+            delta = precos["shopee_valor"]
         elif tipo == "flex":
-            total += precos["ml_valor"]
+            delta = precos["ml_valor"]
         else:
-            total += precos["avulso_valor"]
+            delta = precos["avulso_valor"]
+        total += (-delta if is_cancelado else delta)
     return total.quantize(Decimal("0.01"))
 
 
@@ -707,7 +720,7 @@ def resumo_entregadores(
             raise HTTPException(400, "executor_tipo inválido. Use 'e' ou 'm'.")
 
     # Inclui saída e entrega; exclui cancelados (alinhado a contabilidade/dashboard)
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
+    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "cancelado", "cancelados"]
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.codigo.isnot(None),
@@ -719,10 +732,6 @@ def resumo_entregadores(
         ),
     )
 
-    if data_inicio is not None:
-        stmt = stmt.where(Saida.data >= data_inicio)
-    if data_fim is not None:
-        stmt = stmt.where(Saida.data <= data_fim)
     if entregador_id is not None or motoboy_id is not None:
         entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
             db=db,
@@ -740,11 +749,14 @@ def resumo_entregadores(
         else:
             stmt = stmt.where(or_(*conds_executor))
 
-    rows = db.scalars(stmt).all()
+    rows_raw = db.scalars(stmt).all()
+    rows, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_raw, data_inicio, data_fim)
 
     agrupado: Dict[str, Dict[str, Any]] = {}
     for saida in rows:
-        dia = saida.timestamp.date().isoformat()
+        ctx = op_ctx_map.get(saida.id_saida)
+        op_ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or saida.timestamp
+        dia = op_ts.date().isoformat()
         if getattr(saida, "motoboy_id", None) is not None:
             mid = saida.motoboy_id
             key = f"{dia}_m_{mid}"
@@ -757,6 +769,11 @@ def resumo_entregadores(
                     "qtde_shopee": 0,
                     "qtde_flex": 0,
                     "qtde_avulso": 0,
+                    "cancel_shopee": 0,
+                    "cancel_flex": 0,
+                    "cancel_avulso": 0,
+                    "total_feitos": 0,
+                    "total_cancelado": 0,
                     "g_total": 0,
                 }
         else:
@@ -774,10 +791,22 @@ def resumo_entregadores(
                     "qtde_shopee": 0,
                     "qtde_flex": 0,
                     "qtde_avulso": 0,
+                    "cancel_shopee": 0,
+                    "cancel_flex": 0,
+                    "cancel_avulso": 0,
+                    "total_feitos": 0,
+                    "total_cancelado": 0,
                     "g_total": 0,
                 }
+        status_norm = (saida.status or "").strip().lower()
+        is_cancelado = "cancel" in status_norm
         tipo = _normalizar_servico(saida.servico)
-        agrupado[key][f"qtde_{tipo}"] += 1
+        if is_cancelado:
+            agrupado[key]["total_cancelado"] = agrupado[key].get("total_cancelado", 0) + 1
+            agrupado[key][f"cancel_{tipo}"] += 1
+        else:
+            agrupado[key]["total_feitos"] = agrupado[key].get("total_feitos", 0) + 1
+            agrupado[key][f"qtde_{tipo}"] += 1
         if getattr(saida, "is_grande", False):
             agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + 1
 
@@ -855,7 +884,13 @@ def resumo_entregadores(
         valor_shopee = item["qtde_shopee"] * precos["shopee_valor"]
         valor_flex = item["qtde_flex"] * precos["ml_valor"]
         valor_avulso = item["qtde_avulso"] * precos["avulso_valor"]
-        total_dia = valor_shopee + valor_flex + valor_avulso
+        valor_feitos = valor_shopee + valor_flex + valor_avulso
+        valor_cancelados = (
+            Decimal(item.get("cancel_shopee", 0)) * precos["shopee_valor"]
+            + Decimal(item.get("cancel_flex", 0)) * precos["ml_valor"]
+            + Decimal(item.get("cancel_avulso", 0)) * precos["avulso_valor"]
+        ).quantize(Decimal("0.01"))
+        total_dia = (valor_feitos - valor_cancelados).quantize(Decimal("0.01"))
 
         fech_status, id_fech, fech = _get_fechamento(eid, mid, item["data"])
 
@@ -910,6 +945,11 @@ def resumo_entregadores(
                     "total": valor_avulso,
                 },
                 total_dia=total_dia,
+                total_feitos=item.get("total_feitos", 0),
+                total_cancelado=item.get("total_cancelado", 0),
+                valor_feitos=valor_feitos.quantize(Decimal("0.01")),
+                valor_cancelados=valor_cancelados.quantize(Decimal("0.01")),
+                valor_total=total_dia,
                 g_total=item.get("g_total", 0),
                 fechamento_status=fech_status,
                 id_fechamento=id_fech,
@@ -932,8 +972,9 @@ def resumo_entregadores(
     sumShopee = sum(i.shopee["qtde"] for i in lista)
     sumFlex = sum(i.flex["qtde"] for i in lista)
     sumAvulso = sum(i.avulso["qtde"] for i in lista)
-    sumValor = sum((i.total_dia for i in lista), Decimal("0.00"))
+    sumValor = sum((i.valor_total for i in lista), Decimal("0.00"))
     sumTotalEntregas = sumShopee + sumFlex + sumAvulso
+    sumTotalCancelado = sum(i.total_cancelado for i in lista)
 
     totalItems = len(lista)
     totalPages = (totalItems + pageSize - 1) // pageSize if totalItems else 0
@@ -952,6 +993,7 @@ def resumo_entregadores(
         sumAvulso=sumAvulso,
         sumValor=sumValor,
         sumTotalEntregas=sumTotalEntregas,
+        sumTotalCancelado=sumTotalCancelado,
     )
 
 

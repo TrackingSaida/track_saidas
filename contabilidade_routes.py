@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import Coleta, Entregador, EntregadorFechamento, Motoboy, Saida, User
+from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
 
@@ -235,13 +236,12 @@ def get_resumo_contabilidade(
         select(Saida)
         .where(
             Saida.sub_base == sub_base,
-            Saida.timestamp >= dt_start,
-            Saida.timestamp <= dt_end,
             Saida.codigo.isnot(None),
             func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
         )
     )
-    rows_saidas_raw = db.scalars(stmt_saidas).all()
+    rows_saidas_all = db.scalars(stmt_saidas).all()
+    rows_saidas_raw, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_saidas_all, data_inicio, data_fim)
     # Filtrar pelo modo de indicadores: só contam saídas que "entregaram" conforme modo (saiu vs entregue)
     rows_saidas = [s for s in rows_saidas_raw if _saida_conta_para_indicador(s, modo)]
     total_saidas = len(rows_saidas)
@@ -285,7 +285,9 @@ def get_resumo_contabilidade(
         eid, mid = _resolve_actor_saida(db, sub_base, s)
         if eid is None and mid is None:
             continue
-        data_saida = s.timestamp.date()
+        ctx = op_ctx_map.get(s.id_saida)
+        op_ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
+        data_saida = op_ts.date()
         if eid is not None:
             if cache_coberto.get((("e", eid), data_saida), False):
                 continue

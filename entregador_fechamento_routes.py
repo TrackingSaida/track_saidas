@@ -6,7 +6,7 @@ GET /entregadores/fechamentos/{id_fechamento} — obter um (para modal)
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date
 from decimal import Decimal
 from typing import Optional
 
@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
+from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
 from entregador_routes import (
     _resolve_user_base,
@@ -34,7 +35,7 @@ STATUS_GERADO = "GERADO"
 STATUS_REAJUSTADO = "REAJUSTADO"
 
 # Status válidos para saidas no cálculo (alinhado ao app mobile)
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente"]
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "cancelado", "cancelados"]
 
 
 def _contar_g_por_servico_entregador(
@@ -49,11 +50,10 @@ def _contar_g_por_servico_entregador(
         Saida.sub_base == sub_base,
         Saida.entregador_id == id_entregador,
         Saida.is_grande.is_(True),
-        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
-        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
     )
     stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
-    rows = db.scalars(stmt).all()
+    rows_raw = db.scalars(stmt).all()
+    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     g_shopee = g_ml = g_avulso = 0
     for s in rows:
         t = _normalizar_servico(s.servico)
@@ -78,11 +78,10 @@ def _contar_g_por_servico_motoboy(
         Saida.sub_base == sub_base,
         Saida.motoboy_id == motoboy_id,
         Saida.is_grande.is_(True),
-        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
-        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
     )
     stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
-    rows = db.scalars(stmt).all()
+    rows_raw = db.scalars(stmt).all()
+    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     g_shopee = g_ml = g_avulso = 0
     for s in rows:
         t = _normalizar_servico(s.servico)
@@ -137,12 +136,11 @@ def _calcular_valor_base(
         Saida.sub_base == sub_base,
         Saida.entregador_id == id_entregador,
         Saida.codigo.isnot(None),
-        Saida.timestamp >= datetime.combine(periodo_inicio, time.min),
-        Saida.timestamp <= datetime.combine(periodo_fim, time(23, 59, 59)),
     )
     from sqlalchemy import func
     stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
-    rows = db.scalars(stmt).all()
+    rows_raw = db.scalars(stmt).all()
+    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
 
     precos = resolver_precos_entregador(db, id_entregador, sub_base)
     total = Decimal("0.00")
