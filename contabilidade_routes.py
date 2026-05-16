@@ -31,14 +31,14 @@ STATUS_FECHAMENTO_CONTABIL = ("GERADO", "REAJUSTADO", "FECHADO")  # FECHADO = le
 def _saida_conta_para_indicador(saida: Saida, modo_entregas: str) -> bool:
     """
     Define se a saída entra na contagem de indicadores/despesas conforme o modo.
-    modo 'saiu': status contendo "saiu" (comportamento legado).
+    modo 'saiu'/'operacional': status operacionais válidos (alinhado a Registros/Fechamento).
     modo 'entregue': apenas status exatamente "entregue" (app mobile).
     """
     st = (getattr(saida, "status", None) or "").strip().lower()
     if modo_entregas == "entregue":
         return st == "entregue"
-    # modo "saiu" ou default
-    return "saiu" in st
+    # modo "saiu"/"operacional" ou default
+    return st in STATUS_SAIDAS_VALIDOS
 
 
 def _decimal(v) -> Decimal:
@@ -213,14 +213,14 @@ class ContabilidadeResumoResponse(BaseModel):
 def get_resumo_contabilidade(
     data_inicio: date = Query(..., description="Data inicial do período"),
     data_fim: date = Query(..., description="Data final do período"),
-    modo_entregas: str = Query("saiu", description="Base de contagem: 'saiu' (saiu para entrega) ou 'entregue' (status entregue app mobile)"),
+    modo_entregas: str = Query("saiu", description="Base de contagem: 'saiu'/'operacional' (status operacionais válidos) ou 'entregue' (status entregue app mobile)"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     if data_inicio > data_fim:
         raise HTTPException(400, "data_inicio deve ser menor ou igual a data_fim.")
     modo = (modo_entregas or "saiu").strip().lower()
-    if modo not in ("saiu", "entregue"):
+    if modo not in ("saiu", "operacional", "entregue"):
         modo = "saiu"
 
     sub_base = getattr(current_user, "sub_base", None)
