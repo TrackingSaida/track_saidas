@@ -49,6 +49,7 @@ from codigo_normalizer import (
     is_qr_like_scan_payload,
 )
 from entregador_routes import resolver_precos_motoboy
+from saida_operacional_utils import carregar_contexto_operacional
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 
@@ -299,6 +300,25 @@ def _valor_saida(precos: Dict[str, Decimal], saida: Saida) -> Decimal:
     return precos["avulso"]
 
 
+def _filtrar_por_data_operacional(
+    db: Session,
+    saidas: List[Saida],
+    data_ref: Optional[date],
+) -> List[Saida]:
+    if not saidas or data_ref is None:
+        return list(saidas)
+    ctx_map = carregar_contexto_operacional(db, [s.id_saida for s in saidas])
+    out: List[Saida] = []
+    for s in saidas:
+        ctx = ctx_map.get(s.id_saida)
+        if ctx and (ctx.removido_sem_inicio_ativo or not ctx.leitura_valida):
+            continue
+        ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
+        if ts and ts.date() == data_ref:
+            out.append(s)
+    return out
+
+
 # ============================================================
 # GET /mobile/entregas
 # ============================================================
@@ -337,8 +357,6 @@ def listar_entregas(
     )
     if status == "pendente":
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
-        if hoje is not None:
-            q = q.where(Saida.data == hoje)
     elif status == "finalizadas":
         q = q.where(Saida.status == STATUS_ENTREGUE)
         if hoje is not None:
@@ -362,6 +380,8 @@ def listar_entregas(
     q = q.order_by(Saida.data.desc(), Saida.timestamp.desc())
 
     rows = db.scalars(q).all()
+    if status == "pendente" and hoje is not None:
+        rows = _filtrar_por_data_operacional(db, rows, hoje)
     out = []
     for s in rows:
         detail = _get_detail_for_saida(db, s.id_saida)
@@ -524,13 +544,21 @@ def resumo_entregas(
             hoje = date.today()
     else:
         hoje = date.today()
-    pendentes = db.scalar(
-        select(func.count(Saida.id_saida)).where(
+    rows_pendentes_all = db.scalars(
+        select(Saida).where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
             Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
         )
-    ) or 0
+    ).all()
+    ctx_map_pendentes = carregar_contexto_operacional(db, [s.id_saida for s in rows_pendentes_all])
+    rows_pendentes = [
+        s
+        for s in rows_pendentes_all
+        if not (ctx_map_pendentes.get(s.id_saida) and (ctx_map_pendentes[s.id_saida].removido_sem_inicio_ativo or not ctx_map_pendentes[s.id_saida].leitura_valida))
+    ]
+    rows_pendentes_hoje = _filtrar_por_data_operacional(db, rows_pendentes, hoje)
+    pendentes = len(rows_pendentes_hoje)
     # Finalizadas hoje: baseia-se no evento "entregue" do histórico para alinhar com as telas de registros.
     finalizadas_hoje = db.scalar(
         select(func.count(Saida.id_saida))
@@ -561,15 +589,12 @@ def resumo_entregas(
             Saida.status == STATUS_AUSENTE,
         )
     ) or 0
-    # Em atraso (D+1): só contabiliza criação antes de hoje (data de criação < hoje)
-    atraso_d1 = db.scalar(
-        select(func.count(Saida.id_saida)).where(
-            Saida.sub_base == sub_base,
-            Saida.motoboy_id == motoboy_id,
-            Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
-            func.date(Saida.timestamp) < hoje,
-        )
-    ) or 0
+    # Em atraso (D+1): considera data operacional da última ação válida.
+    atraso_d1 = sum(
+        1
+        for s in rows_pendentes
+        if ((ctx_map_pendentes.get(s.id_saida).operacional_ts if ctx_map_pendentes.get(s.id_saida) else None) or s.timestamp).date() < hoje
+    )
 
     return {
         "pendentes": pendentes,
@@ -1277,7 +1302,20 @@ def deletar_entrega_mobile(
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     _check_delete_window_or_409(s.timestamp)
     try:
-        db.delete(s)
+        db.add(
+            SaidaHistorico(
+                id_saida=s.id_saida,
+                evento="removido_sem_inicio",
+                status_anterior=s.status,
+                status_novo=s.status,
+                motoboy_id_anterior=s.motoboy_id,
+                motoboy_id_novo=None,
+                user_id=user.id,
+            )
+        )
+        s.motoboy_id = None
+        if normalizar_status_saida(s.status) in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+            s.status = STATUS_SAIU_PARA_ENTREGA
         db.commit()
     except Exception:
         db.rollback()
@@ -1296,6 +1334,17 @@ def desatribuir_entrega(
 ):
     """Remove atribuição: motoboy_id = null. Apenas para entregas do próprio motoboy."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    db.add(
+        SaidaHistorico(
+            id_saida=s.id_saida,
+            evento="desatribuido",
+            status_anterior=s.status,
+            status_novo=s.status,
+            motoboy_id_anterior=s.motoboy_id,
+            motoboy_id_novo=None,
+            user_id=user.id,
+        )
+    )
     s.motoboy_id = None
     db.commit()
     return {"ok": True, "id_saida": id_saida}

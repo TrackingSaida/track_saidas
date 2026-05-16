@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from saida_operacional_utils import carregar_contexto_operacional
 from codigo_normalizer import canonicalize_servico
 
 
@@ -156,6 +157,7 @@ class SaidaHistoricoItemOut(BaseModel):
     usuario_nome: Optional[str] = None
     motoboy_id_anterior: Optional[int] = None
     motoboy_id_novo: Optional[int] = None
+    acao_label: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -768,16 +770,10 @@ def listar_saidas(
 
     rows = db.execute(stmt).scalars().all()
 
-    # Data/hora para exibição: primeiro evento do histórico ou fallback para saida.timestamp
-    first_ts_map = {}
+    op_ctx_map = {}
     if rows:
         ids = [r.id_saida for r in rows]
-        hist_rows = db.execute(
-            select(SaidaHistorico.id_saida, func.min(SaidaHistorico.timestamp).label("ts"))
-            .where(SaidaHistorico.id_saida.in_(ids))
-            .group_by(SaidaHistorico.id_saida)
-        ).all()
-        first_ts_map = {row.id_saida: row.ts for row in hist_rows}
+        op_ctx_map = carregar_contexto_operacional(db, ids)
 
     return {
         "total": total,
@@ -787,9 +783,11 @@ def listar_saidas(
         "items": [
             {
                 "id_saida": r.id_saida,
-                "timestamp": first_ts_map.get(r.id_saida) or r.timestamp,
+                "timestamp": (op_ctx_map.get(r.id_saida).operacional_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
+                "data_hora_acao": (op_ctx_map.get(r.id_saida).ultimo_evento_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
+                "acao": (op_ctx_map.get(r.id_saida).acao_label if op_ctx_map.get(r.id_saida) else None) or "Sem ação",
                 "sub_base": r.sub_base,
-                "username": r.username,
+                "username": (op_ctx_map.get(r.id_saida).ultimo_ator_username if op_ctx_map.get(r.id_saida) else None) or r.username,
                 "entregador": r.entregador,
                 "entregador_id": getattr(r, "entregador_id", None),
                 "motoboy_id": getattr(r, "motoboy_id", None),
@@ -1004,6 +1002,7 @@ def get_saida_historico(
     out = []
     for row in rows:
         h, username = row[0], row[1]
+        evento_norm = (h.evento or "").strip().lower()
         out.append(SaidaHistoricoItemOut(
             id=h.id,
             id_saida=h.id_saida,
@@ -1015,6 +1014,20 @@ def get_saida_historico(
             usuario_nome=username,
             motoboy_id_anterior=h.motoboy_id_anterior,
             motoboy_id_novo=h.motoboy_id_novo,
+            acao_label={
+                "lido": "Lido",
+                "scan": "Scan",
+                "assumir": "Assumiu entrega",
+                "assumido": "Assumiu entrega",
+                "reatribuicao": "Reatribuido",
+                "reatribuido": "Reatribuido",
+                "removido_sem_inicio": "Removido sem iniciar rota",
+                "desatribuido": "Desatribuido",
+                "em_rota": "Iniciou rota",
+                "entregue": "Entregue",
+                "ausente": "Ausente",
+                "cancelado": "Cancelado",
+            }.get(evento_norm, (h.evento or "").replace("_", " ").capitalize()),
         ))
     return out
 
