@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -634,6 +634,9 @@ def _calcular_valor_base_periodo(
         func.lower(Saida.status).in_(STATUS_VALOR_BASE_VALIDOS),
         or_(*conds_executor),
     )
+    # Reduz cardinalidade para períodos grandes antes da filtragem operacional.
+    stmt = stmt.where(Saida.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()))
+    stmt = stmt.where(Saida.timestamp < datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time()))
     rows_raw = db.scalars(stmt).all()
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     precos = resolver_precos_entregador(db, entregador_id, sub_base_user)
@@ -669,6 +672,9 @@ def _calcular_valor_base_motoboy_periodo(
         Saida.codigo.isnot(None),
         func.lower(Saida.status).in_(STATUS_VALOR_BASE_VALIDOS),
     )
+    # Reduz cardinalidade para períodos grandes antes da filtragem operacional.
+    stmt = stmt.where(Saida.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()))
+    stmt = stmt.where(Saida.timestamp < datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time()))
     rows_raw = db.scalars(stmt).all()
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     precos = resolver_precos_motoboy(db, sub_base_user, motoboy_id=motoboy_id)
@@ -731,6 +737,11 @@ def resumo_entregadores(
             Saida.motoboy_id.isnot(None),
         ),
     )
+    # Pré-filtro por janela de timestamp para evitar carregar massa histórica completa.
+    if data_inicio is not None:
+        stmt = stmt.where(Saida.timestamp >= datetime.combine(data_inicio, datetime.min.time()))
+    if data_fim is not None:
+        stmt = stmt.where(Saida.timestamp < datetime.combine(data_fim + timedelta(days=1), datetime.min.time()))
 
     if entregador_id is not None or motoboy_id is not None:
         entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
