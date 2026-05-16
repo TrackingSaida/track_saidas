@@ -34,6 +34,38 @@ STATUS_COLETADO = "coletado"
 MEDIA_ENTREGAS_POR_ROTA_DEFAULT = 140
 
 
+def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> Dict[int, str]:
+    ids = sorted({int(mid) for mid in motoboy_ids if mid is not None})
+    if not ids:
+        return {}
+    rows_motoboy = db.execute(
+        select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(ids))
+    ).all()
+    motoboy_user_map: Dict[int, Optional[int]] = {
+        int(mid): (int(uid) if uid is not None else None)
+        for mid, uid in rows_motoboy
+    }
+    user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
+    user_map: Dict[int, tuple] = {}
+    if user_ids:
+        rows_user = db.execute(
+            select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
+        ).all()
+        user_map = {
+            int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
+            for uid, nome, sobrenome, username in rows_user
+        }
+    out: Dict[int, str] = {}
+    for mid in ids:
+        uid = motoboy_user_map.get(mid)
+        if uid is None:
+            out[mid] = f"Motoboy {mid}"
+            continue
+        nome, sobrenome, username = user_map.get(uid, ("", "", ""))
+        out[mid] = (f"{nome} {sobrenome}".strip() or username or f"Motoboy {mid}")
+    return out
+
+
 def _sub_base(user: User) -> str:
     sb = getattr(user, "sub_base", None)
     if not sb:
@@ -979,12 +1011,15 @@ def get_dashboard_saidas(
     rows_validas = [s for s in rows_saidas if (s.status or "").lower() in status_lower]
     cancelamentos = sum(1 for s in rows_saidas if (s.status or "").lower() in ("cancelado", "cancelada"))
     total_saidas = len(rows_validas)
+    actor_por_saida: Dict[int, tuple] = {}
+    for s in rows_validas:
+        actor_por_saida[int(s.id_saida)] = _resolve_actor_saida(db, sub_base, s)
     taxa_cancelamento = round((cancelamentos / (total_saidas + cancelamentos) * 100), 1) if (total_saidas + cancelamentos) > 0 else 0.0
 
     # Entregadores/motoboys ativos no período (que tiveram ao menos uma saída)
     atores_ativos = set()  # ("e", eid) ou ("m", mid)
     for s in rows_validas:
-        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is not None:
             atores_ativos.add(("e", eid))
         elif mid is not None:
@@ -995,7 +1030,7 @@ def get_dashboard_saidas(
     cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
     custo_total = Decimal("0")
     for s in rows_validas:
-        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is None and mid is None:
             continue
         key = ("e", eid) if eid is not None else ("m", mid)
@@ -1042,7 +1077,7 @@ def get_dashboard_saidas(
         key = dt.isoformat()
         evolucao_map[key] = {"date": key, "shopee": 0, "mercado_livre": 0, "avulso": 0, "valor_total": Decimal("0")}
     for s in rows_validas:
-        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is None and mid is None:
             continue
         key = ("e", eid) if eid is not None else ("m", mid)
@@ -1089,7 +1124,7 @@ def get_dashboard_saidas(
     ent_ml: Dict[tuple, int] = {}
     ent_avulso: Dict[tuple, int] = {}
     for s in rows_validas:
-        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is None and mid is None:
             continue
         actor_key = ("e", eid) if eid is not None else ("m", mid)
@@ -1115,12 +1150,18 @@ def get_dashboard_saidas(
             ent_avulso[actor_key] = ent_avulso.get(actor_key, 0) + 1
         ent_custo[actor_key] = ent_custo.get(actor_key, Decimal("0")) + v
     ent_nomes: Dict[tuple, str] = {}
+    ent_ids = [k[1] for k in ent_vol if k[0] == "e"]
+    motoboy_ids = [k[1] for k in ent_vol if k[0] == "m"]
+    ent_map: Dict[int, str] = {}
+    if ent_ids:
+        rows_ent = db.scalars(select(Entregador).where(Entregador.id_entregador.in_(sorted(set(ent_ids))))).all()
+        ent_map = {int(e.id_entregador): (e.nome or f"ID {e.id_entregador}") for e in rows_ent}
+    motoboy_nome_map = _carregar_nomes_motoboy_ids(db, motoboy_ids)
     for k in ent_vol:
         if k[0] == "e":
-            ent = db.get(Entregador, k[1])
-            ent_nomes[k] = (ent.nome or f"ID {k[1]}") if ent else f"ID {k[1]}"
+            ent_nomes[k] = ent_map.get(int(k[1]), f"ID {k[1]}")
         else:
-            ent_nomes[k] = _contab_motoboy_nome(db, k[1])
+            ent_nomes[k] = motoboy_nome_map.get(int(k[1]), _contab_motoboy_nome(db, k[1]))
     ranking_entregadores = [
         DashboardSaidasRankingEntregadorOut(
             id_entregador=actor_key[1] if actor_key[0] == "e" else None,

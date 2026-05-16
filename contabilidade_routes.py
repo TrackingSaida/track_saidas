@@ -89,6 +89,39 @@ def _get_motoboy_nome(db: Session, motoboy_id: int) -> str:
     return nome or f"Motoboy {motoboy_id}"
 
 
+def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> Dict[int, str]:
+    """Resolve nomes de motoboy em lote para evitar N+1."""
+    ids = sorted({int(mid) for mid in motoboy_ids if mid is not None})
+    if not ids:
+        return {}
+    rows_motoboy = db.execute(
+        select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(ids))
+    ).all()
+    motoboy_user_map: Dict[int, Optional[int]] = {
+        int(mid): (int(uid) if uid is not None else None)
+        for mid, uid in rows_motoboy
+    }
+    user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
+    user_map: Dict[int, tuple] = {}
+    if user_ids:
+        rows_user = db.execute(
+            select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
+        ).all()
+        user_map = {
+            int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
+            for uid, nome, sobrenome, username in rows_user
+        }
+    out: Dict[int, str] = {}
+    for mid in ids:
+        uid = motoboy_user_map.get(mid)
+        if uid is None:
+            out[mid] = f"Motoboy {mid}"
+            continue
+        nome, sobrenome, username = user_map.get(uid, ("", "", ""))
+        out[mid] = (f"{nome} {sobrenome}".strip() or username or f"Motoboy {mid}")
+    return out
+
+
 # --------------- Schemas ---------------
 
 
@@ -238,6 +271,8 @@ def get_resumo_contabilidade(
             Saida.sub_base == sub_base,
             Saida.codigo.isnot(None),
             func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
+            Saida.timestamp >= dt_start,
+            Saida.timestamp <= dt_end,
         )
     )
     rows_saidas_all = db.scalars(stmt_saidas).all()
@@ -245,6 +280,37 @@ def get_resumo_contabilidade(
     # Filtrar pelo modo de indicadores: só contam saídas que "entregaram" conforme modo (saiu vs entregue)
     rows_saidas = [s for s in rows_saidas_raw if _saida_conta_para_indicador(s, modo)]
     total_saidas = len(rows_saidas)
+    # Resolve ator de cada saída uma única vez para reutilizar em todos os loops.
+    nome_legacy_norms = {
+        _normalizar_nome_entregador((s.entregador or ""))
+        for s in rows_saidas
+        if getattr(s, "motoboy_id", None) is None
+        and getattr(s, "entregador_id", None) is None
+        and (s.entregador or "").strip()
+    }
+    ent_por_nome_norm: Dict[str, int] = {}
+    if nome_legacy_norms:
+        rows_ent = db.scalars(select(Entregador).where(Entregador.sub_base == sub_base)).all()
+        for ent in rows_ent:
+            key = _normalizar_nome_entregador(ent.nome or "")
+            if key and key in nome_legacy_norms and key not in ent_por_nome_norm:
+                ent_por_nome_norm[key] = ent.id_entregador
+    actor_por_saida: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+    for s in rows_saidas:
+        eid = getattr(s, "entregador_id", None)
+        mid = getattr(s, "motoboy_id", None)
+        if mid is not None:
+            actor_por_saida[int(s.id_saida)] = (None, int(mid))
+            continue
+        if eid is not None:
+            actor_por_saida[int(s.id_saida)] = (int(eid), None)
+            continue
+        nome_norm = _normalizar_nome_entregador(s.entregador or "")
+        actor_por_saida[int(s.id_saida)] = (ent_por_nome_norm.get(nome_norm), None)
+    nomes_motoboy_map = _carregar_nomes_motoboy_ids(
+        db,
+        [mid for eid, mid in actor_por_saida.values() if mid is not None],
+    )
 
     # Saídas por serviço
     saidas_shopee = sum(1 for s in rows_saidas if (s.servico or "").lower() == "shopee")
@@ -282,7 +348,7 @@ def get_resumo_contabilidade(
     despesa_pendente_por_ent: Dict[int, Decimal] = {}
     despesa_pendente_por_motoboy: Dict[int, Decimal] = {}
     for s in rows_saidas:
-        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is None and mid is None:
             continue
         ctx = op_ctx_map.get(s.id_saida)
@@ -435,7 +501,7 @@ def get_resumo_contabilidade(
     saidas_por_ent: Dict[int, int] = {}
     saidas_por_motoboy: Dict[int, int] = {}
     for s in rows_saidas:
-        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is not None:
             saidas_por_ent[eid] = saidas_por_ent.get(eid, 0) + 1
         elif mid is not None:
@@ -462,7 +528,7 @@ def get_resumo_contabilidade(
             EntregadorDespesaItem(
                 id_entregador=None,
                 id_motoboy=mid,
-                nome=_get_motoboy_nome(db, mid),
+                nome=nomes_motoboy_map.get(mid, f"Motoboy {mid}"),
                 saidas=saidas_por_motoboy.get(mid, 0),
                 despesa=_decimal(desp_d).quantize(Decimal("0.01")),
                 percentual=pct,
@@ -489,7 +555,7 @@ def get_resumo_contabilidade(
             d += timedelta(days=1)
     for s in rows_saidas:
         data_saida = s.timestamp.date()
-        eid, mid = _resolve_actor_saida(db, sub_base, s)
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is None and mid is None:
             continue
         if eid is not None:
