@@ -18,24 +18,32 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "reatribuido",
 }
 
+EVENTOS_REATRIBUICAO = {
+    "assumir",
+    "assumido",
+    "reatribuicao",
+    "reatribuido",
+}
+
 EVENTOS_INVALIDANTES = {
     "removido_sem_inicio",
     "desatribuido",
 }
 
 ROTULOS_ACAO = {
-    "lido": "Lido",
-    "scan": "Scan",
-    "assumir": "Reatribuido",
-    "assumido": "Reatribuido",
-    "reatribuicao": "Reatribuido",
-    "reatribuido": "Reatribuido",
-    "removido_sem_inicio": "Removido sem iniciar rota",
+    "lido": "Leu pedido",
+    "scan": "Escaneou pedido",
+    "assumir": "Reatribuiu pedido",
+    "assumido": "Reatribuiu pedido",
+    "reatribuicao": "Reatribuiu pedido",
+    "reatribuido": "Reatribuiu pedido",
+    "reatribuido_em_rota": "Reatribuído -> Iniciou rota",
+    "removido_sem_inicio": "Removeu sem iniciar rota",
     "em_rota": "Iniciou rota",
-    "entregue": "Entregue",
-    "ausente": "Ausente",
-    "cancelado": "Cancelado",
-    "desatribuido": "Desatribuido",
+    "entregue": "Finalizou entrega",
+    "ausente": "Registrou ausência",
+    "cancelado": "Registrou cancelamento",
+    "desatribuido": "Desatribuiu pedido",
 }
 
 
@@ -53,10 +61,25 @@ class SaidaOperacionalContext:
     removido_sem_inicio_ativo: bool
 
 
-def _rotulo_acao(evento: Optional[str]) -> Optional[str]:
+def _normalizar_evento(evento: Optional[str]) -> str:
+    return (evento or "").strip().lower().replace(" ", "_")
+
+
+def resolver_chave_acao(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
     if not evento:
         return None
-    key = (evento or "").strip().lower()
+    key = _normalizar_evento(evento)
+    if key in EVENTOS_REATRIBUICAO:
+        return "reatribuido"
+    if key == "em_rota" and houve_reatribuicao:
+        return "reatribuido_em_rota"
+    return key
+
+
+def rotulo_acao_evento(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
+    key = resolver_chave_acao(evento, houve_reatribuicao=houve_reatribuicao)
+    if not key:
+        return None
     return ROTULOS_ACAO.get(key, (evento or "").replace("_", " ").strip().capitalize())
 
 
@@ -86,6 +109,7 @@ def carregar_contexto_operacional(
                 "ultimo": None,
                 "op": None,
                 "removido_ativo": False,
+                "teve_reatribuicao": False,
             },
         )
 
@@ -96,8 +120,11 @@ def carregar_contexto_operacional(
         if evento in EVENTOS_INVALIDANTES:
             estado["op"] = None
             estado["removido_ativo"] = True
+            estado["teve_reatribuicao"] = False
             continue
 
+        if evento in EVENTOS_REATRIBUICAO:
+            estado["teve_reatribuicao"] = True
         if evento in EVENTOS_ATRIBUICAO_VALIDOS:
             estado["op"] = h
             estado["removido_ativo"] = False
@@ -133,12 +160,13 @@ def carregar_contexto_operacional(
         op_evento = (getattr(op, "evento", None) or None) if op is not None else None
         op_user_id = getattr(op, "user_id", None) if op is not None else None
         op_user_id = int(op_user_id) if op_user_id is not None else None
+        houve_reatribuicao = bool(estado.get("teve_reatribuicao", False))
 
         out[sid] = SaidaOperacionalContext(
             id_saida=sid,
             ultimo_evento=ultimo_evento,
             ultimo_evento_ts=getattr(ultimo, "timestamp", None) if ultimo is not None else None,
-            acao_label=_rotulo_acao(ultimo_evento),
+            acao_label=rotulo_acao_evento(ultimo_evento, houve_reatribuicao=houve_reatribuicao),
             ultimo_ator_username=user_map.get(op_user_id) if op_user_id is not None else None,
             ultimo_ator_user_id=op_user_id,
             operacional_evento=op_evento,

@@ -20,7 +20,12 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
-from saida_operacional_utils import carregar_contexto_operacional, filtrar_saidas_por_periodo_operacional
+from saida_operacional_utils import (
+    carregar_contexto_operacional,
+    filtrar_saidas_por_periodo_operacional,
+    resolver_chave_acao,
+    rotulo_acao_evento,
+)
 from codigo_normalizer import canonicalize_servico
 
 
@@ -381,10 +386,7 @@ def _status_group_aliases(token: str) -> List[str]:
 
 
 def _acao_equivalente(evento_norm: str) -> str:
-    v = (evento_norm or "").strip().lower().replace(" ", "_")
-    if v in {"assumir", "assumido", "reatribuicao", "reatribuido"}:
-        return "reatribuido"
-    return v
+    return resolver_chave_acao(evento_norm) or ""
 
 
 # ============================================================
@@ -795,8 +797,17 @@ def listar_saidas(
         allowed_labels = set()
         for token in acao_tokens:
             token_norm = " ".join(token.split())
-            allowed_eventos.add(token_norm.replace(" ", "_"))
+            token_key = token_norm.replace(" ", "_")
+            allowed_eventos.add(token_key)
             allowed_labels.add(token_norm)
+            label_canonico = rotulo_acao_evento(token_key)
+            if label_canonico:
+                allowed_labels.add(_norm_text(label_canonico))
+            if token_key in {"reatribuido", "reatribuido_em_rota"}:
+                allowed_eventos.add("reatribuido")
+                allowed_eventos.add("reatribuido_em_rota")
+                allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido") or ""))
+                allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido_em_rota") or ""))
         rows_filtradas = [
             r for r in rows_filtradas
             if (
@@ -810,7 +821,7 @@ def listar_saidas(
                 )
                 or (
                     (ctx := op_ctx_map.get(r.id_saida)) is not None
-                    and _norm_text(_acao_equivalente(ctx.ultimo_evento)) in allowed_eventos
+                    and _acao_equivalente(ctx.ultimo_evento) in allowed_eventos
                 )
             )
         ]
@@ -1079,20 +1090,7 @@ def get_saida_historico(
             usuario_nome=username,
             motoboy_id_anterior=h.motoboy_id_anterior,
             motoboy_id_novo=h.motoboy_id_novo,
-            acao_label={
-                "lido": "Lido",
-                "scan": "Scan",
-                "assumir": "Assumiu entrega",
-                "assumido": "Assumiu entrega",
-                "reatribuicao": "Reatribuido",
-                "reatribuido": "Reatribuido",
-                "removido_sem_inicio": "Removido sem iniciar rota",
-                "desatribuido": "Desatribuido",
-                "em_rota": "Iniciou rota",
-                "entregue": "Entregue",
-                "ausente": "Ausente",
-                "cancelado": "Cancelado",
-            }.get(evento_norm, (h.evento or "").replace("_", " ").capitalize()),
+            acao_label=rotulo_acao_evento(evento_norm),
         ))
     return out
 
