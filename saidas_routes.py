@@ -14,13 +14,13 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import select, func, or_, case
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
-from saida_operacional_utils import carregar_contexto_operacional
+from saida_operacional_utils import carregar_contexto_operacional, filtrar_saidas_por_periodo_operacional
 from codigo_normalizer import canonicalize_servico
 
 
@@ -673,10 +673,6 @@ def listar_saidas(
         base_norm = base.strip().lower()
         stmt = stmt.where(func.unaccent(func.lower(Saida.base)) == func.unaccent(base_norm))
 
-    if de:
-        stmt = stmt.where(Saida.data >= de)
-    if ate:
-        stmt = stmt.where(Saida.data <= ate)
 
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
         ent_norm = entregador.strip().lower()
@@ -728,52 +724,33 @@ def listar_saidas(
         )
         stmt = stmt.where(or_conds)
 
-    subq = stmt.subquery()
-    servico_expr = subq.c.servico
-    agg_row = db.execute(
-        select(
-            func.count().label("total"),
-            func.coalesce(
-                func.sum(case((_servico_is_shopee_expr(servico_expr), 1), else_=0)),
-                0,
-            ).label("sum_shopee"),
-            func.coalesce(
-                func.sum(case((_servico_is_mercado_expr(servico_expr), 1), else_=0)),
-                0,
-            ).label("sum_mercado"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            (~_servico_is_shopee_expr(servico_expr))
-                            & (~_servico_is_mercado_expr(servico_expr)),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("sum_avulso"),
-        ).select_from(subq)
-    ).one()
-
-    total = int(agg_row.total or 0)
-    sumShopee = int(agg_row.sum_shopee or 0)
-    sumMercado = int(agg_row.sum_mercado or 0)
-    sumAvulso = int(agg_row.sum_avulso or 0)
-
-    stmt = stmt.order_by(Saida.timestamp.desc())
-    if limit:
-        stmt = stmt.limit(limit)
-    if offset:
-        stmt = stmt.offset(offset)
-
-    rows = db.execute(stmt).scalars().all()
-
-    op_ctx_map = {}
-    if rows:
-        ids = [r.id_saida for r in rows]
-        op_ctx_map = carregar_contexto_operacional(db, ids)
+    rows_all = db.execute(stmt).scalars().all()
+    rows_filtradas, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_all, de, ate)
+    rows_filtradas.sort(
+        key=lambda r: (
+            ((op_ctx_map.get(r.id_saida).operacional_ts if op_ctx_map.get(r.id_saida) and op_ctx_map.get(r.id_saida).operacional_ts else None) or r.timestamp)
+        ),
+        reverse=True,
+    )
+    total = len(rows_filtradas)
+    sumShopee = 0
+    sumMercado = 0
+    sumAvulso = 0
+    for r in rows_filtradas:
+        srv = (r.servico or "").strip().lower()
+        if ("shopee" in srv) or ("spx" in srv):
+            sumShopee += 1
+        elif (
+            ("mercado livre" in srv)
+            or ("mercado_livre" in srv)
+            or ("mercadolivre" in srv)
+            or (" ml" in f" {srv}")
+            or ("flex" in srv)
+        ):
+            sumMercado += 1
+        else:
+            sumAvulso += 1
+    rows = rows_filtradas[offset : (offset + limit) if limit else None]
 
     return {
         "total": total,
