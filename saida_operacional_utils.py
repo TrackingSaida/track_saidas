@@ -210,7 +210,10 @@ def filtrar_saidas_por_periodo_operacional(
         if sid is None:
             continue
         ctx = ctx_map.get(int(sid))
-        if ctx and (ctx.removido_sem_inicio_ativo or not ctx.leitura_valida):
+        # Mantém exclusão apenas para casos invalidantes explícitos.
+        # Em bases legadas, ausência de leitura válida no histórico não deve remover
+        # o registro se houver timestamp base em Saida.
+        if ctx and ctx.removido_sem_inicio_ativo:
             continue
         ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or getattr(s, "timestamp", None)
         if ts is None:
