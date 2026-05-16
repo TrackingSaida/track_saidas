@@ -16,6 +16,7 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "assumido",
     "reatribuicao",
     "reatribuido",
+    "em_rota",
 }
 
 EVENTOS_INVALIDANTES = {

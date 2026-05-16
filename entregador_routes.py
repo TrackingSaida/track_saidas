@@ -705,8 +705,8 @@ def resumo_entregadores(
         else:
             raise HTTPException(400, "executor_tipo inválido. Use 'e' ou 'm'.")
 
-    # Inclui saída e entrega; exclui cancelados (alinhado a contabilidade/dashboard)
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "cancelado", "cancelados"]
+    # Inclui saída e entrega; mantém consistência com STATUS_VALOR_BASE_VALIDOS.
+    status_validos = STATUS_VALOR_BASE_VALIDOS
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.codigo.isnot(None),

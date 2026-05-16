@@ -347,6 +347,39 @@ def _servico_is_mercado_expr(expr):
     return srv.like("%mercado%") | srv.like("%flex%") | srv.like("%ml%")
 
 
+def _norm_text(value: Optional[str]) -> str:
+    return unicodedata.normalize("NFD", (value or "").strip().lower()).encode("ascii", "ignore").decode("ascii")
+
+
+def _parse_multi_values(values: Optional[List[str]]) -> List[str]:
+    out: List[str] = []
+    for raw in values or []:
+        if raw is None:
+            continue
+        for part in str(raw).split(","):
+            token = part.strip()
+            if token:
+                out.append(token)
+    return out
+
+
+def _status_group_aliases(token: str) -> List[str]:
+    key = _norm_text(token).replace("_", " ").replace("-", " ")
+    key = " ".join(key.split())
+    groups = {
+        "saiu": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
+        "saiu para entrega": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
+        "em rota": ["em rota", "em_rota"],
+        "entregue": ["entregue"],
+        "ausente": ["ausente"],
+        "coletado": ["coletado"],
+        "nao coletado": ["nao coletado", "não coletado"],
+        "cancelado": ["cancelado", "cancelados"],
+    }
+    normalized = groups.get(key, [key])
+    return sorted({v for v in normalized if v})
+
+
 # ============================================================
 # POST — REGISTRAR SAÍDA
 # ============================================================
@@ -655,9 +688,10 @@ def listar_saidas(
     base: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     entregador: Optional[str] = Query(None),
-    status_: Optional[str] = Query(None, alias="status"),
+    status_: Optional[List[str]] = Query(None, alias="status"),
     codigo: Optional[str] = Query(None),
-    servico: Optional[str] = Query(None),
+    servico: Optional[List[str]] = Query(None),
+    acao: Optional[List[str]] = Query(None),
     localizar: Optional[str] = Query(None),
     somente_g: Optional[bool] = Query(None),
     codigo_exato: bool = Query(False),
@@ -678,23 +712,42 @@ def listar_saidas(
         ent_norm = entregador.strip().lower()
         stmt = stmt.where(func.unaccent(func.lower(Saida.entregador)) == func.unaccent(ent_norm))
 
-    if status_ and status_.strip() and status_.lower() != "(todos)":
-        st_norm = status_.strip().lower()
-        stmt = stmt.where(func.unaccent(func.lower(Saida.status)) == func.unaccent(st_norm))
+    status_tokens_raw = [
+        t for t in _parse_multi_values(status_) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    status_aliases = sorted(
+        {
+            alias
+            for token in status_tokens_raw
+            for alias in _status_group_aliases(token)
+        }
+    )
+    if status_aliases:
+        conds_status = [
+            func.unaccent(func.lower(Saida.status)) == func.unaccent(alias)
+            for alias in status_aliases
+        ]
+        stmt = stmt.where(or_(*conds_status))
 
-    if servico and servico.strip() and servico.lower() != "(todos)":
-        srv_norm = servico.strip().lower()
-        if srv_norm == "shopee":
-            stmt = stmt.where(_servico_is_shopee_expr(Saida.servico))
-        elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
-            stmt = stmt.where(_servico_is_mercado_expr(Saida.servico))
-        elif srv_norm == "avulso":
-            stmt = stmt.where(
-                (~_servico_is_shopee_expr(Saida.servico))
-                & (~_servico_is_mercado_expr(Saida.servico))
-            )
-        else:
-            stmt = stmt.where(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
+    servico_tokens = [
+        _norm_text(t) for t in _parse_multi_values(servico) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    if servico_tokens:
+        conds_srv = []
+        for srv_norm in servico_tokens:
+            if srv_norm == "shopee":
+                conds_srv.append(_servico_is_shopee_expr(Saida.servico))
+            elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
+                conds_srv.append(_servico_is_mercado_expr(Saida.servico))
+            elif srv_norm == "avulso":
+                conds_srv.append(
+                    (~_servico_is_shopee_expr(Saida.servico))
+                    & (~_servico_is_mercado_expr(Saida.servico))
+                )
+            else:
+                conds_srv.append(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
+        if conds_srv:
+            stmt = stmt.where(or_(*conds_srv))
 
     if somente_g:
         stmt = stmt.where(Saida.is_grande.is_(True))
@@ -726,6 +779,34 @@ def listar_saidas(
 
     rows_all = db.execute(stmt).scalars().all()
     rows_filtradas, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_all, de, ate)
+    acao_tokens = [
+        _norm_text(t).replace("_", " ") for t in _parse_multi_values(acao)
+        if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    if acao_tokens:
+        allowed_eventos = set()
+        allowed_labels = set()
+        for token in acao_tokens:
+            token_norm = " ".join(token.split())
+            allowed_eventos.add(token_norm.replace(" ", "_"))
+            allowed_labels.add(token_norm)
+        rows_filtradas = [
+            r for r in rows_filtradas
+            if (
+                (
+                    (ctx := op_ctx_map.get(r.id_saida)) is not None
+                    and _norm_text(ctx.ultimo_evento).replace("_", " ") in allowed_labels
+                )
+                or (
+                    (ctx := op_ctx_map.get(r.id_saida)) is not None
+                    and _norm_text(ctx.acao_label) in allowed_labels
+                )
+                or (
+                    (ctx := op_ctx_map.get(r.id_saida)) is not None
+                    and _norm_text(ctx.ultimo_evento) in allowed_eventos
+                )
+            )
+        ]
     rows_filtradas.sort(
         key=lambda r: (
             ((op_ctx_map.get(r.id_saida).operacional_ts if op_ctx_map.get(r.id_saida) and op_ctx_map.get(r.id_saida).operacional_ts else None) or r.timestamp)
