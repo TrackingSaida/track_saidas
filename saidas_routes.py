@@ -728,6 +728,12 @@ def listar_saidas(
 ):
     sub_base = current_user.sub_base
     stmt = select(Saida).where(Saida.sub_base == sub_base)
+    # Pré-filtro por janela de timestamp para reduzir cardinalidade antes do
+    # processamento operacional em memória.
+    if de is not None:
+        stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
+    if ate is not None:
+        stmt = stmt.where(Saida.timestamp < datetime.combine(ate + timedelta(days=1), datetime.min.time()))
 
     if base and base.strip() and base.lower() != "(todas)":
         base_norm = base.strip().lower()
