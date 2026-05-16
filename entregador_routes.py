@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -591,6 +591,19 @@ def _resolve_executor_scope_ids(
     return entregador_ids, motoboy_ids
 
 
+STATUS_VALOR_BASE_VALIDOS = [
+    "saiu",
+    "saiu pra entrega",
+    "saiu_pra_entrega",
+    "saiu_para_entrega",
+    "em_rota",
+    "entregue",
+    "ausente",
+    "cancelado",
+    "cancelados",
+]
+
+
 def _calcular_valor_base_periodo(
     db: Session,
     sub_base_user: str,
@@ -598,15 +611,28 @@ def _calcular_valor_base_periodo(
     periodo_inicio: date,
     periodo_fim: date,
 ) -> Decimal:
-    """Calcula o valor_base a partir das saídas do entregador no período (para resumo e modal)."""
+    """Calcula valor_base por escopo equivalente do entregador (legacy + motoboy vinculado)."""
     if periodo_inicio > periodo_fim:
         return Decimal("0.00")
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "entregue", "cancelado", "cancelados"]
+
+    entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
+        db=db,
+        sub_base_user=sub_base_user,
+        entregador_id=entregador_id,
+    )
+    conds_executor = []
+    if entregador_ids:
+        conds_executor.append(Saida.entregador_id.in_(sorted(entregador_ids)))
+    if motoboy_ids:
+        conds_executor.append(Saida.motoboy_id.in_(sorted(motoboy_ids)))
+    if not conds_executor:
+        return Decimal("0.00")
+
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
-        Saida.entregador_id == entregador_id,
         Saida.codigo.isnot(None),
-        func.lower(Saida.status).in_(status_validos),
+        func.lower(Saida.status).in_(STATUS_VALOR_BASE_VALIDOS),
+        or_(*conds_executor),
     )
     rows_raw = db.scalars(stmt).all()
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
@@ -637,12 +663,11 @@ def _calcular_valor_base_motoboy_periodo(
     """Calcula o valor_base a partir das saídas do motoboy no período (resumo/fechamento)."""
     if periodo_inicio > periodo_fim:
         return Decimal("0.00")
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "cancelado", "cancelados"]
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.motoboy_id == motoboy_id,
         Saida.codigo.isnot(None),
-        func.lower(Saida.status).in_(status_validos),
+        func.lower(Saida.status).in_(STATUS_VALOR_BASE_VALIDOS),
     )
     rows_raw = db.scalars(stmt).all()
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
@@ -661,31 +686,6 @@ def _calcular_valor_base_motoboy_periodo(
             delta = precos["avulso_valor"]
         total += (-delta if is_cancelado else delta)
     return total.quantize(Decimal("0.01"))
-
-
-@router.get("/fechamentos/calcular")
-def calcular_valor_base_fechamento(
-    entregador_id: int = Query(...),
-    periodo_inicio: date = Query(...),
-    periodo_fim: date = Query(...),
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    """Retorna valor_base calculado para o período (para modal de fechamento)."""
-    sub_base_user = _resolve_user_base(db, current_user)
-    if periodo_inicio > periodo_fim:
-        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    ent = db.get(Entregador, entregador_id)
-    if not ent or (ent.sub_base and ent.sub_base != sub_base_user):
-        raise HTTPException(404, "Entregador não encontrado.")
-    valor_base = _calcular_valor_base_periodo(db, sub_base_user, entregador_id, periodo_inicio, periodo_fim)
-    return {
-        "valor_base": valor_base,
-        "entregador_id": entregador_id,
-        "entregador_nome": ent.nome,
-        "periodo_inicio": periodo_inicio.isoformat(),
-        "periodo_fim": periodo_fim.isoformat(),
-    }
 
 
 @router.get("/resumo", response_model=EntregadorResumoResponse)
@@ -719,8 +719,8 @@ def resumo_entregadores(
         else:
             raise HTTPException(400, "executor_tipo inválido. Use 'e' ou 'm'.")
 
-    # Inclui saída e entrega; exclui cancelados (alinhado a contabilidade/dashboard)
-    status_validos = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "cancelado", "cancelados"]
+    # Inclui saída e entrega; mantém consistência com STATUS_VALOR_BASE_VALIDOS.
+    status_validos = STATUS_VALOR_BASE_VALIDOS
     stmt = select(Saida).where(
         Saida.sub_base == sub_base_user,
         Saida.codigo.isnot(None),

@@ -6,7 +6,7 @@ GET /entregadores/fechamentos/{id_fechamento} — obter um (para modal)
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -25,7 +25,9 @@ from entregador_routes import (
     resolver_precos_entregador,
     resolver_precos_motoboy,
     _calcular_valor_base_motoboy_periodo,
+    _calcular_valor_base_periodo,
     _normalizar_servico,
+    STATUS_VALOR_BASE_VALIDOS,
 )
 
 router = APIRouter(prefix="", tags=["Fechamentos"])
@@ -34,8 +36,8 @@ router = APIRouter(prefix="", tags=["Fechamentos"])
 STATUS_GERADO = "GERADO"
 STATUS_REAJUSTADO = "REAJUSTADO"
 
-# Status válidos para saidas no cálculo (alinhado ao app mobile)
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "em_rota", "entregue", "ausente", "cancelado", "cancelados"]
+# Status válidos para saidas no cálculo (fonte única compartilhada)
+STATUS_SAIDAS_VALIDOS = STATUS_VALOR_BASE_VALIDOS
 
 
 def _contar_g_por_servico_entregador(
@@ -119,42 +121,6 @@ def _get_motoboy_username(db: Session, motoboy: Motoboy) -> str:
     if not u:
         return f"Motoboy {motoboy.id_motoboy}"
     return (u.username or f"{u.nome or ''} {u.sobrenome or ''}".strip() or f"Motoboy {motoboy.id_motoboy}").strip()
-
-
-def _calcular_valor_base(
-    db: Session,
-    sub_base: str,
-    id_entregador: int,
-    periodo_inicio: date,
-    periodo_fim: date,
-) -> Decimal:
-    """
-    Calcula o valor_base a partir das saidas do entregador no período.
-    Usa a mesma lógica do resumo por entregador.
-    """
-    stmt = select(Saida).where(
-        Saida.sub_base == sub_base,
-        Saida.entregador_id == id_entregador,
-        Saida.codigo.isnot(None),
-    )
-    from sqlalchemy import func
-    stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
-    rows_raw = db.scalars(stmt).all()
-    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
-
-    precos = resolver_precos_entregador(db, id_entregador, sub_base)
-    total = Decimal("0.00")
-
-    for saida in rows:
-        tipo = _normalizar_servico(saida.servico)
-        if tipo == "shopee":
-            total += precos["shopee_valor"]
-        elif tipo == "flex":
-            total += precos["ml_valor"]
-        else:
-            total += precos["avulso_valor"]
-
-    return total.quantize(Decimal("0.01"))
 
 
 def _buscar_fechamento_por_data(
@@ -272,7 +238,7 @@ def calcular_valor_base_preview(
     if not ent or ent.sub_base != sub_base:
         raise HTTPException(404, "Entregador não encontrado.")
 
-    valor_base = _calcular_valor_base(
+    valor_base = _calcular_valor_base_periodo(
         db, sub_base, entregador_id, periodo_inicio, periodo_fim
     )
     g = _contar_g_por_servico_entregador(db, sub_base, entregador_id, periodo_inicio, periodo_fim)
@@ -342,7 +308,7 @@ def criar_fechamento(
                 EntregadorFechamento.periodo_fim == payload.periodo_fim,
             )
         )
-        valor_base = _calcular_valor_base(
+        valor_base = _calcular_valor_base_periodo(
             db, sub_base, payload.id_entregador,
             payload.periodo_inicio, payload.periodo_fim,
         )
@@ -417,7 +383,7 @@ def obter_fechamento(
             fech.periodo_inicio, fech.periodo_fim,
         )
     else:
-        valor_base_recalc = _calcular_valor_base(
+        valor_base_recalc = _calcular_valor_base_periodo(
             db, sub_base, fech.id_entregador,
             fech.periodo_inicio, fech.periodo_fim,
         )
@@ -472,7 +438,7 @@ def atualizar_fechamento(
             fech.periodo_inicio, fech.periodo_fim,
         )
     else:
-        valor_base_recalc = _calcular_valor_base(
+        valor_base_recalc = _calcular_valor_base_periodo(
             db, sub_base, fech.id_entregador,
             fech.periodo_inicio, fech.periodo_fim,
         )

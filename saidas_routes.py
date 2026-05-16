@@ -14,13 +14,18 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import select, func, or_, case
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
-from saida_operacional_utils import carregar_contexto_operacional
+from saida_operacional_utils import (
+    carregar_contexto_operacional,
+    filtrar_saidas_por_periodo_operacional,
+    resolver_chave_acao,
+    rotulo_acao_evento,
+)
 from codigo_normalizer import canonicalize_servico
 
 
@@ -347,6 +352,53 @@ def _servico_is_mercado_expr(expr):
     return srv.like("%mercado%") | srv.like("%flex%") | srv.like("%ml%")
 
 
+def _norm_text(value: Optional[str]) -> str:
+    return unicodedata.normalize("NFD", (value or "").strip().lower()).encode("ascii", "ignore").decode("ascii")
+
+
+def _parse_multi_values(values: Optional[List[str]]) -> List[str]:
+    out: List[str] = []
+    for raw in values or []:
+        if raw is None:
+            continue
+        for part in str(raw).split(","):
+            token = part.strip()
+            if token:
+                out.append(token)
+    return out
+
+
+def _status_group_aliases(token: str) -> List[str]:
+    key = _norm_text(token).replace("_", " ").replace("-", " ")
+    key = " ".join(key.split())
+    groups = {
+        "saiu": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
+        "saiu para entrega": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
+        "em rota": ["em rota", "em_rota"],
+        "entregue": ["entregue"],
+        "ausente": ["ausente"],
+        "coletado": ["coletado"],
+        "nao coletado": ["nao coletado", "não coletado"],
+        "cancelado": ["cancelado", "cancelados"],
+    }
+    normalized = groups.get(key, [key])
+    return sorted({v for v in normalized if v})
+
+
+def _acao_equivalente(evento_norm: str) -> str:
+    return resolver_chave_acao(evento_norm) or ""
+
+
+def _nome_executor_atual(db: Session, saida: Saida) -> Optional[str]:
+    """Resolve nome exibível do responsável atual priorizando motoboy_id."""
+    mid = getattr(saida, "motoboy_id", None)
+    if mid is not None:
+        motoboy = db.get(Motoboy, mid)
+        if motoboy:
+            return _get_motoboy_nome(db, motoboy)
+    return getattr(saida, "entregador", None)
+
+
 # ============================================================
 # POST — REGISTRAR SAÍDA
 # ============================================================
@@ -655,9 +707,10 @@ def listar_saidas(
     base: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     entregador: Optional[str] = Query(None),
-    status_: Optional[str] = Query(None, alias="status"),
+    status_: Optional[List[str]] = Query(None, alias="status"),
     codigo: Optional[str] = Query(None),
-    servico: Optional[str] = Query(None),
+    servico: Optional[List[str]] = Query(None),
+    acao: Optional[List[str]] = Query(None),
     localizar: Optional[str] = Query(None),
     somente_g: Optional[bool] = Query(None),
     codigo_exato: bool = Query(False),
@@ -673,32 +726,47 @@ def listar_saidas(
         base_norm = base.strip().lower()
         stmt = stmt.where(func.unaccent(func.lower(Saida.base)) == func.unaccent(base_norm))
 
-    if de:
-        stmt = stmt.where(Saida.data >= de)
-    if ate:
-        stmt = stmt.where(Saida.data <= ate)
 
+    entregador_filter_norm = ""
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
-        ent_norm = entregador.strip().lower()
-        stmt = stmt.where(func.unaccent(func.lower(Saida.entregador)) == func.unaccent(ent_norm))
+        entregador_filter_norm = _norm_text(entregador)
 
-    if status_ and status_.strip() and status_.lower() != "(todos)":
-        st_norm = status_.strip().lower()
-        stmt = stmt.where(func.unaccent(func.lower(Saida.status)) == func.unaccent(st_norm))
+    status_tokens_raw = [
+        t for t in _parse_multi_values(status_) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    status_aliases = sorted(
+        {
+            alias
+            for token in status_tokens_raw
+            for alias in _status_group_aliases(token)
+        }
+    )
+    if status_aliases:
+        conds_status = [
+            func.unaccent(func.lower(Saida.status)) == func.unaccent(alias)
+            for alias in status_aliases
+        ]
+        stmt = stmt.where(or_(*conds_status))
 
-    if servico and servico.strip() and servico.lower() != "(todos)":
-        srv_norm = servico.strip().lower()
-        if srv_norm == "shopee":
-            stmt = stmt.where(_servico_is_shopee_expr(Saida.servico))
-        elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
-            stmt = stmt.where(_servico_is_mercado_expr(Saida.servico))
-        elif srv_norm == "avulso":
-            stmt = stmt.where(
-                (~_servico_is_shopee_expr(Saida.servico))
-                & (~_servico_is_mercado_expr(Saida.servico))
-            )
-        else:
-            stmt = stmt.where(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
+    servico_tokens = [
+        _norm_text(t) for t in _parse_multi_values(servico) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    if servico_tokens:
+        conds_srv = []
+        for srv_norm in servico_tokens:
+            if srv_norm == "shopee":
+                conds_srv.append(_servico_is_shopee_expr(Saida.servico))
+            elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
+                conds_srv.append(_servico_is_mercado_expr(Saida.servico))
+            elif srv_norm == "avulso":
+                conds_srv.append(
+                    (~_servico_is_shopee_expr(Saida.servico))
+                    & (~_servico_is_mercado_expr(Saida.servico))
+                )
+            else:
+                conds_srv.append(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
+        if conds_srv:
+            stmt = stmt.where(or_(*conds_srv))
 
     if somente_g:
         stmt = stmt.where(Saida.is_grande.is_(True))
@@ -728,53 +796,125 @@ def listar_saidas(
         )
         stmt = stmt.where(or_conds)
 
-    subq = stmt.subquery()
-    servico_expr = subq.c.servico
-    agg_row = db.execute(
-        select(
-            func.count().label("total"),
-            func.coalesce(
-                func.sum(case((_servico_is_shopee_expr(servico_expr), 1), else_=0)),
-                0,
-            ).label("sum_shopee"),
-            func.coalesce(
-                func.sum(case((_servico_is_mercado_expr(servico_expr), 1), else_=0)),
-                0,
-            ).label("sum_mercado"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            (~_servico_is_shopee_expr(servico_expr))
-                            & (~_servico_is_mercado_expr(servico_expr)),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("sum_avulso"),
-        ).select_from(subq)
-    ).one()
+    rows_all = db.execute(stmt).scalars().all()
+    rows_filtradas, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_all, de, ate)
+    executor_nome_cache: Dict[int, Optional[str]] = {}
 
-    total = int(agg_row.total or 0)
-    sumShopee = int(agg_row.sum_shopee or 0)
-    sumMercado = int(agg_row.sum_mercado or 0)
-    sumAvulso = int(agg_row.sum_avulso or 0)
+    # Evita N+1 em bases grandes: resolve nomes de motoboy em lote.
+    motoboy_ids = sorted(
+        {
+            int(getattr(r, "motoboy_id"))
+            for r in rows_filtradas
+            if getattr(r, "motoboy_id", None) is not None
+        }
+    )
+    motoboy_nome_map: Dict[int, str] = {}
+    if motoboy_ids:
+        rows_motoboy = db.execute(
+            select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(motoboy_ids))
+        ).all()
+        motoboy_user_map = {
+            int(mid): (int(uid) if uid is not None else None)
+            for mid, uid in rows_motoboy
+        }
+        user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
+        user_map: Dict[int, tuple] = {}
+        if user_ids:
+            rows_user = db.execute(
+                select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
+            ).all()
+            user_map = {
+                int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
+                for uid, nome, sobrenome, username in rows_user
+            }
 
-    stmt = stmt.order_by(Saida.timestamp.desc())
-    if limit:
-        stmt = stmt.limit(limit)
-    if offset:
-        stmt = stmt.offset(offset)
+        for mid, uid in motoboy_user_map.items():
+            if uid is None:
+                motoboy_nome_map[mid] = f"Motoboy {mid}"
+                continue
+            nome, sobrenome, username_val = user_map.get(uid, ("", "", ""))
+            nome_fmt = f"{nome} {sobrenome}".strip() or username_val or f"Motoboy {mid}"
+            motoboy_nome_map[mid] = nome_fmt
 
-    rows = db.execute(stmt).scalars().all()
+    def _nome_executor_cached(saida: Saida) -> Optional[str]:
+        sid = int(saida.id_saida)
+        if sid not in executor_nome_cache:
+            mid = getattr(saida, "motoboy_id", None)
+            nome_motoboy = None
+            if mid is not None:
+                nome_motoboy = motoboy_nome_map.get(int(mid))
+            executor_nome_cache[sid] = nome_motoboy or getattr(saida, "entregador", None)
+        return executor_nome_cache[sid]
 
-    op_ctx_map = {}
-    if rows:
-        ids = [r.id_saida for r in rows]
-        op_ctx_map = carregar_contexto_operacional(db, ids)
+    if entregador_filter_norm:
+        rows_filtradas = [
+            r for r in rows_filtradas
+            if _norm_text(_nome_executor_cached(r)) == entregador_filter_norm
+        ]
+    acao_tokens = [
+        _norm_text(t).replace("_", " ") for t in _parse_multi_values(acao)
+        if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    if acao_tokens:
+        allowed_eventos = set()
+        allowed_labels = set()
+        for token in acao_tokens:
+            token_norm = " ".join(token.split())
+            token_key = token_norm.replace(" ", "_")
+            allowed_eventos.add(token_key)
+            allowed_labels.add(token_norm)
+            label_canonico = rotulo_acao_evento(token_key)
+            if label_canonico:
+                allowed_labels.add(_norm_text(label_canonico))
+            if token_key in {"reatribuido", "reatribuido_em_rota"}:
+                allowed_eventos.add("reatribuido")
+                allowed_eventos.add("reatribuido_em_rota")
+                allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido") or ""))
+                allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido_em_rota") or ""))
+        rows_filtradas = [
+            r for r in rows_filtradas
+            if (
+                (
+                    (ctx := op_ctx_map.get(r.id_saida)) is not None
+                    and _norm_text(_acao_equivalente(ctx.ultimo_evento)).replace("_", " ") in allowed_labels
+                )
+                or (
+                    (ctx := op_ctx_map.get(r.id_saida)) is not None
+                    and _norm_text(ctx.acao_label) in allowed_labels
+                )
+                or (
+                    (ctx := op_ctx_map.get(r.id_saida)) is not None
+                    and _acao_equivalente(ctx.ultimo_evento) in allowed_eventos
+                )
+            )
+        ]
+    rows_filtradas.sort(
+        key=lambda r: (
+            ((op_ctx_map.get(r.id_saida).operacional_ts if op_ctx_map.get(r.id_saida) and op_ctx_map.get(r.id_saida).operacional_ts else None) or r.timestamp)
+        ),
+        reverse=True,
+    )
+    total = len(rows_filtradas)
+    sumShopee = 0
+    sumMercado = 0
+    sumAvulso = 0
+    for r in rows_filtradas:
+        srv = (r.servico or "").strip().lower()
+        if ("shopee" in srv) or ("spx" in srv):
+            sumShopee += 1
+        elif (
+            ("mercado livre" in srv)
+            or ("mercado_livre" in srv)
+            or ("mercadolivre" in srv)
+            or (" ml" in f" {srv}")
+            or ("flex" in srv)
+        ):
+            sumMercado += 1
+        else:
+            sumAvulso += 1
+    rows = rows_filtradas[offset : (offset + limit) if limit else None]
 
+    nomes_executor = {int(r.id_saida): _nome_executor_cached(r) for r in rows}
     return {
         "total": total,
         "sumShopee": sumShopee,
@@ -783,12 +923,12 @@ def listar_saidas(
         "items": [
             {
                 "id_saida": r.id_saida,
-                "timestamp": (op_ctx_map.get(r.id_saida).operacional_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
+                "timestamp": r.timestamp,
                 "data_hora_acao": (op_ctx_map.get(r.id_saida).ultimo_evento_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
                 "acao": (op_ctx_map.get(r.id_saida).acao_label if op_ctx_map.get(r.id_saida) else None) or "Sem ação",
                 "sub_base": r.sub_base,
                 "username": (op_ctx_map.get(r.id_saida).ultimo_ator_username if op_ctx_map.get(r.id_saida) else None) or r.username,
-                "entregador": r.entregador,
+                "entregador": nomes_executor.get(int(r.id_saida)) or r.entregador,
                 "entregador_id": getattr(r, "entregador_id", None),
                 "motoboy_id": getattr(r, "motoboy_id", None),
                 "codigo": r.codigo,
@@ -860,13 +1000,14 @@ def get_saida_detalhe(
             endereco_origem=detail_row.endereco_origem,
             foto_urls=foto_urls_list or None,
         )
+    executor_nome = _nome_executor_atual(db, obj) or obj.entregador
     return SaidaDetalheCompletoOut(
         id_saida=obj.id_saida,
         timestamp=obj.timestamp,
         data=obj.data,
         sub_base=obj.sub_base,
         username=obj.username,
-        entregador=obj.entregador,
+        entregador=executor_nome,
         motoboy_id=obj.motoboy_id,
         data_hora_entrega=obj.data_hora_entrega,
         codigo=obj.codigo,
@@ -1014,20 +1155,7 @@ def get_saida_historico(
             usuario_nome=username,
             motoboy_id_anterior=h.motoboy_id_anterior,
             motoboy_id_novo=h.motoboy_id_novo,
-            acao_label={
-                "lido": "Lido",
-                "scan": "Scan",
-                "assumir": "Assumiu entrega",
-                "assumido": "Assumiu entrega",
-                "reatribuicao": "Reatribuido",
-                "reatribuido": "Reatribuido",
-                "removido_sem_inicio": "Removido sem iniciar rota",
-                "desatribuido": "Desatribuido",
-                "em_rota": "Iniciou rota",
-                "entregue": "Entregue",
-                "ausente": "Ausente",
-                "cancelado": "Cancelado",
-            }.get(evento_norm, (h.evento or "").replace("_", " ").capitalize()),
+            acao_label=rotulo_acao_evento(evento_norm),
         ))
     return out
 

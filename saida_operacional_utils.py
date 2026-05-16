@@ -2,16 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models import SaidaHistorico, User
 
+MAX_IDS_POR_LOTE = 5000
+T = TypeVar("T")
+
 EVENTOS_ATRIBUICAO_VALIDOS = {
     "lido",
     "scan",
+    "assumir",
+    "assumido",
+    "reatribuicao",
+    "reatribuido",
+}
+
+EVENTOS_REATRIBUICAO = {
     "assumir",
     "assumido",
     "reatribuicao",
@@ -24,18 +34,19 @@ EVENTOS_INVALIDANTES = {
 }
 
 ROTULOS_ACAO = {
-    "lido": "Lido",
-    "scan": "Scan",
-    "assumir": "Assumiu entrega",
-    "assumido": "Assumiu entrega",
-    "reatribuicao": "Reatribuido",
-    "reatribuido": "Reatribuido",
-    "removido_sem_inicio": "Removido sem iniciar rota",
+    "lido": "Leu pedido",
+    "scan": "Escaneou pedido",
+    "assumir": "Reatribuiu pedido",
+    "assumido": "Reatribuiu pedido",
+    "reatribuicao": "Reatribuiu pedido",
+    "reatribuido": "Reatribuiu pedido",
+    "reatribuido_em_rota": "Reatribuído -> Iniciou rota",
+    "removido_sem_inicio": "Removeu sem iniciar rota",
     "em_rota": "Iniciou rota",
-    "entregue": "Entregue",
-    "ausente": "Ausente",
-    "cancelado": "Cancelado",
-    "desatribuido": "Desatribuido",
+    "entregue": "Finalizou entrega",
+    "ausente": "Registrou ausência",
+    "cancelado": "Registrou cancelamento",
+    "desatribuido": "Desatribuiu pedido",
 }
 
 
@@ -53,10 +64,32 @@ class SaidaOperacionalContext:
     removido_sem_inicio_ativo: bool
 
 
-def _rotulo_acao(evento: Optional[str]) -> Optional[str]:
+def _normalizar_evento(evento: Optional[str]) -> str:
+    return (evento or "").strip().lower().replace(" ", "_")
+
+
+def _chunked(values: Sequence[T], chunk_size: int) -> Iterable[Sequence[T]]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size deve ser maior que zero")
+    for i in range(0, len(values), chunk_size):
+        yield values[i : i + chunk_size]
+
+
+def resolver_chave_acao(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
     if not evento:
         return None
-    key = (evento or "").strip().lower()
+    key = _normalizar_evento(evento)
+    if key in EVENTOS_REATRIBUICAO:
+        return "reatribuido"
+    if key == "em_rota" and houve_reatribuicao:
+        return "reatribuido_em_rota"
+    return key
+
+
+def rotulo_acao_evento(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
+    key = resolver_chave_acao(evento, houve_reatribuicao=houve_reatribuicao)
+    if not key:
+        return None
     return ROTULOS_ACAO.get(key, (evento or "").replace("_", " ").strip().capitalize())
 
 
@@ -64,15 +97,18 @@ def carregar_contexto_operacional(
     db: Session,
     saida_ids: Iterable[int],
 ) -> Dict[int, SaidaOperacionalContext]:
-    ids = [int(i) for i in saida_ids if i is not None]
+    ids = list(dict.fromkeys(int(i) for i in saida_ids if i is not None))
     if not ids:
         return {}
 
-    historicos = db.execute(
-        select(SaidaHistorico)
-        .where(SaidaHistorico.id_saida.in_(ids))
-        .order_by(SaidaHistorico.id_saida.asc(), SaidaHistorico.timestamp.asc(), SaidaHistorico.id.asc())
-    ).scalars().all()
+    historicos = []
+    for ids_lote in _chunked(ids, MAX_IDS_POR_LOTE):
+        rows_lote = db.execute(
+            select(SaidaHistorico)
+            .where(SaidaHistorico.id_saida.in_(ids_lote))
+            .order_by(SaidaHistorico.id_saida.asc(), SaidaHistorico.timestamp.asc(), SaidaHistorico.id.asc())
+        ).scalars().all()
+        historicos.extend(rows_lote)
 
     estado_por_saida: Dict[int, Dict[str, object]] = {}
     user_ids = set()
@@ -86,6 +122,7 @@ def carregar_contexto_operacional(
                 "ultimo": None,
                 "op": None,
                 "removido_ativo": False,
+                "teve_reatribuicao": False,
             },
         )
 
@@ -96,17 +133,23 @@ def carregar_contexto_operacional(
         if evento in EVENTOS_INVALIDANTES:
             estado["op"] = None
             estado["removido_ativo"] = True
+            estado["teve_reatribuicao"] = False
             continue
 
+        if evento in EVENTOS_REATRIBUICAO:
+            estado["teve_reatribuicao"] = True
         if evento in EVENTOS_ATRIBUICAO_VALIDOS:
             estado["op"] = h
             estado["removido_ativo"] = False
 
     user_map: Dict[int, str] = {}
     if user_ids:
-        rows_user = db.execute(
-            select(User.id, User.username).where(User.id.in_(sorted(user_ids)))
-        ).all()
+        rows_user = []
+        for user_ids_lote in _chunked(sorted(user_ids), MAX_IDS_POR_LOTE):
+            rows_lote = db.execute(
+                select(User.id, User.username).where(User.id.in_(user_ids_lote))
+            ).all()
+            rows_user.extend(rows_lote)
         user_map = {int(uid): (uname or "") for uid, uname in rows_user}
 
     out: Dict[int, SaidaOperacionalContext] = {}
@@ -133,12 +176,13 @@ def carregar_contexto_operacional(
         op_evento = (getattr(op, "evento", None) or None) if op is not None else None
         op_user_id = getattr(op, "user_id", None) if op is not None else None
         op_user_id = int(op_user_id) if op_user_id is not None else None
+        houve_reatribuicao = bool(estado.get("teve_reatribuicao", False))
 
         out[sid] = SaidaOperacionalContext(
             id_saida=sid,
             ultimo_evento=ultimo_evento,
             ultimo_evento_ts=getattr(ultimo, "timestamp", None) if ultimo is not None else None,
-            acao_label=_rotulo_acao(ultimo_evento),
+            acao_label=rotulo_acao_evento(ultimo_evento, houve_reatribuicao=houve_reatribuicao),
             ultimo_ator_username=user_map.get(op_user_id) if op_user_id is not None else None,
             ultimo_ator_user_id=op_user_id,
             operacional_evento=op_evento,
