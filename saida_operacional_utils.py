@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models import SaidaHistorico, User
+
+MAX_IDS_POR_LOTE = 5000
+T = TypeVar("T")
 
 EVENTOS_ATRIBUICAO_VALIDOS = {
     "lido",
@@ -65,6 +68,13 @@ def _normalizar_evento(evento: Optional[str]) -> str:
     return (evento or "").strip().lower().replace(" ", "_")
 
 
+def _chunked(values: Sequence[T], chunk_size: int) -> Iterable[Sequence[T]]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size deve ser maior que zero")
+    for i in range(0, len(values), chunk_size):
+        yield values[i : i + chunk_size]
+
+
 def resolver_chave_acao(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
     if not evento:
         return None
@@ -87,15 +97,18 @@ def carregar_contexto_operacional(
     db: Session,
     saida_ids: Iterable[int],
 ) -> Dict[int, SaidaOperacionalContext]:
-    ids = [int(i) for i in saida_ids if i is not None]
+    ids = list(dict.fromkeys(int(i) for i in saida_ids if i is not None))
     if not ids:
         return {}
 
-    historicos = db.execute(
-        select(SaidaHistorico)
-        .where(SaidaHistorico.id_saida.in_(ids))
-        .order_by(SaidaHistorico.id_saida.asc(), SaidaHistorico.timestamp.asc(), SaidaHistorico.id.asc())
-    ).scalars().all()
+    historicos = []
+    for ids_lote in _chunked(ids, MAX_IDS_POR_LOTE):
+        rows_lote = db.execute(
+            select(SaidaHistorico)
+            .where(SaidaHistorico.id_saida.in_(ids_lote))
+            .order_by(SaidaHistorico.id_saida.asc(), SaidaHistorico.timestamp.asc(), SaidaHistorico.id.asc())
+        ).scalars().all()
+        historicos.extend(rows_lote)
 
     estado_por_saida: Dict[int, Dict[str, object]] = {}
     user_ids = set()
@@ -131,9 +144,12 @@ def carregar_contexto_operacional(
 
     user_map: Dict[int, str] = {}
     if user_ids:
-        rows_user = db.execute(
-            select(User.id, User.username).where(User.id.in_(sorted(user_ids)))
-        ).all()
+        rows_user = []
+        for user_ids_lote in _chunked(sorted(user_ids), MAX_IDS_POR_LOTE):
+            rows_lote = db.execute(
+                select(User.id, User.username).where(User.id.in_(user_ids_lote))
+            ).all()
+            rows_user.extend(rows_lote)
         user_map = {int(uid): (uname or "") for uid, uname in rows_user}
 
     out: Dict[int, SaidaOperacionalContext] = {}
