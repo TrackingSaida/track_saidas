@@ -34,6 +34,7 @@ from codigo_normalizer import canonicalize_servico
 # ============================================================
 
 router = APIRouter(prefix="/saidas", tags=["Saídas"])
+MAX_IDS_POR_LOTE = 5000
 
 
 # ============================================================
@@ -366,6 +367,12 @@ def _parse_multi_values(values: Optional[List[str]]) -> List[str]:
             if token:
                 out.append(token)
     return out
+
+
+def _chunked_ids(values: List[int], chunk_size: int = MAX_IDS_POR_LOTE) -> List[List[int]]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size deve ser maior que zero")
+    return [values[i : i + chunk_size] for i in range(0, len(values), chunk_size)]
 
 
 def _status_group_aliases(token: str) -> List[str]:
@@ -810,9 +817,12 @@ def listar_saidas(
     )
     motoboy_nome_map: Dict[int, str] = {}
     if motoboy_ids:
-        rows_motoboy = db.execute(
-            select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(motoboy_ids))
-        ).all()
+        rows_motoboy = []
+        for motoboy_ids_lote in _chunked_ids(motoboy_ids):
+            rows_lote = db.execute(
+                select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(motoboy_ids_lote))
+            ).all()
+            rows_motoboy.extend(rows_lote)
         motoboy_user_map = {
             int(mid): (int(uid) if uid is not None else None)
             for mid, uid in rows_motoboy
@@ -820,9 +830,12 @@ def listar_saidas(
         user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
         user_map: Dict[int, tuple] = {}
         if user_ids:
-            rows_user = db.execute(
-                select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
-            ).all()
+            rows_user = []
+            for user_ids_lote in _chunked_ids(user_ids):
+                rows_lote = db.execute(
+                    select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids_lote))
+                ).all()
+                rows_user.extend(rows_lote)
             user_map = {
                 int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
                 for uid, nome, sobrenome, username in rows_user
