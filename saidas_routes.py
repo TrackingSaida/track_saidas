@@ -800,10 +800,50 @@ def listar_saidas(
     rows_filtradas, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_all, de, ate)
     executor_nome_cache: Dict[int, Optional[str]] = {}
 
+    # Evita N+1 em bases grandes: resolve nomes de motoboy em lote.
+    motoboy_ids = sorted(
+        {
+            int(getattr(r, "motoboy_id"))
+            for r in rows_filtradas
+            if getattr(r, "motoboy_id", None) is not None
+        }
+    )
+    motoboy_nome_map: Dict[int, str] = {}
+    if motoboy_ids:
+        rows_motoboy = db.execute(
+            select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(motoboy_ids))
+        ).all()
+        motoboy_user_map = {
+            int(mid): (int(uid) if uid is not None else None)
+            for mid, uid in rows_motoboy
+        }
+        user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
+        user_map: Dict[int, tuple] = {}
+        if user_ids:
+            rows_user = db.execute(
+                select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
+            ).all()
+            user_map = {
+                int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
+                for uid, nome, sobrenome, username in rows_user
+            }
+
+        for mid, uid in motoboy_user_map.items():
+            if uid is None:
+                motoboy_nome_map[mid] = f"Motoboy {mid}"
+                continue
+            nome, sobrenome, username_val = user_map.get(uid, ("", "", ""))
+            nome_fmt = f"{nome} {sobrenome}".strip() or username_val or f"Motoboy {mid}"
+            motoboy_nome_map[mid] = nome_fmt
+
     def _nome_executor_cached(saida: Saida) -> Optional[str]:
         sid = int(saida.id_saida)
         if sid not in executor_nome_cache:
-            executor_nome_cache[sid] = _nome_executor_atual(db, saida)
+            mid = getattr(saida, "motoboy_id", None)
+            nome_motoboy = None
+            if mid is not None:
+                nome_motoboy = motoboy_nome_map.get(int(mid))
+            executor_nome_cache[sid] = nome_motoboy or getattr(saida, "entregador", None)
         return executor_nome_cache[sid]
 
     if entregador_filter_norm:
