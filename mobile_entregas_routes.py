@@ -1268,6 +1268,11 @@ def scan_codigo(
     if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
         if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
             saida.qr_payload_raw = qr_payload_raw.strip()
+    if motoboy_id is not None:
+        motoboy = db.get(Motoboy, motoboy_id)
+        if motoboy:
+            saida.entregador = _get_motoboy_nome(db, motoboy)
+            saida.entregador_id = None
     saida.motoboy_id = motoboy_id
     saida.status = status_scan
     if status_norm == STATUS_AUSENTE:
@@ -1395,6 +1400,10 @@ def assumir_entrega(
 
     antigo = s.motoboy_id
     s.motoboy_id = user.motoboy_id
+    motoboy = db.get(Motoboy, user.motoboy_id)
+    if motoboy:
+        s.entregador = _get_motoboy_nome(db, motoboy)
+        s.entregador_id = None
     s.status = STATUS_SAIU_PARA_ENTREGA
     if status_norm == STATUS_AUSENTE:
         detail = _get_detail_for_saida(db, id_saida)

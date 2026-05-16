@@ -389,6 +389,16 @@ def _acao_equivalente(evento_norm: str) -> str:
     return resolver_chave_acao(evento_norm) or ""
 
 
+def _nome_executor_atual(db: Session, saida: Saida) -> Optional[str]:
+    """Resolve nome exibível do responsável atual priorizando motoboy_id."""
+    mid = getattr(saida, "motoboy_id", None)
+    if mid is not None:
+        motoboy = db.get(Motoboy, mid)
+        if motoboy:
+            return _get_motoboy_nome(db, motoboy)
+    return getattr(saida, "entregador", None)
+
+
 # ============================================================
 # POST — REGISTRAR SAÍDA
 # ============================================================
@@ -851,6 +861,7 @@ def listar_saidas(
             sumAvulso += 1
     rows = rows_filtradas[offset : (offset + limit) if limit else None]
 
+    nomes_executor = {int(r.id_saida): _nome_executor_atual(db, r) for r in rows}
     return {
         "total": total,
         "sumShopee": sumShopee,
@@ -864,7 +875,7 @@ def listar_saidas(
                 "acao": (op_ctx_map.get(r.id_saida).acao_label if op_ctx_map.get(r.id_saida) else None) or "Sem ação",
                 "sub_base": r.sub_base,
                 "username": (op_ctx_map.get(r.id_saida).ultimo_ator_username if op_ctx_map.get(r.id_saida) else None) or r.username,
-                "entregador": r.entregador,
+                "entregador": nomes_executor.get(int(r.id_saida)) or r.entregador,
                 "entregador_id": getattr(r, "entregador_id", None),
                 "motoboy_id": getattr(r, "motoboy_id", None),
                 "codigo": r.codigo,
@@ -936,13 +947,14 @@ def get_saida_detalhe(
             endereco_origem=detail_row.endereco_origem,
             foto_urls=foto_urls_list or None,
         )
+    executor_nome = _nome_executor_atual(db, obj) or obj.entregador
     return SaidaDetalheCompletoOut(
         id_saida=obj.id_saida,
         timestamp=obj.timestamp,
         data=obj.data,
         sub_base=obj.sub_base,
         username=obj.username,
-        entregador=obj.entregador,
+        entregador=executor_nome,
         motoboy_id=obj.motoboy_id,
         data_hora_entrega=obj.data_hora_entrega,
         codigo=obj.codigo,
