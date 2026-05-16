@@ -380,6 +380,13 @@ def _status_group_aliases(token: str) -> List[str]:
     return sorted({v for v in normalized if v})
 
 
+def _acao_equivalente(evento_norm: str) -> str:
+    v = (evento_norm or "").strip().lower().replace(" ", "_")
+    if v in {"assumir", "assumido", "reatribuicao", "reatribuido"}:
+        return "reatribuido"
+    return v
+
+
 # ============================================================
 # POST — REGISTRAR SAÍDA
 # ============================================================
@@ -795,7 +802,7 @@ def listar_saidas(
             if (
                 (
                     (ctx := op_ctx_map.get(r.id_saida)) is not None
-                    and _norm_text(ctx.ultimo_evento).replace("_", " ") in allowed_labels
+                    and _norm_text(_acao_equivalente(ctx.ultimo_evento)).replace("_", " ") in allowed_labels
                 )
                 or (
                     (ctx := op_ctx_map.get(r.id_saida)) is not None
@@ -803,7 +810,7 @@ def listar_saidas(
                 )
                 or (
                     (ctx := op_ctx_map.get(r.id_saida)) is not None
-                    and _norm_text(ctx.ultimo_evento) in allowed_eventos
+                    and _norm_text(_acao_equivalente(ctx.ultimo_evento)) in allowed_eventos
                 )
             )
         ]
@@ -841,7 +848,7 @@ def listar_saidas(
         "items": [
             {
                 "id_saida": r.id_saida,
-                "timestamp": (op_ctx_map.get(r.id_saida).operacional_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
+                "timestamp": r.timestamp,
                 "data_hora_acao": (op_ctx_map.get(r.id_saida).ultimo_evento_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
                 "acao": (op_ctx_map.get(r.id_saida).acao_label if op_ctx_map.get(r.id_saida) else None) or "Sem ação",
                 "sub_base": r.sub_base,

@@ -16,7 +16,6 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "assumido",
     "reatribuicao",
     "reatribuido",
-    "em_rota",
 }
 
 EVENTOS_INVALIDANTES = {
@@ -27,8 +26,8 @@ EVENTOS_INVALIDANTES = {
 ROTULOS_ACAO = {
     "lido": "Lido",
     "scan": "Scan",
-    "assumir": "Assumiu entrega",
-    "assumido": "Assumiu entrega",
+    "assumir": "Reatribuido",
+    "assumido": "Reatribuido",
     "reatribuicao": "Reatribuido",
     "reatribuido": "Reatribuido",
     "removido_sem_inicio": "Removido sem iniciar rota",
