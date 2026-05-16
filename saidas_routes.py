@@ -727,9 +727,9 @@ def listar_saidas(
         stmt = stmt.where(func.unaccent(func.lower(Saida.base)) == func.unaccent(base_norm))
 
 
+    entregador_filter_norm = ""
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
-        ent_norm = entregador.strip().lower()
-        stmt = stmt.where(func.unaccent(func.lower(Saida.entregador)) == func.unaccent(ent_norm))
+        entregador_filter_norm = _norm_text(entregador)
 
     status_tokens_raw = [
         t for t in _parse_multi_values(status_) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
@@ -798,6 +798,19 @@ def listar_saidas(
 
     rows_all = db.execute(stmt).scalars().all()
     rows_filtradas, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_all, de, ate)
+    executor_nome_cache: Dict[int, Optional[str]] = {}
+
+    def _nome_executor_cached(saida: Saida) -> Optional[str]:
+        sid = int(saida.id_saida)
+        if sid not in executor_nome_cache:
+            executor_nome_cache[sid] = _nome_executor_atual(db, saida)
+        return executor_nome_cache[sid]
+
+    if entregador_filter_norm:
+        rows_filtradas = [
+            r for r in rows_filtradas
+            if _norm_text(_nome_executor_cached(r)) == entregador_filter_norm
+        ]
     acao_tokens = [
         _norm_text(t).replace("_", " ") for t in _parse_multi_values(acao)
         if _norm_text(t) not in {"", "(todos)", "todos", "all"}
@@ -861,7 +874,7 @@ def listar_saidas(
             sumAvulso += 1
     rows = rows_filtradas[offset : (offset + limit) if limit else None]
 
-    nomes_executor = {int(r.id_saida): _nome_executor_atual(db, r) for r in rows}
+    nomes_executor = {int(r.id_saida): _nome_executor_cached(r) for r in rows}
     return {
         "total": total,
         "sumShopee": sumShopee,
