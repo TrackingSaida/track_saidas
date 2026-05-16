@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from typing import Optional, List, Dict, Tuple
 
@@ -222,6 +222,23 @@ def _get_detail_for_saida(db: Session, id_saida: int) -> Optional[SaidaDetail]:
     )
 
 
+def _carregar_details_por_saida_ids(db: Session, saida_ids: List[int]) -> Dict[int, SaidaDetail]:
+    ids = sorted({int(i) for i in saida_ids if i is not None})
+    if not ids:
+        return {}
+    rows = db.execute(
+        select(SaidaDetail)
+        .where(SaidaDetail.id_saida.in_(ids))
+        .order_by(SaidaDetail.id_saida.asc(), SaidaDetail.id_detail.desc())
+    ).scalars().all()
+    out: Dict[int, SaidaDetail] = {}
+    for d in rows:
+        sid = int(d.id_saida)
+        if sid not in out:
+            out[sid] = d
+    return out
+
+
 def _servico_tipo(serv: Optional[str]) -> str:
     """Retorna Shopee | Flex | Avulso para exibição."""
     s = (serv or "").strip().lower()
@@ -382,10 +399,10 @@ def listar_entregas(
     rows = db.scalars(q).all()
     if status == "pendente" and hoje is not None:
         rows = _filtrar_por_data_operacional(db, rows, hoje)
+    details_map = _carregar_details_por_saida_ids(db, [s.id_saida for s in rows])
     out = []
     for s in rows:
-        detail = _get_detail_for_saida(db, s.id_saida)
-        out.append(_saida_to_item(s, detail))
+        out.append(_saida_to_item(s, details_map.get(int(s.id_saida))))
     return out
 
 
@@ -420,6 +437,8 @@ def extrato_financeiro_motoboy(
         Saida.sub_base == sub_base,
         Saida.motoboy_id == motoboy_id,
         Saida.codigo.isnot(None),
+        Saida.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()),
+        Saida.timestamp < datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time()),
     ).order_by(Saida.data.desc(), Saida.timestamp.desc())
     rows_all = db.scalars(q).all()
     rows_periodo = list(rows_all)

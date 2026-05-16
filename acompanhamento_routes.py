@@ -27,6 +27,38 @@ from saidas_routes import (
 router = APIRouter(prefix="/acompanhamento", tags=["Acompanhamento"])
 
 
+def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> dict[int, str]:
+    ids = sorted({int(mid) for mid in motoboy_ids if mid is not None})
+    if not ids:
+        return {}
+    rows_motoboy = db.execute(
+        select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(ids))
+    ).all()
+    motoboy_user_map = {
+        int(mid): (int(uid) if uid is not None else None)
+        for mid, uid in rows_motoboy
+    }
+    user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
+    user_map = {}
+    if user_ids:
+        rows_user = db.execute(
+            select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
+        ).all()
+        user_map = {
+            int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
+            for uid, nome, sobrenome, username in rows_user
+        }
+    out: dict[int, str] = {}
+    for mid in ids:
+        uid = motoboy_user_map.get(mid)
+        if uid is None:
+            out[mid] = f"Motoboy {mid}"
+            continue
+        nome, sobrenome, username = user_map.get(uid, ("", "", ""))
+        out[mid] = (f"{nome} {sobrenome}".strip() or username or f"Motoboy {mid}")
+    return out
+
+
 class AcompanhamentoItem(BaseModel):
     data: str
     motoboy_id: int
@@ -96,10 +128,13 @@ def acompanhamento_mapa(
         stmt = stmt.where(Saida.motoboy_id == motoboy_id)
 
     rows = db.execute(stmt).all()
+    nomes_motoboy = _carregar_nomes_motoboy_ids(
+        db,
+        [int(saida.motoboy_id) for saida, _ in rows if getattr(saida, "motoboy_id", None) is not None],
+    )
     items = []
     for saida, detail in rows:
-        motoboy = db.get(Motoboy, saida.motoboy_id) if saida.motoboy_id else None
-        motoboy_nome = _get_motoboy_nome(db, motoboy) if motoboy else None
+        motoboy_nome = nomes_motoboy.get(int(saida.motoboy_id)) if saida.motoboy_id else None
         lat = float(detail.latitude) if detail.latitude is not None else None
         lon = float(detail.longitude) if detail.longitude is not None else None
         if lat is None or lon is None:
@@ -187,6 +222,7 @@ def acompanhamento_dia(
     totais_em_rota = 0
     totais_ausente = 0
 
+    nomes_motoboy = _carregar_nomes_motoboy_ids(db, [int(mid) for mid in by_motoboy.keys()])
     for mid, list_saidas in sorted(by_motoboy.items()):
         pedidos = len(list_saidas)
         entregues = 0
@@ -209,8 +245,7 @@ def acompanhamento_dia(
 
         sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
 
-        motoboy = db.get(Motoboy, mid)
-        motoboy_nome = _get_motoboy_nome(db, motoboy) if motoboy else f"Motoboy {mid}"
+        motoboy_nome = nomes_motoboy.get(int(mid), f"Motoboy {mid}")
 
         items.append(
             AcompanhamentoItem(

@@ -471,8 +471,10 @@ def list_executores(
         )
         .order_by(Motoboy.id_motoboy)
     )
-    for motoboy in db.scalars(stmt_mb).all():
-        nome = _get_motoboy_nome(db, motoboy.id_motoboy)
+    motoboys = db.scalars(stmt_mb).all()
+    nomes_motoboy = _carregar_nomes_motoboy_ids(db, [m.id_motoboy for m in motoboys])
+    for motoboy in motoboys:
+        nome = nomes_motoboy.get(int(motoboy.id_motoboy), f"Motoboy {motoboy.id_motoboy}")
         out.append(ExecutorItem(
             id_entregador=None,
             id_motoboy=motoboy.id_motoboy,
@@ -505,6 +507,39 @@ def _get_motoboy_nome(db: Session, motoboy_id: int) -> str:
         return f"Motoboy {motoboy_id}"
     nome = (f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or "").strip()
     return nome or f"Motoboy {motoboy_id}"
+
+
+def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> Dict[int, str]:
+    """Resolve nomes de motoboy em lote para evitar N+1."""
+    ids = sorted({int(mid) for mid in motoboy_ids if mid is not None})
+    if not ids:
+        return {}
+    rows_motoboy = db.execute(
+        select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(ids))
+    ).all()
+    motoboy_user_map: Dict[int, Optional[int]] = {
+        int(mid): (int(uid) if uid is not None else None)
+        for mid, uid in rows_motoboy
+    }
+    user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
+    user_map: Dict[int, tuple] = {}
+    if user_ids:
+        rows_user = db.execute(
+            select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
+        ).all()
+        user_map = {
+            int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
+            for uid, nome, sobrenome, username in rows_user
+        }
+    out: Dict[int, str] = {}
+    for mid in ids:
+        uid = motoboy_user_map.get(mid)
+        if uid is None:
+            out[mid] = f"Motoboy {mid}"
+            continue
+        nome, sobrenome, username = user_map.get(uid, ("", "", ""))
+        out[mid] = (f"{nome} {sobrenome}".strip() or username or f"Motoboy {mid}")
+    return out
 
 
 def _resolve_executor_scope_ids(
@@ -762,6 +797,10 @@ def resumo_entregadores(
 
     rows_raw = db.scalars(stmt).all()
     rows, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_raw, data_inicio, data_fim)
+    nomes_motoboy_map = _carregar_nomes_motoboy_ids(
+        db,
+        [int(getattr(s, "motoboy_id")) for s in rows if getattr(s, "motoboy_id", None) is not None],
+    )
 
     agrupado: Dict[str, Dict[str, Any]] = {}
     for saida in rows:
@@ -776,7 +815,7 @@ def resumo_entregadores(
                     "data": dia,
                     "entregador_id": None,
                     "motoboy_id": mid,
-                    "entregador_nome": _get_motoboy_nome(db, mid),
+                    "entregador_nome": nomes_motoboy_map.get(int(mid), f"Motoboy {mid}"),
                     "qtde_shopee": 0,
                     "qtde_flex": 0,
                     "qtde_avulso": 0,
