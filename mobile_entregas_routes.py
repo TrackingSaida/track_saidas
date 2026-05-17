@@ -49,7 +49,7 @@ from codigo_normalizer import (
     is_qr_like_scan_payload,
 )
 from entregador_routes import resolver_precos_motoboy
-from saida_operacional_utils import carregar_contexto_operacional
+from saida_operacional_utils import carregar_contexto_operacional, EVENTOS_ATRIBUICAO_VALIDOS
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 
@@ -434,12 +434,24 @@ def extrato_financeiro_motoboy(
     if modo not in ("grupo_entregue", "todos"):
         modo = "grupo_entregue"
 
+    dt_inicio = datetime.combine(periodo_inicio, datetime.min.time())
+    dt_fim_exclusivo = datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time())
+    eventos_operacionais = tuple(EVENTOS_ATRIBUICAO_VALIDOS)
+    subq_hist_periodo = select(1).where(
+        SaidaHistorico.id_saida == Saida.id_saida,
+        SaidaHistorico.evento.in_(eventos_operacionais),
+        SaidaHistorico.timestamp >= dt_inicio,
+        SaidaHistorico.timestamp < dt_fim_exclusivo,
+    )
     q = select(Saida).where(
         Saida.sub_base == sub_base,
         Saida.motoboy_id == motoboy_id,
         Saida.codigo.isnot(None),
-        Saida.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()),
-        Saida.timestamp < datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time()),
+        (
+            (Saida.timestamp >= dt_inicio)
+            & (Saida.timestamp < dt_fim_exclusivo)
+        )
+        | exists(subq_hist_periodo),
     ).order_by(Saida.data.desc(), Saida.timestamp.desc())
     rows_all = db.scalars(q).all()
     rows_periodo = list(rows_all)
