@@ -22,6 +22,7 @@ from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
 from saida_operacional_utils import (
     carregar_contexto_operacional,
+    EVENTOS_ATRIBUICAO_VALIDOS,
     filtrar_saidas_por_periodo_operacional,
     resolver_chave_acao,
     rotulo_acao_evento,
@@ -730,10 +731,45 @@ def listar_saidas(
     stmt = select(Saida).where(Saida.sub_base == sub_base)
     # Pré-filtro por janela de timestamp para reduzir cardinalidade antes do
     # processamento operacional em memória.
+    dt_inicio = datetime.combine(de, datetime.min.time()) if de is not None else None
+    dt_fim_exclusivo = datetime.combine(ate + timedelta(days=1), datetime.min.time()) if ate is not None else None
+    eventos_operacionais = tuple(EVENTOS_ATRIBUICAO_VALIDOS)
     if de is not None:
-        stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
-    if ate is not None:
-        stmt = stmt.where(Saida.timestamp < datetime.combine(ate + timedelta(days=1), datetime.min.time()))
+        if dt_fim_exclusivo is not None:
+            subq_hist_periodo = select(1).where(
+                SaidaHistorico.id_saida == Saida.id_saida,
+                SaidaHistorico.evento.in_(eventos_operacionais),
+                SaidaHistorico.timestamp >= dt_inicio,
+                SaidaHistorico.timestamp < dt_fim_exclusivo,
+            )
+            stmt = stmt.where(
+                (
+                    (Saida.timestamp >= dt_inicio)
+                    & (Saida.timestamp < dt_fim_exclusivo)
+                )
+                | exists(subq_hist_periodo)
+            )
+        else:
+            stmt = stmt.where(
+                (Saida.timestamp >= dt_inicio)
+                | exists(
+                    select(1).where(
+                        SaidaHistorico.id_saida == Saida.id_saida,
+                        SaidaHistorico.evento.in_(eventos_operacionais),
+                        SaidaHistorico.timestamp >= dt_inicio,
+                    )
+                )
+            )
+    elif ate is not None:
+        subq_hist_ate = select(1).where(
+            SaidaHistorico.id_saida == Saida.id_saida,
+            SaidaHistorico.evento.in_(eventos_operacionais),
+            SaidaHistorico.timestamp < dt_fim_exclusivo,
+        )
+        stmt = stmt.where(
+            (Saida.timestamp < dt_fim_exclusivo)
+            | exists(subq_hist_ate)
+        )
 
     if base and base.strip() and base.lower() != "(todas)":
         base_norm = base.strip().lower()
