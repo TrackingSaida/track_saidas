@@ -1297,6 +1297,7 @@ def scan_codigo(
         if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
             saida.qr_payload_raw = qr_payload_raw.strip()
     motoboy_id_anterior = saida.motoboy_id
+    status_anterior = status_norm
     if motoboy_id is not None:
         motoboy = db.get(Motoboy, motoboy_id)
         if motoboy:
@@ -1332,7 +1333,19 @@ def scan_codigo(
     db.commit()
     db.refresh(saida)
     detail = _get_detail_for_saida(db, saida.id_saida)
-    return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+    houve_atribuicao_ou_progresso = bool(
+        motoboy_id is not None
+        and (
+            motoboy_id_anterior != motoboy_id
+            or status_anterior != status_scan
+        )
+    )
+    return {
+        "ok": True,
+        "conflito": False,
+        "ja_existia": not houve_atribuicao_ou_progresso,
+        "entrega": _saida_to_item(saida, detail),
+    }
 
 
 # ============================================================
