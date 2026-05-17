@@ -371,6 +371,7 @@ def listar_entregas(
     q = select(Saida).where(
         Saida.sub_base == sub_base,
         Saida.motoboy_id == motoboy_id,
+        Saida.codigo.isnot(None),
     )
     if status == "pendente":
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
@@ -580,6 +581,7 @@ def resumo_entregas(
         select(Saida).where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
+            Saida.codigo.isnot(None),
             Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
         )
     ).all()
@@ -597,6 +599,7 @@ def resumo_entregas(
         .where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
+            Saida.codigo.isnot(None),
             Saida.status == STATUS_ENTREGUE,
             exists(
                 select(1).where(
@@ -611,6 +614,7 @@ def resumo_entregas(
         select(func.count(Saida.id_saida)).where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
+            Saida.codigo.isnot(None),
             Saida.status == STATUS_SAIU_PARA_ENTREGA,
         )
     ) or 0
@@ -618,6 +622,7 @@ def resumo_entregas(
         select(func.count(Saida.id_saida)).where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
+            Saida.codigo.isnot(None),
             Saida.status == STATUS_AUSENTE,
         )
     ) or 0
