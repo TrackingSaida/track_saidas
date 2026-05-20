@@ -105,7 +105,10 @@ def carregar_contexto_operacional(
     for ids_lote in _chunked(ids, MAX_IDS_POR_LOTE):
         rows_lote = db.execute(
             select(SaidaHistorico)
-            .where(SaidaHistorico.id_saida.in_(ids_lote))
+            .where(
+                SaidaHistorico.id_saida.in_(ids_lote),
+                SaidaHistorico.evento.in_(tuple(EVENTOS_ATRIBUICAO_VALIDOS | EVENTOS_INVALIDANTES)),
+            )
             .order_by(SaidaHistorico.id_saida.asc(), SaidaHistorico.timestamp.asc(), SaidaHistorico.id.asc())
         ).scalars().all()
         historicos.extend(rows_lote)

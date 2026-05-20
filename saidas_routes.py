@@ -995,7 +995,12 @@ def listar_saidas(
             sumMercado += 1
         else:
             sumAvulso += 1
-    rows = rows_filtradas[offset : (offset + limit) if limit else None]
+    if limit is not None:
+        start_idx = max(0, int(offset))
+        end_idx = start_idx + max(0, int(limit))
+        rows = rows_filtradas[start_idx:end_idx]
+    else:
+        rows = rows_filtradas[max(0, int(offset)):]
 
     nomes_executor = {int(r.id_saida): _nome_executor_cached(r) for r in rows}
     return {
