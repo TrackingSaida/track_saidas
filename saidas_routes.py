@@ -28,6 +28,7 @@ from saida_operacional_utils import (
     rotulo_acao_evento,
 )
 from codigo_normalizer import canonicalize_servico
+from log_leitura_service import registrar_log_leitura_critico
 
 
 # ============================================================
@@ -520,6 +521,7 @@ def ler_saida(
 ):
     sub_base = current_user.sub_base
     username = current_user.username
+    role = getattr(current_user, "role", None)
     ignorar_coleta = bool(current_user.ignorar_coleta)
     owner_valor = Decimal(getattr(current_user, "owner_valor", 0))
 
@@ -686,9 +688,35 @@ def ler_saida(
         if not mesmo_ent:
             mesmo_ent = _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
         if mesmo_ent:
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=username,
+                origem="desconhecida",
+                tipo="saida",
+                codigo=existente.codigo,
+                resultado="duplicado",
+                role=role,
+                motoboy_id=motoboy_id,
+                id_saida=existente.id_saida,
+                origem_app="web",
+                endpoint="/saidas/ler",
+            )
             return SaidaOut.model_validate(existente)
         # outro entregador → 409 para front acionar PATCH de troca.
         # Sem retry: front trata com Swal + PATCH, evita latência de retry em fluxo normal.
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=username,
+            origem="desconhecida",
+            tipo="saida",
+            codigo=existente.codigo,
+            resultado="atribuido_a_outro",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=existente.id_saida,
+            origem_app="web",
+            endpoint="/saidas/ler",
+        )
         return JSONResponse(
             status_code=409,
             content={

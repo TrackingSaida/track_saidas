@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import User, LogLeitura
+from log_leitura_service import RESULTADOS_CRITICOS, registrar_log_leitura_critico
 
 # ============================================================
 # ROTAS DE LOGS DE LEITURA
@@ -94,36 +95,26 @@ def registrar_log_leitura(
     if not sub_base or not username:
         return
 
+    # Mantém compatibilidade do endpoint legado, mas restringe aos críticos acordados.
+    if payload.resultado not in RESULTADOS_CRITICOS:
+        return
+
     try:
-        log = LogLeitura(
+        registrar_log_leitura_critico(
             sub_base=sub_base,
             username=username,
-
             origem=payload.origem,
             tipo=payload.tipo,
             codigo=payload.codigo,
-
             resultado=payload.resultado,
-
-            # métricas antigas
-            delta_from_last_read_ms=payload.delta_from_last_read_ms,
-            delta_read_to_send_ms=payload.delta_read_to_send_ms,
-            delta_send_to_response_ms=payload.delta_send_to_response_ms,
-
-            ts_read=payload.ts_read,
-
-            backend_processing_ms=payload.backend_processing_ms,
-
-            network_status=payload.network_status,
-            device_type=payload.device_type,
-            os=payload.os,
+            role=getattr(current_user, "role", None),
+            motoboy_id=getattr(current_user, "motoboy_id", None),
+            id_saida=None,
+            origem_app="web",
+            endpoint="/logs/leituras",
         )
 
-        db.add(log)
-        db.commit()
-
     except Exception as e:
-        db.rollback()
         # 🔇 nunca propaga erro
         print("[LOG_LEITURA_ERROR]", str(e))
 

@@ -50,6 +50,7 @@ from codigo_normalizer import (
 )
 from entregador_routes import resolver_precos_motoboy
 from saida_operacional_utils import carregar_contexto_operacional, EVENTOS_ATRIBUICAO_VALIDOS
+from log_leitura_service import registrar_log_leitura_critico
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 
@@ -1286,6 +1287,19 @@ def scan_codigo(
             db.commit()
             db.refresh(saida)
             detail = _get_detail_for_saida(db, saida.id_saida)
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=getattr(user, "username", None),
+                origem=origem,
+                tipo="saida",
+                codigo=saida.codigo,
+                resultado="duplicado",
+                role=role,
+                motoboy_id=None,
+                id_saida=saida.id_saida,
+                origem_app="mobile",
+                endpoint="/mobile/scan",
+            )
             return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id == motoboy_id:
             if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
@@ -1294,11 +1308,37 @@ def scan_codigo(
             _garantir_cobranca_owner_saida(db, saida, owner_valor)
             db.commit()
             detail = _get_detail_for_saida(db, saida.id_saida)
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=getattr(user, "username", None),
+                origem=origem,
+                tipo="saida",
+                codigo=saida.codigo,
+                resultado="duplicado",
+                role=role,
+                motoboy_id=motoboy_id,
+                id_saida=saida.id_saida,
+                origem_app="mobile",
+                endpoint="/mobile/scan",
+            )
             return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id is not None:
             _garantir_cobranca_owner_saida(db, saida, owner_valor)
             db.commit()
             nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=getattr(user, "username", None),
+                origem=origem,
+                tipo="saida",
+                codigo=saida.codigo,
+                resultado="atribuido_a_outro",
+                role=role,
+                motoboy_id=motoboy_id,
+                id_saida=saida.id_saida,
+                origem_app="mobile",
+                endpoint="/mobile/scan",
+            )
             return JSONResponse(
                 status_code=409,
                 content={
@@ -1492,4 +1532,18 @@ def assumir_entrega(
     )
     _garantir_cobranca_owner_saida(db, s, owner_valor)
     db.commit()
+    if antigo is not None and antigo != user.motoboy_id:
+        registrar_log_leitura_critico(
+            sub_base=getattr(user, "sub_base", None),
+            username=getattr(user, "username", None),
+            origem="manual",
+            tipo="saida",
+            codigo=s.codigo,
+            resultado="assumiu_de_outro",
+            role=getattr(user, "role", None),
+            motoboy_id=getattr(user, "motoboy_id", None),
+            id_saida=s.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/entrega/{id_saida}/assumir",
+        )
     return {"ok": True, "id_saida": id_saida}
