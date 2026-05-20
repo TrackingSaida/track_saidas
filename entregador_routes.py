@@ -273,6 +273,68 @@ def _resolver_entregador_principal_do_motoboy(
     return sorted(entregador_ids)[0]
 
 
+def _resolver_entregador_principal_do_motoboy_robusto(
+    db: Session,
+    sub_base: str,
+    motoboy_id: int,
+) -> Optional[int]:
+    """
+    Resolve entregador principal para um motoboy com fallback robusto:
+    1) vínculo por username/documento (_resolve_executor_scope_ids);
+    2) match por nome normalizado (User.nome+sobrenome vs Entregador.nome).
+    """
+    entregador_id = _resolver_entregador_principal_do_motoboy(
+        db=db,
+        sub_base=sub_base,
+        motoboy_id=motoboy_id,
+    )
+    if entregador_id is not None:
+        return entregador_id
+
+    motoboy = db.get(Motoboy, motoboy_id)
+    if not motoboy:
+        return None
+
+    pertence_sub_base = bool((motoboy.sub_base or "").strip() == (sub_base or "").strip())
+    if not pertence_sub_base:
+        pertence_sub_base = (
+            db.scalar(
+                select(func.count())
+                .select_from(MotoboySubBase)
+                .where(
+                    MotoboySubBase.motoboy_id == motoboy_id,
+                    MotoboySubBase.sub_base == sub_base,
+                    MotoboySubBase.ativo.is_(True),
+                )
+            )
+            or 0
+        ) > 0
+    if not pertence_sub_base:
+        return None
+
+    u = db.get(User, motoboy.user_id) if motoboy.user_id else None
+    nome_user = (f"{(u.nome or '').strip()} {(u.sobrenome or '').strip()}".strip() if u else "")
+    nome_user_norm = " ".join(nome_user.lower().split()) if nome_user else ""
+    if not nome_user_norm:
+        return None
+
+    entregadores = db.scalars(
+        select(Entregador).where(
+            Entregador.sub_base == sub_base,
+            Entregador.ativo.is_(True),
+        )
+    ).all()
+    for ent in entregadores:
+        nome_ent = (ent.nome or "").strip()
+        if not nome_ent:
+            continue
+        nome_ent_norm = " ".join(nome_ent.lower().split())
+        if nome_ent_norm == nome_user_norm:
+            return int(ent.id_entregador)
+
+    return None
+
+
 def resolver_precos_motoboy(
     db: Session,
     sub_base: str,
@@ -286,7 +348,7 @@ def resolver_precos_motoboy(
     """
     zero = Decimal("0.00")
     if motoboy_id is not None:
-        entregador_id = _resolver_entregador_principal_do_motoboy(
+        entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
             db=db,
             sub_base=sub_base,
             motoboy_id=motoboy_id,
@@ -1187,7 +1249,7 @@ def get_precos_executores(
     motoboys = db.scalars(stmt_mb).all()
     nomes_motoboy = _carregar_nomes_motoboy_ids(db, [m.id_motoboy for m in motoboys])
     for motoboy in motoboys:
-        entregador_id = _resolver_entregador_principal_do_motoboy(
+        entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
             db=db,
             sub_base=sub_base_user,
             motoboy_id=int(motoboy.id_motoboy),
