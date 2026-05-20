@@ -1266,6 +1266,9 @@ def get_precos_individuais(
                     )
                 ).first()
             ep = cache_ep[eid]
+        # A grade de exceções deve listar apenas motoboys com exceção ativa.
+        if ep is None:
+            continue
         items.append(_preco_item_from_motoboy(db, sub_base_user, motoboy, ep))
     return PrecoIndividuaisResponse(items=items)
 
