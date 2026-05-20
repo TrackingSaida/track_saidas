@@ -675,6 +675,77 @@ def _preco_item_from_motoboy(
     )
 
 
+def _obter_ou_criar_entregador_legado_para_motoboy(
+    db: Session,
+    sub_base_user: str,
+    id_motoboy: int,
+) -> int:
+    """
+    Garante um entregador legado para persistir exceção de preço por motoboy.
+    Regra:
+    1) tenta resolver vínculo existente;
+    2) se não existir, cria entregador legado automaticamente.
+    """
+    existente = _resolver_entregador_principal_do_motoboy_robusto(
+        db=db,
+        sub_base=sub_base_user,
+        motoboy_id=int(id_motoboy),
+    )
+    if existente is not None:
+        return int(existente)
+
+    motoboy = db.get(Motoboy, int(id_motoboy))
+    if not motoboy:
+        raise HTTPException(status_code=404, detail="Motoboy não encontrado.")
+
+    user = db.get(User, motoboy.user_id) if motoboy.user_id else None
+    username_ref = ((getattr(user, "username", None) or f"motoboy.{id_motoboy}").strip())
+    nome_ref = (
+        f"{(getattr(user, 'nome', None) or '').strip()} {(getattr(user, 'sobrenome', None) or '').strip()}".strip()
+        or username_ref
+        or f"Motoboy {id_motoboy}"
+    )
+    documento_ref = (motoboy.documento or "").strip() or None
+
+    by_username = db.scalars(
+        select(Entregador).where(
+            Entregador.sub_base == sub_base_user,
+            Entregador.username_entregador == username_ref,
+        )
+    ).first()
+    if by_username:
+        return int(by_username.id_entregador)
+
+    if documento_ref:
+        by_documento = db.scalars(
+            select(Entregador).where(
+                Entregador.sub_base == sub_base_user,
+                Entregador.documento == documento_ref,
+            )
+        ).first()
+        if by_documento:
+            return int(by_documento.id_entregador)
+
+    novo_entregador = Entregador(
+        sub_base=sub_base_user,
+        nome=nome_ref,
+        telefone=((getattr(user, "contato", None) or "").strip() or "Não informado"),
+        documento=documento_ref,
+        ativo=True,
+        rua=(motoboy.rua or "").strip() or "Não informado",
+        numero=(motoboy.numero or "").strip() or "S/N",
+        complemento=(motoboy.complemento or "").strip(),
+        cep=(motoboy.cep or "").strip() or "00000000",
+        cidade=(motoboy.cidade or "").strip() or "Não informado",
+        bairro=(motoboy.bairro or "").strip() or "Não informado",
+        coletador=False,
+        username_entregador=username_ref,
+    )
+    db.add(novo_entregador)
+    db.flush()
+    return int(novo_entregador.id_entregador)
+
+
 def _resolve_executor_scope_ids(
     db: Session,
     sub_base_user: str,
@@ -1561,16 +1632,11 @@ def post_motoboy_precos(
     if int(id_motoboy) not in mb_ids:
         raise HTTPException(status_code=404, detail="Motoboy não encontrado na sub_base.")
 
-    entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
+    entregador_id = _obter_ou_criar_entregador_legado_para_motoboy(
         db=db,
-        sub_base=sub_base_user,
-        motoboy_id=int(id_motoboy),
+        sub_base_user=sub_base_user,
+        id_motoboy=int(id_motoboy),
     )
-    if entregador_id is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Motoboy sem vínculo de entregador para exceção de preço. Cadastre/associe o entregador legado deste motoboy.",
-        )
     out = _salvar_preco_por_entregador(db, sub_base_user, int(entregador_id), body)
     nome_mb = _carregar_nomes_motoboy_ids(db, [int(id_motoboy)]).get(int(id_motoboy), f"Motoboy {id_motoboy}")
     out.motoboy_id = int(id_motoboy)
