@@ -1,5 +1,69 @@
 # track_saidas
 
+## Logs críticos de leitura
+
+Os logs de leitura usam a tabela existente `logs_leitura` e registram somente eventos críticos:
+
+- `duplicado`
+- `atribuido_a_outro`
+- `assumiu_de_outro`
+
+Campos importantes para consulta: `sub_base`, `username`, `codigo`, `resultado`, `motoboy_id`, `id_saida`, `origem_app`, `endpoint`, `created_at`.
+
+### Consultas úteis
+
+Eventos críticos do dia por usuário:
+
+```sql
+SELECT
+  created_at,
+  resultado,
+  codigo,
+  id_saida,
+  motoboy_id,
+  origem_app,
+  endpoint
+FROM logs_leitura
+WHERE sub_base = 'Giro Express'
+  AND username = 'USUARIO_AQUI'
+  AND created_at >= date_trunc('day', now())
+  AND created_at < date_trunc('day', now()) + interval '1 day'
+ORDER BY created_at DESC;
+```
+
+Resumo diário por resultado:
+
+```sql
+SELECT
+  resultado,
+  COUNT(*) AS total
+FROM logs_leitura
+WHERE sub_base = 'Giro Express'
+  AND created_at >= date_trunc('day', now())
+  AND created_at < date_trunc('day', now()) + interval '1 day'
+GROUP BY resultado
+ORDER BY total DESC;
+```
+
+Join opcional com `saidas` por `id_saida`:
+
+```sql
+SELECT
+  l.created_at,
+  l.resultado,
+  l.codigo AS codigo_log,
+  l.id_saida,
+  s.codigo AS codigo_saida,
+  s.status,
+  s.entregador
+FROM logs_leitura l
+LEFT JOIN saidas s ON s.id_saida = l.id_saida
+WHERE l.sub_base = 'Giro Express'
+  AND l.created_at >= date_trunc('day', now())
+  AND l.created_at < date_trunc('day', now()) + interval '1 day'
+ORDER BY l.created_at DESC;
+```
+
 ## Migrações de banco de dados
 
 As alterações de schema (colunas, tabelas) são aplicadas manualmente. Veja [migrations/README.md](migrations/README.md) para a lista de migrações e como executá-las (ex.: correção do erro `column entregador_fechamentos.id_motoboy does not exist`).

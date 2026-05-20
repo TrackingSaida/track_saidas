@@ -19,6 +19,7 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "assumido",
     "reatribuicao",
     "reatribuido",
+    "nova_saida_mesmo_entregador",
 }
 
 EVENTOS_REATRIBUICAO = {
@@ -33,6 +34,13 @@ EVENTOS_INVALIDANTES = {
     "desatribuido",
 }
 
+EVENTOS_UI_ULTIMA_ACAO = {
+    "em_rota",
+    "entregue",
+    "ausente",
+    "cancelado",
+}
+
 ROTULOS_ACAO = {
     "lido": "Leu pedido",
     "scan": "Escaneou pedido",
@@ -40,6 +48,7 @@ ROTULOS_ACAO = {
     "assumido": "Reatribuiu pedido",
     "reatribuicao": "Reatribuiu pedido",
     "reatribuido": "Reatribuiu pedido",
+    "nova_saida_mesmo_entregador": "Nova saída confirmada com o mesmo motoboy",
     "reatribuido_em_rota": "Reatribuído -> Iniciou rota",
     "removido_sem_inicio": "Removeu sem iniciar rota",
     "em_rota": "Iniciou rota",
@@ -105,7 +114,12 @@ def carregar_contexto_operacional(
     for ids_lote in _chunked(ids, MAX_IDS_POR_LOTE):
         rows_lote = db.execute(
             select(SaidaHistorico)
-            .where(SaidaHistorico.id_saida.in_(ids_lote))
+            .where(
+                SaidaHistorico.id_saida.in_(ids_lote),
+                SaidaHistorico.evento.in_(
+                    tuple(EVENTOS_ATRIBUICAO_VALIDOS | EVENTOS_INVALIDANTES | EVENTOS_UI_ULTIMA_ACAO)
+                ),
+            )
             .order_by(SaidaHistorico.id_saida.asc(), SaidaHistorico.timestamp.asc(), SaidaHistorico.id.asc())
         ).scalars().all()
         historicos.extend(rows_lote)

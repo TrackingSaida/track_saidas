@@ -681,6 +681,13 @@ class LogLeitura(Base):
     # resultado final
     resultado = Column(Text, nullable=False)
 
+    # contexto crítico para auditoria operacional
+    role = Column(Integer, nullable=True)
+    motoboy_id = Column(BigInteger, nullable=True)
+    id_saida = Column(BigInteger, nullable=True, index=True)
+    origem_app = Column(Text, nullable=True)
+    endpoint = Column(Text, nullable=True)
+
     # métricas antigas (mantidas)
     delta_from_last_read_ms = Column(Numeric(12, 3), nullable=True)
     delta_read_to_send_ms = Column(Numeric(12, 3), nullable=True)

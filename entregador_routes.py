@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from db import get_db
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
@@ -67,6 +67,16 @@ class ExecutorItem(BaseModel):
     id_motoboy: Optional[int] = None
     nome: str
     tipo: str  # "entregador" | "motoboy"
+    executor_tipo: Optional[str] = None  # "e" | "m"
+    executor_id: Optional[int] = None
+    executor_key: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PrecoExecutorOption(BaseModel):
+    entregador_id: int
+    nome: str
     executor_tipo: Optional[str] = None  # "e" | "m"
     executor_id: Optional[int] = None
     executor_key: Optional[str] = None
@@ -148,6 +158,8 @@ class PrecoGlobalUpdate(BaseModel):
 class PrecoIndividualItem(BaseModel):
     entregador_id: int
     entregador_nome: Optional[str] = None
+    motoboy_id: Optional[int] = None
+    motoboy_nome: Optional[str] = None
     shopee_valor: Optional[Decimal] = None
     ml_valor: Optional[Decimal] = None
     avulso_valor: Optional[Decimal] = None
@@ -158,6 +170,7 @@ class PrecoIndividuaisResponse(BaseModel):
 
 
 class PrecoEntregadorUpdate(BaseModel):
+    motoboy_id: Optional[int] = Field(None, ge=1)
     shopee_valor: Optional[Decimal] = Field(None, ge=0)
     ml_valor: Optional[Decimal] = Field(None, ge=0)
     avulso_valor: Optional[Decimal] = Field(None, ge=0)
@@ -263,6 +276,68 @@ def _resolver_entregador_principal_do_motoboy(
     return sorted(entregador_ids)[0]
 
 
+def _resolver_entregador_principal_do_motoboy_robusto(
+    db: Session,
+    sub_base: str,
+    motoboy_id: int,
+) -> Optional[int]:
+    """
+    Resolve entregador principal para um motoboy com fallback robusto:
+    1) vínculo por username/documento (_resolve_executor_scope_ids);
+    2) match por nome normalizado (User.nome+sobrenome vs Entregador.nome).
+    """
+    entregador_id = _resolver_entregador_principal_do_motoboy(
+        db=db,
+        sub_base=sub_base,
+        motoboy_id=motoboy_id,
+    )
+    if entregador_id is not None:
+        return entregador_id
+
+    motoboy = db.get(Motoboy, motoboy_id)
+    if not motoboy:
+        return None
+
+    pertence_sub_base = bool((motoboy.sub_base or "").strip() == (sub_base or "").strip())
+    if not pertence_sub_base:
+        pertence_sub_base = (
+            db.scalar(
+                select(func.count())
+                .select_from(MotoboySubBase)
+                .where(
+                    MotoboySubBase.motoboy_id == motoboy_id,
+                    MotoboySubBase.sub_base == sub_base,
+                    MotoboySubBase.ativo.is_(True),
+                )
+            )
+            or 0
+        ) > 0
+    if not pertence_sub_base:
+        return None
+
+    u = db.get(User, motoboy.user_id) if motoboy.user_id else None
+    nome_user = (f"{(u.nome or '').strip()} {(u.sobrenome or '').strip()}".strip() if u else "")
+    nome_user_norm = " ".join(nome_user.lower().split()) if nome_user else ""
+    if not nome_user_norm:
+        return None
+
+    entregadores = db.scalars(
+        select(Entregador).where(
+            Entregador.sub_base == sub_base,
+            Entregador.ativo.is_(True),
+        )
+    ).all()
+    for ent in entregadores:
+        nome_ent = (ent.nome or "").strip()
+        if not nome_ent:
+            continue
+        nome_ent_norm = " ".join(nome_ent.lower().split())
+        if nome_ent_norm == nome_user_norm:
+            return int(ent.id_entregador)
+
+    return None
+
+
 def resolver_precos_motoboy(
     db: Session,
     sub_base: str,
@@ -276,7 +351,7 @@ def resolver_precos_motoboy(
     """
     zero = Decimal("0.00")
     if motoboy_id is not None:
-        entregador_id = _resolver_entregador_principal_do_motoboy(
+        entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
             db=db,
             sub_base=sub_base,
             motoboy_id=motoboy_id,
@@ -540,6 +615,135 @@ def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> Dict[int
         nome, sobrenome, username = user_map.get(uid, ("", "", ""))
         out[mid] = (f"{nome} {sobrenome}".strip() or username or f"Motoboy {mid}")
     return out
+
+
+def _carregar_motoboys_ativos_da_subbase(db: Session, sub_base_user: str) -> List[Motoboy]:
+    stmt = (
+        select(Motoboy)
+        .join(User, User.id == Motoboy.user_id)
+        .outerjoin(MotoboySubBase, MotoboySubBase.motoboy_id == Motoboy.id_motoboy)
+        .where(
+            User.role == 4,
+            User.status.is_(True),
+            or_(
+                Motoboy.sub_base == sub_base_user,
+                MotoboySubBase.sub_base == sub_base_user,
+            ),
+        )
+        .order_by(Motoboy.id_motoboy.asc())
+    )
+    motoboys = db.scalars(stmt).all()
+    # dedupe por id_motoboy (join com subbase pode repetir)
+    seen = set()
+    out: List[Motoboy] = []
+    for m in motoboys:
+        mid = int(m.id_motoboy)
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append(m)
+    return out
+
+
+def _preco_item_from_motoboy(
+    db: Session,
+    sub_base_user: str,
+    motoboy: Motoboy,
+    ep: Optional[EntregadorPreco],
+) -> PrecoIndividualItem:
+    mid = int(motoboy.id_motoboy)
+    nome_mb = _carregar_nomes_motoboy_ids(db, [mid]).get(mid, f"Motoboy {mid}")
+    entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
+        db=db,
+        sub_base=sub_base_user,
+        motoboy_id=mid,
+    )
+    entregador_nome: Optional[str] = None
+    if entregador_id is not None:
+        ent = db.get(Entregador, int(entregador_id))
+        if ent and ent.sub_base == sub_base_user:
+            entregador_nome = (ent.nome or "").strip() or None
+
+    return PrecoIndividualItem(
+        entregador_id=int(entregador_id or 0),
+        entregador_nome=entregador_nome,
+        motoboy_id=mid,
+        motoboy_nome=nome_mb,
+        shopee_valor=(ep.shopee_valor if ep else None),
+        ml_valor=(ep.ml_valor if ep else None),
+        avulso_valor=(ep.avulso_valor if ep else None),
+    )
+
+
+def _obter_ou_criar_entregador_legado_para_motoboy(
+    db: Session,
+    sub_base_user: str,
+    id_motoboy: int,
+) -> int:
+    """
+    Garante um entregador legado para persistir exceção de preço por motoboy.
+    Regra:
+    1) tenta resolver vínculo existente;
+    2) se não existir, cria entregador legado automaticamente.
+    """
+    existente = _resolver_entregador_principal_do_motoboy_robusto(
+        db=db,
+        sub_base=sub_base_user,
+        motoboy_id=int(id_motoboy),
+    )
+    if existente is not None:
+        return int(existente)
+
+    motoboy = db.get(Motoboy, int(id_motoboy))
+    if not motoboy:
+        raise HTTPException(status_code=404, detail="Motoboy não encontrado.")
+
+    user = db.get(User, motoboy.user_id) if motoboy.user_id else None
+    username_ref = ((getattr(user, "username", None) or f"motoboy.{id_motoboy}").strip())
+    nome_ref = (
+        f"{(getattr(user, 'nome', None) or '').strip()} {(getattr(user, 'sobrenome', None) or '').strip()}".strip()
+        or username_ref
+        or f"Motoboy {id_motoboy}"
+    )
+    documento_ref = (motoboy.documento or "").strip() or None
+
+    by_username = db.scalars(
+        select(Entregador).where(
+            Entregador.sub_base == sub_base_user,
+            Entregador.username_entregador == username_ref,
+        )
+    ).first()
+    if by_username:
+        return int(by_username.id_entregador)
+
+    if documento_ref:
+        by_documento = db.scalars(
+            select(Entregador).where(
+                Entregador.sub_base == sub_base_user,
+                Entregador.documento == documento_ref,
+            )
+        ).first()
+        if by_documento:
+            return int(by_documento.id_entregador)
+
+    novo_entregador = Entregador(
+        sub_base=sub_base_user,
+        nome=nome_ref,
+        telefone=((getattr(user, "contato", None) or "").strip() or "Não informado"),
+        documento=documento_ref,
+        ativo=True,
+        rua=(motoboy.rua or "").strip() or "Não informado",
+        numero=(motoboy.numero or "").strip() or "S/N",
+        complemento=(motoboy.complemento or "").strip(),
+        cep=(motoboy.cep or "").strip() or "00000000",
+        cidade=(motoboy.cidade or "").strip() or "Não informado",
+        bairro=(motoboy.bairro or "").strip() or "Não informado",
+        coletador=False,
+        username_entregador=username_ref,
+    )
+    db.add(novo_entregador)
+    db.flush()
+    return int(novo_entregador.id_entregador)
 
 
 def _resolve_executor_scope_ids(
@@ -1110,28 +1314,64 @@ def get_precos_individuais(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Lista apenas exceções (usa_preco_global=False) da sub_base do owner."""
+    """Lista exceções por motoboy ativo (com fallback legado por entregador)."""
     sub_base_user = _resolve_user_base(db, current_user)
-    stmt = (
-        select(EntregadorPreco)
-        .join(Entregador, EntregadorPreco.id_entregador == Entregador.id_entregador)
-        .where(
-            Entregador.sub_base == sub_base_user,
-            EntregadorPreco.usa_preco_global.is_(False),
+    motoboys = _carregar_motoboys_ativos_da_subbase(db, sub_base_user)
+    cache_ep: Dict[int, Optional[EntregadorPreco]] = {}
+    items: List[PrecoIndividualItem] = []
+    for motoboy in motoboys:
+        mid = int(motoboy.id_motoboy)
+        entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
+            db=db,
+            sub_base=sub_base_user,
+            motoboy_id=mid,
         )
-    )
-    rows = db.scalars(stmt).all()
-    items = [
-        PrecoIndividualItem(
-            entregador_id=ep.id_entregador,
-            entregador_nome=ep.entregador.nome if ep.entregador else None,
-            shopee_valor=ep.shopee_valor,
-            ml_valor=ep.ml_valor,
-            avulso_valor=ep.avulso_valor,
-        )
-        for ep in rows
-    ]
+        ep = None
+        if entregador_id is not None:
+            eid = int(entregador_id)
+            if eid not in cache_ep:
+                cache_ep[eid] = db.scalars(
+                    select(EntregadorPreco).where(
+                        EntregadorPreco.id_entregador == eid,
+                        EntregadorPreco.usa_preco_global.is_(False),
+                    )
+                ).first()
+            ep = cache_ep[eid]
+        # A grade de exceções deve listar apenas motoboys com exceção ativa.
+        if ep is None:
+            continue
+        items.append(_preco_item_from_motoboy(db, sub_base_user, motoboy, ep))
     return PrecoIndividuaisResponse(items=items)
+
+
+@router.get("/precos/executores", response_model=List[PrecoExecutorOption])
+def get_precos_executores(
+    status: Optional[str] = Query("ativo", description="Para entregadores: ativo, inativo ou todos"),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Lista opções de motoboy ativo para cadastro de exceção de preço.
+    Usa fonte equivalente às telas de registros/leitura (users role=4 ativos).
+    """
+    sub_base_user = _resolve_user_base(db, current_user)
+    motoboys = _carregar_motoboys_ativos_da_subbase(db, sub_base_user)
+    nomes_motoboy = _carregar_nomes_motoboy_ids(db, [m.id_motoboy for m in motoboys])
+    out: List[PrecoExecutorOption] = []
+    for motoboy in motoboys:
+        mid = int(motoboy.id_motoboy)
+        nome_mb = nomes_motoboy.get(mid, f"Motoboy {mid}")
+        out.append(
+            PrecoExecutorOption(
+                entregador_id=0,  # compat legado no front; seleção real por motoboy_id
+                nome=nome_mb,
+                executor_tipo="m",
+                executor_id=mid,
+                executor_key=f"m_{mid}",
+            )
+        )
+    out.sort(key=lambda x: (x.nome or "").strip().lower())
+    return out
 
 
 @router.get("/{id_entregador}", response_model=EntregadorOut)
@@ -1324,17 +1564,12 @@ def patch_entregador(
         raise HTTPException(status_code=500, detail="Erro ao atualizar o entregador/coletador.")
 
 
-@router.post("/{id_entregador}/precos", response_model=PrecoIndividualItem)
-def post_entregador_precos(
+def _salvar_preco_por_entregador(
+    db: Session,
+    sub_base_user: str,
     id_entregador: int,
     body: PrecoEntregadorUpdate,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    """Cria ou atualiza exceção de preço para um entregador. Força usa_preco_global=False."""
-    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
-        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
-    sub_base_user = _resolve_user_base(db, current_user)
+) -> PrecoIndividualItem:
     ent = _get_owned_entregador(db, sub_base_user, id_entregador)
     ep = db.scalars(
         select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
@@ -1367,6 +1602,48 @@ def post_entregador_precos(
     )
 
 
+@router.post("/{id_entregador}/precos", response_model=PrecoIndividualItem)
+def post_entregador_precos(
+    id_entregador: int,
+    body: PrecoEntregadorUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Compatibilidade legado: salva exceção por entregador."""
+    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
+        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
+    sub_base_user = _resolve_user_base(db, current_user)
+    return _salvar_preco_por_entregador(db, sub_base_user, id_entregador, body)
+
+
+@router.post("/motoboys/{id_motoboy}/precos", response_model=PrecoIndividualItem)
+def post_motoboy_precos(
+    id_motoboy: int,
+    body: PrecoEntregadorUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Novo contrato: salva exceção selecionando motoboy ativo."""
+    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
+        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
+    sub_base_user = _resolve_user_base(db, current_user)
+    motoboys = _carregar_motoboys_ativos_da_subbase(db, sub_base_user)
+    mb_ids = {int(m.id_motoboy) for m in motoboys}
+    if int(id_motoboy) not in mb_ids:
+        raise HTTPException(status_code=404, detail="Motoboy não encontrado na sub_base.")
+
+    entregador_id = _obter_ou_criar_entregador_legado_para_motoboy(
+        db=db,
+        sub_base_user=sub_base_user,
+        id_motoboy=int(id_motoboy),
+    )
+    out = _salvar_preco_por_entregador(db, sub_base_user, int(entregador_id), body)
+    nome_mb = _carregar_nomes_motoboy_ids(db, [int(id_motoboy)]).get(int(id_motoboy), f"Motoboy {id_motoboy}")
+    out.motoboy_id = int(id_motoboy)
+    out.motoboy_nome = nome_mb
+    return out
+
+
 @router.delete("/{id_entregador}/precos", status_code=status.HTTP_204_NO_CONTENT)
 def delete_entregador_precos(
     id_entregador: int,
@@ -1382,6 +1659,34 @@ def delete_entregador_precos(
     if ep:
         db.delete(ep)
     db.commit()
+    return
+
+
+@router.delete("/motoboys/{id_motoboy}/precos", status_code=status.HTTP_204_NO_CONTENT)
+def delete_motoboy_precos(
+    id_motoboy: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Novo contrato: remove exceção selecionando motoboy."""
+    sub_base_user = _resolve_user_base(db, current_user)
+    motoboys = _carregar_motoboys_ativos_da_subbase(db, sub_base_user)
+    mb_ids = {int(m.id_motoboy) for m in motoboys}
+    if int(id_motoboy) not in mb_ids:
+        raise HTTPException(status_code=404, detail="Motoboy não encontrado na sub_base.")
+    entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
+        db=db,
+        sub_base=sub_base_user,
+        motoboy_id=int(id_motoboy),
+    )
+    if entregador_id is None:
+        return
+    ep = db.scalars(
+        select(EntregadorPreco).where(EntregadorPreco.id_entregador == int(entregador_id))
+    ).first()
+    if ep:
+        db.delete(ep)
+        db.commit()
     return
 
 

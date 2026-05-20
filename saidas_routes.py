@@ -28,6 +28,7 @@ from saida_operacional_utils import (
     rotulo_acao_evento,
 )
 from codigo_normalizer import canonicalize_servico
+from log_leitura_service import registrar_log_leitura_critico
 
 
 # ============================================================
@@ -103,6 +104,14 @@ class SaidaLerIn(BaseModel):
     # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
     registrar_nao_coletado: bool = False
     qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
+
+
+class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
+    id_saida: int
+    motoboy_id: Optional[int] = None
+    entregador_id: Optional[int] = None
+    entregador: Optional[str] = None
+    origem: str = "web"
 
 
 class SaidaDetailOut(BaseModel):
@@ -229,6 +238,40 @@ def _status_ja_em_rota_ou_saida(status_norm: str) -> bool:
     if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
         return True
     return False
+
+
+def _status_esta_finalizado(status_norm: str) -> bool:
+    return status_norm in {STATUS_ENTREGUE, STATUS_CANCELADO}
+
+
+def _ctx_data_operacional(saida: Saida, ctx_map: dict[int, object]) -> date:
+    ctx = ctx_map.get(int(saida.id_saida))
+    op_ts = getattr(ctx, "operacional_ts", None) if ctx else None
+    base_ts = op_ts or getattr(saida, "timestamp", None)
+    if base_ts is not None:
+        return base_ts.date()
+    return getattr(saida, "data", None) or date.today()
+
+
+def _montar_payload_nova_saida_mesmo_entregador(
+    *,
+    data_operacional_anterior: date,
+    data_operacional_nova: date,
+    id_motoboy: Optional[int],
+    confirmado_por: Optional[str],
+    origem: str,
+    data_hora_confirmacao: datetime,
+) -> str:
+    payload = {
+        "tipo_evento": "nova_saida_mesmo_entregador",
+        "data_operacional_anterior": data_operacional_anterior.isoformat(),
+        "data_operacional_nova": data_operacional_nova.isoformat(),
+        "id_motoboy": int(id_motoboy) if id_motoboy is not None else None,
+        "confirmado_por": confirmado_por or "",
+        "origem": origem or "desconhecida",
+        "data_hora_confirmacao": data_hora_confirmacao.isoformat(sep=" ", timespec="seconds"),
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _resolve_entregador(
@@ -520,6 +563,7 @@ def ler_saida(
 ):
     sub_base = current_user.sub_base
     username = current_user.username
+    role = getattr(current_user, "role", None)
     ignorar_coleta = bool(current_user.ignorar_coleta)
     owner_valor = Decimal(getattr(current_user, "owner_valor", 0))
 
@@ -686,9 +730,88 @@ def ler_saida(
         if not mesmo_ent:
             mesmo_ent = _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
         if mesmo_ent:
+            if _status_esta_finalizado(status_norm):
+                registrar_log_leitura_critico(
+                    sub_base=sub_base,
+                    username=username,
+                    origem="desconhecida",
+                    tipo="saida",
+                    codigo=existente.codigo,
+                    resultado="bloqueio_status_finalizado",
+                    role=role,
+                    motoboy_id=motoboy_id,
+                    id_saida=existente.id_saida,
+                    origem_app="web",
+                    endpoint="/saidas/ler",
+                )
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "code": "STATUS_FINALIZADO",
+                        "id_saida": existente.id_saida,
+                        "status_atual": status_norm,
+                        "message": f"Pedido com status finalizado: {status_norm}.",
+                        "entregador_atual": existente.entregador,
+                    },
+                )
+            ctx_map = carregar_contexto_operacional(db, [existente.id_saida])
+            data_operacional = _ctx_data_operacional(existente, ctx_map)
+            hoje = date.today()
+            if data_operacional < hoje:
+                registrar_log_leitura_critico(
+                    sub_base=sub_base,
+                    username=username,
+                    origem="desconhecida",
+                    tipo="saida",
+                    codigo=existente.codigo,
+                    resultado="leitura_dia_anterior_aguardando_confirmacao",
+                    role=role,
+                    motoboy_id=motoboy_id,
+                    id_saida=existente.id_saida,
+                    origem_app="web",
+                    endpoint="/saidas/ler",
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "LEITURA_DIA_ANTERIOR",
+                        "id_saida": existente.id_saida,
+                        "data_operacional_anterior": data_operacional.isoformat(),
+                        "status_atual": existente.status,
+                        "motoboy_id": existente.motoboy_id,
+                        "motoboy_nome": existente.entregador,
+                        "message": "Pedido já lido em data anterior para o mesmo motoboy.",
+                    },
+                )
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=username,
+                origem="desconhecida",
+                tipo="saida",
+                codigo=existente.codigo,
+                resultado="duplicado",
+                role=role,
+                motoboy_id=motoboy_id,
+                id_saida=existente.id_saida,
+                origem_app="web",
+                endpoint="/saidas/ler",
+            )
             return SaidaOut.model_validate(existente)
         # outro entregador → 409 para front acionar PATCH de troca.
         # Sem retry: front trata com Swal + PATCH, evita latência de retry em fluxo normal.
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=username,
+            origem="desconhecida",
+            tipo="saida",
+            codigo=existente.codigo,
+            resultado="atribuido_a_outro",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=existente.id_saida,
+            origem_app="web",
+            endpoint="/saidas/ler",
+        )
         return JSONResponse(
             status_code=409,
             content={
@@ -700,8 +823,161 @@ def ler_saida(
             },
         )
 
+    if _status_esta_finalizado(status_norm):
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=username,
+            origem="desconhecida",
+            tipo="saida",
+            codigo=existente.codigo,
+            resultado="bloqueio_status_finalizado",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=existente.id_saida,
+            origem_app="web",
+            endpoint="/saidas/ler",
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "STATUS_FINALIZADO",
+                "id_saida": existente.id_saida,
+                "status_atual": status_norm,
+                "message": f"Pedido com status finalizado: {status_norm}.",
+                "entregador_atual": existente.entregador,
+            },
+        )
+
     # status cancelado ou outro: retornar como está (idempotente) ou 422 conforme regra de negócio
     return SaidaOut.model_validate(existente)
+
+
+@router.post("/confirmar-nova-saida-mesmo-entregador")
+def confirmar_nova_saida_mesmo_entregador(
+    payload: ConfirmarNovaSaidaMesmoEntregadorIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = current_user.sub_base
+    username = current_user.username
+    if not sub_base or not username:
+        raise HTTPException(401, "Usuário inválido.")
+
+    saida = db.scalar(
+        select(Saida).where(
+            Saida.id_saida == payload.id_saida,
+            Saida.sub_base == sub_base,
+        )
+    )
+    if saida is None:
+        raise HTTPException(404, "Saída não encontrada.")
+
+    status_norm = normalizar_status_saida(saida.status)
+    if _status_esta_finalizado(status_norm):
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=username,
+            origem="desconhecida",
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="bloqueio_status_finalizado",
+            role=getattr(current_user, "role", None),
+            motoboy_id=saida.motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app=payload.origem or "web",
+            endpoint="/saidas/confirmar-nova-saida-mesmo-entregador",
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "STATUS_FINALIZADO",
+                "id_saida": saida.id_saida,
+                "status_atual": status_norm,
+                "message": f"Pedido com status finalizado: {status_norm}.",
+                "entregador_atual": saida.entregador,
+            },
+        )
+
+    mesmo_ent = False
+    if payload.motoboy_id is not None:
+        mesmo_ent = saida.motoboy_id == payload.motoboy_id
+    if not mesmo_ent and payload.entregador_id is not None:
+        mesmo_ent = saida.entregador_id == payload.entregador_id
+    if not mesmo_ent and payload.entregador:
+        mesmo_ent = _normalizar_nome(payload.entregador) == _normalizar_nome(saida.entregador or "")
+    if not mesmo_ent:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "TROCA_ENTREGADOR",
+                "id_saida": saida.id_saida,
+                "message": "Código já saiu com outro entregador.",
+                "entregador_atual": saida.entregador,
+                "username": saida.username,
+            },
+        )
+
+    ctx_map = carregar_contexto_operacional(db, [saida.id_saida])
+    data_operacional_anterior = _ctx_data_operacional(saida, ctx_map)
+    hoje = date.today()
+    if data_operacional_anterior >= hoje:
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=username,
+            origem="desconhecida",
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="duplicado",
+            role=getattr(current_user, "role", None),
+            motoboy_id=saida.motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app=payload.origem or "web",
+            endpoint="/saidas/confirmar-nova-saida-mesmo-entregador",
+        )
+        return SaidaOut.model_validate(saida)
+
+    data_hora_confirmacao = datetime.now()
+    payload_historico = _montar_payload_nova_saida_mesmo_entregador(
+        data_operacional_anterior=data_operacional_anterior,
+        data_operacional_nova=hoje,
+        id_motoboy=saida.motoboy_id,
+        confirmado_por=username,
+        origem=payload.origem or "desconhecida",
+        data_hora_confirmacao=data_hora_confirmacao,
+    )
+    db.add(
+        SaidaHistorico(
+            id_saida=saida.id_saida,
+            evento="nova_saida_mesmo_entregador",
+            status_anterior=saida.status,
+            status_novo=saida.status,
+            motoboy_id_anterior=saida.motoboy_id,
+            motoboy_id_novo=saida.motoboy_id,
+            user_id=getattr(current_user, "id", None),
+            payload=payload_historico,
+        )
+    )
+    try:
+        db.commit()
+        db.refresh(saida)
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Erro ao confirmar nova saída para o mesmo motoboy.")
+
+    registrar_log_leitura_critico(
+        sub_base=sub_base,
+        username=username,
+        origem="desconhecida",
+        tipo="saida",
+        codigo=saida.codigo,
+        resultado="nova_saida_mesmo_entregador_confirmada",
+        role=getattr(current_user, "role", None),
+        motoboy_id=saida.motoboy_id,
+        id_saida=saida.id_saida,
+        origem_app=payload.origem or "web",
+        endpoint="/saidas/confirmar-nova-saida-mesmo-entregador",
+    )
+    return SaidaOut.model_validate(saida)
 
 
 # ============================================================
@@ -967,7 +1243,12 @@ def listar_saidas(
             sumMercado += 1
         else:
             sumAvulso += 1
-    rows = rows_filtradas[offset : (offset + limit) if limit else None]
+    if limit is not None:
+        start_idx = max(0, int(offset))
+        end_idx = start_idx + max(0, int(limit))
+        rows = rows_filtradas[start_idx:end_idx]
+    else:
+        rows = rows_filtradas[max(0, int(offset)):]
 
     nomes_executor = {int(r.id_saida): _nome_executor_cached(r) for r in rows}
     return {
