@@ -19,6 +19,7 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "assumido",
     "reatribuicao",
     "reatribuido",
+    "nova_saida_mesmo_entregador",
 }
 
 EVENTOS_REATRIBUICAO = {
@@ -47,6 +48,7 @@ ROTULOS_ACAO = {
     "assumido": "Reatribuiu pedido",
     "reatribuicao": "Reatribuiu pedido",
     "reatribuido": "Reatribuiu pedido",
+    "nova_saida_mesmo_entregador": "Nova saída confirmada com o mesmo motoboy",
     "reatribuido_em_rota": "Reatribuído -> Iniciou rota",
     "removido_sem_inicio": "Removeu sem iniciar rota",
     "em_rota": "Iniciou rota",

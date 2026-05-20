@@ -13,6 +13,9 @@ RESULTADOS_CRITICOS = {
     "duplicado",
     "atribuido_a_outro",
     "assumiu_de_outro",
+    "leitura_dia_anterior_aguardando_confirmacao",
+    "nova_saida_mesmo_entregador_confirmada",
+    "bloqueio_status_finalizado",
 }
 
 # Evita gravações repetidas do mesmo evento vindo de mais de um endpoint.

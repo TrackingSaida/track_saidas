@@ -106,6 +106,10 @@ class ScanBody(BaseModel):
     origem: str = "camera"  # camera | manual
 
 
+class ConfirmarNovaSaidaMesmoEntregadorBody(BaseModel):
+    origem: str = "mobile"
+
+
 class AusenteBody(BaseModel):
     motivo_id: int
     observacao: Optional[str] = None
@@ -335,6 +339,39 @@ def _filtrar_por_data_operacional(
         if ts and ts.date() == data_ref:
             out.append(s)
     return out
+
+
+def _status_esta_finalizado(status_norm: str) -> bool:
+    return status_norm in {STATUS_ENTREGUE, STATUS_CANCELADO}
+
+
+def _ctx_data_operacional_saida(db: Session, saida: Saida) -> date:
+    ctx_map = carregar_contexto_operacional(db, [saida.id_saida])
+    ctx = ctx_map.get(saida.id_saida)
+    ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or saida.timestamp
+    return ts_op.date() if ts_op else (saida.data or date.today())
+
+
+def _payload_nova_saida_mesmo_entregador(
+    *,
+    data_operacional_anterior: date,
+    data_operacional_nova: date,
+    id_motoboy: Optional[int],
+    confirmado_por: Optional[str],
+    origem: str,
+) -> str:
+    return json.dumps(
+        {
+            "tipo_evento": "nova_saida_mesmo_entregador",
+            "data_operacional_anterior": data_operacional_anterior.isoformat(),
+            "data_operacional_nova": data_operacional_nova.isoformat(),
+            "id_motoboy": int(id_motoboy) if id_motoboy is not None else None,
+            "confirmado_por": confirmado_por or "",
+            "origem": origem or "mobile",
+            "data_hora_confirmacao": datetime.now().isoformat(sep=" ", timespec="seconds"),
+        },
+        ensure_ascii=False,
+    )
 
 
 # ============================================================
@@ -1261,16 +1298,28 @@ def scan_codigo(
     # ——— Existe: validar status (não permitir cancelado, entregue, em_rota de outro) ———
     status_norm = normalizar_status_saida(saida.status)
 
-    if status_norm == STATUS_CANCELADO:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Pedido cancelado. Não é possível registrar leitura. Status: {STATUS_CANCELADO}.",
+    if _status_esta_finalizado(status_norm):
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=getattr(user, "username", None),
+            origem=origem,
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="bloqueio_status_finalizado",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/scan",
         )
-
-    if status_norm == STATUS_ENTREGUE:
-        raise HTTPException(
+        return JSONResponse(
             status_code=422,
-            detail=f"Pedido já entregue. Não é possível registrar leitura. Status: {STATUS_ENTREGUE}.",
+            content={
+                "code": "STATUS_FINALIZADO",
+                "id_saida": saida.id_saida,
+                "status_atual": saida.status,
+                "message": f"Pedido com status finalizado: {saida.status}.",
+            },
         )
 
     # Em rota / saiu:
@@ -1302,6 +1351,34 @@ def scan_codigo(
             )
             return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id == motoboy_id:
+            data_operacional = _ctx_data_operacional_saida(db, saida)
+            hoje = date.today()
+            if data_operacional < hoje:
+                registrar_log_leitura_critico(
+                    sub_base=sub_base,
+                    username=getattr(user, "username", None),
+                    origem=origem,
+                    tipo="saida",
+                    codigo=saida.codigo,
+                    resultado="leitura_dia_anterior_aguardando_confirmacao",
+                    role=role,
+                    motoboy_id=motoboy_id,
+                    id_saida=saida.id_saida,
+                    origem_app="mobile",
+                    endpoint="/mobile/scan",
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "LEITURA_DIA_ANTERIOR",
+                        "id_saida": saida.id_saida,
+                        "data_operacional_anterior": data_operacional.isoformat(),
+                        "status_atual": saida.status,
+                        "motoboy_id": saida.motoboy_id,
+                        "motoboy_nome": _nome_motoboy_atual(db, saida) or saida.entregador or "",
+                        "conflito": False,
+                    },
+                )
             if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
                 if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
                     saida.qr_payload_raw = qr_payload_raw.strip()
@@ -1403,6 +1480,127 @@ def scan_codigo(
         "ja_existia": not houve_atribuicao_ou_progresso,
         "entrega": _saida_to_item(saida, detail),
     }
+
+
+@router.post("/entrega/{id_saida}/confirmar-nova-saida-mesmo-entregador")
+def confirmar_nova_saida_mesmo_entregador_mobile(
+    id_saida: int,
+    body: ConfirmarNovaSaidaMesmoEntregadorBody = Body(default=ConfirmarNovaSaidaMesmoEntregadorBody()),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_mobile_scan_user),
+):
+    sub_base = user.sub_base
+    role = int(getattr(user, "role", 0) or 0)
+    motoboy_id = getattr(user, "motoboy_id", None) if role == 4 else None
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    saida = db.scalar(
+        select(Saida).where(
+            Saida.id_saida == id_saida,
+            Saida.sub_base == sub_base,
+        )
+    )
+    if not saida:
+        raise HTTPException(status_code=404, detail="Saída não encontrada.")
+
+    status_norm = normalizar_status_saida(saida.status)
+    if _status_esta_finalizado(status_norm):
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=getattr(user, "username", None),
+            origem="desconhecida",
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="bloqueio_status_finalizado",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/entrega/{id_saida}/confirmar-nova-saida-mesmo-entregador",
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "STATUS_FINALIZADO",
+                "id_saida": saida.id_saida,
+                "status_atual": saida.status,
+                "message": f"Pedido com status finalizado: {saida.status}.",
+            },
+        )
+
+    if motoboy_id is not None and saida.motoboy_id is not None and saida.motoboy_id != motoboy_id:
+        nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "TROCA_ENTREGADOR",
+                "conflito": True,
+                "motoboy_atual": nome_atual,
+                "id_saida": saida.id_saida,
+            },
+        )
+
+    data_operacional_anterior = _ctx_data_operacional_saida(db, saida)
+    hoje = date.today()
+    if data_operacional_anterior >= hoje:
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=getattr(user, "username", None),
+            origem="desconhecida",
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="duplicado",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/entrega/{id_saida}/confirmar-nova-saida-mesmo-entregador",
+        )
+        detail = _get_detail_for_saida(db, saida.id_saida)
+        return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+
+    payload_hist = _payload_nova_saida_mesmo_entregador(
+        data_operacional_anterior=data_operacional_anterior,
+        data_operacional_nova=hoje,
+        id_motoboy=saida.motoboy_id,
+        confirmado_por=getattr(user, "username", None),
+        origem=(body.origem or "mobile"),
+    )
+    db.add(
+        SaidaHistorico(
+            id_saida=saida.id_saida,
+            evento="nova_saida_mesmo_entregador",
+            status_anterior=saida.status,
+            status_novo=saida.status,
+            motoboy_id_anterior=saida.motoboy_id,
+            motoboy_id_novo=saida.motoboy_id,
+            user_id=getattr(user, "id", None),
+            payload=payload_hist,
+        )
+    )
+    try:
+        db.commit()
+        db.refresh(saida)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Erro ao confirmar nova saída.")
+
+    registrar_log_leitura_critico(
+        sub_base=sub_base,
+        username=getattr(user, "username", None),
+        origem="desconhecida",
+        tipo="saida",
+        codigo=saida.codigo,
+        resultado="nova_saida_mesmo_entregador_confirmada",
+        role=role,
+        motoboy_id=motoboy_id,
+        id_saida=saida.id_saida,
+        origem_app="mobile",
+        endpoint="/mobile/entrega/{id_saida}/confirmar-nova-saida-mesmo-entregador",
+    )
+    detail = _get_detail_for_saida(db, saida.id_saida)
+    return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _saida_to_item(saida, detail)}
 
 
 # ============================================================
