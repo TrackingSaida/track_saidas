@@ -74,6 +74,16 @@ class ExecutorItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class PrecoExecutorOption(BaseModel):
+    entregador_id: int
+    nome: str
+    executor_tipo: Optional[str] = None  # "e" | "m"
+    executor_id: Optional[int] = None
+    executor_key: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class EntregadorOut(BaseModel):
     id_entregador: int
     nome: Optional[str] = None
@@ -1132,6 +1142,82 @@ def get_precos_individuais(
         for ep in rows
     ]
     return PrecoIndividuaisResponse(items=items)
+
+
+@router.get("/precos/executores", response_model=List[PrecoExecutorOption])
+def get_precos_executores(
+    status: Optional[str] = Query("ativo", description="Para entregadores: ativo, inativo ou todos"),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Lista opções para cadastro de exceção de preço.
+    Sempre retorna `entregador_id` válido (inclusive para perfis motoboy mapeados),
+    para compatibilidade com POST /entregadores/{id_entregador}/precos.
+    """
+    sub_base_user = _resolve_user_base(db, current_user)
+    options_by_id: Dict[int, PrecoExecutorOption] = {}
+
+    # Entregadores
+    stmt_ent = select(Entregador).where(Entregador.sub_base == sub_base_user)
+    if status == "ativo":
+        stmt_ent = stmt_ent.where(Entregador.ativo.is_(True))
+    elif status == "inativo":
+        stmt_ent = stmt_ent.where(Entregador.ativo.is_(False))
+    for ent in db.scalars(stmt_ent).all():
+        nome_ent = (ent.nome or f"Entregador {ent.id_entregador}").strip()
+        options_by_id[int(ent.id_entregador)] = PrecoExecutorOption(
+            entregador_id=int(ent.id_entregador),
+            nome=nome_ent,
+            executor_tipo="e",
+            executor_id=int(ent.id_entregador),
+            executor_key=f"e_{ent.id_entregador}",
+        )
+
+    # Motoboys vinculados: resolve para entregador_id equivalente
+    stmt_mb = (
+        select(Motoboy)
+        .join(MotoboySubBase, MotoboySubBase.motoboy_id == Motoboy.id_motoboy)
+        .where(
+            MotoboySubBase.sub_base == sub_base_user,
+            MotoboySubBase.ativo.is_(True),
+        )
+        .order_by(Motoboy.id_motoboy)
+    )
+    motoboys = db.scalars(stmt_mb).all()
+    nomes_motoboy = _carregar_nomes_motoboy_ids(db, [m.id_motoboy for m in motoboys])
+    for motoboy in motoboys:
+        entregador_id = _resolver_entregador_principal_do_motoboy(
+            db=db,
+            sub_base=sub_base_user,
+            motoboy_id=int(motoboy.id_motoboy),
+        )
+        if not entregador_id:
+            continue
+        nome_mb = nomes_motoboy.get(int(motoboy.id_motoboy), f"Motoboy {motoboy.id_motoboy}")
+        eid = int(entregador_id)
+        if eid not in options_by_id:
+            options_by_id[eid] = PrecoExecutorOption(
+                entregador_id=eid,
+                nome=nome_mb,
+                executor_tipo="m",
+                executor_id=int(motoboy.id_motoboy),
+                executor_key=f"m_{motoboy.id_motoboy}",
+            )
+        else:
+            # Se já existe pelo entregador, mantém o id e atualiza metadata do executor
+            # para refletir o perfil motoboy vinculado.
+            opt = options_by_id[eid]
+            if (opt.executor_tipo or "e") == "e":
+                opt.executor_tipo = "m"
+                opt.executor_id = int(motoboy.id_motoboy)
+                opt.executor_key = f"m_{motoboy.id_motoboy}"
+                if nome_mb and nome_mb.strip():
+                    opt.nome = nome_mb.strip()
+
+    out = list(options_by_id.values())
+    out.sort(key=lambda x: (x.nome or "").strip().lower())
+    return out
 
 
 @router.get("/{id_entregador}", response_model=EntregadorOut)
