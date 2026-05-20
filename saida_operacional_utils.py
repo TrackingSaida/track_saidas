@@ -33,6 +33,13 @@ EVENTOS_INVALIDANTES = {
     "desatribuido",
 }
 
+EVENTOS_UI_ULTIMA_ACAO = {
+    "em_rota",
+    "entregue",
+    "ausente",
+    "cancelado",
+}
+
 ROTULOS_ACAO = {
     "lido": "Leu pedido",
     "scan": "Escaneou pedido",
@@ -107,7 +114,9 @@ def carregar_contexto_operacional(
             select(SaidaHistorico)
             .where(
                 SaidaHistorico.id_saida.in_(ids_lote),
-                SaidaHistorico.evento.in_(tuple(EVENTOS_ATRIBUICAO_VALIDOS | EVENTOS_INVALIDANTES)),
+                SaidaHistorico.evento.in_(
+                    tuple(EVENTOS_ATRIBUICAO_VALIDOS | EVENTOS_INVALIDANTES | EVENTOS_UI_ULTIMA_ACAO)
+                ),
             )
             .order_by(SaidaHistorico.id_saida.asc(), SaidaHistorico.timestamp.asc(), SaidaHistorico.id.asc())
         ).scalars().all()
