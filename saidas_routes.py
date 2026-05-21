@@ -6,6 +6,7 @@ import os
 import re
 import unicodedata
 from typing import Optional, List
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, date, timedelta
@@ -37,6 +38,11 @@ from log_leitura_service import registrar_log_leitura_critico
 
 router = APIRouter(prefix="/saidas", tags=["Saídas"])
 MAX_IDS_POR_LOTE = 5000
+OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
+
+
+def _hoje_operacional() -> date:
+    return datetime.now(OPERACAO_TZ).date()
 
 
 # ============================================================
@@ -250,7 +256,7 @@ def _ctx_data_operacional(saida: Saida, ctx_map: dict[int, object]) -> date:
     base_ts = op_ts or getattr(saida, "timestamp", None)
     if base_ts is not None:
         return base_ts.date()
-    return getattr(saida, "data", None) or date.today()
+    return getattr(saida, "data", None) or _hoje_operacional()
 
 
 def _montar_payload_nova_saida_mesmo_entregador(
@@ -756,7 +762,7 @@ def ler_saida(
                 )
             ctx_map = carregar_contexto_operacional(db, [existente.id_saida])
             data_operacional = _ctx_data_operacional(existente, ctx_map)
-            hoje = date.today()
+            hoje = _hoje_operacional()
             if data_operacional < hoje:
                 registrar_log_leitura_critico(
                     sub_base=sub_base,
@@ -919,7 +925,7 @@ def confirmar_nova_saida_mesmo_entregador(
 
     ctx_map = carregar_contexto_operacional(db, [saida.id_saida])
     data_operacional_anterior = _ctx_data_operacional(saida, ctx_map)
-    hoje = date.today()
+    hoje = _hoje_operacional()
     if data_operacional_anterior >= hoje:
         registrar_log_leitura_critico(
             sub_base=sub_base,

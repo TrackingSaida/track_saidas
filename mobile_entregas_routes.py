@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from typing import Optional, List, Dict, Tuple
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -53,6 +54,11 @@ from saida_operacional_utils import carregar_contexto_operacional, EVENTOS_ATRIB
 from log_leitura_service import registrar_log_leitura_critico
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
+OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
+
+
+def _hoje_operacional() -> date:
+    return datetime.now(OPERACAO_TZ).date()
 
 
 # ============================================================
@@ -349,7 +355,7 @@ def _ctx_data_operacional_saida(db: Session, saida: Saida) -> date:
     ctx_map = carregar_contexto_operacional(db, [saida.id_saida])
     ctx = ctx_map.get(saida.id_saida)
     ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or saida.timestamp
-    return ts_op.date() if ts_op else (saida.data or date.today())
+    return ts_op.date() if ts_op else (saida.data or _hoje_operacional())
 
 
 def _payload_nova_saida_mesmo_entregador(
@@ -400,9 +406,9 @@ def listar_entregas(
             try:
                 hoje = date.fromisoformat(data.strip())
             except ValueError:
-                hoje = date.today()
+                hoje = _hoje_operacional()
         else:
-            hoje = date.today()
+            hoje = _hoje_operacional()
     else:
         hoje = None
 
@@ -458,7 +464,7 @@ def extrato_financeiro_motoboy(
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
 
-    hoje = date.today()
+    hoje = _hoje_operacional()
     inicio_in = _parse_data_yyyy_mm_dd(data_inicio)
     fim_in = _parse_data_yyyy_mm_dd(data_fim)
     if inicio_in is None or fim_in is None:
@@ -624,9 +630,9 @@ def resumo_entregas(
         try:
             hoje = date.fromisoformat(data.strip())
         except ValueError:
-            hoje = date.today()
+            hoje = _hoje_operacional()
     else:
-        hoje = date.today()
+        hoje = _hoje_operacional()
     rows_pendentes_all = db.scalars(
         select(Saida).where(
             Saida.sub_base == sub_base,
@@ -787,7 +793,7 @@ def rotas_iniciar(
                 )
             )
 
-    hoje = date.today()
+    hoje = _hoje_operacional()
     rota = RotasMotoboy(
         motoboy_id=motoboy_id,
         data=hoje,
@@ -818,9 +824,9 @@ def rotas_ativa(
         try:
             hoje = date.fromisoformat(data.strip())
         except ValueError:
-            hoje = date.today()
+            hoje = _hoje_operacional()
     else:
-        hoje = date.today()
+        hoje = _hoje_operacional()
     # Só retorna rota realmente ativa: status=ativa, sem finalizado_em (evita dados manuais/desatualizados)
     rota = db.scalar(
         select(RotasMotoboy).where(
@@ -1352,7 +1358,7 @@ def scan_codigo(
             return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id == motoboy_id:
             data_operacional = _ctx_data_operacional_saida(db, saida)
-            hoje = date.today()
+            hoje = _hoje_operacional()
             if data_operacional < hoje:
                 registrar_log_leitura_critico(
                     sub_base=sub_base,
@@ -1542,7 +1548,7 @@ def confirmar_nova_saida_mesmo_entregador_mobile(
         )
 
     data_operacional_anterior = _ctx_data_operacional_saida(db, saida)
-    hoje = date.today()
+    hoje = _hoje_operacional()
     if data_operacional_anterior >= hoje:
         registrar_log_leitura_critico(
             sub_base=sub_base,
