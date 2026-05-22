@@ -71,6 +71,7 @@ class SaidaOperacionalContext:
     ultimo_evento: Optional[str]
     ultimo_evento_ts: Optional[datetime]
     acao_label: Optional[str]
+    executado_por: Optional[str]
     ultimo_ator_username: Optional[str]
     ultimo_ator_user_id: Optional[int]
     operacional_evento: Optional[str]
@@ -181,6 +182,7 @@ def carregar_contexto_operacional(
                 ultimo_evento=None,
                 ultimo_evento_ts=None,
                 acao_label=None,
+                executado_por="—",
                 ultimo_ator_username=None,
                 ultimo_ator_user_id=None,
                 operacional_evento=None,
@@ -193,6 +195,14 @@ def carregar_contexto_operacional(
         ultimo = estado.get("ultimo")
         op = estado.get("op")
         ultimo_evento = (getattr(ultimo, "evento", None) or None) if ultimo is not None else None
+        ultimo_user_id = getattr(ultimo, "user_id", None) if ultimo is not None else None
+        ultimo_user_id = int(ultimo_user_id) if ultimo_user_id is not None else None
+        executado_por = "—"
+        if ultimo_evento:
+            if ultimo_user_id is not None:
+                executado_por = user_map.get(ultimo_user_id) or "—"
+            else:
+                executado_por = "Sistema"
         op_evento = (getattr(op, "evento", None) or None) if op is not None else None
         op_user_id = getattr(op, "user_id", None) if op is not None else None
         op_user_id = int(op_user_id) if op_user_id is not None else None
@@ -203,6 +213,7 @@ def carregar_contexto_operacional(
             ultimo_evento=ultimo_evento,
             ultimo_evento_ts=getattr(ultimo, "timestamp", None) if ultimo is not None else None,
             acao_label=rotulo_acao_evento(ultimo_evento, houve_reatribuicao=houve_reatribuicao),
+            executado_por=executado_por,
             ultimo_ator_username=user_map.get(op_user_id) if op_user_id is not None else None,
             ultimo_ator_user_id=op_user_id,
             operacional_evento=op_evento,

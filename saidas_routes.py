@@ -1284,6 +1284,7 @@ def listar_saidas(
                 "timestamp": r.timestamp,
                 "data_hora_acao": (op_ctx_map.get(r.id_saida).ultimo_evento_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
                 "acao": (op_ctx_map.get(r.id_saida).acao_label if op_ctx_map.get(r.id_saida) else None) or "Sem ação",
+                "executado_por": (op_ctx_map.get(r.id_saida).executado_por if op_ctx_map.get(r.id_saida) else None) or "—",
                 "sub_base": r.sub_base,
                 "username": (op_ctx_map.get(r.id_saida).ultimo_ator_username if op_ctx_map.get(r.id_saida) else None) or r.username,
                 "entregador": nomes_executor.get(int(r.id_saida)) or r.entregador,
