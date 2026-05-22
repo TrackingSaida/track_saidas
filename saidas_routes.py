@@ -250,6 +250,22 @@ def _status_esta_finalizado(status_norm: str) -> bool:
     return status_norm in {STATUS_ENTREGUE, STATUS_CANCELADO}
 
 
+def _evento_status_manual(status_norm: str) -> Optional[str]:
+    if status_norm == STATUS_CANCELADO:
+        return "cancelado"
+    if status_norm == STATUS_ENTREGUE:
+        return "entregue"
+    if status_norm == STATUS_AUSENTE:
+        return "ausente"
+    if status_norm in ("coletado",):
+        return "status_coletado_manual"
+    if status_norm in ("não coletado", "nao coletado"):
+        return "status_nao_coletado_manual"
+    if status_norm in ("saiu", STATUS_SAIU_PARA_ENTREGA):
+        return "status_saiu_manual"
+    return None
+
+
 def _ctx_data_operacional(saida: Saida, ctx_map: dict[int, object]) -> date:
     ctx = ctx_map.get(int(saida.id_saida))
     op_ts = getattr(ctx, "operacional_ts", None) if ctx else None
@@ -1515,6 +1531,14 @@ def atualizar_saida(
 ):
     sub_base = current_user.sub_base
     obj = _get_owned_saida(db, sub_base, id_saida)
+    status_anterior = normalizar_status_saida(obj.status)
+    motoboy_anterior = obj.motoboy_id
+    entregador_anterior = (obj.entregador or "").strip()
+    payload_changed = {
+        "status": False,
+        "motoboy": False,
+        "executor": False,
+    }
 
     if payload.codigo is not None:
         novo = payload.codigo.strip()
@@ -1538,6 +1562,10 @@ def atualizar_saida(
             )
             obj.entregador_id = entregador_id
             obj.entregador = entregador_nome
+            payload_changed["executor"] = (
+                payload_changed["executor"]
+                or (entregador_nome or "").strip() != entregador_anterior
+            )
         except HTTPException as e:
             # Se não encontrou entregador pelo nome mas a saída já tem entregador/motoboy,
             # manter o atual e aplicar só status/serviço/etc (evita falha ao editar só status ex.: cancelado)
@@ -1555,12 +1583,16 @@ def atualizar_saida(
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
         obj.status = STATUS_SAIU_PARA_ENTREGA
+        payload_changed["motoboy"] = (motoboy_anterior != obj.motoboy_id)
+        payload_changed["executor"] = payload_changed["executor"] or payload_changed["motoboy"]
+        payload_changed["status"] = True
 
     if payload.status is not None:
         novo_status = normalizar_status_saida(payload.status)
+        payload_changed["status"] = payload_changed["status"] or (novo_status != normalizar_status_saida(obj.status))
         obj.status = novo_status
         # Se alterou para cancelado, marcar cobrança como cancelada (não contabilizada)
-        if novo_status == "cancelado":
+        if novo_status == STATUS_CANCELADO:
             itens = db.scalars(
                 select(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida == obj.id_saida)
             ).all()
@@ -1581,6 +1613,29 @@ def atualizar_saida(
                 "Apenas admin, root ou operador podem marcar ou desmarcar pacote como G (Grande).",
             )
         obj.is_grande = bool(payload.is_grande)
+
+    status_novo = normalizar_status_saida(obj.status)
+    status_mudou = status_novo != status_anterior
+    motoboy_novo = obj.motoboy_id
+    executor_mudou = payload_changed["executor"] or ((obj.entregador or "").strip() != entregador_anterior)
+    evento_historico = None
+    if status_mudou:
+        evento_historico = _evento_status_manual(status_novo)
+    if executor_mudou and evento_historico not in {"cancelado", "entregue", "ausente"}:
+        evento_historico = "reatribuido"
+
+    if evento_historico:
+        db.add(
+            SaidaHistorico(
+                id_saida=obj.id_saida,
+                evento=evento_historico,
+                status_anterior=status_anterior,
+                status_novo=status_novo,
+                motoboy_id_anterior=motoboy_anterior,
+                motoboy_id_novo=motoboy_novo,
+                user_id=current_user.id,
+            )
+        )
 
     try:
         db.commit()

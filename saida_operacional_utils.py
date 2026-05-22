@@ -39,6 +39,9 @@ EVENTOS_UI_ULTIMA_ACAO = {
     "entregue",
     "ausente",
     "cancelado",
+    "status_saiu_manual",
+    "status_coletado_manual",
+    "status_nao_coletado_manual",
 }
 
 ROTULOS_ACAO = {
@@ -56,6 +59,9 @@ ROTULOS_ACAO = {
     "ausente": "Registrou ausência",
     "cancelado": "Registrou cancelamento",
     "desatribuido": "Desatribuiu pedido",
+    "status_saiu_manual": "Atualizou status para Saiu para entrega",
+    "status_coletado_manual": "Atualizou status para Coletado",
+    "status_nao_coletado_manual": "Atualizou status para Não Coletado",
 }
 
 
