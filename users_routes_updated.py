@@ -5,12 +5,13 @@ import time
 from datetime import date
 from typing import Optional, List, Any
 import re
+import unicodedata
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import select, func
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from db import get_db
 from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD
@@ -29,6 +30,7 @@ class MotoboyOut(BaseModel):
     id_motoboy: Optional[int] = None
     documento: Optional[str] = None
     cnpj: Optional[str] = None
+    chave_pix: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -58,6 +60,7 @@ class UserCreate(BaseModel):
     # Campos obrigatórios quando role=4
     documento: Optional[str] = None
     cnpj: Optional[str] = None
+    chave_pix: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -106,6 +109,7 @@ class AdminUserUpdate(BaseModel):
     # Campos motoboy (quando role=4)
     documento: Optional[str] = None
     cnpj: Optional[str] = None
+    chave_pix: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -206,6 +210,94 @@ def _placeholder_username_from_nome(nome: Optional[str], sub_base: Optional[str]
     if first:
         return first
     return base
+
+
+def _username_token(raw: Optional[str]) -> str:
+    """
+    Normaliza token para username:
+    - remove acentos
+    - mantém apenas [a-z0-9]
+    """
+    txt = (raw or "").strip().lower()
+    if not txt:
+        return ""
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", txt)
+
+
+def _normalize_username_for_compare(username: Optional[str]) -> str:
+    return (username or "").strip().lower()
+
+
+def _username_exists_in_sub_base(
+    db: Session,
+    sub_base: str,
+    username: str,
+    exclude_user_id: Optional[int] = None,
+) -> bool:
+    normalized = _normalize_username_for_compare(username)
+    if not normalized:
+        return False
+    stmt = select(User.id).where(
+        User.sub_base == sub_base,
+        func.lower(func.trim(User.username)) == normalized,
+    )
+    if exclude_user_id is not None:
+        stmt = stmt.where(User.id != exclude_user_id)
+    return db.scalar(stmt.limit(1)) is not None
+
+
+def _generate_unique_username_for_sub_base(
+    db: Session,
+    sub_base: str,
+    nome: Optional[str],
+    sobrenome: Optional[str],
+) -> str:
+    """
+    Gera username único na sub_base.
+    Prioridade:
+    1) primeiroNome.subbase
+    2) primeiroNome.ultimoSobrenome
+    3) primeiroNome.ultimoSobrenome.subbase
+    4) sufixo incremental (ex.: ...2, ...3)
+    """
+    first = _username_token(_first_word(nome))
+    last = _username_token(_last_word(sobrenome))
+    base = _username_token(_sanitize_sub_base(sub_base or ""))
+
+    candidates: list[str] = []
+    if first and base:
+        candidates.append(f"{first}.{base}")
+    if first and last:
+        candidates.append(f"{first}.{last}")
+    if first and last and base:
+        candidates.append(f"{first}.{last}.{base}")
+    if first:
+        candidates.append(first)
+    if base:
+        candidates.append(base)
+
+    seen: set[str] = set()
+    unique_candidates: list[str] = []
+    for cand in candidates:
+        c = (cand or "").strip(".")
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        unique_candidates.append(c)
+
+    for cand in unique_candidates:
+        if not _username_exists_in_sub_base(db, sub_base, cand):
+            return cand
+
+    root = unique_candidates[0] if unique_candidates else "user"
+    i = 2
+    while True:
+        cand = f"{root}{i}"
+        if not _username_exists_in_sub_base(db, sub_base, cand):
+            return cand
+        i += 1
 
 
 def _placeholder_email_from_nome_sobrenome(
@@ -349,12 +441,18 @@ def create_user(
             password_hash_val = get_password_hash(DEFAULT_PASSWORD)
     else:
         # Role 4 (motoboy): placeholders permitidos
-        username_val = (body.username or "").strip() or _placeholder_username_from_nome(body.nome, sub_base) or _sanitize_sub_base(sub_base or "") or f"sem_username_{_ts}"
+        username_manual = (body.username or "").strip()
+        if username_manual:
+            username_val = username_manual
+        else:
+            username_val = _generate_unique_username_for_sub_base(db, sub_base, body.nome, body.sobrenome)
         email_val = (body.email or "").strip() or _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or f"sem-email-{_ts}@{_sub_base_domain(sub_base)}.com"
         if (body.password or "").strip():
             password_hash_val = get_password_hash((body.password or "").strip())
         else:
             password_hash_val = get_password_hash(default_password_motoboy(sub_base))
+
+    username_val = (username_val or "").strip()
 
     # Emails e usernames únicos
     email_raw = (body.email or "").strip()
@@ -365,13 +463,7 @@ def create_user(
     # Username único POR sub_base (permite mesmo username em sub_bases diferentes)
     username_check = (username_val or "").strip()
     if username_check:
-        exists_username = db.scalar(
-            select(User).where(
-                User.username == username_check,
-                User.sub_base == sub_base,
-            )
-        )
-        if exists_username:
+        if _username_exists_in_sub_base(db, sub_base, username_check):
             raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
 
     # Contato único (telefone/celular) — mesma sub_base
@@ -425,6 +517,7 @@ def create_user(
                 sub_base=sub_base,
                 documento=(body.documento or "").strip(),
                 cnpj=(body.cnpj or "").strip(),
+                chave_pix=(body.chave_pix or "").strip() or None,
                 rua=(body.rua or "").strip(),
                 numero=(body.numero or "").strip(),
                 complemento=(body.complemento or "").strip() or None,
@@ -448,6 +541,17 @@ def create_user(
 
         return {"ok": True, "id": new_user.id}
 
+    except IntegrityError as e:
+        db.rollback()
+        msg = str(getattr(e, "orig", e)).lower()
+        if "username" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+        if "email" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Email já existe.")
+        if "contato" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Contato já existe para esta sub_base.")
+        logger.exception("Erro de integridade ao criar usuário: %s", e)
+        raise HTTPException(409, "Conflito de dados ao criar usuário.")
     except Exception as e:
         db.rollback()
         logger.exception("Erro ao criar usuário: %s", e)
@@ -613,19 +717,29 @@ def admin_update_user(
     # Campos User
     user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role"}
 
-    # Validação de username único por sub_base ao editar
-    if "username" in updates and updates["username"]:
-        new_username = (updates["username"] or "").strip()
-        if new_username and new_username != (user.username or ""):
-            exists_username = db.scalar(
-                select(User).where(
-                    User.username == new_username,
-                    User.sub_base == user.sub_base,
-                    User.id != user.id,
+    # Validação/normalização de username por perfil
+    if "username" in updates:
+        raw_username = updates.get("username")
+        new_username = (raw_username or "").strip()
+        current_username = (user.username or "").strip()
+
+        if not new_username:
+            if user.role == 4:
+                nome_ref = updates.get("nome", user.nome)
+                sobrenome_ref = updates.get("sobrenome", user.sobrenome)
+                new_username = _generate_unique_username_for_sub_base(
+                    db, user.sub_base or current_user.sub_base or "", nome_ref, sobrenome_ref
                 )
-            )
-            if exists_username:
-                raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+            else:
+                raise HTTPException(422, "Username é obrigatório para este perfil.")
+
+        if (
+            _normalize_username_for_compare(new_username) != _normalize_username_for_compare(current_username)
+            and _username_exists_in_sub_base(db, user.sub_base or "", new_username, exclude_user_id=user.id)
+        ):
+            raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+
+        updates["username"] = new_username
 
     for field, value in updates.items():
         if field in user_fields:
@@ -633,7 +747,7 @@ def admin_update_user(
 
     # Campos Motoboy (role=4)
     motoboy_fields = {
-        "documento", "cnpj", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
+        "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
         "pode_ler_coleta", "pode_ler_saida"
     }
     sub_base = current_user.sub_base or ""
@@ -642,6 +756,8 @@ def admin_update_user(
             for field in motoboy_fields:
                 if field in updates:
                     val = updates[field]
+                    if field == "chave_pix":
+                        val = (val or "").strip() or None
                     if field == "pode_ler_coleta" and owner and owner.ignorar_coleta:
                         val = False
                     setattr(user.motoboy, field, val)
@@ -660,6 +776,7 @@ def admin_update_user(
                 sub_base=sub_base,
                 documento=(updates.get("documento") or "").strip(),
                 cnpj=(updates.get("cnpj") or "").strip(),
+                chave_pix=(updates.get("chave_pix") or "").strip() or None,
                 rua=(updates.get("rua") or "").strip(),
                 numero=(updates.get("numero") or "").strip(),
                 complemento=(updates.get("complemento") or "").strip() or None,
@@ -676,7 +793,20 @@ def admin_update_user(
             db.flush()
             db.add(MotoboySubBase(motoboy_id=motoboy.id_motoboy, sub_base=sub_base, ativo=True))
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        msg = str(getattr(e, "orig", e)).lower()
+        if "username" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+        if "email" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Email já existe.")
+        if "contato" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Contato já existe para esta sub_base.")
+        logger.exception("Erro de integridade ao atualizar usuário id=%s: %s", user_id, e)
+        raise HTTPException(409, "Conflito de dados ao atualizar usuário.")
+
     db.refresh(user)
     return _user_to_out(user)
 

@@ -123,6 +123,14 @@ def _get_motoboy_username(db: Session, motoboy: Motoboy) -> str:
     return (u.username or f"{u.nome or ''} {u.sobrenome or ''}".strip() or f"Motoboy {motoboy.id_motoboy}").strip()
 
 
+def _get_motoboy_chave_pix(db: Session, motoboy_id: int) -> Optional[str]:
+    """Busca a chave PIX atual do motoboy, quando existir."""
+    motoboy = db.get(Motoboy, motoboy_id)
+    if not motoboy:
+        return None
+    return (getattr(motoboy, "chave_pix", None) or "").strip() or None
+
+
 def _buscar_fechamento_por_data(
     db: Session,
     sub_base: str,
@@ -175,6 +183,7 @@ class FechamentoOut(BaseModel):
     id_entregador: Optional[int] = None
     id_motoboy: Optional[int] = None
     username_entregador: Optional[str] = None
+    chave_pix: Optional[str] = None
     periodo_inicio: date
     periodo_fim: date
     valor_base: Decimal
@@ -276,9 +285,11 @@ def criar_fechamento(
             "Escolha um período cuja data final seja anterior à data de hoje.",
         )
 
+    chave_pix: Optional[str] = None
     if payload.id_motoboy is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, payload.id_motoboy)
         username_ent = _get_motoboy_username(db, motoboy)
+        chave_pix = (getattr(motoboy, "chave_pix", None) or "").strip() or None
         id_entregador_val = None
         id_motoboy_val = payload.id_motoboy
         existente = db.scalar(
@@ -348,6 +359,7 @@ def criar_fechamento(
         id_entregador=fech.id_entregador,
         id_motoboy=fech.id_motoboy,
         username_entregador=fech.username_entregador,
+        chave_pix=chave_pix,
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
         valor_base=fech.valor_base,
@@ -377,7 +389,9 @@ def obter_fechamento(
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
 
+    chave_pix: Optional[str] = None
     if getattr(fech, "id_motoboy", None) is not None:
+        chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
         valor_base_recalc = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
@@ -395,6 +409,7 @@ def obter_fechamento(
         id_entregador=fech.id_entregador,
         id_motoboy=getattr(fech, "id_motoboy", None),
         username_entregador=fech.username_entregador,
+        chave_pix=chave_pix,
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
         valor_base=fech.valor_base,
@@ -432,7 +447,9 @@ def atualizar_fechamento(
             "Apenas fechamentos com status GERADO podem ser reajustados.",
         )
 
+    chave_pix: Optional[str] = None
     if getattr(fech, "id_motoboy", None) is not None:
+        chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
         valor_base_recalc = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
@@ -472,6 +489,7 @@ def atualizar_fechamento(
         id_entregador=fech.id_entregador,
         id_motoboy=getattr(fech, "id_motoboy", None),
         username_entregador=fech.username_entregador,
+        chave_pix=chave_pix,
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
         valor_base=fech.valor_base,

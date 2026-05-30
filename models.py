@@ -134,6 +134,7 @@ class Motoboy(Base):
     sub_base = Column(Text)
     documento = Column(Text)
     cnpj = Column(Text)
+    chave_pix = Column(Text)
 
     rua = Column(Text, nullable=False)
     numero = Column(Text, nullable=False)
