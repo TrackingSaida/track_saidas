@@ -10,7 +10,7 @@ import unicodedata
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import get_db
@@ -226,15 +226,26 @@ def _username_token(raw: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]+", "", txt)
 
 
-def _username_exists_in_sub_base(db: Session, sub_base: str, username: str) -> bool:
-    if not username:
+def _normalize_username_for_compare(username: Optional[str]) -> str:
+    return (username or "").strip().lower()
+
+
+def _username_exists_in_sub_base(
+    db: Session,
+    sub_base: str,
+    username: str,
+    exclude_user_id: Optional[int] = None,
+) -> bool:
+    normalized = _normalize_username_for_compare(username)
+    if not normalized:
         return False
-    return db.scalar(
-        select(User).where(
-            User.username == username,
-            User.sub_base == sub_base,
-        )
-    ) is not None
+    stmt = select(User.id).where(
+        User.sub_base == sub_base,
+        func.lower(func.trim(User.username)) == normalized,
+    )
+    if exclude_user_id is not None:
+        stmt = stmt.where(User.id != exclude_user_id)
+    return db.scalar(stmt.limit(1)) is not None
 
 
 def _generate_unique_username_for_sub_base(
@@ -441,6 +452,8 @@ def create_user(
         else:
             password_hash_val = get_password_hash(default_password_motoboy(sub_base))
 
+    username_val = (username_val or "").strip()
+
     # Emails e usernames únicos
     email_raw = (body.email or "").strip()
     if email_raw:
@@ -450,13 +463,7 @@ def create_user(
     # Username único POR sub_base (permite mesmo username em sub_bases diferentes)
     username_check = (username_val or "").strip()
     if username_check:
-        exists_username = db.scalar(
-            select(User).where(
-                User.username == username_check,
-                User.sub_base == sub_base,
-            )
-        )
-        if exists_username:
+        if _username_exists_in_sub_base(db, sub_base, username_check):
             raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
 
     # Contato único (telefone/celular) — mesma sub_base
@@ -702,16 +709,13 @@ def admin_update_user(
     # Validação de username único por sub_base ao editar
     if "username" in updates and updates["username"]:
         new_username = (updates["username"] or "").strip()
-        if new_username and new_username != (user.username or ""):
-            exists_username = db.scalar(
-                select(User).where(
-                    User.username == new_username,
-                    User.sub_base == user.sub_base,
-                    User.id != user.id,
-                )
-            )
-            if exists_username:
-                raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+        current_username = (user.username or "").strip()
+        if (
+            new_username
+            and _normalize_username_for_compare(new_username) != _normalize_username_for_compare(current_username)
+            and _username_exists_in_sub_base(db, user.sub_base or "", new_username, exclude_user_id=user.id)
+        ):
+            raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
 
     for field, value in updates.items():
         if field in user_fields:
