@@ -29,6 +29,7 @@ class MotoboyOut(BaseModel):
     id_motoboy: Optional[int] = None
     documento: Optional[str] = None
     cnpj: Optional[str] = None
+    chave_pix: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -58,6 +59,7 @@ class UserCreate(BaseModel):
     # Campos obrigatórios quando role=4
     documento: Optional[str] = None
     cnpj: Optional[str] = None
+    chave_pix: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -106,6 +108,7 @@ class AdminUserUpdate(BaseModel):
     # Campos motoboy (quando role=4)
     documento: Optional[str] = None
     cnpj: Optional[str] = None
+    chave_pix: Optional[str] = None
     rua: Optional[str] = None
     numero: Optional[str] = None
     complemento: Optional[str] = None
@@ -425,6 +428,7 @@ def create_user(
                 sub_base=sub_base,
                 documento=(body.documento or "").strip(),
                 cnpj=(body.cnpj or "").strip(),
+                chave_pix=(body.chave_pix or "").strip() or None,
                 rua=(body.rua or "").strip(),
                 numero=(body.numero or "").strip(),
                 complemento=(body.complemento or "").strip() or None,
@@ -633,7 +637,7 @@ def admin_update_user(
 
     # Campos Motoboy (role=4)
     motoboy_fields = {
-        "documento", "cnpj", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
+        "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
         "pode_ler_coleta", "pode_ler_saida"
     }
     sub_base = current_user.sub_base or ""
@@ -642,6 +646,8 @@ def admin_update_user(
             for field in motoboy_fields:
                 if field in updates:
                     val = updates[field]
+                    if field == "chave_pix":
+                        val = (val or "").strip() or None
                     if field == "pode_ler_coleta" and owner and owner.ignorar_coleta:
                         val = False
                     setattr(user.motoboy, field, val)
@@ -660,6 +666,7 @@ def admin_update_user(
                 sub_base=sub_base,
                 documento=(updates.get("documento") or "").strip(),
                 cnpj=(updates.get("cnpj") or "").strip(),
+                chave_pix=(updates.get("chave_pix") or "").strip() or None,
                 rua=(updates.get("rua") or "").strip(),
                 numero=(updates.get("numero") or "").strip(),
                 complemento=(updates.get("complemento") or "").strip() or None,
