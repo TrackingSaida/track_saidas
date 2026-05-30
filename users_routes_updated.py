@@ -5,6 +5,7 @@ import time
 from datetime import date
 from typing import Optional, List, Any
 import re
+import unicodedata
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -211,6 +212,83 @@ def _placeholder_username_from_nome(nome: Optional[str], sub_base: Optional[str]
     return base
 
 
+def _username_token(raw: Optional[str]) -> str:
+    """
+    Normaliza token para username:
+    - remove acentos
+    - mantém apenas [a-z0-9]
+    """
+    txt = (raw or "").strip().lower()
+    if not txt:
+        return ""
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", txt)
+
+
+def _username_exists_in_sub_base(db: Session, sub_base: str, username: str) -> bool:
+    if not username:
+        return False
+    return db.scalar(
+        select(User).where(
+            User.username == username,
+            User.sub_base == sub_base,
+        )
+    ) is not None
+
+
+def _generate_unique_username_for_sub_base(
+    db: Session,
+    sub_base: str,
+    nome: Optional[str],
+    sobrenome: Optional[str],
+) -> str:
+    """
+    Gera username único na sub_base.
+    Prioridade:
+    1) primeiroNome.subbase
+    2) primeiroNome.ultimoSobrenome
+    3) primeiroNome.ultimoSobrenome.subbase
+    4) sufixo incremental (ex.: ...2, ...3)
+    """
+    first = _username_token(_first_word(nome))
+    last = _username_token(_last_word(sobrenome))
+    base = _username_token(_sanitize_sub_base(sub_base or ""))
+
+    candidates: list[str] = []
+    if first and base:
+        candidates.append(f"{first}.{base}")
+    if first and last:
+        candidates.append(f"{first}.{last}")
+    if first and last and base:
+        candidates.append(f"{first}.{last}.{base}")
+    if first:
+        candidates.append(first)
+    if base:
+        candidates.append(base)
+
+    seen: set[str] = set()
+    unique_candidates: list[str] = []
+    for cand in candidates:
+        c = (cand or "").strip(".")
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        unique_candidates.append(c)
+
+    for cand in unique_candidates:
+        if not _username_exists_in_sub_base(db, sub_base, cand):
+            return cand
+
+    root = unique_candidates[0] if unique_candidates else "user"
+    i = 2
+    while True:
+        cand = f"{root}{i}"
+        if not _username_exists_in_sub_base(db, sub_base, cand):
+            return cand
+        i += 1
+
+
 def _placeholder_email_from_nome_sobrenome(
     nome: Optional[str], sobrenome: Optional[str], sub_base: Optional[str]
 ) -> str:
@@ -352,7 +430,11 @@ def create_user(
             password_hash_val = get_password_hash(DEFAULT_PASSWORD)
     else:
         # Role 4 (motoboy): placeholders permitidos
-        username_val = (body.username or "").strip() or _placeholder_username_from_nome(body.nome, sub_base) or _sanitize_sub_base(sub_base or "") or f"sem_username_{_ts}"
+        username_manual = (body.username or "").strip()
+        if username_manual:
+            username_val = username_manual
+        else:
+            username_val = _generate_unique_username_for_sub_base(db, sub_base, body.nome, body.sobrenome)
         email_val = (body.email or "").strip() or _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or f"sem-email-{_ts}@{_sub_base_domain(sub_base)}.com"
         if (body.password or "").strip():
             password_hash_val = get_password_hash((body.password or "").strip())
