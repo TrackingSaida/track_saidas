@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import select, func
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from db import get_db
 from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD
@@ -541,6 +541,17 @@ def create_user(
 
         return {"ok": True, "id": new_user.id}
 
+    except IntegrityError as e:
+        db.rollback()
+        msg = str(getattr(e, "orig", e)).lower()
+        if "username" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+        if "email" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Email já existe.")
+        if "contato" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Contato já existe para esta sub_base.")
+        logger.exception("Erro de integridade ao criar usuário: %s", e)
+        raise HTTPException(409, "Conflito de dados ao criar usuário.")
     except Exception as e:
         db.rollback()
         logger.exception("Erro ao criar usuário: %s", e)
@@ -706,16 +717,29 @@ def admin_update_user(
     # Campos User
     user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role"}
 
-    # Validação de username único por sub_base ao editar
-    if "username" in updates and updates["username"]:
-        new_username = (updates["username"] or "").strip()
+    # Validação/normalização de username por perfil
+    if "username" in updates:
+        raw_username = updates.get("username")
+        new_username = (raw_username or "").strip()
         current_username = (user.username or "").strip()
+
+        if not new_username:
+            if user.role == 4:
+                nome_ref = updates.get("nome", user.nome)
+                sobrenome_ref = updates.get("sobrenome", user.sobrenome)
+                new_username = _generate_unique_username_for_sub_base(
+                    db, user.sub_base or current_user.sub_base or "", nome_ref, sobrenome_ref
+                )
+            else:
+                raise HTTPException(422, "Username é obrigatório para este perfil.")
+
         if (
-            new_username
-            and _normalize_username_for_compare(new_username) != _normalize_username_for_compare(current_username)
+            _normalize_username_for_compare(new_username) != _normalize_username_for_compare(current_username)
             and _username_exists_in_sub_base(db, user.sub_base or "", new_username, exclude_user_id=user.id)
         ):
             raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+
+        updates["username"] = new_username
 
     for field, value in updates.items():
         if field in user_fields:
@@ -769,7 +793,20 @@ def admin_update_user(
             db.flush()
             db.add(MotoboySubBase(motoboy_id=motoboy.id_motoboy, sub_base=sub_base, ativo=True))
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        msg = str(getattr(e, "orig", e)).lower()
+        if "username" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Já existe um usuário com esse username nesta sub_base.")
+        if "email" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Email já existe.")
+        if "contato" in msg and ("already exists" in msg or "duplicate key" in msg):
+            raise HTTPException(409, "Contato já existe para esta sub_base.")
+        logger.exception("Erro de integridade ao atualizar usuário id=%s: %s", user_id, e)
+        raise HTTPException(409, "Conflito de dados ao atualizar usuário.")
+
     db.refresh(user)
     return _user_to_out(user)
 
