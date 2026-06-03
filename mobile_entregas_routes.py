@@ -43,6 +43,8 @@ from saidas_routes import (
     _should_store_qr_payload_raw,
     normalizar_status_saida,
     _get_motoboy_nome,
+    _status_esta_finalizado,
+    _status_finalizado_detail,
 )
 from codigo_normalizer import (
     normalize_codigo,
@@ -345,10 +347,6 @@ def _filtrar_por_data_operacional(
         if ts and ts.date() == data_ref:
             out.append(s)
     return out
-
-
-def _status_esta_finalizado(status_norm: str) -> bool:
-    return status_norm in {STATUS_ENTREGUE, STATUS_CANCELADO}
 
 
 def _ctx_data_operacional_saida(db: Session, saida: Saida) -> date:
@@ -1013,6 +1011,8 @@ def marcar_entregue(
     Se body for enviado, preenche tipo_recebedor, nome_recebedor, tipo_documento, numero_documento, observacao_entrega em saidas_detail."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
+    if _status_esta_finalizado(status_norm):
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if status_norm == STATUS_SAIU_PARA_ENTREGA:
         raise HTTPException(
             status_code=422,
@@ -1073,6 +1073,8 @@ def marcar_ausente(
     """Marca entrega como AUSENTE com motivo. Só permite se status for EM_ROTA."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
+    if _status_esta_finalizado(status_norm):
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if status_norm == STATUS_SAIU_PARA_ENTREGA:
         raise HTTPException(
             status_code=422,
@@ -1623,6 +1625,9 @@ def deletar_entrega_mobile(
     Reaproveita a mesma regra de janela de exclusão (24h) da web.
     """
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    status_norm = normalizar_status_saida(s.status)
+    if _status_esta_finalizado(status_norm):
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     _check_delete_window_or_409(s.timestamp)
     try:
         db.add(
@@ -1657,6 +1662,9 @@ def desatribuir_entrega(
 ):
     """Remove atribuição: motoboy_id = null. Apenas para entregas do próprio motoboy."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    status_norm = normalizar_status_saida(s.status)
+    if _status_esta_finalizado(status_norm):
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     db.add(
         SaidaHistorico(
             id_saida=s.id_saida,
@@ -1687,16 +1695,8 @@ def assumir_entrega(
     if not s or s.sub_base != user.sub_base:
         raise HTTPException(status_code=404, detail="Entrega não encontrada.")
     status_norm = normalizar_status_saida(s.status)
-    if status_norm == STATUS_CANCELADO:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Pedido cancelado. Não é possível assumir. Status: {STATUS_CANCELADO}.",
-        )
-    if status_norm == STATUS_ENTREGUE:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Pedido já entregue. Não é possível assumir. Status: {STATUS_ENTREGUE}.",
-        )
+    if _status_esta_finalizado(status_norm):
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     owner_valor = _owner_valor_por_sub_base(db, user, user.sub_base or "")
     if s.motoboy_id == user.motoboy_id:
         _garantir_cobranca_owner_saida(db, s, owner_valor)

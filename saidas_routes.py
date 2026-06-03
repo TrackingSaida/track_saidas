@@ -250,6 +250,17 @@ def _status_esta_finalizado(status_norm: str) -> bool:
     return status_norm in {STATUS_ENTREGUE, STATUS_CANCELADO}
 
 
+def _status_finalizado_detail(saida: Saida, status_norm: Optional[str] = None) -> dict:
+    status_atual = status_norm or normalizar_status_saida(saida.status)
+    return {
+        "code": "STATUS_FINALIZADO",
+        "id_saida": saida.id_saida,
+        "status_atual": status_atual,
+        "message": f"Pedido com status finalizado: {status_atual}.",
+        "entregador_atual": saida.entregador,
+    }
+
+
 def _evento_status_manual(status_norm: str) -> Optional[str]:
     if status_norm == STATUS_CANCELADO:
         return "cancelado"
@@ -1414,6 +1425,9 @@ def patch_saida_foto(
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     obj = _get_owned_saida(db, sub_base, id_saida)
+    status_norm = normalizar_status_saida(obj.status)
+    if _status_esta_finalizado(status_norm):
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_norm))
     detail_row = db.scalar(
         select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).order_by(SaidaDetail.id_detail.desc()).limit(1)
     )
@@ -1533,6 +1547,21 @@ def atualizar_saida(
     sub_base = current_user.sub_base
     obj = _get_owned_saida(db, sub_base, id_saida)
     status_anterior = normalizar_status_saida(obj.status)
+    if _status_esta_finalizado(status_anterior):
+        has_payload_change = any(
+            (
+                payload.entregador_id is not None,
+                payload.entregador is not None,
+                payload.motoboy_id is not None,
+                payload.status is not None,
+                payload.codigo is not None,
+                payload.servico is not None,
+                payload.base is not None,
+                payload.is_grande is not None,
+            )
+        )
+        if has_payload_change:
+            raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_anterior))
     motoboy_anterior = obj.motoboy_id
     entregador_anterior = (obj.entregador or "").strip()
     payload_changed = {
