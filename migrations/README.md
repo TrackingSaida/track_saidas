@@ -27,3 +27,16 @@ ADD COLUMN IF NOT EXISTS tipo_owner TEXT NOT NULL DEFAULT 'subbase';
 ```
 
 Ou, se o Render não tiver Shell, use a **connection string** em um cliente (DBeaver, psql, etc.) e rode o arquivo `.sql`.
+
+## history_cleanup_state.sql
+
+Cria as tabelas da rotina de limpeza de histórico D-60:
+
+- `maintenance_job_state`: checkpoint de execução para retomada automática por janela.
+- `history_retention_policy`: política de retenção (v1 global em 60 dias com chave `__global__`, preparada para futuro por `sub_base`).
+
+Executar:
+
+```sql
+-- arquivo: migrations/history_cleanup_state.sql
+```

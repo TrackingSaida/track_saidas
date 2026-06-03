@@ -622,6 +622,58 @@ class SaidaHistorico(Base):
 
 
 # ==========================
+# Tabela: maintenance_job_state
+# ==========================
+class MaintenanceJobState(Base):
+    __tablename__ = "maintenance_job_state"
+
+    job_name = Column(Text, primary_key=True)
+    retention_days = Column(Integer, nullable=False, server_default=text("60"))
+    last_saida_id = Column(BigInteger, nullable=False, server_default=text("0"))
+
+    status = Column(Text, nullable=False, server_default=text("'idle'"))
+    last_rows_historico = Column(Integer, nullable=False, server_default=text("0"))
+    last_rows_saidas = Column(Integer, nullable=False, server_default=text("0"))
+    last_duration_ms = Column(Integer, nullable=False, server_default=text("0"))
+
+    last_run_started_at = Column(DateTime(timezone=False), nullable=True)
+    last_run_finished_at = Column(DateTime(timezone=False), nullable=True)
+    last_error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<MaintenanceJobState job_name={self.job_name!r} status={self.status!r} "
+            f"last_saida_id={self.last_saida_id}>"
+        )
+
+
+# ==========================
+# Tabela: history_retention_policy (futuro por sub_base)
+# ==========================
+class HistoryRetentionPolicy(Base):
+    __tablename__ = "history_retention_policy"
+    __table_args__ = (
+        UniqueConstraint("sub_base", name="uq_history_retention_policy_sub_base"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False, server_default=text("'__global__'"))  # __global__ = política default
+    retention_days = Column(Integer, nullable=False, server_default=text("60"))
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<HistoryRetentionPolicy id={self.id} sub_base={self.sub_base!r} "
+            f"retention_days={self.retention_days} ativo={self.ativo}>"
+        )
+
+
+# ==========================
 # Tabela: rotas_motoboy
 # ==========================
 class RotasMotoboy(Base):

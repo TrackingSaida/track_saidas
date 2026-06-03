@@ -217,6 +217,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 from db import SessionLocal
 from ml_int_service import refresh_all_ml_int_tokens
 from shopee_routes import refresh_all_shopee_tokens
+from cleanup_service import run_history_cleanup, estimate_old_volume
 
 @app.on_event("startup")
 def startup_event():
@@ -259,6 +260,61 @@ def internal_refresh_tokens(request: Request):
         ml_count = refresh_all_ml_int_tokens(db)
         shopee_count = refresh_all_shopee_tokens(db)
         return {"status": "ok", "ml_refreshed": ml_count, "shopee_refreshed": shopee_count}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
+
+@app.post(f"{API_PREFIX}/internal/cleanup-history", tags=["Internal"])
+def internal_cleanup_history(request: Request):
+    """
+    Limpa histórico > D-60 (v1: saidas e saida_historico), em lotes e com limite de janela.
+    Protegido por header X-Cron-Secret (CRON_CLEANUP_SECRET, fallback CRON_REFRESH_SECRET).
+    """
+    secret = os.getenv("CRON_CLEANUP_SECRET") or os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_CLEANUP_SECRET não configurado"})
+
+    received = request.headers.get("X-Cron-Secret")
+    if received != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    batch_size = int(os.getenv("HISTORY_CLEANUP_BATCH_SIZE", "3000"))
+    max_runtime_seconds = int(os.getenv("HISTORY_CLEANUP_MAX_RUNTIME_SECONDS", "540"))
+    retention_days = int(os.getenv("HISTORY_RETENTION_DAYS", "60"))
+
+    db = SessionLocal()
+    try:
+        before = estimate_old_volume(db, retention_days=retention_days)
+        result = run_history_cleanup(
+            db,
+            retention_days=retention_days,
+            batch_size=batch_size,
+            max_runtime_seconds=max_runtime_seconds,
+        )
+        after = estimate_old_volume(db, retention_days=result.retention_days)
+        payload = {
+            "status": result.status,
+            "partial": result.partial,
+            "retention_days": result.retention_days,
+            "cutoff_utc": result.cutoff.isoformat(),
+            "deleted": {
+                "saidas": result.rows_saidas,
+                "saida_historico": result.rows_historico,
+            },
+            "processed_saida_ids": result.processed_saida_ids,
+            "last_saida_id_checkpoint": result.last_saida_id,
+            "duration_ms": result.duration_ms,
+            "remaining_estimate": {
+                "before": before,
+                "after": after,
+            },
+        }
+        if result.error:
+            payload["error"] = result.error
+        status_code = 200 if result.status != "error" else 500
+        return JSONResponse(status_code=status_code, content=payload)
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
     finally:

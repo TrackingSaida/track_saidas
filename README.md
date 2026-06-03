@@ -68,6 +68,84 @@ ORDER BY l.created_at DESC;
 
 As alterações de schema (colunas, tabelas) são aplicadas manualmente. Veja [migrations/README.md](migrations/README.md) para a lista de migrações e como executá-las (ex.: correção do erro `column entregador_fechamentos.id_motoboy does not exist`).
 
+## Rotina de limpeza de histórico D-60 (Render)
+
+### Escopo da v1
+
+- Tabelas: `saidas` e `saida_historico`.
+- Política de retenção: 60 dias.
+- Execução: endpoint interno protegido + Cron Job diário no Render.
+- Política default armazenada em `history_retention_policy.sub_base='__global__'`.
+
+### Pré-requisitos
+
+1. Aplicar migração `migrations/history_cleanup_state.sql`.
+2. Configurar variáveis no Web Service e no Cron Job:
+   - `CRON_CLEANUP_SECRET` (obrigatória)
+   - `HISTORY_RETENTION_DAYS` (default `60`)
+   - `HISTORY_CLEANUP_BATCH_SIZE` (default `3000`)
+   - `HISTORY_CLEANUP_MAX_RUNTIME_SECONDS` (default `540`)
+
+### Endpoint interno
+
+- `POST /api/internal/cleanup-history`
+- Header obrigatório: `X-Cron-Secret: <CRON_CLEANUP_SECRET>`
+- Resposta inclui:
+  - `deleted.saidas`
+  - `deleted.saida_historico`
+  - `partial` (quando não termina na janela)
+  - `last_saida_id_checkpoint` (retomada automática)
+  - `remaining_estimate.before/after`
+
+### Agendamento recomendado no Render
+
+Para rodar perto de 03:00 BRT (UTC-3), configurar cron em UTC:
+
+- Schedule: `0 6 * * *`
+- Command:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_CLEANUP_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/cleanup-history"
+```
+
+Se o job não terminar no orçamento de tempo, ele retorna `partial=true` e continua no próximo dia a partir do checkpoint salvo.
+
+## Benchmark de performance (Registros)
+
+Antes de ativar a limpeza e após alguns ciclos, rodar os mesmos testes em `GET /api/saidas/listar`:
+
+```bash
+# ajustar TOKEN e SUB_BASE
+export BASE_URL="https://track-saidas-api.onrender.com"
+export TOKEN="SEU_JWT"
+export SUB_BASE="SUA_SUB_BASE"
+
+# cenário 1: período padrão
+curl -s -o /tmp/registros_periodo.json -w "http=%{http_code} total=%{time_total}s\n" \
+  -H "Authorization: Bearer $TOKEN" \
+  "$BASE_URL/api/saidas/listar?sub_base=$SUB_BASE&de=2026-05-01&ate=2026-05-31&limit=50&offset=0"
+
+# cenário 2: cancelados no período
+curl -s -o /tmp/registros_cancelados.json -w "http=%{http_code} total=%{time_total}s\n" \
+  -H "Authorization: Bearer $TOKEN" \
+  "$BASE_URL/api/saidas/listar?sub_base=$SUB_BASE&status=cancelado&de=2026-05-01&ate=2026-05-31&limit=50&offset=0"
+```
+
+No banco, capturar plano/tempo para comparação:
+
+```sql
+EXPLAIN ANALYZE
+SELECT id_saida, timestamp, codigo, status
+FROM saidas
+WHERE sub_base = 'SUA_SUB_BASE'
+  AND timestamp >= '2026-05-01'
+  AND timestamp <  '2026-06-01'
+ORDER BY timestamp DESC
+LIMIT 50 OFFSET 0;
+```
+
 ## Configuração do Backblaze B2 (fotos de entrega)
 
 O upload de fotos de entrega/ausente usa um bucket B2 privado. O backend só gera URLs presigned se as credenciais estiverem configuradas.
