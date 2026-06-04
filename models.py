@@ -313,6 +313,7 @@ class EntregadorPrecoGlobal(Base):
     shopee_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     ml_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     avulso_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    considerar_pacote_g_adicional = Column(Boolean, nullable=False, server_default=text("false"))
 
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
