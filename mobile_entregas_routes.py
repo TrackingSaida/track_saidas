@@ -58,6 +58,8 @@ from pedido_campos_obrigatorios_service import (
     validate_campos_obrigatorios_conclusao,
     raise_if_campos_obrigatorios_faltando,
     resolve_campos_obrigatorios_ativos,
+    build_campos_cache_for_sub_base,
+    resolve_campos_obrigatorios_from_cache,
 )
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
@@ -248,10 +250,19 @@ def _carregar_details_por_saida_ids(db: Session, saida_ids: List[int]) -> Dict[i
     ids = sorted({int(i) for i in saida_ids if i is not None})
     if not ids:
         return {}
+    latest_ids_subq = (
+        select(
+            SaidaDetail.id_saida.label("id_saida"),
+            func.max(SaidaDetail.id_detail).label("max_id_detail"),
+        )
+        .where(SaidaDetail.id_saida.in_(ids))
+        .group_by(SaidaDetail.id_saida)
+        .subquery()
+    )
     rows = db.execute(
         select(SaidaDetail)
-        .where(SaidaDetail.id_saida.in_(ids))
-        .order_by(SaidaDetail.id_saida.asc(), SaidaDetail.id_detail.desc())
+        .join(latest_ids_subq, SaidaDetail.id_detail == latest_ids_subq.c.max_id_detail)
+        .order_by(SaidaDetail.id_saida.asc())
     ).scalars().all()
     out: Dict[int, SaidaDetail] = {}
     for d in rows:
@@ -457,18 +468,17 @@ def listar_entregas(
     if status == "pendente" and hoje is not None:
         rows = _filtrar_por_data_operacional(db, rows, hoje)
     details_map = _carregar_details_por_saida_ids(db, [s.id_saida for s in rows])
+    campos_cache = build_campos_cache_for_sub_base(db, sub_base=sub_base)
     out = []
     for s in rows:
         item = _saida_to_item(s, details_map.get(int(s.id_saida)))
-        campos_entregue = resolve_campos_obrigatorios_ativos(
-            db,
-            sub_base=s.sub_base,
+        campos_entregue = resolve_campos_obrigatorios_from_cache(
+            cache=campos_cache,
             servico=s.servico,
             contexto="ENTREGUE",
         )
-        campos_ausente = resolve_campos_obrigatorios_ativos(
-            db,
-            sub_base=s.sub_base,
+        campos_ausente = resolve_campos_obrigatorios_from_cache(
+            cache=campos_cache,
             servico=s.servico,
             contexto="AUSENTE",
         )

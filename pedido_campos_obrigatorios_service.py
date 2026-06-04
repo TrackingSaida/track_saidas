@@ -78,6 +78,37 @@ def resolve_campos_obrigatorios_ativos(
     return sorted(campos_union)
 
 
+def build_campos_cache_for_sub_base(db: Session, *, sub_base: str) -> Dict[tuple, List[str]]:
+    cache: Dict[tuple, List[str]] = {}
+    rows = db.scalars(
+        select(PedidoCamposObrigatoriosConfig).where(
+            PedidoCamposObrigatoriosConfig.sub_base == sub_base,
+            PedidoCamposObrigatoriosConfig.ativo.is_(True),
+        )
+    ).all()
+    for row in rows:
+        servico = canonicalize_servico(getattr(row, "servico", None))
+        contexto = normalize_contexto(getattr(row, "contexto", "AMBOS"))
+        campos = parse_campos_obrigatorios_text(getattr(row, "campos_obrigatorios", "[]"))
+        key = (servico, contexto)
+        if key not in cache:
+            cache[key] = []
+        cache[key] = sorted(set(cache[key] + campos))
+    return cache
+
+
+def resolve_campos_obrigatorios_from_cache(
+    *,
+    cache: Dict[tuple, List[str]],
+    servico: Optional[str],
+    contexto: str,
+) -> List[str]:
+    servico_norm = canonicalize_servico(servico)
+    contexto_norm = normalize_contexto(contexto)
+    merged = set(cache.get((servico_norm, "AMBOS"), [])) | set(cache.get((servico_norm, contexto_norm), []))
+    return sorted(merged)
+
+
 def _has_foto(detail: Optional[SaidaDetail], overrides: Optional[Dict[str, Optional[str]]] = None) -> bool:
     if overrides and "foto_url" in overrides:
         value = (overrides.get("foto_url") or "").strip()
