@@ -16,13 +16,13 @@ from db import get_db
 from auth import get_current_user
 from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy, RotasMotoboy
 from saidas_routes import (
-    _get_motoboy_nome,
     normalizar_status_saida,
     STATUS_SAIU_PARA_ENTREGA,
     STATUS_EM_ROTA,
     STATUS_ENTREGUE,
     STATUS_AUSENTE,
 )
+from saida_operacional_utils import carregar_contexto_operacional
 
 router = APIRouter(prefix="/acompanhamento", tags=["Acompanhamento"])
 
@@ -84,6 +84,16 @@ class AcompanhamentoTotais(BaseModel):
 class AcompanhamentoDiaResponse(BaseModel):
     items: List[AcompanhamentoItem]
     totais: AcompanhamentoTotais
+
+
+class AcompanhamentoSaidasDiaResponse(BaseModel):
+    data: str
+    motoboy_id: int
+    motoboy_nome: str
+    pendentes_hoje: int
+    sum_shopee: int
+    sum_mercado: int
+    sum_avulso: int
 
 
 class AcompanhamentoMapaItem(BaseModel):
@@ -278,4 +288,81 @@ def acompanhamento_dia(
             ausente_ou_ocorrencias=totais_ausente,
             sla=sla_total,
         ),
+    )
+
+
+@router.get("/saidas-dia", response_model=AcompanhamentoSaidasDiaResponse)
+def acompanhamento_saidas_dia(
+    motoboy_id: int = Query(..., description="Motoboy obrigatório"),
+    data: Optional[date] = Query(None, description="Data de referência (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Retorna os pendentes operacionais do motoboy na data, com a mesma
+    regra de período operacional das telas de Registros e Mobile.
+    """
+    sub_base = getattr(current_user, "sub_base", None)
+    if not sub_base or not str(sub_base).strip():
+        raise HTTPException(status_code=403, detail="Sub_base não definida.")
+
+    data_ref = data or date.today()
+    rows_pendentes_all = db.scalars(
+        select(Saida).where(
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+            Saida.codigo.isnot(None),
+            Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
+        )
+    ).all()
+
+    ctx_map = carregar_contexto_operacional(db, [s.id_saida for s in rows_pendentes_all])
+    rows_pendentes_validos = [
+        s
+        for s in rows_pendentes_all
+        if not (
+            ctx_map.get(s.id_saida)
+            and (
+                ctx_map[s.id_saida].removido_sem_inicio_ativo
+                or not ctx_map[s.id_saida].leitura_valida
+            )
+        )
+    ]
+    rows_pendentes_dia = [
+        s
+        for s in rows_pendentes_validos
+        if (
+            ((ctx_map.get(s.id_saida).operacional_ts if ctx_map.get(s.id_saida) else None) or s.timestamp).date()
+            == data_ref
+        )
+    ]
+
+    sum_shopee = 0
+    sum_mercado = 0
+    sum_avulso = 0
+    for s in rows_pendentes_dia:
+        srv = (s.servico or "").strip().lower()
+        if ("shopee" in srv) or ("spx" in srv):
+            sum_shopee += 1
+        elif (
+            ("mercado livre" in srv)
+            or ("mercado_livre" in srv)
+            or ("mercadolivre" in srv)
+            or (" ml" in f" {srv}")
+            or ("flex" in srv)
+        ):
+            sum_mercado += 1
+        else:
+            sum_avulso += 1
+
+    motoboy_nome = _carregar_nomes_motoboy_ids(db, [motoboy_id]).get(motoboy_id, f"Motoboy {motoboy_id}")
+
+    return AcompanhamentoSaidasDiaResponse(
+        data=data_ref.isoformat(),
+        motoboy_id=motoboy_id,
+        motoboy_nome=motoboy_nome,
+        pendentes_hoje=len(rows_pendentes_dia),
+        sum_shopee=sum_shopee,
+        sum_mercado=sum_mercado,
+        sum_avulso=sum_avulso,
     )
