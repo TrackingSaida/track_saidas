@@ -52,7 +52,12 @@ from codigo_normalizer import (
     is_qr_like_scan_payload,
 )
 from entregador_routes import resolver_precos_motoboy
-from saida_operacional_utils import carregar_contexto_operacional, EVENTOS_ATRIBUICAO_VALIDOS
+from saida_operacional_utils import (
+    carregar_contexto_operacional,
+    EVENTOS_ATRIBUICAO_VALIDOS,
+    deve_excluir_saida_operacional,
+    timestamp_operacional_saida,
+)
 from log_leitura_service import registrar_log_leitura_critico
 from pedido_campos_obrigatorios_service import (
     validate_campos_obrigatorios_conclusao,
@@ -366,9 +371,9 @@ def _filtrar_por_data_operacional(
     out: List[Saida] = []
     for s in saidas:
         ctx = ctx_map.get(s.id_saida)
-        if ctx and (ctx.removido_sem_inicio_ativo or not ctx.leitura_valida):
+        if deve_excluir_saida_operacional(ctx):
             continue
-        ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
+        ts = timestamp_operacional_saida(ctx, s.timestamp)
         if ts and ts.date() == data_ref:
             out.append(s)
     return out
@@ -541,9 +546,9 @@ def extrato_financeiro_motoboy(
     rows: List[Saida] = []
     for s in rows_periodo:
         ctx = op_ctx_map.get(s.id_saida)
-        if ctx and (ctx.removido_sem_inicio_ativo or not ctx.leitura_valida):
+        if deve_excluir_saida_operacional(ctx):
             continue
-        ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
+        ts_op = timestamp_operacional_saida(ctx, s.timestamp)
         if ts_op is None:
             continue
         if ts_op.date() < periodo_inicio or ts_op.date() > periodo_fim:
@@ -683,7 +688,7 @@ def resumo_entregas(
     rows_pendentes = [
         s
         for s in rows_pendentes_all
-        if not (ctx_map_pendentes.get(s.id_saida) and (ctx_map_pendentes[s.id_saida].removido_sem_inicio_ativo or not ctx_map_pendentes[s.id_saida].leitura_valida))
+        if not deve_excluir_saida_operacional(ctx_map_pendentes.get(s.id_saida))
     ]
     rows_pendentes_hoje = _filtrar_por_data_operacional(db, rows_pendentes, hoje)
     pendentes = len(rows_pendentes_hoje)
@@ -724,7 +729,10 @@ def resumo_entregas(
     atraso_d1 = sum(
         1
         for s in rows_pendentes
-        if ((ctx_map_pendentes.get(s.id_saida).operacional_ts if ctx_map_pendentes.get(s.id_saida) else None) or s.timestamp).date() < hoje
+        if (
+            (ts := timestamp_operacional_saida(ctx_map_pendentes.get(s.id_saida), s.timestamp))
+            and ts.date() < hoje
+        )
     )
 
     return {
