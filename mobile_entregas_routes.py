@@ -107,6 +107,7 @@ class EntregaListItem(BaseModel):
     endereco_origem: Optional[str] = None  # manual | ocr | voz
     possui_endereco: bool = False
     tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
+    tem_comprovante: bool = False
 
 
 class ScanBody(BaseModel):
@@ -277,6 +278,7 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         endereco = ", ".join(parts) if parts else None
     lat = float(detail.latitude) if detail and detail.latitude is not None else None
     lon = float(detail.longitude) if detail and detail.longitude is not None else None
+    tem_comprovante = bool((detail.foto_url or "").strip()) if detail else False
     return {
         "id_saida": s.id_saida,
         "codigo": s.codigo,
@@ -297,6 +299,7 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "endereco_origem": (detail.endereco_origem or "").strip() or None if detail else None,
         "possui_endereco": _possui_endereco(detail),
         "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
+        "tem_comprovante": tem_comprovante,
     }
 
 
