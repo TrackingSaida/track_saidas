@@ -428,6 +428,10 @@ def listar_entregas(
     status: Optional[str] = None,
     dia: Optional[str] = None,
     data: Optional[str] = None,
+    subtipo: Optional[str] = Query(
+        None,
+        description="Para status=finalizadas: entregue (padrão) ou cancelado",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
@@ -460,15 +464,26 @@ def listar_entregas(
     if status == "pendente":
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
     elif status == "finalizadas":
-        q = q.where(Saida.status == STATUS_ENTREGUE)
+        subtipo_norm = (subtipo or "entregue").strip().lower()
+        if subtipo_norm == "cancelado":
+            q = q.where(Saida.status == STATUS_CANCELADO)
+        else:
+            q = q.where(Saida.status == STATUS_ENTREGUE)
         if hoje is not None:
-            # Filtro "finalizadas hoje": pelo evento entregue no histórico com data = hoje
-            subq_entregue = select(1).where(
-                SaidaHistorico.id_saida == Saida.id_saida,
-                SaidaHistorico.evento == "entregue",
-                func.date(SaidaHistorico.timestamp) == hoje,
-            )
-            q = q.where(exists(subq_entregue))
+            if subtipo_norm == "cancelado":
+                subq_cancel = select(1).where(
+                    SaidaHistorico.id_saida == Saida.id_saida,
+                    SaidaHistorico.evento == "cancelado",
+                    func.date(SaidaHistorico.timestamp) == hoje,
+                )
+                q = q.where(exists(subq_cancel))
+            else:
+                subq_entregue = select(1).where(
+                    SaidaHistorico.id_saida == Saida.id_saida,
+                    SaidaHistorico.evento == "entregue",
+                    func.date(SaidaHistorico.timestamp) == hoje,
+                )
+                q = q.where(exists(subq_entregue))
     elif status == "ausentes":
         q = q.where(Saida.status == STATUS_AUSENTE)
         if hoje is not None:
@@ -510,7 +525,7 @@ def listar_entregas(
 def extrato_financeiro_motoboy(
     data_inicio: Optional[str] = Query(None, description="YYYY-MM-DD"),
     data_fim: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    status_filtro: str = Query("grupo_entregue", description="grupo_entregue | todos"),
+    status_filtro: str = Query("grupo_entregue", description="grupo_entregue | todos | cancelados"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
@@ -530,7 +545,7 @@ def extrato_financeiro_motoboy(
         raise HTTPException(status_code=400, detail="data_inicio deve ser menor ou igual a data_fim.")
 
     modo = (status_filtro or "grupo_entregue").strip().lower()
-    if modo not in ("grupo_entregue", "todos"):
+    if modo not in ("grupo_entregue", "todos", "cancelados"):
         modo = "grupo_entregue"
 
     dt_inicio = datetime.combine(periodo_inicio, datetime.min.time())
@@ -585,7 +600,12 @@ def extrato_financeiro_motoboy(
         status_up = _status_normalizado_upper(s.status)
         is_cancelado = status_up == STATUS_CANCELADO
         is_grupo_entregue = status_up in grupo_entregue
-        passa_filtro = (modo == "todos") or is_grupo_entregue
+        if modo == "cancelados":
+            passa_filtro = is_cancelado
+        elif modo == "todos":
+            passa_filtro = True
+        else:
+            passa_filtro = is_grupo_entregue
 
         ctx = op_ctx_map.get(s.id_saida)
         ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
@@ -737,6 +757,22 @@ def resumo_entregas(
             Saida.status == STATUS_AUSENTE,
         )
     ) or 0
+    ausentes_hoje = db.scalar(
+        select(func.count(Saida.id_saida)).where(
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+            Saida.codigo.isnot(None),
+            Saida.status == STATUS_AUSENTE,
+            exists(
+                select(1).where(
+                    SaidaHistorico.id_saida == Saida.id_saida,
+                    SaidaHistorico.evento == "ausente",
+                    func.date(SaidaHistorico.timestamp) == hoje,
+                )
+            ),
+        )
+    ) or 0
+    total_finalizado_hoje = int(finalizadas_hoje) + int(ausentes_hoje)
     # Em atraso (D+1): considera data operacional da última ação válida.
     atraso_d1 = sum(
         1
@@ -750,6 +786,8 @@ def resumo_entregas(
     return {
         "pendentes": pendentes,
         "finalizadas_hoje": finalizadas_hoje,
+        "ausentes_hoje": ausentes_hoje,
+        "total_finalizado_hoje": total_finalizado_hoje,
         "pode_iniciar_rota": tem_saiu_para_entrega > 0,
         "ausentes": ausentes,
         "atraso_d1": atraso_d1,
