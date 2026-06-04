@@ -15,7 +15,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import select, func, or_, exists
+from sqlalchemy import select, func, or_, exists, text
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -37,6 +37,7 @@ from log_leitura_service import registrar_log_leitura_critico
 # ============================================================
 
 router = APIRouter(prefix="/saidas", tags=["Saídas"])
+pedidos_router = APIRouter(prefix="/pedidos", tags=["Pedidos"])
 MAX_IDS_POR_LOTE = 5000
 OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -118,6 +119,21 @@ class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     origem: str = "web"
+
+
+class LancarAvulsoIn(BaseModel):
+    identificacao: Optional[str] = None
+    quantidade: int = Field(default=1, ge=1)
+    entregador_id: Optional[int] = None
+    entregador: Optional[str] = None
+    motoboy_id: Optional[int] = None
+
+
+class LancarAvulsoOut(BaseModel):
+    quantidade_criada: int
+    codigos: List[str]
+    saidas: List[dict]
+    mensagem: str
 
 
 class SaidaDetailOut(BaseModel):
@@ -414,6 +430,29 @@ def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
     if re.search(r"4[5-9]\d{9}", raw):
         return True
     return False
+
+
+def _normalizar_label_avulso(label: Optional[str]) -> str:
+    raw = unicodedata.normalize("NFD", (label or "").strip().upper())
+    ascii_only = "".join(c for c in raw if unicodedata.category(c) != "Mn")
+    ascii_only = re.sub(r"[^A-Z0-9]+", "-", ascii_only).strip("-")
+    ascii_only = re.sub(r"-{2,}", "-", ascii_only)
+    return ascii_only[:48]
+
+
+def _next_avulso_seq(db: Session) -> int:
+    db.execute(text("CREATE SEQUENCE IF NOT EXISTS avulso_codigo_seq START WITH 1 INCREMENT BY 1"))
+    return int(db.execute(text("SELECT nextval('avulso_codigo_seq')")).scalar_one())
+
+
+def _gerar_codigo_avulso(db: Session, label_norm: str) -> str:
+    while True:
+        seq = _next_avulso_seq(db)
+        sufixo = f"{seq:06d}"
+        codigo = f"AVULSO-{label_norm}-{sufixo}" if label_norm else f"AVULSO-{sufixo}"
+        existe = db.scalar(select(Saida.id_saida).where(Saida.codigo == codigo).limit(1))
+        if not existe:
+            return codigo
 
 
 def _servico_text_expr(expr):
@@ -1011,6 +1050,136 @@ def confirmar_nova_saida_mesmo_entregador(
         endpoint="/saidas/confirmar-nova-saida-mesmo-entregador",
     )
     return SaidaOut.model_validate(saida)
+
+
+def _lancar_avulso_impl(
+    payload: LancarAvulsoIn,
+    db: Session,
+    current_user: User,
+):
+    sub_base = current_user.sub_base
+    username = current_user.username
+    if not sub_base or not username:
+        raise HTTPException(401, "Usuário inválido.")
+
+    owner_valor = Decimal(getattr(current_user, "owner_valor", 0))
+    role = int(getattr(current_user, "role", 0) or 0)
+
+    motoboy_id: Optional[int] = None
+    entregador_id: Optional[int] = None
+    entregador_nome = ""
+
+    if payload.motoboy_id is not None:
+        motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        motoboy_id = motoboy.id_motoboy
+        entregador_nome = _get_motoboy_nome(db, motoboy)
+    elif payload.entregador_id is not None or (payload.entregador and payload.entregador.strip()):
+        entregador_id, entregador_nome = _resolve_entregador(
+            db,
+            sub_base,
+            entregador_id=payload.entregador_id,
+            entregador_nome=payload.entregador,
+        )
+    elif role == 4 and getattr(current_user, "motoboy_id", None):
+        motoboy = _resolve_motoboy_for_subbase(db, sub_base, int(current_user.motoboy_id))
+        motoboy_id = motoboy.id_motoboy
+        entregador_nome = _get_motoboy_nome(db, motoboy)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe motoboy_id ou entregador_id/entregador."},
+        )
+
+    quantidade = int(payload.quantidade or 0)
+    if quantidade < 1:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "QUANTIDADE_INVALIDA", "message": "Quantidade mínima é 1."},
+        )
+
+    label_norm = _normalizar_label_avulso(payload.identificacao)
+    codigos: List[str] = []
+    saidas_criadas: List[dict] = []
+    status_inicial = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+    servico = canonicalize_servico("Avulso")
+
+    try:
+        for _ in range(quantidade):
+            codigo = _gerar_codigo_avulso(db, label_norm)
+            row = Saida(
+                sub_base=sub_base,
+                username=username,
+                entregador=entregador_nome,
+                entregador_id=entregador_id,
+                motoboy_id=motoboy_id,
+                codigo=codigo,
+                servico=servico,
+                status=status_inicial,
+                base=(payload.identificacao or "").strip() or None,
+            )
+            db.add(row)
+            db.flush()
+            db.add(
+                SaidaHistorico(
+                    id_saida=row.id_saida,
+                    evento="lancar_avulso",
+                    status_novo=status_inicial,
+                    user_id=getattr(current_user, "id", None),
+                    payload=json.dumps(
+                        {
+                            "identificacao": (payload.identificacao or "").strip() or None,
+                            "codigo": codigo,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+            db.add(
+                OwnerCobrancaItem(
+                    sub_base=sub_base,
+                    id_coleta=None,
+                    id_saida=row.id_saida,
+                    valor=owner_valor,
+                )
+            )
+            codigos.append(codigo)
+            saidas_criadas.append(
+                {
+                    "id_saida": int(row.id_saida),
+                    "codigo": codigo,
+                    "servico": servico,
+                    "status": status_inicial,
+                }
+            )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro ao lançar avulso: {e}")
+
+    qtd = len(codigos)
+    msg = "1 avulso lançado com sucesso." if qtd == 1 else f"{qtd} avulsos lançados com sucesso."
+    return {"quantidade_criada": qtd, "codigos": codigos, "saidas": saidas_criadas, "mensagem": msg}
+
+
+@router.post("/pedidos/lancar-avulso", response_model=LancarAvulsoOut)
+def lancar_avulso_legacy(
+    payload: LancarAvulsoIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _lancar_avulso_impl(payload, db, current_user)
+
+
+@pedidos_router.post("/lancar-avulso", response_model=LancarAvulsoOut)
+def lancar_avulso(
+    payload: LancarAvulsoIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _lancar_avulso_impl(payload, db, current_user)
 
 
 # ============================================================

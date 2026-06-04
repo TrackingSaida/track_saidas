@@ -123,7 +123,7 @@ from users_routes_updated import router as users_router
 from entregador_routes import router as entregadores_router
 from entregador_fechamento_routes import router as fechamento_router
 from auth import router as auth_router
-from saidas_routes import router as saidas_router
+from saidas_routes import router as saidas_router, pedidos_router
 from owner_routes import router as owners_router
 from base import router as base_router
 from coletas import router as coletas_router
@@ -154,6 +154,7 @@ app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
+app.include_router(pedidos_router,      prefix=API_PREFIX)
 app.include_router(acompanhamento_router, prefix=API_PREFIX)
 app.include_router(mobile_entregas_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
