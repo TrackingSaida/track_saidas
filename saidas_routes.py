@@ -1501,7 +1501,10 @@ def get_saida_detalhe(
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     obj = _get_owned_saida(db, sub_base, id_saida)
     detail_row = db.scalar(
-        select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).limit(1)
+        select(SaidaDetail)
+        .where(SaidaDetail.id_saida == id_saida)
+        .order_by(SaidaDetail.id_detail.desc())
+        .limit(1)
     )
     detail_out = None
     if detail_row:
@@ -1570,6 +1573,7 @@ class SaidaFotoPatchBody(BaseModel):
     foto_url: str = Field(min_length=1)
     status: str = Field(pattern="^(entregue|ausente)$")
     validar_campos_obrigatorios: bool = True
+    alterar_status: bool = True
 
 
 def _normalize_foto_url_to_key(foto_url: str) -> str:
@@ -1600,7 +1604,7 @@ def patch_saida_foto(
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     obj = _get_owned_saida(db, sub_base, id_saida)
     status_norm = normalizar_status_saida(obj.status)
-    if _status_esta_finalizado(status_norm):
+    if _status_esta_finalizado(status_norm) and body.alterar_status:
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_norm))
     detail_row = db.scalar(
         select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).order_by(SaidaDetail.id_detail.desc()).limit(1)
@@ -1643,7 +1647,7 @@ def patch_saida_foto(
         )
         db.add(detail_row)
 
-    if body.validar_campos_obrigatorios:
+    if body.validar_campos_obrigatorios and body.alterar_status:
         contexto_validacao = "ENTREGUE" if status_canon == STATUS_ENTREGUE else "AUSENTE"
         faltantes = validate_campos_obrigatorios_conclusao(
             db,
@@ -1654,17 +1658,18 @@ def patch_saida_foto(
         )
         raise_if_campos_obrigatorios_faltando(faltantes)
 
-    status_anterior = obj.status
-    obj.status = status_canon
-    db.add(
-        SaidaHistorico(
-            id_saida=id_saida,
-            evento=body.status.lower(),
-            status_anterior=status_anterior,
-            status_novo=status_canon,
-            user_id=current_user.id,
+    if body.alterar_status:
+        status_anterior = obj.status
+        obj.status = status_canon
+        db.add(
+            SaidaHistorico(
+                id_saida=id_saida,
+                evento=body.status.lower(),
+                status_anterior=status_anterior,
+                status_novo=status_canon,
+                user_id=current_user.id,
+            )
         )
-    )
     db.commit()
     logger.info(
         "PATCH foto: id_saida=%s object_key=%s status=%s foto_urls_count=%s user_id=%s",

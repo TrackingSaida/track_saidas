@@ -120,6 +120,12 @@ class EntregaListItem(BaseModel):
     possui_endereco: bool = False
     tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
     tem_comprovante: bool = False
+    tipo_recebedor: Optional[str] = None
+    nome_recebedor: Optional[str] = None
+    tipo_documento: Optional[str] = None
+    numero_documento: Optional[str] = None
+    observacao_entrega: Optional[str] = None
+    observacao_ocorrencia: Optional[str] = None
     campos_obrigatorios: List[str] = Field(default_factory=list)
     campos_obrigatorios_entregue: List[str] = Field(default_factory=list)
     campos_obrigatorios_ausente: List[str] = Field(default_factory=list)
@@ -324,6 +330,12 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "possui_endereco": _possui_endereco(detail),
         "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
         "tem_comprovante": tem_comprovante,
+        "tipo_recebedor": (detail.tipo_recebedor or "").strip() or None if detail else None,
+        "nome_recebedor": (detail.nome_recebedor or "").strip() or None if detail else None,
+        "tipo_documento": (detail.tipo_documento or "").strip() or None if detail else None,
+        "numero_documento": (detail.numero_documento or "").strip() or None if detail else None,
+        "observacao_entrega": (detail.observacao_entrega or "").strip() or None if detail else None,
+        "observacao_ocorrencia": (detail.observacao_ocorrencia or "").strip() or None if detail else None,
         "campos_obrigatorios": [],
         "campos_obrigatorios_entregue": [],
         "campos_obrigatorios_ausente": [],
@@ -1075,27 +1087,24 @@ def marcar_entregue(
     Se body for enviado, preenche tipo_recebedor, nome_recebedor, tipo_documento, numero_documento, observacao_entrega em saidas_detail."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
-    if _status_esta_finalizado(status_norm):
-        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
-    if status_norm == STATUS_SAIU_PARA_ENTREGA:
-        raise HTTPException(
-            status_code=422,
-            detail="Inicie a rota antes de finalizar entregas.",
-        )
 
-    if body:
-        def _set_if_present(detail: SaidaDetail) -> None:
-            if body.tipo_recebedor is not None:
-                detail.tipo_recebedor = (body.tipo_recebedor or "").strip() or None
-            if body.nome_recebedor is not None:
-                detail.nome_recebedor = (body.nome_recebedor or "").strip() or None
-            if body.tipo_documento is not None:
-                detail.tipo_documento = (body.tipo_documento or "").strip() or None
-            if body.numero_documento is not None:
-                detail.numero_documento = (body.numero_documento or "").strip() or None
-            if body.observacao_entrega is not None:
-                detail.observacao_entrega = (body.observacao_entrega or "").strip() or None
+    def _set_if_present(detail: SaidaDetail) -> None:
+        if not body:
+            return
+        if body.tipo_recebedor is not None:
+            detail.tipo_recebedor = (body.tipo_recebedor or "").strip() or None
+        if body.nome_recebedor is not None:
+            detail.nome_recebedor = (body.nome_recebedor or "").strip() or None
+        if body.tipo_documento is not None:
+            detail.tipo_documento = (body.tipo_documento or "").strip() or None
+        if body.numero_documento is not None:
+            detail.numero_documento = (body.numero_documento or "").strip() or None
+        if body.observacao_entrega is not None:
+            detail.observacao_entrega = (body.observacao_entrega or "").strip() or None
 
+    def _upsert_detail_com_body() -> None:
+        if not body:
+            return
         detail = _get_detail_for_saida(db, id_saida)
         if detail:
             _set_if_present(detail)
@@ -1108,6 +1117,20 @@ def marcar_entregue(
             )
             _set_if_present(detail)
             db.add(detail)
+
+    if _status_esta_finalizado(status_norm):
+        if status_norm == STATUS_ENTREGUE and body:
+            _upsert_detail_com_body()
+            db.commit()
+            return {"ok": True, "id_saida": id_saida, "complemento": True}
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
+    if status_norm == STATUS_SAIU_PARA_ENTREGA:
+        raise HTTPException(
+            status_code=422,
+            detail="Inicie a rota antes de finalizar entregas.",
+        )
+
+    _upsert_detail_com_body()
 
     detail_atual = _get_detail_for_saida(db, id_saida)
     overrides = {}
