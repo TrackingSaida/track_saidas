@@ -54,6 +54,11 @@ from codigo_normalizer import (
 from entregador_routes import resolver_precos_motoboy
 from saida_operacional_utils import carregar_contexto_operacional, EVENTOS_ATRIBUICAO_VALIDOS
 from log_leitura_service import registrar_log_leitura_critico
+from pedido_campos_obrigatorios_service import (
+    validate_campos_obrigatorios_conclusao,
+    raise_if_campos_obrigatorios_faltando,
+    resolve_campos_obrigatorios_ativos,
+)
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
@@ -108,6 +113,9 @@ class EntregaListItem(BaseModel):
     possui_endereco: bool = False
     tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
     tem_comprovante: bool = False
+    campos_obrigatorios: List[str] = Field(default_factory=list)
+    campos_obrigatorios_entregue: List[str] = Field(default_factory=list)
+    campos_obrigatorios_ausente: List[str] = Field(default_factory=list)
 
 
 class ScanBody(BaseModel):
@@ -300,6 +308,9 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "possui_endereco": _possui_endereco(detail),
         "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
         "tem_comprovante": tem_comprovante,
+        "campos_obrigatorios": [],
+        "campos_obrigatorios_entregue": [],
+        "campos_obrigatorios_ausente": [],
     }
 
 
@@ -448,7 +459,23 @@ def listar_entregas(
     details_map = _carregar_details_por_saida_ids(db, [s.id_saida for s in rows])
     out = []
     for s in rows:
-        out.append(_saida_to_item(s, details_map.get(int(s.id_saida))))
+        item = _saida_to_item(s, details_map.get(int(s.id_saida)))
+        campos_entregue = resolve_campos_obrigatorios_ativos(
+            db,
+            sub_base=s.sub_base,
+            servico=s.servico,
+            contexto="ENTREGUE",
+        )
+        campos_ausente = resolve_campos_obrigatorios_ativos(
+            db,
+            sub_base=s.sub_base,
+            servico=s.servico,
+            contexto="AUSENTE",
+        )
+        item["campos_obrigatorios"] = sorted(set((campos_entregue or []) + (campos_ausente or [])))
+        item["campos_obrigatorios_entregue"] = campos_entregue or []
+        item["campos_obrigatorios_ausente"] = campos_ausente or []
+        out.append(item)
     return out
 
 
@@ -908,7 +935,23 @@ def detalhe_entrega(
     """Detalhe de uma entrega para o app."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     detail = _get_detail_for_saida(db, s.id_saida)
-    return _saida_to_item(s, detail)
+    item = _saida_to_item(s, detail)
+    campos_entregue = resolve_campos_obrigatorios_ativos(
+        db,
+        sub_base=s.sub_base,
+        servico=s.servico,
+        contexto="ENTREGUE",
+    )
+    campos_ausente = resolve_campos_obrigatorios_ativos(
+        db,
+        sub_base=s.sub_base,
+        servico=s.servico,
+        contexto="AUSENTE",
+    )
+    item["campos_obrigatorios"] = sorted(set((campos_entregue or []) + (campos_ausente or [])))
+    item["campos_obrigatorios_entregue"] = campos_entregue or []
+    item["campos_obrigatorios_ausente"] = campos_ausente or []
+    return item
 
 
 # ============================================================
@@ -1048,6 +1091,26 @@ def marcar_entregue(
             _set_if_present(detail)
             db.add(detail)
 
+    detail_atual = _get_detail_for_saida(db, id_saida)
+    overrides = {}
+    if body:
+        if body.tipo_recebedor is not None:
+            overrides["tipo_recebedor"] = body.tipo_recebedor
+        if body.nome_recebedor is not None:
+            overrides["nome_recebedor"] = body.nome_recebedor
+        if body.numero_documento is not None:
+            overrides["numero_documento"] = body.numero_documento
+        if body.observacao_entrega is not None:
+            overrides["observacao_entrega"] = body.observacao_entrega
+    faltantes = validate_campos_obrigatorios_conclusao(
+        db,
+        saida=s,
+        contexto="ENTREGUE",
+        detail=detail_atual,
+        overrides=overrides,
+    )
+    raise_if_campos_obrigatorios_faltando(faltantes)
+
     s.status = STATUS_ENTREGUE
     s.data_hora_entrega = datetime.utcnow()  # deprecated: mantido em transição; ver saida_historico evento "entregue"
     db.add(
@@ -1088,6 +1151,16 @@ def marcar_ausente(
         raise HTTPException(status_code=422, detail="Motivo de ausência inválido.")
     if motivo.descricao.strip().lower() == "outro" and not (body.observacao or "").strip():
         raise HTTPException(status_code=422, detail="Observação obrigatória quando motivo é 'Outro'.")
+
+    detail_atual = _get_detail_for_saida(db, id_saida)
+    faltantes = validate_campos_obrigatorios_conclusao(
+        db,
+        saida=s,
+        contexto="AUSENTE",
+        detail=detail_atual,
+        overrides={"observacao_ocorrencia": body.observacao} if body.observacao is not None else None,
+    )
+    raise_if_campos_obrigatorios_faltando(faltantes)
 
     s.status = STATUS_AUSENTE
     detail = _get_detail_for_saida(db, id_saida)

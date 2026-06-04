@@ -40,3 +40,18 @@ Executar:
 ```sql
 -- arquivo: migrations/history_cleanup_state.sql
 ```
+
+## pedido_campos_obrigatorios_config.sql
+
+Cria a tabela de configuração por sub-base para campos obrigatórios na conclusão de pedido:
+
+- serviço (`Shopee`, `Mercado Livre`, `Avulso`);
+- contexto (`ENTREGUE`, `AUSENTE`, `AMBOS`);
+- lista de campos obrigatórios (`campos_obrigatorios` em JSON texto);
+- status ativo/inativo.
+
+Executar:
+
+```sql
+-- arquivo: migrations/pedido_campos_obrigatorios_config.sql
+```

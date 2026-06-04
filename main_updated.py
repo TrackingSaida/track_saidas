@@ -140,6 +140,7 @@ from mobile_entregas_routes import router as mobile_entregas_router
 from upload_routes import router as upload_router
 from acompanhamento_routes import router as acompanhamento_router
 from cep_routes import router as cep_router
+from config_campos_obrigatorios_routes import router as config_campos_obrigatorios_router
 
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
@@ -163,6 +164,7 @@ app.include_router(base_router, prefix=API_PREFIX)
 app.include_router(signup_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
+app.include_router(config_campos_obrigatorios_router, prefix=API_PREFIX)
 
 
 def _cors_headers_for_request(request: Request):

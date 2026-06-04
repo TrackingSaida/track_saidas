@@ -602,6 +602,28 @@ class MotivoAusencia(Base):
 
 
 # ==========================
+# Tabela: pedido_campos_obrigatorios_config
+# ==========================
+class PedidoCamposObrigatoriosConfig(Base):
+    __tablename__ = "pedido_campos_obrigatorios_config"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    servico = Column(Text, nullable=False)
+    contexto = Column(Text, nullable=False, server_default=text("'AMBOS'"))
+    campos_obrigatorios = Column(Text, nullable=False, server_default=text("'[]'"))
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<PedidoCamposObrigatoriosConfig id={self.id} sub_base={self.sub_base!r} "
+            f"servico={self.servico!r} contexto={self.contexto!r} ativo={self.ativo}>"
+        )
+
+
+# ==========================
 # Tabela: saida_historico
 # ==========================
 class SaidaHistorico(Base):

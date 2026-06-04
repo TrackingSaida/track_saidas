@@ -30,6 +30,10 @@ from saida_operacional_utils import (
 )
 from codigo_normalizer import canonicalize_servico
 from log_leitura_service import registrar_log_leitura_critico
+from pedido_campos_obrigatorios_service import (
+    validate_campos_obrigatorios_conclusao,
+    raise_if_campos_obrigatorios_faltando,
+)
 
 
 # ============================================================
@@ -1565,6 +1569,7 @@ def get_saida_detalhe(
 class SaidaFotoPatchBody(BaseModel):
     foto_url: str = Field(min_length=1)
     status: str = Field(pattern="^(entregue|ausente)$")
+    validar_campos_obrigatorios: bool = True
 
 
 def _normalize_foto_url_to_key(foto_url: str) -> str:
@@ -1637,6 +1642,17 @@ def patch_saida_foto(
             foto_url=payload,
         )
         db.add(detail_row)
+
+    if body.validar_campos_obrigatorios:
+        contexto_validacao = "ENTREGUE" if status_canon == STATUS_ENTREGUE else "AUSENTE"
+        faltantes = validate_campos_obrigatorios_conclusao(
+            db,
+            saida=obj,
+            contexto=contexto_validacao,
+            detail=detail_row,
+            overrides={"foto_url": payload},
+        )
+        raise_if_campos_obrigatorios_faltando(faltantes)
 
     status_anterior = obj.status
     obj.status = status_canon
@@ -1788,6 +1804,21 @@ def atualizar_saida(
 
     if payload.status is not None:
         novo_status = normalizar_status_saida(payload.status)
+        if novo_status in (STATUS_ENTREGUE, STATUS_AUSENTE):
+            detail_row = db.scalar(
+                select(SaidaDetail)
+                .where(SaidaDetail.id_saida == id_saida)
+                .order_by(SaidaDetail.id_detail.desc())
+                .limit(1)
+            )
+            contexto_validacao = "ENTREGUE" if novo_status == STATUS_ENTREGUE else "AUSENTE"
+            faltantes = validate_campos_obrigatorios_conclusao(
+                db,
+                saida=obj,
+                contexto=contexto_validacao,
+                detail=detail_row,
+            )
+            raise_if_campos_obrigatorios_faltando(faltantes)
         payload_changed["status"] = payload_changed["status"] or (novo_status != normalizar_status_saida(obj.status))
         obj.status = novo_status
         # Se alterou para cancelado, marcar cobrança como cancelada (não contabilizada)
