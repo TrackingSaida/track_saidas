@@ -20,7 +20,13 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from geocode_utils import geocode_address_any, geocode_address_with_fallbacks
+from geocode_utils import (
+    geocode_address_any,
+    geocode_address_with_fallbacks,
+    otimizar_ordem_entregas,
+    RoutePoint,
+    StartPoint,
+)
 from models import (
     User,
     Saida,
@@ -174,6 +180,24 @@ class IniciarRotaBody(BaseModel):
 class MotivoAusenciaOut(BaseModel):
     id: int
     descricao: str
+
+
+class RoutePointBody(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class RotasOtimizarBody(BaseModel):
+    delivery_ids: List[int] = Field(..., min_length=1, max_length=100)
+    start: Optional[RoutePointBody] = None
+
+
+class RotasOtimizarOut(BaseModel):
+    ordem: List[int]
+    modo: str
+    sem_coordenadas: List[int]
+    distancia_total_m: Optional[int] = None
+    duracao_total_s: Optional[int] = None
 
 
 class RotasIniciarBody(BaseModel):
@@ -843,6 +867,81 @@ def iniciar_rota(
         )
     db.commit()
     return {"atualizados": len(rows)}
+
+
+# ============================================================
+# POST /mobile/rotas/otimizar
+# ============================================================
+@router.post("/rotas/otimizar", response_model=RotasOtimizarOut)
+def rotas_otimizar(
+    body: RotasOtimizarBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Otimiza ordem das entregas (OSRM Trip com fallback nearest neighbor)."""
+    motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    delivery_ids = list(dict.fromkeys(int(i) for i in body.delivery_ids))
+    if len(delivery_ids) > 100:
+        raise HTTPException(status_code=400, detail="Máximo de 100 entregas por otimização.")
+
+    rows = db.scalars(
+        select(Saida).where(
+            Saida.id_saida.in_(delivery_ids),
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+            Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
+        )
+    ).all()
+    found_ids = {int(s.id_saida) for s in rows}
+    if len(found_ids) != len(delivery_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="Um ou mais pedidos são inválidos ou não pertencem ao motoboy.",
+        )
+    if not rows:
+        raise HTTPException(status_code=400, detail="Nenhuma entrega válida para otimização.")
+
+    details_map = _carregar_details_por_saida_ids(db, delivery_ids)
+    com_coord: List[RoutePoint] = []
+    sem_coordenadas: List[int] = []
+
+    for sid in delivery_ids:
+        detail = details_map.get(int(sid))
+        lat = float(detail.latitude) if detail and detail.latitude is not None else None
+        lon = float(detail.longitude) if detail and detail.longitude is not None else None
+        if lat is not None and lon is not None:
+            com_coord.append((int(sid), lat, lon))
+        else:
+            sem_coordenadas.append(int(sid))
+
+    start: Optional[StartPoint] = None
+    if body.start is not None:
+        start = (float(body.start.latitude), float(body.start.longitude))
+
+    if not com_coord:
+        return RotasOtimizarOut(
+            ordem=list(sem_coordenadas),
+            modo="nearest_fallback",
+            sem_coordenadas=sem_coordenadas,
+            distancia_total_m=None,
+            duracao_total_s=None,
+        )
+
+    result = otimizar_ordem_entregas(com_coord, start=start)
+    ordem_otimizada = list(result.get("ordem") or [])
+    ordem_final = ordem_otimizada + sem_coordenadas
+
+    return RotasOtimizarOut(
+        ordem=ordem_final,
+        modo=str(result.get("modo") or "nearest_fallback"),
+        sem_coordenadas=sem_coordenadas,
+        distancia_total_m=result.get("distancia_total_m"),
+        duracao_total_s=result.get("duracao_total_s"),
+    )
 
 
 # ============================================================

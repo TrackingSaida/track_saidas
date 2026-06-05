@@ -8,8 +8,9 @@ Camada principal:
 from __future__ import annotations
 
 import logging
+import math
 import os
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -221,3 +222,188 @@ def geocode_address_with_fallbacks(
         return coords
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Otimização de rota (OSRM Trip + nearest neighbor / haversine)
+# ---------------------------------------------------------------------------
+
+OSRM_TRIP_BASE = "https://router.project-osrm.org/trip/v1/driving"
+OSRM_HTTP_TIMEOUT = 10
+
+RoutePoint = Tuple[int, float, float]  # id_saida, latitude, longitude
+StartPoint = Tuple[float, float]  # latitude, longitude
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distância em metros entre dois pontos (fórmula de Haversine)."""
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
+
+
+def nearest_neighbor_order(
+    points: List[RoutePoint],
+    start: Optional[StartPoint] = None,
+) -> List[int]:
+    """
+    Ordena entregas por vizinho mais próximo (Haversine).
+    points: lista (id_saida, lat, lon) na ordem original de referência.
+    """
+    if not points:
+        return []
+    if len(points) == 1:
+        return [points[0][0]]
+
+    remaining = list(points)
+    ordered_ids: List[int] = []
+
+    if start is not None:
+        cur_lat, cur_lon = start[0], start[1]
+    else:
+        first = remaining.pop(0)
+        ordered_ids.append(first[0])
+        cur_lat, cur_lon = first[1], first[2]
+
+    while remaining:
+        best_idx = 0
+        best_dist = float("inf")
+        for i, (_, lat, lon) in enumerate(remaining):
+            dist = haversine_m(cur_lat, cur_lon, lat, lon)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        next_pt = remaining.pop(best_idx)
+        ordered_ids.append(next_pt[0])
+        cur_lat, cur_lon = next_pt[1], next_pt[2]
+
+    return ordered_ids
+
+
+def _otimizar_ordem_osrm_trip(
+    points: List[RoutePoint],
+    start: Optional[StartPoint] = None,
+) -> Optional[Tuple[List[int], int, int]]:
+    """
+    Otimiza ordem via OSRM Trip. Retorna (ids_ordenados, distancia_m, duracao_s) ou None.
+    Se start for informado, é o primeiro waypoint (não é entrega).
+    """
+    if len(points) < 1:
+        return None
+    if len(points) == 1 and start is None:
+        return None
+
+    id_by_input_index: List[Optional[int]] = []
+    coord_pairs: List[Tuple[float, float]] = []
+
+    if start is not None:
+        id_by_input_index.append(None)
+        coord_pairs.append((start[0], start[1]))
+
+    for sid, lat, lon in points:
+        id_by_input_index.append(sid)
+        coord_pairs.append((lat, lon))
+
+    if len(coord_pairs) < 2:
+        return None
+
+    coords_str = ";".join(f"{lon},{lat}" for lat, lon in coord_pairs)
+    url = f"{OSRM_TRIP_BASE}/{coords_str}"
+    params = {
+        "roundtrip": "false",
+        "overview": "false",
+        "source": "first",
+        "destination": "any",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            params=params,
+            headers={"User-Agent": "TrackSaidasBackend/1.0"},
+            timeout=OSRM_HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning("OSRM Trip falhou (rede/timeout): %s", e)
+        return None
+
+    if not isinstance(data, dict) or data.get("code") != "Ok":
+        logger.warning(
+            "OSRM Trip resposta inválida: code=%s",
+            data.get("code") if isinstance(data, dict) else None,
+        )
+        return None
+
+    trips = data.get("trips") or []
+    waypoints = data.get("waypoints") or []
+    if not trips or len(waypoints) != len(id_by_input_index):
+        logger.warning("OSRM Trip: trips/waypoints ausentes ou tamanho inconsistente")
+        return None
+
+    trip0 = trips[0]
+    distance_m = int(round(float(trip0.get("distance") or 0)))
+    duration_s = int(round(float(trip0.get("duration") or 0)))
+
+    delivery_entries: List[Tuple[int, int]] = []
+    for i, wp in enumerate(waypoints):
+        if i == 0 and start is not None:
+            continue
+        sid = id_by_input_index[i]
+        if sid is None:
+            continue
+        widx = wp.get("waypoint_index")
+        if widx is None:
+            logger.warning("OSRM Trip: waypoint_index ausente no índice %s", i)
+            return None
+        delivery_entries.append((int(widx), sid))
+
+    delivery_entries.sort(key=lambda x: x[0])
+    ordered_ids = [sid for _, sid in delivery_entries]
+    if len(ordered_ids) != len(points):
+        logger.warning("OSRM Trip: ordem retornada incompleta")
+        return None
+
+    return ordered_ids, distance_m, duration_s
+
+
+def otimizar_ordem_entregas(
+    points: List[RoutePoint],
+    start: Optional[StartPoint] = None,
+) -> Dict[str, Any]:
+    """
+    Tenta OSRM Trip; em falha usa nearest neighbor.
+    Retorna dict com ordem, modo, distancia_total_m, duracao_total_s.
+    """
+    if not points:
+        return {
+            "ordem": [],
+            "modo": "nearest_fallback",
+            "distancia_total_m": None,
+            "duracao_total_s": None,
+        }
+
+    if len(points) >= 2 or (len(points) == 1 and start is not None):
+        osrm_result = _otimizar_ordem_osrm_trip(points, start=start)
+        if osrm_result is not None:
+            ordered, dist_m, dur_s = osrm_result
+            return {
+                "ordem": ordered,
+                "modo": "osrm_trip",
+                "distancia_total_m": dist_m,
+                "duracao_total_s": dur_s,
+            }
+
+    ordered = nearest_neighbor_order(points, start=start)
+    return {
+        "ordem": ordered,
+        "modo": "nearest_fallback",
+        "distancia_total_m": None,
+        "duracao_total_s": None,
+    }
