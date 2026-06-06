@@ -219,6 +219,15 @@ class RotasAtivaOut(BaseModel):
     data: Optional[str] = None
 
 
+class RotasOrdemBody(BaseModel):
+    ordem: List[int] = Field(..., min_length=1)
+
+
+class RotasOrdemOut(BaseModel):
+    ordem: List[int]
+    parada_atual: int
+
+
 class ExtratoDiaItem(BaseModel):
     data: str
     total_pacotes_associados: int
@@ -1067,6 +1076,48 @@ def rotas_avancar(
     db.commit()
     db.refresh(rota)
     return RotasAvancarOut(parada_atual=rota.parada_atual)
+
+
+# ============================================================
+# PUT /mobile/rotas/{id}/ordem
+# ============================================================
+@router.put("/rotas/{rota_id}/ordem", response_model=RotasOrdemOut)
+def rotas_atualizar_ordem(
+    rota_id: int,
+    body: RotasOrdemBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Atualiza a ordem das entregas na rota ativa. Paradas já concluídas não podem mudar."""
+    motoboy_id = user.motoboy_id
+    rota = db.get(RotasMotoboy, rota_id)
+    if not rota or rota.motoboy_id != motoboy_id:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+    if rota.status != "ativa":
+        raise HTTPException(status_code=400, detail="Rota não está ativa.")
+
+    ordem_atual = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
+    if not isinstance(ordem_atual, list):
+        ordem_atual = []
+
+    nova_ordem = body.ordem
+    if set(nova_ordem) != set(ordem_atual):
+        raise HTTPException(
+            status_code=400,
+            detail="A nova ordem deve conter exatamente as mesmas entregas da rota.",
+        )
+
+    parada_atual = rota.parada_atual or 0
+    if ordem_atual[:parada_atual] != nova_ordem[:parada_atual]:
+        raise HTTPException(
+            status_code=400,
+            detail="Não é possível alterar a ordem das paradas já concluídas.",
+        )
+
+    rota.ordem_json = json.dumps(nova_ordem)
+    db.commit()
+    db.refresh(rota)
+    return RotasOrdemOut(ordem=nova_ordem, parada_atual=parada_atual)
 
 
 # ============================================================
