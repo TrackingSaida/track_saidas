@@ -258,9 +258,16 @@ class RoutePointBody(BaseModel):
     longitude: float
 
 
+class RotasPriorityBody(BaseModel):
+    type: str  # service | delivery
+    value: Optional[str] = None  # Shopee | Flex | Avulso
+    id_saida: Optional[int] = None
+
+
 class RotasOtimizarBody(BaseModel):
     delivery_ids: List[int] = Field(..., min_length=1, max_length=100)
     start: Optional[RoutePointBody] = None
+    priority: Optional[RotasPriorityBody] = None
 
 
 class RotasOtimizarOut(BaseModel):
@@ -1160,7 +1167,39 @@ def rotas_otimizar(
             duracao_total_s=None,
         )
 
-    result = otimizar_ordem_entregas(com_coord, start=start)
+    stop_penalties = None
+    if body.priority is not None:
+        from geocode_utils import SOFT_PRIORITY_PENALTY_M
+
+        saida_by_id = {int(s.id_saida): s for s in rows}
+        stop_penalties = {}
+        prio = body.priority
+        if prio.type == "service" and prio.value:
+            target = str(prio.value).strip()
+            if target not in ("Shopee", "Flex", "Avulso"):
+                raise HTTPException(status_code=422, detail="Serviço de prioridade inválido.")
+            for stop in stops:
+                if not stop.has_coords:
+                    continue
+                matched = any(
+                    _servico_tipo(saida_by_id[d].servico) == target
+                    for d in stop.delivery_ids
+                    if d in saida_by_id
+                )
+                stop_penalties[stop.representative_id] = 0.0 if matched else SOFT_PRIORITY_PENALTY_M
+        elif prio.type == "delivery" and prio.id_saida is not None:
+            target_id = int(prio.id_saida)
+            if target_id not in found_ids:
+                raise HTTPException(status_code=422, detail="Pacote de prioridade não está na rota.")
+            for stop in stops:
+                if not stop.has_coords:
+                    continue
+                matched = target_id in stop.delivery_ids
+                stop_penalties[stop.representative_id] = 0.0 if matched else SOFT_PRIORITY_PENALTY_M
+        else:
+            raise HTTPException(status_code=422, detail="Prioridade inválida.")
+
+    result = otimizar_ordem_entregas(com_coord, start=start, stop_penalties=stop_penalties)
     ordem_otimizada = list(result.get("ordem") or [])
     ordem_expandida = expand_stop_order(ordem_otimizada, stops)
     ordem_final = ordem_expandida + sem_coordenadas

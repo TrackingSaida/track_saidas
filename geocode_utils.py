@@ -316,6 +316,52 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return r * c
 
 
+SOFT_PRIORITY_THRESHOLD_M = 1500.0
+SOFT_PRIORITY_PENALTY_M = 500.0
+
+
+def nearest_neighbor_soft_priority(
+    points: List[RoutePoint],
+    stop_penalties: Dict[int, float],
+    start: Optional[StartPoint] = None,
+    threshold_m: float = SOFT_PRIORITY_THRESHOLD_M,
+) -> List[int]:
+    """
+    Vizinho mais próximo com penalidade suave por parada.
+    Penalidade só aplica quando distância < threshold_m.
+    """
+    if not points:
+        return []
+    if len(points) == 1:
+        return [points[0][0]]
+
+    remaining = list(points)
+    ordered_ids: List[int] = []
+
+    if start is not None:
+        cur_lat, cur_lon = start[0], start[1]
+    else:
+        first = remaining.pop(0)
+        ordered_ids.append(first[0])
+        cur_lat, cur_lon = first[1], first[2]
+
+    while remaining:
+        best_idx = 0
+        best_cost = float("inf")
+        for i, (sid, lat, lon) in enumerate(remaining):
+            dist_m = haversine_m(cur_lat, cur_lon, lat, lon)
+            penalty = stop_penalties.get(sid, 0.0)
+            cost = dist_m if dist_m >= threshold_m else dist_m + penalty
+            if cost < best_cost:
+                best_cost = cost
+                best_idx = i
+        next_pt = remaining.pop(best_idx)
+        ordered_ids.append(next_pt[0])
+        cur_lat, cur_lon = next_pt[1], next_pt[2]
+
+    return ordered_ids
+
+
 def nearest_neighbor_order(
     points: List[RoutePoint],
     start: Optional[StartPoint] = None,
@@ -442,12 +488,30 @@ def _otimizar_ordem_osrm_trip(
     return ordered_ids, distance_m, duration_s
 
 
+def _route_distance_duration_m(points: List[RoutePoint], ordered_ids: List[int]) -> Tuple[int, int]:
+    """Distância e duração estimadas (30 km/h) para ordem de paradas."""
+    id_to_coord = {sid: (lat, lon) for sid, lat, lon in points}
+    dist_m = 0.0
+    prev: Optional[Tuple[float, float]] = None
+    for sid in ordered_ids:
+        coord = id_to_coord.get(sid)
+        if coord is None:
+            continue
+        if prev is not None:
+            dist_m += haversine_m(prev[0], prev[1], coord[0], coord[1])
+        prev = coord
+    duration_s = int(round((dist_m / 1000.0 / 30.0) * 3600)) if dist_m > 0 else 0
+    return int(round(dist_m)), duration_s
+
+
 def otimizar_ordem_entregas(
     points: List[RoutePoint],
     start: Optional[StartPoint] = None,
+    stop_penalties: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """
     Tenta OSRM Trip; em falha usa nearest neighbor.
+    Com stop_penalties, usa nearest_neighbor_soft_priority (modo priority_soft).
     Retorna dict com ordem, modo, distancia_total_m, duracao_total_s.
     """
     if not points:
@@ -456,6 +520,16 @@ def otimizar_ordem_entregas(
             "modo": "nearest_fallback",
             "distancia_total_m": None,
             "duracao_total_s": None,
+        }
+
+    if stop_penalties:
+        ordered = nearest_neighbor_soft_priority(points, stop_penalties, start=start)
+        dist_m, dur_s = _route_distance_duration_m(points, ordered)
+        return {
+            "ordem": ordered,
+            "modo": "priority_soft",
+            "distancia_total_m": dist_m,
+            "duracao_total_s": dur_s,
         }
 
     if len(points) >= 2 or (len(points) == 1 and start is not None):
@@ -470,9 +544,10 @@ def otimizar_ordem_entregas(
             }
 
     ordered = nearest_neighbor_order(points, start=start)
+    dist_m, dur_s = _route_distance_duration_m(points, ordered)
     return {
         "ordem": ordered,
         "modo": "nearest_fallback",
-        "distancia_total_m": None,
-        "duracao_total_s": None,
+        "distancia_total_m": dist_m,
+        "duracao_total_s": dur_s,
     }
