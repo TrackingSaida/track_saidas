@@ -1,9 +1,14 @@
 """Fuzzy matching para 'Você quis dizer?'."""
 from __future__ import annotations
 
+import os
+import re
 from typing import List, Optional, Tuple
 
-from address_normalizer import normalize_street_part
+from address_normalizer import normalize_street_part, normalizeAddressQuery, normalize_cep
+
+FUZZY_DID_YOU_MEAN_THRESHOLD = float(os.getenv("FUZZY_DID_YOU_MEAN_THRESHOLD", "0.72"))
+FUZZY_LOW_SCORE_THRESHOLD = float(os.getenv("FUZZY_LOW_SCORE_THRESHOLD", "0.65"))
 
 
 def _levenshtein(a: str, b: str) -> int:
@@ -35,15 +40,54 @@ def similarity(a: str, b: str) -> float:
     return 1.0 - (dist / max_len)
 
 
+def extract_query_street(query: str, hints: Optional[dict] = None) -> str:
+    """Extrai logradouro da query completa (remove número, CEP, cidade, UF)."""
+    hints = hints or {}
+    hint_rua = (hints.get("rua") or "").strip()
+    if len(hint_rua) >= 3:
+        return normalize_street_part(hint_rua)
+
+    q = normalizeAddressQuery(query) or (query or "").strip()
+    if not q:
+        return ""
+
+    # Primeiro segmento antes da vírgula = logradouro + número
+    primary = q.split(",")[0].strip()
+    primary = re.sub(r"\b\d{5}-?\d{3}\b", " ", primary)
+    primary = re.sub(r"\b\d+[a-zA-Z]?\b", " ", primary)
+    primary = re.sub(r"\s+", " ", primary).strip()
+    street = normalize_street_part(primary)
+    if len(street) >= 3:
+        return street
+
+    q = re.sub(r"\b\d{5}-?\d{3}\b", " ", q)
+    q = re.sub(r"\b\d+[a-zA-Z]?\b", " ", q)
+    for part in (hints.get("cidade"), hints.get("estado"), "Brasil"):
+        if part and str(part).strip():
+            q = re.sub(re.escape(str(part).strip()), " ", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b[A-Za-z]{2}\b(?=\s*$)", " ", q)
+    q = re.sub(r"\s*,\s*", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return normalize_street_part(q) or normalize_street_part(query)
+
+
 def find_did_you_mean(
     query: str,
     candidates: List[Tuple[str, str, str]],
-    threshold: float = 0.82,
+    threshold: Optional[float] = None,
+    hints: Optional[dict] = None,
 ) -> Optional[Tuple[str, str, str, float]]:
     """Retorna (rua, cidade, estado, sim) se houver match fuzzy forte."""
+    street_q = extract_query_street(query, hints)
+    if len(street_q) < 3:
+        street_q = normalize_street_part(query)
+    if len(street_q) < 3:
+        return None
+
+    thresh = threshold if threshold is not None else FUZZY_DID_YOU_MEAN_THRESHOLD
     best: Optional[Tuple[str, str, str, float]] = None
     for rua, cidade, estado in candidates:
-        sim = similarity(query, rua)
-        if sim >= threshold and (best is None or sim > best[3]):
+        sim = similarity(street_q, rua)
+        if sim >= thresh and (best is None or sim > best[3]):
             best = (rua, cidade, estado, sim)
     return best

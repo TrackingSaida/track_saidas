@@ -2,13 +2,20 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from address_fuzzy import find_did_you_mean, similarity
+from address_fuzzy import (
+    FUZZY_DID_YOU_MEAN_THRESHOLD,
+    FUZZY_LOW_SCORE_THRESHOLD,
+    extract_query_street,
+    find_did_you_mean,
+    similarity,
+)
 from address_normalizer import (
     normalize_address_key,
     normalize_cep,
@@ -20,6 +27,8 @@ from address_providers.base import RawAddressHit
 from models import EnderecoConhecido
 
 logger = logging.getLogger(__name__)
+
+FUZZY_CANDIDATES_LIMIT = int(os.getenv("FUZZY_CANDIDATES_LIMIT", "200"))
 
 
 def _row_to_hit(row: EnderecoConhecido) -> RawAddressHit:
@@ -45,6 +54,8 @@ def search_known(
 ) -> List[Tuple[RawAddressHit, int]]:
     q_norm = normalizeAddressQuery(query)
     q_street = normalize_street_part(q_norm)
+    if len(q_street) < 3:
+        q_street = extract_query_street(query)
     if len(q_street) < 3:
         return []
     pattern = f"%{q_street[:40]}%"
@@ -143,7 +154,37 @@ def upsert_from_save(
         db.rollback()
 
 
-def get_fuzzy_candidates(db: Session, sub_base: str, limit: int = 100) -> List[Tuple[str, str, str]]:
+def _saida_detail_candidates(db: Session, sub_base: str, limit: int) -> List[Tuple[str, str, str]]:
+    try:
+        from models import Saida, SaidaDetail
+
+        rows = db.execute(
+            select(
+                SaidaDetail.dest_rua,
+                SaidaDetail.dest_cidade,
+                SaidaDetail.dest_estado,
+                func.count(),
+            )
+            .join(Saida, Saida.id_saida == SaidaDetail.id_saida)
+            .where(
+                Saida.sub_base == sub_base,
+                SaidaDetail.dest_rua.isnot(None),
+                SaidaDetail.dest_rua != "",
+            )
+            .group_by(SaidaDetail.dest_rua, SaidaDetail.dest_cidade, SaidaDetail.dest_estado)
+            .order_by(func.count().desc())
+            .limit(limit)
+        ).all()
+        return [(r[0], r[1] or "", r[2] or "") for r in rows if r[0]]
+    except Exception as e:
+        logger.debug("saida_detail fuzzy candidates skip: %s", e)
+        return []
+
+
+def get_fuzzy_candidates(db: Session, sub_base: str, limit: int = FUZZY_CANDIDATES_LIMIT) -> List[Tuple[str, str, str]]:
+    seen: set[Tuple[str, str, str]] = set()
+    candidates: List[Tuple[str, str, str]] = []
+
     try:
         rows = (
             db.execute(
@@ -154,38 +195,137 @@ def get_fuzzy_candidates(db: Session, sub_base: str, limit: int = 100) -> List[T
             )
             .all()
         )
-        return [(r[0], r[1], r[2]) for r in rows if r[0]]
+        for rua, cidade, estado in rows:
+            if not rua:
+                continue
+            key = (rua, cidade or "", estado or "")
+            if key not in seen:
+                seen.add(key)
+                candidates.append(key)
     except Exception:
-        return []
+        pass
+
+    for item in _saida_detail_candidates(db, sub_base, limit):
+        if item not in seen:
+            seen.add(item)
+            candidates.append(item)
+
+    return candidates[:limit]
 
 
-def build_did_you_mean(db: Session, sub_base: str, query: str) -> Optional[dict]:
-    candidates = get_fuzzy_candidates(db, sub_base)
-    match = find_did_you_mean(query, candidates)
-    if not match:
-        return None
-    rua, cidade, estado, _sim = match
-    rows = (
-        db.execute(
+def _resolve_known_row(
+    db: Session,
+    sub_base: str,
+    rua: str,
+    cidade: str,
+    street_q: str,
+    threshold: float,
+) -> Optional[EnderecoConhecido]:
+    try:
+        q = (
             select(EnderecoConhecido)
-            .where(
-                EnderecoConhecido.sub_base == sub_base,
-                EnderecoConhecido.cidade.ilike(cidade),
-            )
+            .where(EnderecoConhecido.sub_base == sub_base)
             .order_by(EnderecoConhecido.qtd_utilizacoes.desc())
-            .limit(20)
+            .limit(30)
         )
-        .scalars()
-        .all()
-    )
-    for row in rows:
-        if similarity(query, row.rua or "") >= 0.82:
+        if cidade:
+            q = q.where(EnderecoConhecido.cidade.ilike(cidade))
+        rows = db.execute(q).scalars().all()
+        for row in rows:
+            if similarity(street_q, row.rua or "") >= threshold:
+                return row
+        for row in rows:
+            if normalize_street_part(rua) in normalize_street_part(row.rua or ""):
+                return row
+    except Exception:
+        pass
+    return None
+
+
+def build_did_you_mean(
+    db: Session,
+    sub_base: str,
+    query: str,
+    hints: Optional[dict] = None,
+    known_hits: Optional[List[Tuple[RawAddressHit, int]]] = None,
+) -> Optional[dict]:
+    street_q = extract_query_street(query, hints)
+    threshold = FUZZY_DID_YOU_MEAN_THRESHOLD
+
+    candidates = get_fuzzy_candidates(db, sub_base)
+    match = find_did_you_mean(query, candidates, threshold=threshold, hints=hints)
+    if match:
+        rua, cidade, estado, _sim = match
+        row = _resolve_known_row(db, sub_base, rua, cidade, street_q, threshold)
+        if row:
             hit = _row_to_hit(row)
             return {
                 "original_query": query,
-                "suggestion": _format_suggestion_dict(hit, 90, 0.9, int(row.qtd_utilizacoes or 1)),
+                "suggestion": _format_suggestion_dict(hit, 75, 0.65, int(row.qtd_utilizacoes or 1)),
             }
+
+    if known_hits:
+        best: Optional[Tuple[RawAddressHit, int, float]] = None
+        for hit, qtd in known_hits:
+            if not hit.latitude or not hit.longitude or not hit.rua:
+                continue
+            sim = similarity(street_q, hit.rua)
+            if sim >= 0.5 and (best is None or sim > best[2]):
+                best = (hit, qtd, sim)
+        if best:
+            hit, qtd, _sim = best
+            return {
+                "original_query": query,
+                "suggestion": _format_suggestion_dict(hit, 70, 0.6, qtd),
+            }
+
     return None
+
+
+def build_did_you_mean_from_below_threshold(
+    below: List[Tuple[RawAddressHit, int, int, float, float]],
+    search_query: str,
+    hints: Optional[dict] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+) -> Optional[dict]:
+    street_q = extract_query_street(search_query, hints)
+    best: Optional[Tuple[RawAddressHit, int, int, float, float, float]] = None
+
+    for hit, known_qtd, score, confidence, dist in below:
+        if not hit.rua or not hit.cidade:
+            continue
+        sim = similarity(street_q, hit.rua)
+        if sim < FUZZY_LOW_SCORE_THRESHOLD:
+            continue
+        if latitude is not None and longitude is not None and dist > 60:
+            continue
+        if best is None or sim > best[5] or (sim == best[5] and score > best[2]):
+            best = (hit, known_qtd, score, confidence, dist, sim)
+
+    if not best:
+        return None
+    hit, known_qtd, score, confidence, _dist, _sim = best
+    return build_did_you_mean_from_hit(
+        search_query,
+        hit,
+        max(score, 15),
+        min(confidence, 0.65),
+        known_qtd,
+    )
+
+
+def build_did_you_mean_from_hit(
+    query: str,
+    hit: RawAddressHit,
+    score: int,
+    confidence: float,
+    known_qtd: int = 0,
+) -> dict:
+    return {
+        "original_query": query,
+        "suggestion": _format_suggestion_dict(hit, score, confidence, known_qtd),
+    }
 
 
 def _format_suggestion_dict(hit: RawAddressHit, score: int, confidence: float, qtd: int) -> dict:

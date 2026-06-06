@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 
-from address_fuzzy import find_did_you_mean, similarity
+from address_fuzzy import extract_query_street, find_did_you_mean, similarity
 from address_normalizer import normalizeAddressQuery, normalize_address_key, normalize_estado_uf
 import sys
 from pathlib import Path
@@ -96,8 +96,25 @@ class TestFuzzy(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match[0], "Rua Cabo Frio")
 
+    def test_did_you_mean_full_query(self):
+        candidates = [("Rua Cabo Frio", "Barueri", "SP")]
+        match = find_did_you_mean("Rua Cabo Rio 43, Barueri, SP", candidates)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[0], "Rua Cabo Frio")
+
+    def test_extract_query_street(self):
+        street = extract_query_street("Rua Cabo Rio 43, Barueri, SP", {"cidade": "Barueri", "estado": "SP"})
+        self.assertIn("cabo", street)
+        self.assertNotIn("43", street)
+
     def test_similarity(self):
-        self.assertGreater(similarity("Rua Cabo Rio", "Rua Cabo Frio"), 0.82)
+        self.assertGreater(similarity("Rua Cabo Rio", "Rua Cabo Frio"), 0.72)
+
+    def test_similarity_street_parts(self):
+        self.assertGreater(
+            similarity(extract_query_street("Rua Cabo Rio 43, Barueri"), "Rua Cabo Frio"),
+            0.72,
+        )
 
 
 class TestNormalizeEstadoUf(unittest.TestCase):
@@ -110,6 +127,15 @@ class TestNormalizeEstadoUf(unittest.TestCase):
 
     def test_iso_br(self):
         self.assertEqual(normalize_estado_uf(None, iso3166="BR-SP"), "SP")
+
+
+class TestBelowThresholdFallback(unittest.TestCase):
+    def test_low_score_street_similarity(self):
+        from address_fuzzy import FUZZY_LOW_SCORE_THRESHOLD, extract_query_street
+
+        street_q = extract_query_street("Rua dona flôr 226, Jandira", {"cidade": "Jandira"})
+        sim = similarity(street_q, "Rua Dona Flor")
+        self.assertGreaterEqual(sim, FUZZY_LOW_SCORE_THRESHOLD)
 
 
 class TestHaversine(unittest.TestCase):

@@ -65,10 +65,8 @@ def get_cached(
                 updated = updated.replace(tzinfo=timezone.utc)
             if updated < cutoff:
                 db.delete(row)
-                db.commit()
+                db.flush()
                 return None
-            row.hit_count = (row.hit_count or 0) + 1
-            db.commit()
             return json.loads(row.payload_json)
         except Exception as e:
             logger.warning("suggestion_cache get db error: %s", e)
@@ -109,7 +107,7 @@ def set_cached(
                     hit_count=0,
                 )
                 db.add(row)
-            db.commit()
+            db.flush()
             return
         except Exception as e:
             logger.warning("suggestion_cache set db error: %s", e)

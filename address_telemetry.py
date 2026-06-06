@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import random
 from typing import Any, Dict, Optional
 
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+_SAMPLE_RATE = float(os.getenv("ADDRESS_TELEMETRY_SAMPLE_RATE", "1.0"))
 
 
 def _query_hash(query: Optional[str]) -> Optional[str]:
@@ -28,6 +32,8 @@ def log_address_event(
     try:
         if db is None:
             return
+        if _SAMPLE_RATE < 1.0 and random.random() > _SAMPLE_RATE:
+            return
         from models import AddressTelemetry
 
         row = AddressTelemetry(
@@ -38,7 +44,7 @@ def log_address_event(
             event_metadata=metadata or {},
         )
         db.add(row)
-        db.commit()
+        db.flush()
     except Exception as e:
         logger.debug("address_telemetry skip: %s (%s)", event_type, e)
         try:
