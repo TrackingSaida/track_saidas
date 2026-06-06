@@ -9,6 +9,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Boolean,
+    JSON,
     text,
     UniqueConstraint,
     ForeignKey,
@@ -807,3 +808,56 @@ class GeocodeCache(Base):
 
     def __repr__(self) -> str:
         return f"<GeocodeCache id={self.id} key_hash={self.key_hash[:8]}…>"
+
+
+# ==========================
+# Tabela: enderecos_conhecidos
+# ==========================
+class EnderecoConhecido(Base):
+    __tablename__ = "enderecos_conhecidos"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(Integer, nullable=True)
+    rua = Column(Text, nullable=False)
+    numero = Column(Text, nullable=True)
+    bairro = Column(Text, nullable=True)
+    cidade = Column(Text, nullable=False)
+    estado = Column(Text, nullable=False)
+    cep = Column(Text, nullable=True)
+    latitude = Column(Numeric(12, 8), nullable=False)
+    longitude = Column(Numeric(12, 8), nullable=False)
+    qtd_utilizacoes = Column(Integer, nullable=False, server_default=text("1"))
+    ultima_utilizacao = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ==========================
+# Tabela: suggestion_cache
+# ==========================
+class SuggestionCache(Base):
+    __tablename__ = "suggestion_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key_hash = Column(Text, nullable=False, unique=True)
+    sub_base = Column(Text, nullable=False)
+    query_normalizada = Column(Text, nullable=False)
+    payload_json = Column(Text, nullable=False)
+    hit_count = Column(Integer, nullable=False, server_default=text("0"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ==========================
+# Tabela: address_telemetry
+# ==========================
+class AddressTelemetry(Base):
+    __tablename__ = "address_telemetry"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(Text, nullable=False)
+    sub_base = Column(Text, nullable=True)
+    motoboy_id = Column(Integer, nullable=True)
+    query_hash = Column(Text, nullable=True)
+    metadata = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -204,6 +204,46 @@ class EnderecoBody(BaseModel):
     origem: str = "manual"  # manual | ocr | voz | suggestion | autocomplete | mapa
 
 
+class EnderecoSugestoesHints(BaseModel):
+    rua: Optional[str] = None
+    numero: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
+    cep: Optional[str] = None
+
+
+class EnderecoSugestoesBody(BaseModel):
+    query: str = Field(min_length=3)
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    hints: Optional[EnderecoSugestoesHints] = None
+    limit: int = Field(default=8, ge=1, le=15)
+
+
+class EnderecoSugestaoOut(BaseModel):
+    label: str
+    rua: str
+    numero: str = ""
+    bairro: str = ""
+    cidade: str
+    estado: str
+    cep: str = ""
+    latitude: float
+    longitude: float
+    score: int
+    confidence: float = 0.0
+    source: str
+    distance_km: Optional[float] = None
+    badge: Optional[str] = None
+    already_used: bool = False
+
+
+class EnderecoSugestoesResponse(BaseModel):
+    suggestions: List[EnderecoSugestaoOut]
+    did_you_mean: Optional[dict] = None
+
+
 class IniciarRotaBody(BaseModel):
     delivery_ids: Optional[List[int]] = None  # se enviado, só esses id_saida vão para EM_ROTA
 
@@ -1376,6 +1416,32 @@ def detalhe_entrega(
 
 
 # ============================================================
+# POST /mobile/enderecos/sugestoes
+# ============================================================
+@router.post("/enderecos/sugestoes", response_model=EnderecoSugestoesResponse)
+def buscar_sugestoes_endereco(
+    body: EnderecoSugestoesBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from smart_address_search import SmartAddressSearch
+
+    hints = body.hints.model_dump() if body.hints else {}
+    result = SmartAddressSearch().search(
+        db=db,
+        query=body.query,
+        sub_base=user.sub_base or "",
+        motoboy_id=user.motoboy_id,
+        latitude=body.latitude,
+        longitude=body.longitude,
+        hints=hints,
+        limit=body.limit,
+    )
+    suggestions = [EnderecoSugestaoOut(**s) for s in result.get("suggestions", [])]
+    return EnderecoSugestoesResponse(suggestions=suggestions, did_you_mean=result.get("did_you_mean"))
+
+
+# ============================================================
 # PUT /mobile/entrega/{id_saida}/endereco
 # ============================================================
 @router.put("/entrega/{id_saida}/endereco", response_model=EntregaListItem)
@@ -1453,6 +1519,16 @@ def atualizar_endereco(
                 id_saida,
                 endereco_formatado[:80],
             )
+            from address_telemetry import log_address_event
+
+            log_address_event(
+                db,
+                "address_geocode_failure",
+                user.sub_base,
+                user.motoboy_id,
+                endereco_formatado,
+                {"id_saida": id_saida},
+            )
             raise HTTPException(
                 status_code=422,
                 detail="Não foi possível obter a localização deste endereço. Verifique o endereço (rua, número, bairro, cidade, estado) e tente novamente.",
@@ -1501,6 +1577,50 @@ def atualizar_endereco(
         db.add(detail)
     db.commit()
     db.refresh(detail)
+
+    if lat is not None and lon is not None:
+        try:
+            from known_addresses_service import upsert_from_save
+            from address_telemetry import log_address_event
+
+            upsert_from_save(
+                db,
+                sub_base=user.sub_base or "",
+                motoboy_id=user.motoboy_id,
+                rua=body.rua.strip(),
+                numero=str(body.numero).strip(),
+                bairro=body.bairro.strip(),
+                cidade=body.cidade.strip(),
+                estado=body.estado.strip(),
+                cep=body.cep.strip(),
+                latitude=float(lat),
+                longitude=float(lon),
+            )
+            log_address_event(
+                db,
+                "address_saved_success",
+                user.sub_base,
+                user.motoboy_id,
+                endereco_formatado,
+                {"id_saida": id_saida, "origem": origem},
+            )
+        except Exception as e:
+            log.warning("known_address upsert failed: %s", e)
+    else:
+        try:
+            from address_telemetry import log_address_event
+
+            log_address_event(
+                db,
+                "address_saved_failure",
+                user.sub_base,
+                user.motoboy_id,
+                endereco_formatado,
+                {"id_saida": id_saida, "reason": "no_coords"},
+            )
+        except Exception:
+            pass
+
     return _saida_to_item(s, detail)
 
 
