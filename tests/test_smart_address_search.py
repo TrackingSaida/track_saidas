@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 
 from address_fuzzy import find_did_you_mean, similarity
-from address_normalizer import normalizeAddressQuery, normalize_address_key
+from address_normalizer import normalizeAddressQuery, normalize_address_key, normalize_estado_uf
 import sys
 from pathlib import Path
 
@@ -98,6 +98,18 @@ class TestFuzzy(unittest.TestCase):
 
     def test_similarity(self):
         self.assertGreater(similarity("Rua Cabo Rio", "Rua Cabo Frio"), 0.82)
+
+
+class TestNormalizeEstadoUf(unittest.TestCase):
+    def test_sao_paulo_nome_completo(self):
+        self.assertEqual(normalize_estado_uf("São Paulo"), "SP")
+        self.assertNotEqual(normalize_estado_uf("São Paulo"), "SÃ")
+
+    def test_sigla_curta(self):
+        self.assertEqual(normalize_estado_uf("SP"), "SP")
+
+    def test_iso_br(self):
+        self.assertEqual(normalize_estado_uf(None, iso3166="BR-SP"), "SP")
 
 
 class TestHaversine(unittest.TestCase):

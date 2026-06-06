@@ -7,7 +7,7 @@ from typing import List, Optional
 import requests
 
 from address_providers.base import AddressProvider, RawAddressHit
-from address_normalizer import normalize_cep
+from address_normalizer import normalize_cep, normalize_estado_uf
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +76,10 @@ class NominatimProvider(AddressProvider):
         cidade = (
             addr.get("city") or addr.get("town") or addr.get("village") or addr.get("municipality") or ""
         ).strip()
-        estado = (addr.get("state") or "")[:2].upper()
-        if len(estado) < 2 and addr.get("ISO3166-2-lvl4"):
-            estado = str(addr.get("ISO3166-2-lvl4"))[-2:].upper()
+        estado = normalize_estado_uf(
+            addr.get("state"),
+            iso3166=addr.get("ISO3166-2-lvl4"),
+        )
         cep = normalize_cep(addr.get("postcode") or "")
         if not rua and not cidade:
             return None

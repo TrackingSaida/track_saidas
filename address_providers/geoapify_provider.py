@@ -8,7 +8,7 @@ from typing import List, Optional
 import requests
 
 from address_providers.base import AddressProvider, RawAddressHit
-from address_normalizer import normalize_cep
+from address_normalizer import normalize_cep, normalize_estado_uf
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,11 @@ class GeoapifyProvider(AddressProvider):
         numero = str(props.get("housenumber") or props.get("house_number") or "").strip()
         bairro = (props.get("suburb") or props.get("neighbourhood") or props.get("district") or "").strip()
         cidade = (props.get("city") or props.get("town") or props.get("village") or props.get("municipality") or "").strip()
-        estado = (props.get("state_code") or props.get("state") or "")[:2].upper()
+        state_code = (props.get("state_code") or "").strip().upper()
+        if len(state_code) == 2 and state_code.isascii() and state_code.isalpha():
+            estado = state_code
+        else:
+            estado = normalize_estado_uf(props.get("state"))
         cep = normalize_cep(props.get("postcode") or props.get("postal_code") or "")
         if not rua and not cidade:
             return None

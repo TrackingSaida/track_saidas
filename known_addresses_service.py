@@ -9,9 +9,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from address_fuzzy import find_did_you_mean, similarity
-from address_normalizer import normalize_address_key, normalize_street_part, normalizeAddressQuery
+from address_normalizer import (
+    normalize_address_key,
+    normalize_cep,
+    normalize_estado_uf,
+    normalize_street_part,
+    normalizeAddressQuery,
+)
 from address_providers.base import RawAddressHit
-from address_normalizer import normalize_cep
 from models import EnderecoConhecido
 
 logger = logging.getLogger(__name__)
@@ -23,7 +28,7 @@ def _row_to_hit(row: EnderecoConhecido) -> RawAddressHit:
         numero=str(row.numero or ""),
         bairro=row.bairro or "",
         cidade=row.cidade or "",
-        estado=(row.estado or "")[:2].upper(),
+        estado=normalize_estado_uf(row.estado),
         cep=normalize_cep(row.cep),
         latitude=float(row.latitude),
         longitude=float(row.longitude),
@@ -124,7 +129,7 @@ def upsert_from_save(
                     numero=(numero or "").strip() or None,
                     bairro=(bairro or "").strip() or None,
                     cidade=cidade.strip(),
-                    estado=(estado or "")[:2].upper(),
+                    estado=normalize_estado_uf(estado),
                     cep=cep_n or None,
                     latitude=latitude,
                     longitude=longitude,
