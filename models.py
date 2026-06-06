@@ -859,5 +859,5 @@ class AddressTelemetry(Base):
     sub_base = Column(Text, nullable=True)
     motoboy_id = Column(Integer, nullable=True)
     query_hash = Column(Text, nullable=True)
-    metadata = Column(JSON, nullable=True)
+    event_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

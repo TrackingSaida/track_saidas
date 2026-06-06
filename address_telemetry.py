@@ -35,7 +35,7 @@ def log_address_event(
             sub_base=sub_base,
             motoboy_id=motoboy_id,
             query_hash=_query_hash(query),
-            metadata=metadata or {},
+            event_metadata=metadata or {},
         )
         db.add(row)
         db.commit()
