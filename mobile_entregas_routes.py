@@ -229,6 +229,16 @@ class RotasOrdemOut(BaseModel):
     parada_atual: int
 
 
+class RotasResumoOut(BaseModel):
+    rota_id: int
+    paradas: int
+    pedidos: int
+    entregues: int
+    ausentes: int
+    pendentes: int
+    valor_total: Decimal
+
+
 class ExtratoDiaItem(BaseModel):
     data: str
     total_pacotes_associados: int
@@ -404,6 +414,126 @@ def _valor_saida(precos: Dict[str, Decimal], saida: Saida) -> Decimal:
     if t == "Flex":
         return precos["flex"]
     return precos["avulso"]
+
+
+def _precos_mobile_map(db: Session, sub_base: str, motoboy_id: int) -> Dict[str, Decimal]:
+    precos = resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
+    return {
+        "shopee": precos["shopee_valor"],
+        "flex": precos["ml_valor"],
+        "avulso": precos["avulso_valor"],
+    }
+
+
+def _valor_finalizado_hoje_motoboy(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_id: int,
+    hoje: date,
+) -> Decimal:
+    """Soma remuneração de pedidos com evento entregue/ausente na data de conclusão (calendário)."""
+    ids_hoje = set(
+        db.scalars(
+            select(SaidaHistorico.id_saida).where(
+                SaidaHistorico.evento.in_(("entregue", "ausente")),
+                func.date(SaidaHistorico.timestamp) == hoje,
+            )
+        ).all()
+    )
+    if not ids_hoje:
+        return Decimal("0.00")
+    rows = db.scalars(
+        select(Saida).where(
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+            Saida.codigo.isnot(None),
+            Saida.id_saida.in_(ids_hoje),
+            Saida.status.in_([STATUS_ENTREGUE, STATUS_AUSENTE]),
+        )
+    ).all()
+    precos = _precos_mobile_map(db, sub_base, motoboy_id)
+    total = Decimal("0.00")
+    for s in rows:
+        total += _valor_saida(precos, s)
+    return total.quantize(Decimal("0.01"))
+
+
+def _resumo_rota_motoboy(
+    db: Session,
+    *,
+    rota: RotasMotoboy,
+    sub_base: str,
+    motoboy_id: int,
+) -> RotasResumoOut:
+    ordem_raw = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
+    ids = [int(x) for x in (ordem_raw or [])]
+    if not ids:
+        return RotasResumoOut(
+            rota_id=int(rota.id),
+            paradas=0,
+            pedidos=0,
+            entregues=0,
+            ausentes=0,
+            pendentes=0,
+            valor_total=Decimal("0.00"),
+        )
+    rows = db.scalars(
+        select(Saida).where(
+            Saida.id_saida.in_(ids),
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id == motoboy_id,
+        )
+    ).all()
+    rows_by_id = {int(s.id_saida): s for s in rows}
+    details_map = _carregar_details_por_saida_ids(db, ids)
+    from route_stops import build_route_stops
+
+    stops = build_route_stops(ids, details_map)
+    entregues = 0
+    ausentes = 0
+    pendentes = 0
+    precos = _precos_mobile_map(db, sub_base, motoboy_id)
+    valor_total = Decimal("0.00")
+    for id_saida in ids:
+        s = rows_by_id.get(id_saida)
+        if not s:
+            pendentes += 1
+            continue
+        status_up = _status_normalizado_upper(s.status)
+        if status_up == STATUS_ENTREGUE:
+            entregues += 1
+            valor_total += _valor_saida(precos, s)
+        elif status_up == STATUS_AUSENTE:
+            ausentes += 1
+            valor_total += _valor_saida(precos, s)
+        elif status_up in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+            pendentes += 1
+        else:
+            pendentes += 1
+    return RotasResumoOut(
+        rota_id=int(rota.id),
+        paradas=len(stops),
+        pedidos=len(ids),
+        entregues=entregues,
+        ausentes=ausentes,
+        pendentes=pendentes,
+        valor_total=valor_total.quantize(Decimal("0.01")),
+    )
+
+
+def _marcacao_response(db: Session, saida: Saida, *, complemento: bool = False) -> dict:
+    hoje = _hoje_operacional()
+    data_op = _ctx_data_operacional_saida(db, saida)
+    payload = {
+        "ok": True,
+        "id_saida": int(saida.id_saida),
+        "entrega_atrasada": data_op < hoje,
+        "data_operacional": data_op.isoformat(),
+    }
+    if complemento:
+        payload["complemento"] = True
+    return payload
 
 
 def _filtrar_por_data_operacional(
@@ -817,6 +947,10 @@ def resumo_entregas(
         )
     )
 
+    valor_finalizado_hoje = _valor_finalizado_hoje_motoboy(
+        db, sub_base=sub_base, motoboy_id=motoboy_id, hoje=hoje
+    )
+
     return {
         "pendentes": pendentes,
         "finalizadas_hoje": finalizadas_hoje,
@@ -825,6 +959,7 @@ def resumo_entregas(
         "pode_iniciar_rota": tem_saiu_para_entrega > 0,
         "ausentes": ausentes,
         "atraso_d1": atraso_d1,
+        "valor_finalizado_hoje": valor_finalizado_hoje,
     }
 
 
@@ -1158,6 +1293,28 @@ def rotas_finalizar(
 
 
 # ============================================================
+# GET /mobile/rotas/{id}/resumo
+# ============================================================
+@router.get("/rotas/{rota_id}/resumo", response_model=RotasResumoOut)
+def rotas_resumo(
+    rota_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Resumo operacional e financeiro de uma rota (ativa ou finalizada)."""
+    motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+    rota = db.get(RotasMotoboy, rota_id)
+    if not rota or rota.motoboy_id != motoboy_id:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+    if rota.status not in ("ativa", "finalizada"):
+        raise HTTPException(status_code=400, detail="Rota indisponível para resumo.")
+    return _resumo_rota_motoboy(db, rota=rota, sub_base=sub_base, motoboy_id=motoboy_id)
+
+
+# ============================================================
 # GET /mobile/entrega/{id}
 # ============================================================
 @router.get("/entrega/{id_saida}", response_model=EntregaListItem)
@@ -1366,7 +1523,8 @@ def marcar_entregue(
         if status_norm == STATUS_ENTREGUE and body:
             _upsert_detail_com_body()
             db.commit()
-            return {"ok": True, "id_saida": id_saida, "complemento": True}
+            db.refresh(s)
+            return _marcacao_response(db, s, complemento=True)
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if status_norm == STATUS_SAIU_PARA_ENTREGA:
         raise HTTPException(
@@ -1408,7 +1566,8 @@ def marcar_entregue(
         )
     )
     db.commit()
-    return {"ok": True, "id_saida": id_saida}
+    db.refresh(s)
+    return _marcacao_response(db, s)
 
 
 # ============================================================
@@ -1471,7 +1630,8 @@ def marcar_ausente(
         )
     )
     db.commit()
-    return {"ok": True, "id_saida": id_saida}
+    db.refresh(s)
+    return _marcacao_response(db, s)
 
 
 # ============================================================
