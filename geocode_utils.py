@@ -10,9 +10,13 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+from geocode_cache import get_cached, set_cached
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +136,77 @@ def _geocode_with_maps_co(address: str, api_key: str) -> Optional[Tuple[float, f
         return None
 
 
-def geocode_address_any(address: str) -> Optional[Tuple[float, float]]:
+def normalize_cep(cep: Optional[str]) -> str:
+    digits = re.sub(r"\D", "", cep or "")
+    return digits[:8] if len(digits) >= 8 else digits
+
+
+def normalize_address_text(text: Optional[str]) -> str:
+    raw = (text or "").strip().lower()
+    raw = unicodedata.normalize("NFD", raw)
+    raw = "".join(c for c in raw if unicodedata.category(c) != "Mn")
+    raw = re.sub(r"\bn[º°o]\b", "numero", raw)
+    raw = re.sub(r"\s+", " ", raw)
+    return raw.strip()
+
+
+def build_geocode_queries(
+    rua: Optional[str] = None,
+    numero: Optional[str] = None,
+    complemento: Optional[str] = None,
+    bairro: Optional[str] = None,
+    cidade: Optional[str] = None,
+    estado: Optional[str] = None,
+    cep: Optional[str] = None,
+    endereco_formatado: Optional[str] = None,
+) -> List[str]:
+    """Queries priorizadas: CEP+número primeiro, depois fallbacks sem duplicar."""
+    rua_n = (rua or "").strip()
+    num_n = (numero or "").strip()
+    bairro_n = (bairro or "").strip()
+    cidade_n = (cidade or "").strip()
+    estado_n = (estado or "").strip()
+    cep_n = normalize_cep(cep)
+    fmt = (endereco_formatado or "").strip()
+
+    queries: List[str] = []
+    seen: set[str] = set()
+
+    def _add(*parts: Optional[str], suffix: str = "Brasil") -> None:
+        q = ", ".join(p for p in parts if p and str(p).strip()).strip()
+        if not q:
+            return
+        if suffix and not q.endswith(suffix):
+            q = f"{q}, {suffix}"
+        norm = normalize_address_text(q)
+        if norm and norm not in seen:
+            seen.add(norm)
+            queries.append(q)
+
+    if cep_n and num_n:
+        _add(f"{cep_n} {num_n}")
+    if cep_n and rua_n and num_n and cidade_n:
+        _add(cep_n, f"{rua_n} {num_n}", f"{cidade_n} {estado_n}".strip())
+    if rua_n and num_n:
+        _add(rua_n, num_n, bairro_n, f"{cidade_n} {estado_n}".strip(), cep_n or None)
+    if fmt:
+        _add(fmt)
+    if rua_n and bairro_n and cidade_n:
+        _add(rua_n, bairro_n, f"{cidade_n} {estado_n}".strip())
+    if rua_n and cidade_n:
+        _add(rua_n, cidade_n, estado_n)
+    if bairro_n and cidade_n:
+        _add(bairro_n, cidade_n, estado_n)
+    if cidade_n:
+        _add(cidade_n, estado_n)
+
+    return queries
+
+
+def geocode_address_any(
+    address: str,
+    db: Optional[Any] = None,
+) -> Optional[Tuple[float, float]]:
     """
     Wrapper de alto nível: tenta provedor externo configurável e faz fallback para OSM.
 
@@ -144,7 +218,12 @@ def geocode_address_any(address: str) -> Optional[Tuple[float, float]]:
     if not addr:
         return None
 
+    cached = get_cached(db, addr)
+    if cached:
+        return cached[0], cached[1]
+
     provider = os.getenv("GEOCODER_PROVIDER", "geoapify").strip().lower()
+    provider_used: Optional[str] = None
     api_key = os.getenv("GEOCODER_API_KEY", "").strip()
 
     # 1) Tenta provedor externo, se configurado
@@ -152,20 +231,35 @@ def geocode_address_any(address: str) -> Optional[Tuple[float, float]]:
         if provider in ("geoapify", "geo"):
             coords = _geocode_with_geoapify(addr, api_key)
             if coords:
+                provider_used = "geoapify"
+                set_cached(db, addr, coords[0], coords[1], provider_used)
+                logger.info("geocode_attempt query=%s provider=%s success=true", addr[:80], provider_used)
                 return coords
         elif provider in ("locationiq", "lq"):
             coords = _geocode_with_locationiq(addr, api_key)
             if coords:
+                provider_used = "locationiq"
+                set_cached(db, addr, coords[0], coords[1], provider_used)
+                logger.info("geocode_attempt query=%s provider=%s success=true", addr[:80], provider_used)
                 return coords
         elif provider in ("geocode_maps_co", "maps_co", "mapsco"):
             coords = _geocode_with_maps_co(addr, api_key)
             if coords:
+                provider_used = "maps_co"
+                set_cached(db, addr, coords[0], coords[1], provider_used)
+                logger.info("geocode_attempt query=%s provider=%s success=true", addr[:80], provider_used)
                 return coords
         else:
             logger.warning("GEOCODER_PROVIDER '%s' desconhecido; usando apenas OSM", provider)
 
     # 2) Fallback para Nominatim/OpenStreetMap
-    return geocode_address(addr)
+    coords = geocode_address(addr)
+    if coords:
+        set_cached(db, addr, coords[0], coords[1], "nominatim")
+        logger.info("geocode_attempt query=%s provider=nominatim success=true", addr[:80])
+    else:
+        logger.warning("geocode_attempt query=%s provider=any success=false", addr[:80])
+    return coords
 
 
 def geocode_address_with_fallbacks(
@@ -177,50 +271,25 @@ def geocode_address_with_fallbacks(
     estado: Optional[str] = None,
     cep: Optional[str] = None,
     endereco_formatado: Optional[str] = None,
+    db: Optional[Any] = None,
 ) -> Optional[Tuple[float, float]]:
     """
-    Tenta geocoding com várias variações da query para maximizar chance de obter coordenadas.
-    Ordem: endereço completo → sem complemento → sem número → cidade + estado.
+    Tenta geocoding com queries priorizadas (CEP+número primeiro).
     """
-    def _try(*parts: Optional[str]) -> Optional[Tuple[float, float]]:
-        query = ", ".join(p for p in parts if p and str(p).strip()).strip()
-        if not query:
-            return None
-        if not query.endswith("Brasil"):
-            query = f"{query}, Brasil"
-        return geocode_address_any(query)
-
-    # 1) Endereço formatado completo (como veio do app)
-    if endereco_formatado and endereco_formatado.strip():
-        coords = _try(endereco_formatado.strip())
+    queries = build_geocode_queries(
+        rua=rua,
+        numero=numero,
+        complemento=complemento,
+        bairro=bairro,
+        cidade=cidade,
+        estado=estado,
+        cep=cep,
+        endereco_formatado=endereco_formatado,
+    )
+    for query in queries:
+        coords = geocode_address_any(query, db=db)
         if coords:
             return coords
-
-    # 2) Partes: rua, número, bairro, cidade, estado
-    coords = _try(rua, numero, bairro, cidade, estado)
-    if coords:
-        return coords
-
-    # 3) Sem número (às vezes o número atrapalha)
-    coords = _try(rua, bairro, cidade, estado)
-    if coords:
-        return coords
-
-    # 4) Rua, cidade, estado
-    coords = _try(rua, cidade, estado)
-    if coords:
-        return coords
-
-    # 5) Bairro, cidade, estado
-    coords = _try(bairro, cidade, estado)
-    if coords:
-        return coords
-
-    # 6) Cidade, estado (centro da cidade como último recurso)
-    coords = _try(cidade, estado)
-    if coords:
-        return coords
-
     return None
 
 

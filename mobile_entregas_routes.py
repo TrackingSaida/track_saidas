@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from typing import Optional, List, Dict, Tuple
@@ -170,7 +171,7 @@ class EnderecoBody(BaseModel):
     cep: str = Field(min_length=8)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    origem: str = "manual"  # manual | ocr | voz
+    origem: str = "manual"  # manual | ocr | voz | suggestion | autocomplete | mapa
 
 
 class IniciarRotaBody(BaseModel):
@@ -914,18 +915,32 @@ def rotas_otimizar(
     if not rows:
         raise HTTPException(status_code=400, detail="Nenhuma entrega válida para otimização.")
 
+    from route_stops import build_route_stops, expand_stop_order
+
     details_map = _carregar_details_por_saida_ids(db, delivery_ids)
+    stops = build_route_stops(delivery_ids, details_map)
+
     com_coord: List[RoutePoint] = []
     sem_coordenadas: List[int] = []
+    stops_with_coords = 0
+    stops_without_coords = 0
 
-    for sid in delivery_ids:
-        detail = details_map.get(int(sid))
-        lat = float(detail.latitude) if detail and detail.latitude is not None else None
-        lon = float(detail.longitude) if detail and detail.longitude is not None else None
-        if lat is not None and lon is not None:
-            com_coord.append((int(sid), lat, lon))
+    for stop in stops:
+        if stop.has_coords:
+            stops_with_coords += 1
+            com_coord.append((stop.representative_id, stop.lat, stop.lon))
         else:
-            sem_coordenadas.append(int(sid))
+            stops_without_coords += 1
+            sem_coordenadas.extend(stop.delivery_ids)
+
+    logging.getLogger(__name__).info(
+        "rotas_otimizar: %s entregas → %s paradas (%s com coords, %s sem), %s entregas sem coordenadas",
+        len(delivery_ids),
+        len(stops),
+        stops_with_coords,
+        stops_without_coords,
+        len(sem_coordenadas),
+    )
 
     start: Optional[StartPoint] = None
     if body.start is not None:
@@ -942,7 +957,8 @@ def rotas_otimizar(
 
     result = otimizar_ordem_entregas(com_coord, start=start)
     ordem_otimizada = list(result.get("ordem") or [])
-    ordem_final = ordem_otimizada + sem_coordenadas
+    ordem_expandida = expand_stop_order(ordem_otimizada, stops)
+    ordem_final = ordem_expandida + sem_coordenadas
 
     return RotasOtimizarOut(
         ordem=ordem_final,
@@ -1186,14 +1202,44 @@ def atualizar_endereco(
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     detail = _get_detail_for_saida(db, id_saida)
     origem = (body.origem or "manual").strip().lower()
-    if origem not in ("manual", "ocr", "voz"):
+    if origem not in ("manual", "ocr", "voz", "suggestion", "autocomplete", "mapa"):
         origem = "manual"
     parts = [body.rua, body.numero, body.complemento, body.bairro, body.cidade, body.estado, body.cep]
     endereco_formatado = ", ".join(p for p in parts if p)
 
+    log = logging.getLogger(__name__)
+
+    def _valid_client_coords(lat_v: Optional[float], lon_v: Optional[float]) -> bool:
+        if lat_v is None or lon_v is None:
+            return False
+        try:
+            lat_f = float(lat_v)
+            lon_f = float(lon_v)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(lat_f) or not math.isfinite(lon_f):
+            return False
+        if lat_f < -90 or lat_f > 90 or lon_f < -180 or lon_f > 180:
+            return False
+        if lat_f == 0 and lon_f == 0:
+            return False
+        return True
+
     lat = body.latitude
     lon = body.longitude
-    if (lat is None or lon is None) and endereco_formatado.strip():
+    latlon_from_client = _valid_client_coords(lat, lon)
+    geocode_called = False
+
+    if latlon_from_client:
+        lat = float(lat)
+        lon = float(lon)
+        log.info(
+            "endereco_save latlon_from_client=true origem=%s id_saida=%s geocode_called=false",
+            origem,
+            id_saida,
+        )
+    elif endereco_formatado.strip():
+        geocode_called = True
         coords = geocode_address_with_fallbacks(
             rua=body.rua,
             numero=body.numero,
@@ -1203,15 +1249,19 @@ def atualizar_endereco(
             estado=body.estado,
             cep=body.cep,
             endereco_formatado=endereco_formatado,
+            db=db,
         )
         if coords:
             lat, lon = coords
-            logging.getLogger(__name__).info(
-                "Geocoding: salvando lat=%s, lon=%s para id_saida=%s",
-                lat, lon, id_saida,
+            log.info(
+                "endereco_save latlon_from_client=false origem=%s id_saida=%s geocode_called=true lat=%s lon=%s",
+                origem,
+                id_saida,
+                lat,
+                lon,
             )
         else:
-            logging.getLogger(__name__).warning(
+            log.warning(
                 "Geocoding falhou após fallbacks: id_saida=%s, endereco=%s",
                 id_saida,
                 endereco_formatado[:80],
@@ -1220,6 +1270,12 @@ def atualizar_endereco(
                 status_code=422,
                 detail="Não foi possível obter a localização deste endereço. Verifique o endereço (rua, número, bairro, cidade, estado) e tente novamente.",
             )
+    else:
+        log.info(
+            "endereco_save latlon_from_client=false origem=%s id_saida=%s geocode_called=false",
+            origem,
+            id_saida,
+        )
 
     if detail:
         detail.dest_nome = body.destinatario.strip()

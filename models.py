@@ -786,3 +786,24 @@ class LogLeitura(Base):
             f"<LogLeitura id={self.id} tipo={self.tipo} "
             f"origem={self.origem} resultado={self.resultado}>"
         )
+
+
+# ==========================
+# Tabela: geocode_cache
+# ==========================
+class GeocodeCache(Base):
+    __tablename__ = "geocode_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key_hash = Column(Text, nullable=False, unique=True)
+    query_normalizada = Column(Text, nullable=False)
+    latitude = Column(Numeric(12, 8), nullable=False)
+    longitude = Column(Numeric(12, 8), nullable=False)
+    provider = Column(Text, nullable=True)
+    confidence = Column(Numeric(6, 4), nullable=True)
+    hit_count = Column(Integer, nullable=False, server_default=text("0"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<GeocodeCache id={self.id} key_hash={self.key_hash[:8]}…>"
