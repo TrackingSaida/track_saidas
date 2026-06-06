@@ -175,6 +175,22 @@ def validate_campos_obrigatorios_conclusao(
     return faltantes
 
 
+BLOQUEIO_MOTIVO: Dict[str, str] = {
+    "recebedor": "Exige nome do recebedor",
+    "tipo_recebedor": "Exige tipo do recebedor",
+    "documento": "Exige documento",
+    "foto": "Exige foto/comprovante",
+    "observacao": "Exige observação",
+}
+
+
+def format_bloqueio_motivo(faltantes: List[str]) -> str:
+    if not faltantes:
+        return "Campos obrigatórios não preenchidos"
+    first = faltantes[0]
+    return BLOQUEIO_MOTIVO.get(first, f"Exige {CAMPO_LABEL.get(first, first).lower()}")
+
+
 def raise_if_campos_obrigatorios_faltando(faltantes: List[str]) -> None:
     if not faltantes:
         return

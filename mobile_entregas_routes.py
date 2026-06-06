@@ -10,7 +10,7 @@ import logging
 import math
 from datetime import datetime, date, timedelta
 from decimal import Decimal
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -69,6 +69,7 @@ from log_leitura_service import registrar_log_leitura_critico
 from pedido_campos_obrigatorios_service import (
     validate_campos_obrigatorios_conclusao,
     raise_if_campos_obrigatorios_faltando,
+    format_bloqueio_motivo,
     resolve_campos_obrigatorios_ativos,
     build_campos_cache_for_sub_base,
     resolve_campos_obrigatorios_from_cache,
@@ -158,6 +159,35 @@ class EntregueBody(BaseModel):
     tipo_documento: Optional[str] = None
     numero_documento: Optional[str] = None
     observacao_entrega: Optional[str] = None
+
+
+class FinalizarLoteBody(BaseModel):
+    ids: List[int] = Field(min_length=1, max_length=50)
+    acao: Literal["entregue", "ausente"]
+    motivo_id: Optional[int] = None
+    observacao: Optional[str] = None
+
+
+class FinalizarLoteItemOut(BaseModel):
+    id_saida: int
+    status: str
+
+
+class FinalizarLoteBloqueadoOut(BaseModel):
+    id_saida: int
+    codigo: Optional[str] = None
+    motivo: str
+
+
+class FinalizarLoteErroOut(BaseModel):
+    id_saida: int
+    mensagem: str
+
+
+class FinalizarLoteResponse(BaseModel):
+    finalizados: List[FinalizarLoteItemOut]
+    bloqueados: List[FinalizarLoteBloqueadoOut]
+    erros: List[FinalizarLoteErroOut]
 
 
 class EnderecoBody(BaseModel):
@@ -1472,6 +1502,181 @@ def atualizar_endereco(
     db.commit()
     db.refresh(detail)
     return _saida_to_item(s, detail)
+
+
+def _validar_saida_para_finalizacao_lote(
+    s: Optional[Saida],
+    acao: str,
+    motoboy_id: int,
+    sub_base: str,
+) -> Optional[str]:
+    if not s or (s.sub_base or "").strip() != (sub_base or "").strip() or s.motoboy_id != motoboy_id:
+        return "Pedido não encontrado ou não pertence a você"
+    status_norm = normalizar_status_saida(s.status)
+    if _status_esta_finalizado(status_norm):
+        return "Pedido já finalizado"
+    if status_norm == STATUS_AUSENTE and acao == "entregue":
+        return "Pedido já marcado como ausente"
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+        return "Status não permite finalização"
+    return None
+
+
+def _aplicar_entregue_lote(
+    db: Session,
+    s: Saida,
+    user: User,
+    status_anterior: str,
+) -> None:
+    s.status = STATUS_ENTREGUE
+    s.data_hora_entrega = datetime.utcnow()
+    db.add(
+        SaidaHistorico(
+            id_saida=int(s.id_saida),
+            evento="entregue_lote",
+            status_anterior=status_anterior,
+            status_novo=STATUS_ENTREGUE,
+            user_id=user.id,
+        )
+    )
+
+
+def _aplicar_ausente_lote(
+    db: Session,
+    s: Saida,
+    user: User,
+    motivo: MotivoAusencia,
+    observacao: Optional[str],
+    detail: Optional[SaidaDetail],
+    status_anterior: str,
+) -> None:
+    s.status = STATUS_AUSENTE
+    obs = (observacao or "").strip() or None
+    if detail:
+        detail.motivo_ocorrencia = motivo.descricao
+        detail.observacao_ocorrencia = obs
+    else:
+        db.add(
+            SaidaDetail(
+                id_saida=int(s.id_saida),
+                id_entregador=int(user.motoboy_id or 0),
+                status=STATUS_AUSENTE,
+                motivo_ocorrencia=motivo.descricao,
+                observacao_ocorrencia=obs,
+            )
+        )
+    db.add(
+        SaidaHistorico(
+            id_saida=int(s.id_saida),
+            evento="ausente_lote",
+            status_anterior=status_anterior,
+            status_novo=STATUS_AUSENTE,
+            user_id=user.id,
+        )
+    )
+
+
+# ============================================================
+# POST /mobile/entregas/finalizar-lote
+# ============================================================
+@router.post("/entregas/finalizar-lote", response_model=FinalizarLoteResponse)
+def finalizar_lote(
+    body: FinalizarLoteBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Finaliza pedidos em lote (parcial). Backend valida campos obrigatórios por pedido."""
+    motivo: Optional[MotivoAusencia] = None
+    if body.acao == "ausente":
+        if body.motivo_id is None:
+            raise HTTPException(status_code=422, detail="motivo_id é obrigatório para ausência em lote.")
+        motivo = db.get(MotivoAusencia, body.motivo_id)
+        if not motivo or not motivo.ativo:
+            raise HTTPException(status_code=422, detail="Motivo de ausência inválido.")
+        if motivo.descricao.strip().lower() == "outro" and not (body.observacao or "").strip():
+            raise HTTPException(status_code=422, detail="Observação obrigatória quando motivo é 'Outro'.")
+
+    ids_unicos = list(dict.fromkeys(int(i) for i in body.ids))
+    details_map = _carregar_details_por_saida_ids(db, ids_unicos)
+
+    finalizados: List[FinalizarLoteItemOut] = []
+    bloqueados: List[FinalizarLoteBloqueadoOut] = []
+    erros: List[FinalizarLoteErroOut] = []
+
+    for id_saida in ids_unicos:
+        try:
+            s = db.get(Saida, id_saida)
+            bloqueio = _validar_saida_para_finalizacao_lote(
+                s, body.acao, user.motoboy_id, user.sub_base
+            )
+            if bloqueio:
+                bloqueados.append(
+                    FinalizarLoteBloqueadoOut(
+                        id_saida=id_saida,
+                        codigo=getattr(s, "codigo", None) if s else None,
+                        motivo=bloqueio,
+                    )
+                )
+                continue
+
+            assert s is not None
+            detail = details_map.get(id_saida) or _get_detail_for_saida(db, id_saida)
+            status_anterior = normalizar_status_saida(s.status) or (s.status or STATUS_EM_ROTA)
+
+            if body.acao == "entregue":
+                faltantes = validate_campos_obrigatorios_conclusao(
+                    db,
+                    saida=s,
+                    contexto="ENTREGUE",
+                    detail=detail,
+                    overrides=None,
+                )
+                if faltantes:
+                    bloqueados.append(
+                        FinalizarLoteBloqueadoOut(
+                            id_saida=id_saida,
+                            codigo=s.codigo,
+                            motivo=format_bloqueio_motivo(faltantes),
+                        )
+                    )
+                    continue
+                _aplicar_entregue_lote(db, s, user, status_anterior)
+                status_novo = STATUS_ENTREGUE
+            else:
+                assert motivo is not None
+                overrides = (
+                    {"observacao_ocorrencia": body.observacao}
+                    if body.observacao is not None
+                    else None
+                )
+                faltantes = validate_campos_obrigatorios_conclusao(
+                    db,
+                    saida=s,
+                    contexto="AUSENTE",
+                    detail=detail,
+                    overrides=overrides,
+                )
+                if faltantes:
+                    bloqueados.append(
+                        FinalizarLoteBloqueadoOut(
+                            id_saida=id_saida,
+                            codigo=s.codigo,
+                            motivo=format_bloqueio_motivo(faltantes),
+                        )
+                    )
+                    continue
+                _aplicar_ausente_lote(db, s, user, motivo, body.observacao, detail, status_anterior)
+                status_novo = STATUS_AUSENTE
+
+            db.commit()
+            db.refresh(s)
+            finalizados.append(FinalizarLoteItemOut(id_saida=id_saida, status=status_novo))
+        except Exception as exc:
+            db.rollback()
+            logging.exception("finalizar_lote id_saida=%s", id_saida)
+            erros.append(FinalizarLoteErroOut(id_saida=id_saida, mensagem=str(exc)))
+
+    return FinalizarLoteResponse(finalizados=finalizados, bloqueados=bloqueados, erros=erros)
 
 
 # ============================================================
