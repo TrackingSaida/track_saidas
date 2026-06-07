@@ -39,7 +39,13 @@ class GeoapifyProvider(AddressProvider):
         if latitude is not None and longitude is not None:
             params["bias"] = f"proximity:{longitude},{latitude}"
         try:
-            r = requests.get(url, params=params, headers={"User-Agent": "TrackSaidasBackend/1.0"}, timeout=10)
+            http_timeout = float(os.getenv("ADDRESS_PROVIDER_TIMEOUT_SEC", "2")) + 1.0
+            r = requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": "TrackSaidasBackend/1.0"},
+                timeout=http_timeout,
+            )
             r.raise_for_status()
             data = r.json()
             results = data.get("results") if isinstance(data, dict) else data

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Optional
 
 import requests
@@ -42,7 +43,7 @@ class NominatimProvider(AddressProvider):
                 "https://nominatim.openstreetmap.org/search",
                 params=params,
                 headers={"User-Agent": _USER_AGENT},
-                timeout=10,
+                timeout=_HTTP_TIMEOUT_SEC,
             )
             r.raise_for_status()
             data = r.json()

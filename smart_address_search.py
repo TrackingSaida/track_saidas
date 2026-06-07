@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -217,11 +218,12 @@ def _fetch_provider_hits(
         )
         return provider_hits, False, per_provider
 
-    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
-        futures = {
-            pool.submit(_run_provider, p, search_query, latitude, longitude, limit): p
-            for p in providers
-        }
+    executor = ThreadPoolExecutor(max_workers=len(providers))
+    futures = {
+        executor.submit(_run_provider, p, search_query, latitude, longitude, limit): p
+        for p in providers
+    }
+    try:
         try:
             for future in as_completed(futures, timeout=timeout):
                 name, provider_hits, error = future.result()
@@ -229,7 +231,7 @@ def _fetch_provider_hits(
                     provider=name, results=len(provider_hits), error=error,
                 )
                 hits.extend(provider_hits)
-        except Exception:
+        except (FuturesTimeoutError, TimeoutError):
             timed_out = True
             for future, provider in futures.items():
                 if future.done():
@@ -247,6 +249,9 @@ def _fetch_provider_hits(
                     per_provider[provider.name] = ProviderSearchStats(
                         provider=provider.name, error="timeout",
                     )
+    finally:
+        # Não bloquear a resposta HTTP esperando providers lentos após o timeout.
+        executor.shutdown(wait=False, cancel_futures=True)
 
     return hits, timed_out, per_provider
 
@@ -318,6 +323,46 @@ class SmartAddressSearch:
             )
             return {"suggestions": cached_slice, "did_you_mean": dym, "used_google": False}
 
+        try:
+            return self._search_uncached(
+                db=db,
+                search_query=search_query,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                latitude=latitude,
+                longitude=longitude,
+                hints=hints,
+                limit=limit,
+                session_token=session_token,
+            )
+        except Exception as e:
+            logger.exception("address_search failed query=%s", search_query)
+            emit_address_search_log(
+                AddressSearchReport(
+                    query=search_query,
+                    latitude=latitude,
+                    longitude=longitude,
+                    google=GooglePlacesSearchStats(
+                        called=False,
+                        reason="internal_error",
+                        error=str(e)[:300],
+                    ),
+                )
+            )
+            raise
+
+    def _search_uncached(
+        self,
+        db: Session,
+        search_query: str,
+        sub_base: str,
+        motoboy_id: Optional[int],
+        latitude: Optional[float],
+        longitude: Optional[float],
+        hints: dict,
+        limit: int,
+        session_token: Optional[str],
+    ) -> Dict[str, Any]:
         sub_cities, sub_bairros = get_sub_base_stats(db, sub_base)
         mot_cities, mot_bairros = get_motoboy_stats(db, motoboy_id) if motoboy_id else ({}, {})
 

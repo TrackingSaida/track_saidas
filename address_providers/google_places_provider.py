@@ -27,6 +27,7 @@ _AUTOCOMPLETE_FIELD_MASK = (
 )
 
 _DETAILS_FIELD_MASK = "id,formattedAddress,location,addressComponents"
+_GOOGLE_HTTP_TIMEOUT_SEC = float(os.getenv("GOOGLE_PLACES_TIMEOUT_SEC", "5"))
 
 
 def is_google_places_enabled() -> bool:
@@ -189,7 +190,7 @@ class GooglePlacesClient:
                 _AUTOCOMPLETE_URL,
                 json=body,
                 headers=self._headers(_AUTOCOMPLETE_FIELD_MASK),
-                timeout=10,
+                timeout=_GOOGLE_HTTP_TIMEOUT_SEC,
             )
             r.raise_for_status()
             data = r.json()
@@ -256,7 +257,7 @@ class GooglePlacesClient:
                     "X-Goog-FieldMask": _DETAILS_FIELD_MASK,
                     "User-Agent": _USER_AGENT,
                 },
-                timeout=10,
+                timeout=_GOOGLE_HTTP_TIMEOUT_SEC,
             )
             r.raise_for_status()
             data = r.json()
