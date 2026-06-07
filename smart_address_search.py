@@ -12,6 +12,12 @@ from sqlalchemy.orm import Session
 from address_normalizer import normalize_address_key, normalizeAddressQuery, normalize_cep
 from address_providers.base import AddressProvider, RawAddressHit
 from address_providers.geoapify_provider import GeoapifyProvider
+from address_providers.google_places_provider import (
+    GooglePlacesClient,
+    _record_session_google_call,
+    prediction_to_provisional_score,
+    should_auto_invoke_google_places,
+)
 from address_providers.nominatim_provider import NominatimProvider
 from address_ranker import MIN_SUGGESTION_SCORE, RankContext, build_rank_context, score_hit
 from address_telemetry import log_address_event
@@ -26,7 +32,7 @@ from suggestion_cache import get_cached, set_cached
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_TIMEOUT_SEC = float(os.getenv("ADDRESS_PROVIDER_TIMEOUT_SEC", "3"))
+PROVIDER_TIMEOUT_SEC = float(os.getenv("ADDRESS_PROVIDER_TIMEOUT_SEC", "2"))
 SKIP_PROVIDERS_IF_KNOWN = os.getenv("ADDRESS_SKIP_PROVIDERS_IF_KNOWN", "1").strip() in ("1", "true", "yes")
 KNOWN_FAST_SCORE = int(os.getenv("ADDRESS_KNOWN_FAST_SCORE", "40"))
 
@@ -44,6 +50,38 @@ def _dedupe_hits(scored: List[dict]) -> List[dict]:
         if prev is None or item.get("score", 0) > prev.get("score", 0):
             seen[key] = item
     return list(seen.values())
+
+
+def _google_prediction_to_dict(prediction, score: int, search_query: str) -> dict:
+    label_parts = [prediction.main_text, prediction.secondary_text]
+    label = "\n".join(p for p in label_parts if p) or prediction.full_text
+    dist_km = (
+        round(prediction.distance_meters / 1000.0, 2)
+        if prediction.distance_meters is not None
+        else None
+    )
+    return {
+        "label": label,
+        "main_text": prediction.main_text,
+        "secondary_text": prediction.secondary_text,
+        "rua": prediction.main_text,
+        "numero": "",
+        "bairro": "",
+        "cidade": "",
+        "estado": "",
+        "cep": "",
+        "latitude": 0.0,
+        "longitude": 0.0,
+        "score": score,
+        "confidence": round(min(1.0, score / 120.0), 3),
+        "source": "google_places",
+        "distance_km": dist_km,
+        "distance_meters": prediction.distance_meters,
+        "place_id": prediction.place_id,
+        "requires_place_details": True,
+        "badge": None,
+        "already_used": False,
+    }
 
 
 def _hit_to_dict(hit: RawAddressHit, score: int, confidence: float, distance_km: float, known_qtd: int = 0) -> dict:
@@ -151,15 +189,16 @@ def _fetch_provider_hits(
     latitude: Optional[float],
     longitude: Optional[float],
     limit: int,
-) -> List[RawAddressHit]:
+) -> Tuple[List[RawAddressHit], bool]:
     if not providers:
-        return []
+        return [], False
 
     hits: List[RawAddressHit] = []
     timeout = PROVIDER_TIMEOUT_SEC
+    timed_out = False
 
     if len(providers) == 1:
-        return _run_provider(providers[0], search_query, latitude, longitude, limit)
+        return _run_provider(providers[0], search_query, latitude, longitude, limit), False
 
     with ThreadPoolExecutor(max_workers=len(providers)) as pool:
         futures = {
@@ -170,6 +209,7 @@ def _fetch_provider_hits(
             for future in as_completed(futures, timeout=timeout):
                 hits.extend(future.result())
         except Exception:
+            timed_out = True
             for future in futures:
                 if future.done():
                     try:
@@ -177,7 +217,7 @@ def _fetch_provider_hits(
                     except Exception:
                         pass
 
-    return hits
+    return hits, timed_out
 
 
 class SmartAddressSearch:
@@ -201,13 +241,14 @@ class SmartAddressSearch:
         longitude: Optional[float] = None,
         hints: Optional[dict] = None,
         limit: int = 8,
+        session_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         hints = hints or {}
         normalized_query = normalizeAddressQuery(query)
         search_query = normalized_query or query.strip()
         if len(search_query) < 3:
             log_address_event(db, "address_search_no_results", sub_base, motoboy_id, query)
-            return {"suggestions": [], "did_you_mean": None}
+            return {"suggestions": [], "did_you_mean": None, "used_google": False}
 
         log_address_event(db, "address_search_started", sub_base, motoboy_id, search_query)
 
@@ -215,7 +256,7 @@ class SmartAddressSearch:
         if cached is not None:
             log_address_event(db, "address_search_success", sub_base, motoboy_id, search_query, {"cached": True})
             dym = build_did_you_mean(db, sub_base, search_query, hints=hints)
-            return {"suggestions": cached[:limit], "did_you_mean": dym}
+            return {"suggestions": cached[:limit], "did_you_mean": dym, "used_google": False}
 
         sub_cities, sub_bairros = get_sub_base_stats(db, sub_base)
         mot_cities, mot_bairros = get_motoboy_stats(db, motoboy_id) if motoboy_id else ({}, {})
@@ -246,8 +287,9 @@ class SmartAddressSearch:
                     skip_providers = True
                     break
 
+        providers_timed_out = False
         if not skip_providers:
-            provider_hits = _fetch_provider_hits(
+            provider_hits, providers_timed_out = _fetch_provider_hits(
                 self.providers,
                 search_query,
                 latitude,
@@ -287,12 +329,75 @@ class SmartAddressSearch:
                 ]
 
         suggestions = scored[:limit]
+        used_google = False
+
+        invoke_google, google_reason, cost_guard_hit = should_auto_invoke_google_places(
+            suggestions,
+            search_query,
+            hints=hints,
+            providers_timed_out=providers_timed_out,
+            session_token=session_token,
+        )
+        if cost_guard_hit:
+            log_address_event(
+                db,
+                "google_places_cost_guard",
+                sub_base,
+                motoboy_id,
+                search_query,
+                {
+                    "google_places_called": False,
+                    "google_places_cost_guard_hit": True,
+                    "session_token_prefix": (session_token or "")[:8],
+                },
+            )
+        elif invoke_google:
+            _record_session_google_call(session_token)
+            client = GooglePlacesClient()
+            predictions = client.autocomplete(
+                search_query,
+                latitude=latitude,
+                longitude=longitude,
+                session_token=session_token,
+                limit=limit,
+            )
+            google_suggestions = []
+            for pred in predictions:
+                g_score = prediction_to_provisional_score(pred, search_query)
+                google_suggestions.append(_google_prediction_to_dict(pred, g_score, search_query))
+            merged = _dedupe_hits(suggestions + google_suggestions)
+            merged.sort(key=lambda x: (-x["score"], x.get("distance_km") or 9999))
+            suggestions = merged[:limit]
+            used_google = len(google_suggestions) > 0
+            logger.info(
+                "google_places_called=true reason=%s results=%s cost_guard=false",
+                google_reason,
+                len(google_suggestions),
+            )
+            log_address_event(
+                db,
+                "google_places_autocomplete",
+                sub_base,
+                motoboy_id,
+                search_query,
+                {
+                    "google_places_called": True,
+                    "google_places_reason": google_reason,
+                    "google_places_results_count": len(google_suggestions),
+                    "google_places_selected": False,
+                    "google_places_cost_guard_hit": False,
+                },
+            )
 
         if suggestions:
             set_cached(db, sub_base, search_query, latitude, longitude, suggestions)
             log_address_event(
                 db, "address_search_success", sub_base, motoboy_id, search_query,
-                {"count": len(suggestions), "providers": raw_count},
+                {
+                    "count": len(suggestions),
+                    "providers": raw_count,
+                    "used_google": used_google,
+                },
             )
         else:
             log_address_event(db, "address_search_no_results", sub_base, motoboy_id, search_query)
@@ -305,4 +410,74 @@ class SmartAddressSearch:
                 below_threshold, search_query, hints, latitude, longitude,
             )
 
-        return {"suggestions": suggestions, "did_you_mean": did_you_mean}
+        return {"suggestions": suggestions, "did_you_mean": did_you_mean, "used_google": used_google}
+
+    def resolve_place_details(
+        self,
+        db: Session,
+        place_id: str,
+        sub_base: str,
+        motoboy_id: Optional[int] = None,
+        query: str = "",
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+        hints: Optional[dict] = None,
+        session_token: Optional[str] = None,
+    ) -> Optional[dict]:
+        from address_providers.google_places_provider import is_google_places_enabled, get_google_places_api_key
+
+        if not is_google_places_enabled() or not get_google_places_api_key():
+            return None
+
+        client = GooglePlacesClient()
+        hit = client.get_place_details(place_id, session_token=session_token)
+        if not hit:
+            log_address_event(
+                db,
+                "google_places_details_failed",
+                sub_base,
+                motoboy_id,
+                query or place_id,
+                {"place_id": place_id[:32]},
+            )
+            return None
+
+        sub_cities, sub_bairros = get_sub_base_stats(db, sub_base)
+        mot_cities, mot_bairros = get_motoboy_stats(db, motoboy_id) if motoboy_id else ({}, {})
+        ctx_base = build_rank_context(
+            query or hit.rua,
+            hints=hints,
+            gps_lat=latitude,
+            gps_lon=longitude,
+            sub_base_city_weights=sub_cities,
+            sub_base_bairro_weights=sub_bairros,
+            motoboy_city_weights=mot_cities,
+            motoboy_bairro_weights=mot_bairros,
+        )
+        score, confidence, dist = score_hit(hit, ctx_base)
+        suggestion = _hit_to_dict(hit, score, confidence, dist, known_qtd=0)
+        suggestion["place_id"] = place_id
+        suggestion["main_text"] = hit.rua
+        secondary_parts = [p for p in [hit.bairro, hit.cidade, hit.estado] if p]
+        suggestion["secondary_text"] = ", ".join(secondary_parts)
+        suggestion["requires_place_details"] = False
+        if dist < 9000:
+            suggestion["distance_meters"] = int(dist * 1000)
+
+        set_cached(db, sub_base, query or hit.rua, latitude, longitude, [suggestion])
+        log_address_event(
+            db,
+            "google_places_details_success",
+            sub_base,
+            motoboy_id,
+            query or hit.rua,
+                {
+                    "google_places_called": True,
+                    "google_places_reason": "place_details",
+                    "google_places_results_count": 1,
+                    "google_places_selected": True,
+                    "google_places_cost_guard_hit": False,
+                    "place_id": place_id[:32],
+                },
+            )
+        return suggestion

@@ -143,5 +143,15 @@ class TestHaversine(unittest.TestCase):
         self.assertAlmostEqual(haversine_km(-23.51, -46.87, -23.51, -46.87), 0.0, places=2)
 
 
+class TestGooglePlacesRanking(unittest.TestCase):
+    def test_google_places_bonus(self):
+        ctx = build_rank_context("Av. Sebastião Davino dos Reis 1015", gps_lat=-23.51, gps_lon=-46.87)
+        google_hit = _hit(source="google_places", cidade="Sorocaba", estado="SP")
+        other_hit = _hit(source="geoapify", cidade="Sorocaba", estado="SP")
+        score_g, _, _ = score_hit(google_hit, ctx)
+        score_o, _, _ = score_hit(other_hit, ctx)
+        self.assertGreater(score_g, score_o)
+
+
 if __name__ == "__main__":
     unittest.main()

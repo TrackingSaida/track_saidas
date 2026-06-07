@@ -110,6 +110,9 @@ def score_hit(hit: RawAddressHit, ctx: RankContext) -> tuple[int, float, float]:
     if ctx.known_qtd > 0:
         score += min(30, 10 + int(math.log1p(ctx.known_qtd) * 8))
 
+    if hit.source == "google_places":
+        score += 10
+
     score += _recurrence_bonus(ctx.sub_base_city_weights, hit.cidade, 20)
     score += _recurrence_bonus(ctx.sub_base_bairro_weights, hit.bairro, 20)
     score += _recurrence_bonus(ctx.motoboy_city_weights, hit.cidade, 25)

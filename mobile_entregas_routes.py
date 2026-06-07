@@ -219,6 +219,9 @@ class EnderecoSugestoesBody(BaseModel):
     longitude: Optional[float] = None
     hints: Optional[EnderecoSugestoesHints] = None
     limit: int = Field(default=8, ge=1, le=15)
+    session_token: Optional[str] = None
+    allow_google_fallback: bool = False
+    google_fallback_reason: Optional[str] = None  # user_requested | timeout | auto | no_results
 
 
 class EnderecoSugestaoOut(BaseModel):
@@ -226,8 +229,8 @@ class EnderecoSugestaoOut(BaseModel):
     rua: str
     numero: str = ""
     bairro: str = ""
-    cidade: str
-    estado: str
+    cidade: str = ""
+    estado: str = ""
     cep: str = ""
     latitude: float
     longitude: float
@@ -235,13 +238,32 @@ class EnderecoSugestaoOut(BaseModel):
     confidence: float = 0.0
     source: str
     distance_km: Optional[float] = None
+    distance_meters: Optional[int] = None
     badge: Optional[str] = None
     already_used: bool = False
+    main_text: Optional[str] = None
+    secondary_text: Optional[str] = None
+    place_id: Optional[str] = None
+    requires_place_details: bool = False
 
 
 class EnderecoSugestoesResponse(BaseModel):
     suggestions: List[EnderecoSugestaoOut]
     did_you_mean: Optional[dict] = None
+    used_google: bool = False
+
+
+class PlaceDetailsBody(BaseModel):
+    place_id: str = Field(min_length=1)
+    session_token: Optional[str] = None
+    query: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    hints: Optional[EnderecoSugestoesHints] = None
+
+
+class PlaceDetailsResponse(BaseModel):
+    suggestion: Optional[EnderecoSugestaoOut] = None
 
 
 class IniciarRotaBody(BaseModel):
@@ -1475,9 +1497,42 @@ def buscar_sugestoes_endereco(
         longitude=body.longitude,
         hints=hints,
         limit=body.limit,
+        session_token=body.session_token,
     )
     suggestions = [EnderecoSugestaoOut(**s) for s in result.get("suggestions", [])]
-    return EnderecoSugestoesResponse(suggestions=suggestions, did_you_mean=result.get("did_you_mean"))
+    return EnderecoSugestoesResponse(
+        suggestions=suggestions,
+        did_you_mean=result.get("did_you_mean"),
+        used_google=bool(result.get("used_google")),
+    )
+
+
+# ============================================================
+# POST /mobile/enderecos/place-details
+# ============================================================
+@router.post("/enderecos/place-details", response_model=PlaceDetailsResponse)
+def resolver_place_details(
+    body: PlaceDetailsBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from smart_address_search import SmartAddressSearch
+
+    hints = body.hints.model_dump() if body.hints else {}
+    suggestion = SmartAddressSearch().resolve_place_details(
+        db=db,
+        place_id=body.place_id,
+        sub_base=user.sub_base or "",
+        motoboy_id=user.motoboy_id,
+        query=body.query or "",
+        latitude=body.latitude,
+        longitude=body.longitude,
+        hints=hints,
+        session_token=body.session_token,
+    )
+    if not suggestion:
+        return PlaceDetailsResponse(suggestion=None)
+    return PlaceDetailsResponse(suggestion=EnderecoSugestaoOut(**suggestion))
 
 
 # ============================================================
@@ -1494,7 +1549,7 @@ def atualizar_endereco(
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     detail = _get_detail_for_saida(db, id_saida)
     origem = (body.origem or "manual").strip().lower()
-    if origem not in ("manual", "ocr", "voz", "suggestion", "autocomplete", "mapa"):
+    if origem not in ("manual", "ocr", "voz", "suggestion", "autocomplete", "mapa", "google_places"):
         origem = "manual"
     parts = [body.rua, body.numero, body.complemento, body.bairro, body.cidade, body.estado, body.cep]
     endereco_formatado = ", ".join(p for p in parts if p)
