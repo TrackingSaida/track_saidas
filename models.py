@@ -580,7 +580,8 @@ class SaidaDetail(Base):
     latitude = Column(Numeric(12, 8), nullable=True)
     longitude = Column(Numeric(12, 8), nullable=True)
     endereco_formatado = Column(Text, nullable=True)
-    endereco_origem = Column(Text, nullable=True)  # manual | ocr | voz
+    endereco_origem = Column(Text, nullable=True)  # manual | ocr | voz | suggestion | mapa | google_places
+    coord_precision = Column(Text, nullable=True)  # rooftop | street | approx
 
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 

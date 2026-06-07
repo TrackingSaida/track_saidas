@@ -23,8 +23,8 @@ from db import get_db
 from db_utils import db_rollback_safe
 from auth import get_current_user
 from geocode_utils import (
-    geocode_address_any,
     geocode_address_with_fallbacks,
+    haversine_m,
     otimizar_ordem_entregas,
     RoutePoint,
     StartPoint,
@@ -125,7 +125,8 @@ class EntregaListItem(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     endereco_formatado: Optional[str] = None
-    endereco_origem: Optional[str] = None  # manual | ocr | voz
+    endereco_origem: Optional[str] = None  # manual | ocr | voz | suggestion | autocomplete | mapa | google_places
+    coord_precision: Optional[str] = None  # rooftop | street | approx
     possui_endereco: bool = False
     tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
     tem_comprovante: bool = False
@@ -202,7 +203,8 @@ class EnderecoBody(BaseModel):
     cep: str = Field(min_length=8)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    origem: str = "manual"  # manual | ocr | voz | suggestion | autocomplete | mapa
+    origem: str = "manual"  # manual | ocr | voz | suggestion | autocomplete | mapa | google_places
+    coord_precision: Optional[str] = None  # rooftop | street | approx
 
 
 class EnderecoSugestoesHints(BaseModel):
@@ -471,6 +473,7 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "longitude": lon,
         "endereco_formatado": (detail.endereco_formatado or "").strip() or None if detail else None,
         "endereco_origem": (detail.endereco_origem or "").strip() or None if detail else None,
+        "coord_precision": (detail.coord_precision or "").strip() or None if detail else None,
         "possui_endereco": _possui_endereco(detail),
         "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
         "tem_comprovante": tem_comprovante,
@@ -1546,6 +1549,10 @@ def resolver_place_details(
 # ============================================================
 # PUT /mobile/entrega/{id_saida}/endereco
 # ============================================================
+SUGGESTION_ORIGINS = frozenset({"suggestion", "autocomplete", "google_places"})
+REVALIDATE_COORDS_DISTANCE_M = 100.0
+
+
 @router.put("/entrega/{id_saida}/endereco", response_model=EntregaListItem)
 def atualizar_endereco(
     id_saida: int,
@@ -1584,18 +1591,12 @@ def atualizar_endereco(
     lon = body.longitude
     latlon_from_client = _valid_client_coords(lat, lon)
     geocode_called = False
+    coord_precision = (body.coord_precision or "").strip().lower() or None
+    if coord_precision not in ("rooftop", "street", "approx"):
+        coord_precision = None
 
-    if latlon_from_client:
-        lat = float(lat)
-        lon = float(lon)
-        log.info(
-            "endereco_save latlon_from_client=true origem=%s id_saida=%s geocode_called=false",
-            origem,
-            id_saida,
-        )
-    elif endereco_formatado.strip():
-        geocode_called = True
-        coords = geocode_address_with_fallbacks(
+    def _server_geocode() -> Optional[Tuple[float, float, str]]:
+        return geocode_address_with_fallbacks(
             rua=body.rua,
             numero=body.numero,
             complemento=body.complemento,
@@ -1606,14 +1607,52 @@ def atualizar_endereco(
             endereco_formatado=endereco_formatado,
             db=db,
         )
-        if coords:
-            lat, lon = coords
+
+    if latlon_from_client:
+        lat = float(lat)
+        lon = float(lon)
+        if origem in SUGGESTION_ORIGINS:
+            server = _server_geocode()
+            if server:
+                s_lat, s_lon, s_prec = server
+                dist_m = haversine_m(lat, lon, s_lat, s_lon)
+                if dist_m > REVALIDATE_COORDS_DISTANCE_M:
+                    lat, lon = s_lat, s_lon
+                    coord_precision = s_prec
+                    geocode_called = True
+                    log.info(
+                        "endereco_save revalidated suggestion coords dist_m=%.0f id_saida=%s",
+                        dist_m,
+                        id_saida,
+                    )
+                elif coord_precision is None:
+                    coord_precision = s_prec if s_prec != "approx" else "street"
+        if coord_precision is None:
+            if origem in ("mapa", "google_places"):
+                coord_precision = "rooftop"
+            elif origem in ("suggestion", "autocomplete"):
+                coord_precision = "street"
+            else:
+                coord_precision = "approx"
+        log.info(
+            "endereco_save latlon_from_client=true origem=%s id_saida=%s geocode_called=%s precision=%s",
+            origem,
+            id_saida,
+            geocode_called,
+            coord_precision,
+        )
+    elif endereco_formatado.strip():
+        geocode_called = True
+        server = _server_geocode()
+        if server:
+            lat, lon, coord_precision = server
             log.info(
-                "endereco_save latlon_from_client=false origem=%s id_saida=%s geocode_called=true lat=%s lon=%s",
+                "endereco_save latlon_from_client=false origem=%s id_saida=%s geocode_called=true lat=%s lon=%s precision=%s",
                 origem,
                 id_saida,
                 lat,
                 lon,
+                coord_precision,
             )
         else:
             log.warning(
@@ -1653,6 +1692,7 @@ def atualizar_endereco(
         detail.dest_cep = body.cep.strip()
         detail.endereco_formatado = endereco_formatado
         detail.endereco_origem = origem
+        detail.coord_precision = coord_precision
         if lat is not None:
             detail.latitude = lat
         if lon is not None:
@@ -1673,6 +1713,7 @@ def atualizar_endereco(
             dest_cep=body.cep.strip(),
             endereco_formatado=endereco_formatado,
             endereco_origem=origem,
+            coord_precision=coord_precision,
             latitude=lat,
             longitude=lon,
         )

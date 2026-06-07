@@ -21,11 +21,49 @@ from geocode_cache import get_cached, set_cached
 logger = logging.getLogger(__name__)
 
 
-def geocode_address(address: str) -> Optional[Tuple[float, float]]:
+def _infer_nominatim_precision(
+    first: dict,
+    expected_numero: Optional[str] = None,
+) -> str:
+    addr = first.get("address") or {}
+    house = str(addr.get("house_number") or "").strip()
+    exp_num = normalize_address_text(expected_numero or "")
+    house_norm = normalize_address_text(house)
+
+    if expected_numero and expected_numero.strip():
+        if house and (
+            house_norm == exp_num
+            or exp_num in house_norm
+            or house_norm in exp_num
+        ):
+            return "rooftop"
+        if house:
+            return "street"
+        logger.info(
+            "Geocoding (OSM): sem house_number para numero esperado %s",
+            expected_numero,
+        )
+        return "approx"
+
+    if house:
+        return "rooftop"
+
+    typ = str(first.get("type") or "").lower()
+    if typ in ("house", "building", "residential"):
+        return "rooftop"
+    if typ in ("road", "street", "pedestrian"):
+        return "street"
+    return "approx"
+
+
+def geocode_address(
+    address: str,
+    expected_numero: Optional[str] = None,
+) -> Optional[Tuple[float, float, str]]:
     """
     Geocoding via Nominatim (OpenStreetMap).
 
-    Mantida como fallback quando o provedor externo falhar ou não estiver configurado.
+    Retorna (lat, lon, precision) com precision em rooftop|street|approx.
     """
     if not (address or "").strip():
         return None
@@ -35,7 +73,7 @@ def geocode_address(address: str) -> Optional[Tuple[float, float]]:
     try:
         r = requests.get(
             url,
-            params={"q": query, "format": "json", "limit": 1},
+            params={"q": query, "format": "json", "limit": 1, "addressdetails": 1},
             headers={"User-Agent": "TrackSaidasApp/1.0 (https://github.com/track-saidas; contato@track-saidas.com)"},
             timeout=10,
         )
@@ -48,15 +86,88 @@ def geocode_address(address: str) -> Optional[Tuple[float, float]]:
         lat = first.get("lat") or first.get("latitude")
         lon = first.get("lon") or first.get("longitude")
         if lat is not None and lon is not None:
-            logger.info("Geocoding (OSM) ok: %s -> %s, %s", query[:50], lat, lon)
-            return (float(lat), float(lon))
+            precision = _infer_nominatim_precision(first, expected_numero)
+            logger.info(
+                "Geocoding (OSM) ok: %s -> %s, %s precision=%s",
+                query[:50],
+                lat,
+                lon,
+                precision,
+            )
+            return (float(lat), float(lon), precision)
         return None
     except Exception as e:
         logger.warning("Geocoding (OSM) falhou para %s: %s", query[:80], e)
         return None
 
 
-def _geocode_with_geoapify(address: str, api_key: str) -> Optional[Tuple[float, float]]:
+def _geocode_with_google(
+    address: str,
+    api_key: str,
+    expected_numero: Optional[str] = None,
+) -> Optional[Tuple[float, float, str]]:
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    try:
+        r = requests.get(
+            url,
+            params={"address": address, "key": api_key, "region": "br"},
+            headers={"User-Agent": "TrackSaidasBackend/1.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict) or data.get("status") != "OK":
+            logger.warning(
+                "Geocoding (google): status=%s para %s",
+                data.get("status") if isinstance(data, dict) else None,
+                address[:80],
+            )
+            return None
+        results = data.get("results") or []
+        if not results:
+            return None
+        first = results[0]
+        location = (first.get("geometry") or {}).get("location") or {}
+        lat = location.get("lat")
+        lon = location.get("lng")
+        if lat is None or lon is None:
+            return None
+        location_type = str((first.get("geometry") or {}).get("location_type") or "").upper()
+        precision_map = {
+            "ROOFTOP": "rooftop",
+            "RANGE_INTERPOLATED": "rooftop",
+            "GEOMETRIC_CENTER": "street",
+            "APPROXIMATE": "approx",
+        }
+        precision = precision_map.get(location_type, "approx")
+        if expected_numero and expected_numero.strip() and precision != "approx":
+            exp_digits = re.sub(r"\D", "", expected_numero)
+            formatted = str(first.get("formatted_address") or "")
+            fmt_digits = re.sub(r"\D", "", formatted)
+            if exp_digits and exp_digits not in fmt_digits:
+                precision = "approx"
+        logger.info(
+            "Geocoding (google) ok: %s -> %s, %s precision=%s",
+            address[:50],
+            lat,
+            lon,
+            precision,
+        )
+        return float(lat), float(lon), precision
+    except Exception as e:
+        logger.warning("Geocoding (google) falhou para %s: %s", address[:80], e)
+        return None
+
+
+def _external_provider_precision(expected_numero: Optional[str]) -> str:
+    return "street" if (expected_numero or "").strip() else "approx"
+
+
+def _geocode_with_geoapify(
+    address: str,
+    api_key: str,
+    expected_numero: Optional[str] = None,
+) -> Optional[Tuple[float, float, str]]:
     url = "https://api.geoapify.com/v1/geocode/search"
     try:
         r = requests.get(
@@ -75,15 +186,20 @@ def _geocode_with_geoapify(address: str, api_key: str) -> Optional[Tuple[float, 
         lat = first.get("lat") or first.get("latitude")
         lon = first.get("lon") or first.get("longitude")
         if lat is not None and lon is not None:
-            logger.info("Geocoding (geoapify) ok: %s -> %s, %s", address[:50], lat, lon)
-            return float(lat), float(lon)
+            precision = _external_provider_precision(expected_numero)
+            logger.info("Geocoding (geoapify) ok: %s -> %s, %s precision=%s", address[:50], lat, lon, precision)
+            return float(lat), float(lon), precision
         return None
     except Exception as e:
         logger.warning("Geocoding (geoapify) falhou para %s: %s", address[:80], e)
         return None
 
 
-def _geocode_with_locationiq(address: str, api_key: str) -> Optional[Tuple[float, float]]:
+def _geocode_with_locationiq(
+    address: str,
+    api_key: str,
+    expected_numero: Optional[str] = None,
+) -> Optional[Tuple[float, float, str]]:
     url = "https://us1.locationiq.com/v1/search.php"
     try:
         r = requests.get(
@@ -101,15 +217,20 @@ def _geocode_with_locationiq(address: str, api_key: str) -> Optional[Tuple[float
         lat = first.get("lat") or first.get("latitude")
         lon = first.get("lon") or first.get("longitude")
         if lat is not None and lon is not None:
-            logger.info("Geocoding (locationiq) ok: %s -> %s, %s", address[:50], lat, lon)
-            return float(lat), float(lon)
+            precision = _external_provider_precision(expected_numero)
+            logger.info("Geocoding (locationiq) ok: %s -> %s, %s precision=%s", address[:50], lat, lon, precision)
+            return float(lat), float(lon), precision
         return None
     except Exception as e:
         logger.warning("Geocoding (locationiq) falhou para %s: %s", address[:80], e)
         return None
 
 
-def _geocode_with_maps_co(address: str, api_key: str) -> Optional[Tuple[float, float]]:
+def _geocode_with_maps_co(
+    address: str,
+    api_key: str,
+    expected_numero: Optional[str] = None,
+) -> Optional[Tuple[float, float, str]]:
     """Geocoding via geocode.maps.co (OSM/Nominatim, plano gratuito com chave)."""
     url = "https://geocode.maps.co/search"
     try:
@@ -128,8 +249,9 @@ def _geocode_with_maps_co(address: str, api_key: str) -> Optional[Tuple[float, f
         lat = first.get("lat") or first.get("latitude")
         lon = first.get("lon") or first.get("longitude")
         if lat is not None and lon is not None:
-            logger.info("Geocoding (maps.co) ok: %s -> %s, %s", address[:50], lat, lon)
-            return float(lat), float(lon)
+            precision = _external_provider_precision(expected_numero)
+            logger.info("Geocoding (maps.co) ok: %s -> %s, %s precision=%s", address[:50], lat, lon, precision)
+            return float(lat), float(lon), precision
         return None
     except Exception as e:
         logger.warning("Geocoding (maps.co) falhou para %s: %s", address[:80], e)
@@ -167,6 +289,7 @@ def build_geocode_queries(
     cidade_n = (cidade or "").strip()
     estado_n = (estado or "").strip()
     cep_n = normalize_cep(cep)
+    comp_n = (complemento or "").strip()
     fmt = (endereco_formatado or "").strip()
 
     queries: List[str] = []
@@ -189,6 +312,8 @@ def build_geocode_queries(
         _add(cep_n, f"{rua_n} {num_n}", f"{cidade_n} {estado_n}".strip())
     if rua_n and num_n:
         _add(rua_n, num_n, bairro_n, f"{cidade_n} {estado_n}".strip(), cep_n or None)
+    if rua_n and num_n and comp_n:
+        _add(rua_n, num_n, comp_n, bairro_n, f"{cidade_n} {estado_n}".strip(), cep_n or None)
     if fmt:
         _add(fmt)
     if rua_n and bairro_n and cidade_n:
@@ -206,7 +331,8 @@ def build_geocode_queries(
 def geocode_address_any(
     address: str,
     db: Optional[Any] = None,
-) -> Optional[Tuple[float, float]]:
+    expected_numero: Optional[str] = None,
+) -> Optional[Tuple[float, float, str]]:
     """
     Wrapper de alto nível: tenta provedor externo configurável e faz fallback para OSM.
 
@@ -220,7 +346,24 @@ def geocode_address_any(
 
     cached = get_cached(db, addr)
     if cached:
-        return cached[0], cached[1]
+        precision = _external_provider_precision(expected_numero)
+        return cached[0], cached[1], precision
+
+    google_enabled = os.getenv("GOOGLE_GEOCODING_ENABLED", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    google_key = (
+        os.getenv("GOOGLE_GEOCODING_API_KEY", "").strip()
+        or os.getenv("GEOCODER_API_KEY", "").strip()
+    )
+    if google_enabled and google_key:
+        google_coords = _geocode_with_google(addr, google_key, expected_numero)
+        if google_coords:
+            set_cached(db, addr, google_coords[0], google_coords[1], "google")
+            logger.info("geocode_attempt query=%s provider=google success=true", addr[:80])
+            return google_coords
 
     provider = os.getenv("GEOCODER_PROVIDER", "geoapify").strip().lower()
     provider_used: Optional[str] = None
@@ -229,21 +372,21 @@ def geocode_address_any(
     # 1) Tenta provedor externo, se configurado
     if api_key:
         if provider in ("geoapify", "geo"):
-            coords = _geocode_with_geoapify(addr, api_key)
+            coords = _geocode_with_geoapify(addr, api_key, expected_numero)
             if coords:
                 provider_used = "geoapify"
                 set_cached(db, addr, coords[0], coords[1], provider_used)
                 logger.info("geocode_attempt query=%s provider=%s success=true", addr[:80], provider_used)
                 return coords
         elif provider in ("locationiq", "lq"):
-            coords = _geocode_with_locationiq(addr, api_key)
+            coords = _geocode_with_locationiq(addr, api_key, expected_numero)
             if coords:
                 provider_used = "locationiq"
                 set_cached(db, addr, coords[0], coords[1], provider_used)
                 logger.info("geocode_attempt query=%s provider=%s success=true", addr[:80], provider_used)
                 return coords
         elif provider in ("geocode_maps_co", "maps_co", "mapsco"):
-            coords = _geocode_with_maps_co(addr, api_key)
+            coords = _geocode_with_maps_co(addr, api_key, expected_numero)
             if coords:
                 provider_used = "maps_co"
                 set_cached(db, addr, coords[0], coords[1], provider_used)
@@ -253,7 +396,7 @@ def geocode_address_any(
             logger.warning("GEOCODER_PROVIDER '%s' desconhecido; usando apenas OSM", provider)
 
     # 2) Fallback para Nominatim/OpenStreetMap
-    coords = geocode_address(addr)
+    coords = geocode_address(addr, expected_numero=expected_numero)
     if coords:
         set_cached(db, addr, coords[0], coords[1], "nominatim")
         logger.info("geocode_attempt query=%s provider=nominatim success=true", addr[:80])
@@ -272,9 +415,10 @@ def geocode_address_with_fallbacks(
     cep: Optional[str] = None,
     endereco_formatado: Optional[str] = None,
     db: Optional[Any] = None,
-) -> Optional[Tuple[float, float]]:
+) -> Optional[Tuple[float, float, str]]:
     """
     Tenta geocoding com queries priorizadas (CEP+número primeiro).
+    Retorna (lat, lon, precision).
     """
     queries = build_geocode_queries(
         rua=rua,
@@ -287,9 +431,9 @@ def geocode_address_with_fallbacks(
         endereco_formatado=endereco_formatado,
     )
     for query in queries:
-        coords = geocode_address_any(query, db=db)
-        if coords:
-            return coords
+        result = geocode_address_any(query, db=db, expected_numero=numero)
+        if result:
+            return result
     return None
 
 
