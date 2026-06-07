@@ -41,14 +41,16 @@ class TestShouldAutoInvokeGoogle(unittest.TestCase):
         ok, reason, guard = should_auto_invoke_google_places([], "Rua X 10")
         self.assertFalse(ok)
         self.assertFalse(guard)
+        self.assertEqual(reason, "google_disabled")
 
     @patch.dict(
         os.environ,
         {"GOOGLE_PLACES_ENABLED": "true", "GOOGLE_PLACES_API_KEY": "key", "GOOGLE_PLACES_AUTO_FALLBACK": "false"},
     )
     def test_auto_fallback_flag_off(self):
-        ok, _, _ = should_auto_invoke_google_places([], "Rua X 10")
+        ok, reason, _ = should_auto_invoke_google_places([], "Rua X 10")
         self.assertFalse(ok)
+        self.assertEqual(reason, "auto_fallback_off")
 
     @patch.dict(
         os.environ,
@@ -127,10 +129,12 @@ class TestGooglePlacesClient(unittest.TestCase):
             ),
         )
         client = GooglePlacesClient()
-        results = client.autocomplete("Av. Sebastião Davino dos Reis 1015", session_token="sess-1")
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].place_id, "ChIJabc123")
-        self.assertEqual(results[0].distance_meters, 1200)
+        outcome = client.autocomplete("Av. Sebastião Davino dos Reis 1015", session_token="sess-1")
+        self.assertEqual(len(outcome.predictions), 1)
+        self.assertEqual(outcome.http_status, 200)
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.predictions[0].place_id, "ChIJabc123")
+        self.assertEqual(outcome.predictions[0].distance_meters, 1200)
         mock_post.assert_called_once()
         call_kwargs = mock_post.call_args
         body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")

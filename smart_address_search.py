@@ -12,6 +12,14 @@ from sqlalchemy.orm import Session
 from address_normalizer import normalize_address_key, normalizeAddressQuery, normalize_cep
 from address_providers.base import AddressProvider, RawAddressHit
 from address_providers.geoapify_provider import GeoapifyProvider
+from address_search_logging import (
+    AddressSearchReport,
+    GooglePlacesSearchStats,
+    ProviderSearchStats,
+    best_score_by_source,
+    build_provider_stats_list,
+    emit_address_search_log,
+)
 from address_providers.google_places_provider import (
     GooglePlacesClient,
     _record_session_google_call,
@@ -175,12 +183,12 @@ def _run_provider(
     latitude: Optional[float],
     longitude: Optional[float],
     limit: int,
-) -> List[RawAddressHit]:
+) -> Tuple[str, List[RawAddressHit], Optional[str]]:
     try:
-        return provider.search(search_query, latitude, longitude, limit=limit)
+        return provider.name, provider.search(search_query, latitude, longitude, limit=limit), None
     except Exception as e:
         logger.warning("provider %s failed: %s", provider.name, e)
-        return []
+        return provider.name, [], str(e)
 
 
 def _fetch_provider_hits(
@@ -189,16 +197,25 @@ def _fetch_provider_hits(
     latitude: Optional[float],
     longitude: Optional[float],
     limit: int,
-) -> Tuple[List[RawAddressHit], bool]:
+) -> Tuple[List[RawAddressHit], bool, Dict[str, ProviderSearchStats]]:
     if not providers:
-        return [], False
+        return [], False, {}
 
     hits: List[RawAddressHit] = []
     timeout = PROVIDER_TIMEOUT_SEC
     timed_out = False
+    per_provider: Dict[str, ProviderSearchStats] = {
+        p.name: ProviderSearchStats(provider=p.name) for p in providers
+    }
 
     if len(providers) == 1:
-        return _run_provider(providers[0], search_query, latitude, longitude, limit), False
+        name, provider_hits, error = _run_provider(
+            providers[0], search_query, latitude, longitude, limit,
+        )
+        per_provider[name] = ProviderSearchStats(
+            provider=name, results=len(provider_hits), error=error,
+        )
+        return provider_hits, False, per_provider
 
     with ThreadPoolExecutor(max_workers=len(providers)) as pool:
         futures = {
@@ -207,17 +224,37 @@ def _fetch_provider_hits(
         }
         try:
             for future in as_completed(futures, timeout=timeout):
-                hits.extend(future.result())
+                name, provider_hits, error = future.result()
+                per_provider[name] = ProviderSearchStats(
+                    provider=name, results=len(provider_hits), error=error,
+                )
+                hits.extend(provider_hits)
         except Exception:
             timed_out = True
-            for future in futures:
+            for future, provider in futures.items():
                 if future.done():
                     try:
-                        hits.extend(future.result())
-                    except Exception:
-                        pass
+                        name, provider_hits, error = future.result()
+                        per_provider[name] = ProviderSearchStats(
+                            provider=name, results=len(provider_hits), error=error,
+                        )
+                        hits.extend(provider_hits)
+                    except Exception as e:
+                        per_provider[provider.name] = ProviderSearchStats(
+                            provider=provider.name, error=str(e),
+                        )
+                elif per_provider[provider.name].error is None:
+                    per_provider[provider.name] = ProviderSearchStats(
+                        provider=provider.name, error="timeout",
+                    )
 
-    return hits, timed_out
+    return hits, timed_out, per_provider
+
+
+def _final_report_fields(suggestions: List[dict]) -> Tuple[Optional[str], int]:
+    if not suggestions:
+        return None, 0
+    return suggestions[0].get("source"), int(suggestions[0].get("score") or 0)
 
 
 class SmartAddressSearch:
@@ -248,6 +285,16 @@ class SmartAddressSearch:
         search_query = normalized_query or query.strip()
         if len(search_query) < 3:
             log_address_event(db, "address_search_no_results", sub_base, motoboy_id, query)
+            emit_address_search_log(
+                AddressSearchReport(
+                    query=query.strip(),
+                    latitude=latitude,
+                    longitude=longitude,
+                    google=GooglePlacesSearchStats(called=False, reason="query_too_short"),
+                    final_results=0,
+                    best_score=0,
+                )
+            )
             return {"suggestions": [], "did_you_mean": None, "used_google": False}
 
         log_address_event(db, "address_search_started", sub_base, motoboy_id, search_query)
@@ -256,7 +303,20 @@ class SmartAddressSearch:
         if cached is not None:
             log_address_event(db, "address_search_success", sub_base, motoboy_id, search_query, {"cached": True})
             dym = build_did_you_mean(db, sub_base, search_query, hints=hints)
-            return {"suggestions": cached[:limit], "did_you_mean": dym, "used_google": False}
+            cached_slice = cached[:limit]
+            final_provider, best_score = _final_report_fields(cached_slice)
+            emit_address_search_log(
+                AddressSearchReport(
+                    query=search_query,
+                    latitude=latitude,
+                    longitude=longitude,
+                    cached=True,
+                    final_provider=final_provider or "cache",
+                    final_results=len(cached_slice),
+                    best_score=best_score,
+                )
+            )
+            return {"suggestions": cached_slice, "did_you_mean": dym, "used_google": False}
 
         sub_cities, sub_bairros = get_sub_base_stats(db, sub_base)
         mot_cities, mot_bairros = get_motoboy_stats(db, motoboy_id) if motoboy_id else ({}, {})
@@ -288,8 +348,9 @@ class SmartAddressSearch:
                     break
 
         providers_timed_out = False
+        per_provider_stats: Dict[str, ProviderSearchStats] = {}
         if not skip_providers:
-            provider_hits, providers_timed_out = _fetch_provider_hits(
+            provider_hits, providers_timed_out, per_provider_stats = _fetch_provider_hits(
                 self.providers,
                 search_query,
                 latitude,
@@ -330,6 +391,7 @@ class SmartAddressSearch:
 
         suggestions = scored[:limit]
         used_google = False
+        pre_google_best_by_source = best_score_by_source(scored)
 
         invoke_google, google_reason, cost_guard_hit = should_auto_invoke_google_places(
             suggestions,
@@ -337,6 +399,11 @@ class SmartAddressSearch:
             hints=hints,
             providers_timed_out=providers_timed_out,
             session_token=session_token,
+        )
+        google_stats = GooglePlacesSearchStats(
+            called=False,
+            reason=google_reason,
+            cost_guard_hit=cost_guard_hit,
         )
         if cost_guard_hit:
             log_address_event(
@@ -354,26 +421,29 @@ class SmartAddressSearch:
         elif invoke_google:
             _record_session_google_call(session_token)
             client = GooglePlacesClient()
-            predictions = client.autocomplete(
+            outcome = client.autocomplete(
                 search_query,
                 latitude=latitude,
                 longitude=longitude,
                 session_token=session_token,
                 limit=limit,
             )
+            google_stats = GooglePlacesSearchStats(
+                called=True,
+                reason=google_reason,
+                http_status=outcome.http_status,
+                results=len(outcome.predictions),
+                first_result=outcome.first_result,
+                error=outcome.error,
+            )
             google_suggestions = []
-            for pred in predictions:
+            for pred in outcome.predictions:
                 g_score = prediction_to_provisional_score(pred, search_query)
                 google_suggestions.append(_google_prediction_to_dict(pred, g_score, search_query))
             merged = _dedupe_hits(suggestions + google_suggestions)
             merged.sort(key=lambda x: (-x["score"], x.get("distance_km") or 9999))
             suggestions = merged[:limit]
             used_google = len(google_suggestions) > 0
-            logger.info(
-                "google_places_called=true reason=%s results=%s cost_guard=false",
-                google_reason,
-                len(google_suggestions),
-            )
             log_address_event(
                 db,
                 "google_places_autocomplete",
@@ -386,6 +456,8 @@ class SmartAddressSearch:
                     "google_places_results_count": len(google_suggestions),
                     "google_places_selected": False,
                     "google_places_cost_guard_hit": False,
+                    "google_places_http_status": outcome.http_status,
+                    "google_places_error": outcome.error,
                 },
             )
 
@@ -409,6 +481,36 @@ class SmartAddressSearch:
             did_you_mean = build_did_you_mean_from_below_threshold(
                 below_threshold, search_query, hints, latitude, longitude,
             )
+
+        raw_counts: Dict[str, int] = {"known": len(known_results)}
+        for name, stats in per_provider_stats.items():
+            raw_counts[name] = stats.results
+        provider_errors = {
+            name: stats.error for name, stats in per_provider_stats.items() if stats.error
+        }
+        skipped_external = {p.name for p in self.providers} if skip_providers else set()
+        provider_order = ["known"] + [p.name for p in self.providers]
+        final_provider, best_score = _final_report_fields(suggestions)
+        emit_address_search_log(
+            AddressSearchReport(
+                query=search_query,
+                latitude=latitude,
+                longitude=longitude,
+                providers=build_provider_stats_list(
+                    provider_order,
+                    raw_counts,
+                    pre_google_best_by_source,
+                    provider_errors,
+                    skipped=skipped_external,
+                ),
+                google=google_stats,
+                final_provider=final_provider,
+                final_results=len(suggestions),
+                best_score=best_score,
+                providers_timed_out=providers_timed_out,
+                skip_external_providers=skip_providers,
+            )
+        )
 
         return {"suggestions": suggestions, "did_you_mean": did_you_mean, "used_google": used_google}
 

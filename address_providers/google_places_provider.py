@@ -51,6 +51,14 @@ class GooglePlacesPrediction:
 
 
 @dataclass
+class GoogleAutocompleteOutcome:
+    predictions: List[GooglePlacesPrediction]
+    http_status: Optional[int] = None
+    error: Optional[str] = None
+    first_result: Optional[str] = None
+
+
+@dataclass
 class ParsedAddressComponents:
     rua: str = ""
     numero: str = ""
@@ -75,6 +83,27 @@ def _component_short(components: List[dict], type_name: str) -> str:
         if type_name in types:
             return (comp.get("shortText") or comp.get("longText") or comp.get("text") or "").strip()
     return ""
+
+
+def _parse_google_error(response: requests.Response) -> str:
+    try:
+        data = response.json()
+    except Exception:
+        return response.text[:200] if response.text else f"HTTP {response.status_code}"
+
+    err = data.get("error") or {}
+    if isinstance(err, dict):
+        status = (err.get("status") or "").strip()
+        message = (err.get("message") or "").strip()
+        if status and message:
+            return f"{status}: {message}"
+        if status:
+            return status
+        if message:
+            return message
+    if isinstance(data.get("error"), str):
+        return data["error"]
+    return response.text[:200] if response.text else f"HTTP {response.status_code}"
 
 
 def parse_address_components(
@@ -131,9 +160,9 @@ class GooglePlacesClient:
         longitude: Optional[float] = None,
         session_token: Optional[str] = None,
         limit: int = 8,
-    ) -> List[GooglePlacesPrediction]:
+    ) -> GoogleAutocompleteOutcome:
         if not self.api_key or not (query or "").strip():
-            return []
+            return GoogleAutocompleteOutcome([], None, "missing_api_key_or_query", None)
 
         body: Dict[str, Any] = {
             "input": query.strip(),
@@ -164,9 +193,18 @@ class GooglePlacesClient:
             )
             r.raise_for_status()
             data = r.json()
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            error = _parse_google_error(e.response) if e.response is not None else str(e)
+            logger.warning(
+                "GooglePlaces autocomplete HTTP error status=%s error=%s",
+                status,
+                error,
+            )
+            return GoogleAutocompleteOutcome([], status, error, None)
         except Exception as e:
             logger.warning("GooglePlaces autocomplete failed: %s", e)
-            return []
+            return GoogleAutocompleteOutcome([], None, str(e), None)
 
         suggestions = data.get("suggestions") or []
         results: List[GooglePlacesPrediction] = []
@@ -190,7 +228,8 @@ class GooglePlacesClient:
                     distance_meters=distance_meters,
                 )
             )
-        return results
+        first_result = results[0].full_text if results else None
+        return GoogleAutocompleteOutcome(results, 200, None, first_result)
 
     def get_place_details(
         self,
@@ -332,10 +371,12 @@ def should_auto_invoke_google_places(
     Decide se o backend deve chamar Google Places automaticamente.
     Retorna (invoke, reason, cost_guard_hit).
     """
-    if not is_google_places_enabled() or not get_google_places_api_key():
-        return False, "", False
+    if not is_google_places_enabled():
+        return False, "google_disabled", False
+    if not get_google_places_api_key():
+        return False, "google_disabled", False
     if not is_google_places_auto_fallback():
-        return False, "", False
+        return False, "auto_fallback_off", False
 
     if not _session_cost_guard_allows(session_token):
         return False, "session_limit", True
@@ -351,7 +392,7 @@ def should_auto_invoke_google_places(
         if has_street_num:
             return True, "street_number_weak", False
         return True, "low_score", False
-    return False, "", False
+    return False, "score_above_threshold", False
 
 
 class GooglePlacesProvider(AddressProvider):
