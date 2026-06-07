@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from db_utils import db_rollback_safe
 from auth import get_current_user
+from active_route_sync import get_active_route_delivery_ids, sync_active_route_after_delivery_update
 from geocode_utils import (
     geocode_address_with_fallbacks,
     haversine_m,
@@ -186,10 +187,19 @@ class FinalizarLoteErroOut(BaseModel):
     mensagem: str
 
 
+class RotaSyncOut(BaseModel):
+    in_active_route: bool = False
+    rota_finalizada: bool = False
+    rota_id: Optional[str] = None
+    parada_atual: Optional[int] = None
+    ordem: Optional[List[int]] = None
+
+
 class FinalizarLoteResponse(BaseModel):
     finalizados: List[FinalizarLoteItemOut]
     bloqueados: List[FinalizarLoteBloqueadoOut]
     erros: List[FinalizarLoteErroOut]
+    rota_sync: Optional[RotaSyncOut] = None
 
 
 class EnderecoBody(BaseModel):
@@ -625,7 +635,13 @@ def _resumo_rota_motoboy(
     )
 
 
-def _marcacao_response(db: Session, saida: Saida, *, complemento: bool = False) -> dict:
+def _marcacao_response(
+    db: Session,
+    saida: Saida,
+    *,
+    complemento: bool = False,
+    motoboy_id: Optional[int] = None,
+) -> dict:
     hoje = _hoje_operacional()
     data_op = _ctx_data_operacional_saida(db, saida)
     payload = {
@@ -636,6 +652,9 @@ def _marcacao_response(db: Session, saida: Saida, *, complemento: bool = False) 
     }
     if complemento:
         payload["complemento"] = True
+    if motoboy_id is not None:
+        sync = sync_active_route_after_delivery_update(db, motoboy_id, int(saida.id_saida))
+        payload["rota_sync"] = sync
     return payload
 
 
@@ -1862,12 +1881,26 @@ def finalizar_lote(
     ids_unicos = list(dict.fromkeys(int(i) for i in body.ids))
     details_map = _carregar_details_por_saida_ids(db, ids_unicos)
 
+    active_route_ids = get_active_route_delivery_ids(db, user.motoboy_id)
+    active_route_set = set(active_route_ids or [])
+
     finalizados: List[FinalizarLoteItemOut] = []
     bloqueados: List[FinalizarLoteBloqueadoOut] = []
     erros: List[FinalizarLoteErroOut] = []
 
     for id_saida in ids_unicos:
         try:
+            if id_saida in active_route_set:
+                s_preview = db.get(Saida, id_saida)
+                bloqueados.append(
+                    FinalizarLoteBloqueadoOut(
+                        id_saida=id_saida,
+                        codigo=getattr(s_preview, "codigo", None) if s_preview else None,
+                        motivo="Pedido faz parte da rota ativa. Finalize pela rota ou individualmente.",
+                    )
+                )
+                continue
+
             s = db.get(Saida, id_saida)
             bloqueio = _validar_saida_para_finalizacao_lote(
                 s, body.acao, user.motoboy_id, user.sub_base
@@ -1939,7 +1972,20 @@ def finalizar_lote(
             logging.exception("finalizar_lote id_saida=%s", id_saida)
             erros.append(FinalizarLoteErroOut(id_saida=id_saida, mensagem=str(exc)))
 
-    return FinalizarLoteResponse(finalizados=finalizados, bloqueados=bloqueados, erros=erros)
+    rota_sync: Optional[RotaSyncOut] = None
+    if finalizados:
+        sync_raw = sync_active_route_after_delivery_update(
+            db, user.motoboy_id, finalizados[-1].id_saida
+        )
+        if sync_raw.get("in_active_route") or sync_raw.get("rota_finalizada"):
+            rota_sync = RotaSyncOut(**sync_raw)
+
+    return FinalizarLoteResponse(
+        finalizados=finalizados,
+        bloqueados=bloqueados,
+        erros=erros,
+        rota_sync=rota_sync,
+    )
 
 
 # ============================================================
@@ -2035,7 +2081,7 @@ def marcar_entregue(
     )
     db.commit()
     db.refresh(s)
-    return _marcacao_response(db, s)
+    return _marcacao_response(db, s, motoboy_id=user.motoboy_id)
 
 
 # ============================================================
@@ -2099,7 +2145,7 @@ def marcar_ausente(
     )
     db.commit()
     db.refresh(s)
-    return _marcacao_response(db, s)
+    return _marcacao_response(db, s, motoboy_id=user.motoboy_id)
 
 
 # ============================================================
