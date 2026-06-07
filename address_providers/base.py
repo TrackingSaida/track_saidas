@@ -1,9 +1,14 @@
 """Interface de providers de endereço."""
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+
+def provider_http_timeout_sec() -> float:
+    return float(os.getenv("ADDRESS_PROVIDER_TIMEOUT_SEC", "2")) + 1.0
 
 
 @dataclass

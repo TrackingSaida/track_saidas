@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import List, Optional
 
 import requests
 
-from address_providers.base import AddressProvider, RawAddressHit
+from address_providers.base import AddressProvider, RawAddressHit, provider_http_timeout_sec
 from address_normalizer import normalize_cep, normalize_estado_uf
 
 logger = logging.getLogger(__name__)
@@ -43,7 +42,7 @@ class NominatimProvider(AddressProvider):
                 "https://nominatim.openstreetmap.org/search",
                 params=params,
                 headers={"User-Agent": _USER_AGENT},
-                timeout=_HTTP_TIMEOUT_SEC,
+                timeout=provider_http_timeout_sec(),
             )
             r.raise_for_status()
             data = r.json()

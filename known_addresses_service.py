@@ -24,6 +24,7 @@ from address_normalizer import (
     normalizeAddressQuery,
 )
 from address_providers.base import RawAddressHit
+from db_utils import db_rollback_safe
 from models import EnderecoConhecido
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ def search_known(
             .all()
         )
     except Exception as e:
+        db_rollback_safe(db)
         logger.warning("search_known failed: %s", e)
         return []
 

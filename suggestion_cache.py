@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from db_utils import db_rollback_safe
+
 logger = logging.getLogger(__name__)
 
 TTL_DAYS = int(os.getenv("SUGGESTION_CACHE_TTL_DAYS", "7"))
@@ -40,6 +42,7 @@ def _is_table_available(db: Session) -> bool:
         _table_available = True
     except Exception:
         _table_available = False
+        db_rollback_safe(db)
         logger.warning("suggestion_cache: tabela indisponível, usando memória")
     return _table_available
 
@@ -69,6 +72,7 @@ def get_cached(
                 return None
             return json.loads(row.payload_json)
         except Exception as e:
+            db_rollback_safe(db)
             logger.warning("suggestion_cache get db error: %s", e)
     entry = _memory.get(key)
     if not entry:
@@ -110,6 +114,7 @@ def set_cached(
             db.flush()
             return
         except Exception as e:
+            db_rollback_safe(db)
             logger.warning("suggestion_cache set db error: %s", e)
     expires = datetime.now(timezone.utc).timestamp() + TTL_DAYS * 86400
     _memory[key] = (expires, suggestions)

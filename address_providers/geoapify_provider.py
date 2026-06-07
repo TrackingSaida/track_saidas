@@ -7,7 +7,7 @@ from typing import List, Optional
 
 import requests
 
-from address_providers.base import AddressProvider, RawAddressHit
+from address_providers.base import AddressProvider, RawAddressHit, provider_http_timeout_sec
 from address_normalizer import normalize_cep, normalize_estado_uf
 
 logger = logging.getLogger(__name__)
@@ -39,12 +39,11 @@ class GeoapifyProvider(AddressProvider):
         if latitude is not None and longitude is not None:
             params["bias"] = f"proximity:{longitude},{latitude}"
         try:
-            http_timeout = float(os.getenv("ADDRESS_PROVIDER_TIMEOUT_SEC", "2")) + 1.0
             r = requests.get(
                 url,
                 params=params,
                 headers={"User-Agent": "TrackSaidasBackend/1.0"},
-                timeout=http_timeout,
+                timeout=provider_http_timeout_sec(),
             )
             r.raise_for_status()
             data = r.json()

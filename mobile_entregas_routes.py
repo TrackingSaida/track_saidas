@@ -20,6 +20,7 @@ from sqlalchemy import select, func, exists
 from sqlalchemy.orm import Session
 
 from db import get_db
+from db_utils import db_rollback_safe
 from auth import get_current_user
 from geocode_utils import (
     geocode_address_any,
@@ -1488,17 +1489,24 @@ def buscar_sugestoes_endereco(
     from smart_address_search import SmartAddressSearch
 
     hints = body.hints.model_dump() if body.hints else {}
-    result = SmartAddressSearch().search(
-        db=db,
-        query=body.query,
-        sub_base=user.sub_base or "",
-        motoboy_id=user.motoboy_id,
-        latitude=body.latitude,
-        longitude=body.longitude,
-        hints=hints,
-        limit=body.limit,
-        session_token=body.session_token,
-    )
+    try:
+        result = SmartAddressSearch().search(
+            db=db,
+            query=body.query,
+            sub_base=user.sub_base or "",
+            motoboy_id=user.motoboy_id,
+            latitude=body.latitude,
+            longitude=body.longitude,
+            hints=hints,
+            limit=body.limit,
+            session_token=body.session_token,
+        )
+    except Exception:
+        db_rollback_safe(db)
+        logging.getLogger(__name__).exception(
+            "sugestoes_endpoint_degraded sub_base=%s", user.sub_base
+        )
+        result = {"suggestions": [], "did_you_mean": None, "used_google": False}
     suggestions = [EnderecoSugestaoOut(**s) for s in result.get("suggestions", [])]
     return EnderecoSugestoesResponse(
         suggestions=suggestions,

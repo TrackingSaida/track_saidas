@@ -30,6 +30,7 @@ from address_providers.google_places_provider import (
 from address_providers.nominatim_provider import NominatimProvider
 from address_ranker import MIN_SUGGESTION_SCORE, RankContext, build_rank_context, score_hit
 from address_telemetry import log_address_event
+from db_utils import db_rollback_safe
 from known_addresses_service import (
     build_did_you_mean,
     build_did_you_mean_from_below_threshold,
@@ -336,6 +337,7 @@ class SmartAddressSearch:
                 session_token=session_token,
             )
         except Exception as e:
+            db_rollback_safe(db)
             logger.exception("address_search failed query=%s", search_query)
             emit_address_search_log(
                 AddressSearchReport(
@@ -349,7 +351,7 @@ class SmartAddressSearch:
                     ),
                 )
             )
-            raise
+            return {"suggestions": [], "did_you_mean": None, "used_google": False}
 
     def _search_uncached(
         self,
@@ -507,7 +509,11 @@ class SmartAddressSearch:
             )
 
         if suggestions:
-            set_cached(db, sub_base, search_query, latitude, longitude, suggestions)
+            try:
+                set_cached(db, sub_base, search_query, latitude, longitude, suggestions)
+            except Exception as e:
+                db_rollback_safe(db)
+                logger.warning("set_cached failed: %s", e)
             log_address_event(
                 db, "address_search_success", sub_base, motoboy_id, search_query,
                 {
@@ -519,13 +525,18 @@ class SmartAddressSearch:
         else:
             log_address_event(db, "address_search_no_results", sub_base, motoboy_id, search_query)
 
-        did_you_mean = build_did_you_mean(
-            db, sub_base, search_query, hints=hints, known_hits=known_results or None,
-        )
-        if not did_you_mean and not suggestions:
-            did_you_mean = build_did_you_mean_from_below_threshold(
-                below_threshold, search_query, hints, latitude, longitude,
+        did_you_mean = None
+        try:
+            did_you_mean = build_did_you_mean(
+                db, sub_base, search_query, hints=hints, known_hits=known_results or None,
             )
+            if not did_you_mean and not suggestions:
+                did_you_mean = build_did_you_mean_from_below_threshold(
+                    below_threshold, search_query, hints, latitude, longitude,
+                )
+        except Exception as e:
+            db_rollback_safe(db)
+            logger.warning("build_did_you_mean failed: %s", e)
 
         raw_counts: Dict[str, int] = {"known": len(known_results)}
         for name, stats in per_provider_stats.items():

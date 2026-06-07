@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy.orm import Session
 
+from db_utils import db_rollback_safe
+
 logger = logging.getLogger(__name__)
 
 _SAMPLE_RATE = float(os.getenv("ADDRESS_TELEMETRY_SAMPLE_RATE", "1.0"))
@@ -47,8 +49,4 @@ def log_address_event(
         db.flush()
     except Exception as e:
         logger.debug("address_telemetry skip: %s (%s)", event_type, e)
-        try:
-            if db:
-                db.rollback()
-        except Exception:
-            pass
+        db_rollback_safe(db)

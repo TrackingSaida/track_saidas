@@ -5,10 +5,15 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
+import logging
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from address_normalizer import normalize_street_part
+from db_utils import db_rollback_safe
+
+logger = logging.getLogger(__name__)
 from models import EnderecoConhecido, SaidaDetail
 
 _STATS_TTL_SEC = 300
@@ -57,7 +62,12 @@ def get_sub_base_stats(db: Session, sub_base: str) -> Tuple[Dict[str, int], Dict
     cached = _sub_base_cache.get(sub_base)
     if cached and now - cached[0] < _STATS_TTL_SEC:
         return cached[1]
-    result = _load_sub_base_stats(db, sub_base)
+    try:
+        result = _load_sub_base_stats(db, sub_base)
+    except Exception as e:
+        db_rollback_safe(db)
+        logger.warning("get_sub_base_stats failed sub_base=%s: %s", sub_base, e)
+        return {}, {}
     _sub_base_cache[sub_base] = (now, result)
     return result
 
@@ -97,7 +107,9 @@ def get_motoboy_stats(db: Session, motoboy_id: int, days: int = 30) -> Tuple[Dic
         return cached[1]
     try:
         result = _load_motoboy_stats(db, motoboy_id, days)
-    except Exception:
+    except Exception as e:
+        db_rollback_safe(db)
+        logger.warning("get_motoboy_stats failed motoboy_id=%s: %s", motoboy_id, e)
         return {}, {}
     _motoboy_cache[cache_key] = (now, result)
     return result

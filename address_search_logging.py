@@ -70,20 +70,24 @@ def format_address_search_log(report: AddressSearchReport) -> str:
         else:
             lines.append(f"results={p.results}")
             if p.best_score is not None:
+                lines.append(f"score={p.best_score}")
                 lines.append(f"best_score={p.best_score}")
             if p.error:
                 lines.append(f"error={_quote(p.error)}")
         lines.append("")
 
     g = report.google
+    lines.append(f"google_called={'true' if g.called else 'false'}")
     lines.append(f"google_places_called={'true' if g.called else 'false'}")
     if g.reason:
+        lines.append(f"fallback_reason={_quote(g.reason)}")
         lines.append(f"reason={_quote(g.reason)}")
     if g.cost_guard_hit:
         lines.append("google_places_cost_guard_hit=true")
+    if g.http_status is not None:
+        lines.append(f"google_status={g.http_status}")
+        lines.append(f"google_places_status={g.http_status}")
     if g.called or g.http_status is not None:
-        if g.http_status is not None:
-            lines.append(f"google_places_status={g.http_status}")
         lines.append(f"google_places_results={g.results}")
         if g.first_result:
             lines.append(f"google_first_result={_quote(g.first_result)}")
@@ -94,6 +98,7 @@ def format_address_search_log(report: AddressSearchReport) -> str:
     if report.final_provider:
         lines.append(f"final_provider={report.final_provider}")
     lines.append(f"final_results={report.final_results}")
+    lines.append(f"score={report.best_score}")
     lines.append(f"best_score={report.best_score}")
 
     return "\n".join(lines)
