@@ -30,6 +30,7 @@ from active_route_sync import (
 from geocode_utils import (
     geocode_address_with_fallbacks,
     haversine_m,
+    normalize_address_text,
     otimizar_ordem_entregas,
     RoutePoint,
     StartPoint,
@@ -124,6 +125,8 @@ class EntregaListItem(BaseModel):
     endereco: Optional[str] = None
     numero: Optional[str] = None  # dest_numero (para agrupamento CEP+número)
     cep: Optional[str] = None  # dest_cep (para agrupamento CEP+número)
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
     contato: Optional[str] = None
     data: Optional[date] = None
     data_hora_entrega: Optional[datetime] = None
@@ -480,6 +483,8 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "endereco": endereco,
         "numero": (detail.dest_numero or "").strip() or None if detail else None,
         "cep": (detail.dest_cep or "").strip() or None if detail else None,
+        "cidade": (detail.dest_cidade or "").strip() or None if detail else None,
+        "estado": (detail.dest_estado or "").strip() or None if detail else None,
         "contato": detail.dest_contato if detail else None,
         "data": s.data,
         "data_hora_entrega": s.data_hora_entrega,
@@ -1576,6 +1581,41 @@ def resolver_place_details(
 SUGGESTION_ORIGINS = frozenset({"suggestion", "autocomplete", "google_places"})
 REVALIDATE_COORDS_DISTANCE_M = 100.0
 
+PRECISION_RANK = {"approx": 0, "street": 1, "rooftop": 2}
+
+
+def _precision_rank(precision: Optional[str]) -> int:
+    return PRECISION_RANK.get((precision or "").strip().lower(), -1)
+
+
+def _cidade_confere(expected_cidade: str, *texts: Optional[str]) -> bool:
+    expected = normalize_address_text(expected_cidade)
+    if not expected:
+        return False
+    for text in texts:
+        haystack = normalize_address_text(text or "")
+        if expected in haystack:
+            return True
+    return False
+
+
+def _should_replace_client_coords(
+    *,
+    origem: str,
+    client_precision: Optional[str],
+    dist_m: float,
+    body_cidade: str,
+    endereco_formatado: str,
+    server_precision: str,
+) -> bool:
+    if origem == "google_places" or client_precision == "rooftop":
+        return False
+    if dist_m <= REVALIDATE_COORDS_DISTANCE_M:
+        return False
+    if not _cidade_confere(body_cidade, endereco_formatado):
+        return False
+    return _precision_rank(server_precision) >= _precision_rank(client_precision)
+
 
 @router.put("/entrega/{id_saida}/endereco", response_model=EntregaListItem)
 def atualizar_endereco(
@@ -1640,7 +1680,14 @@ def atualizar_endereco(
             if server:
                 s_lat, s_lon, s_prec = server
                 dist_m = haversine_m(lat, lon, s_lat, s_lon)
-                if dist_m > REVALIDATE_COORDS_DISTANCE_M:
+                if _should_replace_client_coords(
+                    origem=origem,
+                    client_precision=coord_precision,
+                    dist_m=dist_m,
+                    body_cidade=body.cidade,
+                    endereco_formatado=endereco_formatado,
+                    server_precision=s_prec,
+                ):
                     lat, lon = s_lat, s_lon
                     coord_precision = s_prec
                     geocode_called = True
@@ -1648,6 +1695,13 @@ def atualizar_endereco(
                         "endereco_save revalidated suggestion coords dist_m=%.0f id_saida=%s",
                         dist_m,
                         id_saida,
+                    )
+                elif dist_m > REVALIDATE_COORDS_DISTANCE_M:
+                    log.warning(
+                        "endereco_save kept client coords dist_m=%.0f id_saida=%s origem=%s",
+                        dist_m,
+                        id_saida,
+                        origem,
                     )
                 elif coord_precision is None:
                     coord_precision = s_prec if s_prec != "approx" else "street"
