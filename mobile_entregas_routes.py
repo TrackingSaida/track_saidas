@@ -22,7 +22,11 @@ from sqlalchemy.orm import Session
 from db import get_db
 from db_utils import db_rollback_safe
 from auth import get_current_user
-from active_route_sync import get_active_route_delivery_ids, sync_active_route_after_delivery_update
+from active_route_sync import (
+    get_active_route_delivery_ids,
+    refresh_active_route_if_stale,
+    sync_active_route_after_delivery_update,
+)
 from geocode_utils import (
     geocode_address_with_fallbacks,
     haversine_m,
@@ -1347,10 +1351,11 @@ def rotas_ativa(
     )
     if not rota:
         return None
+    if not refresh_active_route_if_stale(db, rota):
+        return None
     ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
     if not isinstance(ordem, list):
         ordem = []
-    # Não retornar rota com todas as paradas já concluídas (evita exibir rota concluída do dia anterior)
     if len(ordem) > 0 and rota.parada_atual >= len(ordem):
         return None
     return RotasAtivaOut(

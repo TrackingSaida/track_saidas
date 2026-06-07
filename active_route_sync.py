@@ -46,6 +46,69 @@ def get_active_route_delivery_ids(
     return [int(x) for x in (ordem_raw or [])]
 
 
+def _ordem_from_rota(rota: RotasMotoboy) -> List[int]:
+    ordem_raw = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
+    return [int(x) for x in (ordem_raw or [])]
+
+
+def _recalc_parada_and_maybe_finalize(
+    db: Session,
+    rota: RotasMotoboy,
+    ordem: List[int],
+    *,
+    log_context: str = "",
+) -> bool:
+    """
+    Atualiza parada_atual e finaliza a rota se todos os pedidos da ordem estiverem
+    entregues ou ausentes. Retorna True se a rota permanece ativa.
+    """
+    if not ordem:
+        return False
+
+    rows = db.scalars(select(Saida).where(Saida.id_saida.in_(ordem))).all()
+    status_by_id = {int(s.id_saida): _status_upper(s.status) for s in rows}
+
+    def is_finalized(sid: int) -> bool:
+        return status_by_id.get(sid, "") in (STATUS_ENTREGUE, STATUS_AUSENTE)
+
+    first_pending = len(ordem)
+    for i, sid in enumerate(ordem):
+        if not is_finalized(sid):
+            first_pending = i
+            break
+
+    rota.parada_atual = first_pending
+
+    if first_pending >= len(ordem):
+        rota.status = "finalizada"
+        rota.finalizado_em = datetime.utcnow()
+        logger.info(
+            "active_route_sync rota_finalizada rota_id=%s%s",
+            rota.id,
+            f" {log_context}" if log_context else "",
+        )
+        db.commit()
+        db.refresh(rota)
+        return False
+
+    if log_context:
+        logger.info(
+            "active_route_sync parada_atual=%s rota_id=%s %s",
+            first_pending,
+            rota.id,
+            log_context,
+        )
+    db.commit()
+    db.refresh(rota)
+    return True
+
+
+def refresh_active_route_if_stale(db: Session, rota: RotasMotoboy) -> bool:
+    """Recalcula progresso da rota ativa; finaliza se todos os pedidos já foram concluídos."""
+    ordem = _ordem_from_rota(rota)
+    return _recalc_parada_and_maybe_finalize(db, rota, ordem, log_context="refresh_rotas_ativa")
+
+
 def sync_active_route_after_delivery_update(
     db: Session,
     motoboy_id: int,
@@ -77,45 +140,16 @@ def sync_active_route_after_delivery_update(
     if int(id_saida) not in ordem:
         return {"in_active_route": False, "rota_finalizada": False}
 
-    rows = db.scalars(select(Saida).where(Saida.id_saida.in_(ordem))).all()
-    status_by_id = {int(s.id_saida): _status_upper(s.status) for s in rows}
-
-    def is_finalized(sid: int) -> bool:
-        return status_by_id.get(sid, "") in (STATUS_ENTREGUE, STATUS_AUSENTE)
-
-    first_pending = len(ordem)
-    for i, sid in enumerate(ordem):
-        if not is_finalized(sid):
-            first_pending = i
-            break
-
-    rota.parada_atual = first_pending
-    rota_finalizada = False
-
-    if first_pending >= len(ordem):
-        rota.status = "finalizada"
-        rota.finalizado_em = datetime.utcnow()
-        rota_finalizada = True
-        logger.info(
-            "active_route_sync rota_finalizada rota_id=%s motoboy_id=%s trigger_id_saida=%s",
-            rota.id,
-            motoboy_id,
-            id_saida,
-        )
-    else:
-        logger.info(
-            "active_route_sync parada_atual=%s rota_id=%s motoboy_id=%s trigger_id_saida=%s",
-            first_pending,
-            rota.id,
-            motoboy_id,
-            id_saida,
-        )
-
-    db.commit()
-    db.refresh(rota)
+    still_active = _recalc_parada_and_maybe_finalize(
+        db,
+        rota,
+        ordem,
+        log_context=f"motoboy_id={motoboy_id} trigger_id_saida={id_saida}",
+    )
+    rota_finalizada = not still_active
 
     return {
-        "in_active_route": True,
+        "in_active_route": still_active,
         "rota_id": str(rota.id),
         "parada_atual": int(rota.parada_atual or 0),
         "ordem": ordem,
