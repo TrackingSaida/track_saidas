@@ -261,6 +261,72 @@ def _status_finalizado_detail(saida: Saida, status_norm: Optional[str] = None) -
     }
 
 
+def _validar_alteracao_saida_finalizada(
+    obj: Saida,
+    status_anterior: str,
+    payload: SaidaUpdate,
+) -> None:
+    """Bloqueia alterações inválidas em status finalizado; permite ENTREGUE→CANCELADO e reatribuição."""
+    if not _status_esta_finalizado(status_anterior):
+        return
+    if status_anterior == STATUS_CANCELADO:
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_anterior))
+    if status_anterior == STATUS_ENTREGUE:
+        cancelando = (
+            payload.status is not None
+            and normalizar_status_saida(payload.status) == STATUS_CANCELADO
+        )
+        reatribuindo = (
+            payload.motoboy_id is not None
+            and int(payload.motoboy_id) != int(obj.motoboy_id or 0)
+        )
+        if payload.status is not None and not cancelando:
+            raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_anterior))
+        if not cancelando and not reatribuindo:
+            has_other = any(
+                [
+                    payload.codigo is not None,
+                    payload.servico is not None,
+                    payload.base is not None,
+                    payload.is_grande is not None,
+                    payload.entregador_id is not None,
+                    payload.entregador is not None and (payload.entregador or "").strip(),
+                    payload.motoboy_id is not None,
+                ]
+            )
+            if has_other:
+                raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_anterior))
+        return
+    raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_anterior))
+
+
+def _aplicar_detail_reatribuicao_entregue(
+    db: Session,
+    id_saida: int,
+    motoboy_id: int,
+    status_novo: str,
+) -> None:
+    detail = db.scalar(
+        select(SaidaDetail)
+        .where(SaidaDetail.id_saida == id_saida)
+        .order_by(SaidaDetail.id_detail.desc())
+        .limit(1)
+    )
+    if detail:
+        detail.status = status_novo
+        detail.id_entregador = motoboy_id
+        detail.tentativa = (detail.tentativa or 1) + 1
+    else:
+        db.add(
+            SaidaDetail(
+                id_saida=id_saida,
+                id_entregador=motoboy_id,
+                status=status_novo,
+                tentativa=2,
+            )
+        )
+
+
 def _evento_status_manual(status_norm: str) -> Optional[str]:
     if status_norm == STATUS_CANCELADO:
         return "cancelado"
@@ -845,15 +911,65 @@ def ler_saida(
             origem_app="web",
             endpoint="/saidas/ler",
         )
+        troca_payload = {
+            "code": "TROCA_ENTREGADOR",
+            "id_saida": existente.id_saida,
+            "message": "Código já saiu com outro entregador.",
+            "entregador_atual": existente.entregador,
+            "username": existente.username,
+            "status_atual": status_norm,
+        }
+        return JSONResponse(status_code=409, content=troca_payload)
+
+    if status_norm == STATUS_ENTREGUE:
+        mesmo_ent = False
+        if motoboy_id is not None:
+            mesmo_ent = existente.motoboy_id == motoboy_id
+        if not mesmo_ent and entregador_id is not None:
+            mesmo_ent = existente.entregador_id == entregador_id
+        if not mesmo_ent:
+            mesmo_ent = _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
+        if not mesmo_ent:
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=username,
+                origem="desconhecida",
+                tipo="saida",
+                codigo=existente.codigo,
+                resultado="atribuido_a_outro",
+                role=role,
+                motoboy_id=motoboy_id,
+                id_saida=existente.id_saida,
+                origem_app="web",
+                endpoint="/saidas/ler",
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "TROCA_ENTREGADOR",
+                    "id_saida": existente.id_saida,
+                    "message": "Pedido entregue com outro entregador.",
+                    "entregador_atual": existente.entregador,
+                    "username": existente.username,
+                    "status_atual": status_norm,
+                },
+            )
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=username,
+            origem="desconhecida",
+            tipo="saida",
+            codigo=existente.codigo,
+            resultado="bloqueio_status_finalizado",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=existente.id_saida,
+            origem_app="web",
+            endpoint="/saidas/ler",
+        )
         return JSONResponse(
-            status_code=409,
-            content={
-                "code": "TROCA_ENTREGADOR",
-                "id_saida": existente.id_saida,
-                "message": "Código já saiu com outro entregador.",
-                "entregador_atual": existente.entregador,
-                "username": existente.username,
-            },
+            status_code=422,
+            content=_status_finalizado_detail(existente, status_norm),
         )
 
     if _status_esta_finalizado(status_norm):
@@ -1547,21 +1663,7 @@ def atualizar_saida(
     sub_base = current_user.sub_base
     obj = _get_owned_saida(db, sub_base, id_saida)
     status_anterior = normalizar_status_saida(obj.status)
-    if _status_esta_finalizado(status_anterior):
-        has_payload_change = any(
-            (
-                payload.entregador_id is not None,
-                payload.entregador is not None,
-                payload.motoboy_id is not None,
-                payload.status is not None,
-                payload.codigo is not None,
-                payload.servico is not None,
-                payload.base is not None,
-                payload.is_grande is not None,
-            )
-        )
-        if has_payload_change:
-            raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_anterior))
+    _validar_alteracao_saida_finalizada(obj, status_anterior, payload)
     motoboy_anterior = obj.motoboy_id
     entregador_anterior = (obj.entregador or "").strip()
     payload_changed = {
@@ -1608,7 +1710,23 @@ def atualizar_saida(
             else:
                 raise
 
-    if payload.motoboy_id is not None:
+    reatribuicao_entregue = (
+        status_anterior == STATUS_ENTREGUE
+        and payload.motoboy_id is not None
+        and int(payload.motoboy_id) != int(motoboy_anterior or 0)
+    )
+    if reatribuicao_entregue:
+        motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        obj.motoboy_id = motoboy.id_motoboy
+        obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
+        obj.entregador_id = None
+        obj.status = STATUS_EM_ROTA
+        obj.data_hora_entrega = None
+        _aplicar_detail_reatribuicao_entregue(db, obj.id_saida, motoboy.id_motoboy, STATUS_EM_ROTA)
+        payload_changed["motoboy"] = True
+        payload_changed["executor"] = True
+        payload_changed["status"] = True
+    elif payload.motoboy_id is not None:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
