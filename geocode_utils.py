@@ -405,6 +405,162 @@ def geocode_address_any(
     return coords
 
 
+def _nominatim_city_name(addr: dict) -> str:
+    return (
+        str(addr.get("city") or addr.get("town") or addr.get("village") or addr.get("municipality") or addr.get("county") or "")
+        .strip()
+    )
+
+
+def _nominatim_state_uf(addr: dict) -> str:
+    iso = str(addr.get("ISO3166-2-lvl4") or "").strip().upper()
+    if iso.startswith("BR-") and len(iso) >= 5:
+        return iso[3:5]
+    state = str(addr.get("state") or "").strip()
+    state_norm = normalize_address_text(state)
+    uf_map = {
+        "sao paulo": "SP",
+        "rio de janeiro": "RJ",
+        "minas gerais": "MG",
+    }
+    if len(state) == 2:
+        return state.upper()
+    return uf_map.get(state_norm, state[:2].upper() if len(state) >= 2 else "")
+
+
+def _country_is_brazil(addr: dict) -> bool:
+    country = normalize_address_text(str(addr.get("country") or ""))
+    code = str(addr.get("country_code") or "").strip().lower()
+    return code == "br" or country in ("brasil", "brazil")
+
+
+def _cities_match(expected_cidade: str, addr: dict) -> bool:
+    expected = normalize_address_text(expected_cidade)
+    city = normalize_address_text(_nominatim_city_name(addr))
+    if not expected or not city:
+        return False
+    return expected == city or expected in city or city in expected
+
+
+def _states_match(expected_estado: str, addr: dict) -> bool:
+    exp = normalize_address_text(expected_estado)
+    if len(exp) == 2:
+        return _nominatim_state_uf(addr) == exp.upper()
+    state = normalize_address_text(str(addr.get("state") or ""))
+    return bool(state and (exp in state or state in exp))
+
+
+def _cep_prefix_matches(expected_cep: str, addr: dict) -> bool:
+    exp = normalize_cep(expected_cep)
+    if len(exp) < 5:
+        return True
+    got = normalize_cep(str(addr.get("postcode") or ""))
+    if len(got) < 5:
+        return True
+    return exp[:5] == got[:5]
+
+
+def validate_nominatim_candidate(
+    candidate: dict,
+    *,
+    cidade: str,
+    estado: str,
+    cep: Optional[str] = None,
+) -> bool:
+    addr = candidate.get("address") or {}
+    if not isinstance(addr, dict):
+        return False
+    if not _country_is_brazil(addr):
+        return False
+    if not _states_match(estado, addr):
+        return False
+    if not _cities_match(cidade, addr):
+        return False
+    if not _cep_prefix_matches(cep or "", addr):
+        return False
+    lat = candidate.get("lat") or candidate.get("latitude")
+    lon = candidate.get("lon") or candidate.get("longitude")
+    if lat is None or lon is None:
+        return False
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(lat_f) or not math.isfinite(lon_f):
+        return False
+    if lat_f == 0 and lon_f == 0:
+        return False
+    return True
+
+
+def geocode_address_strict(
+    *,
+    rua: Optional[str] = None,
+    numero: Optional[str] = None,
+    bairro: Optional[str] = None,
+    cidade: Optional[str] = None,
+    estado: Optional[str] = None,
+    cep: Optional[str] = None,
+    db: Optional[Any] = None,
+) -> Optional[Tuple[float, float, str, str, float]]:
+    """
+    Geocode com validação de cidade/estado/CEP. Retorna
+    (lat, lon, precision, source, score) ou None.
+    """
+    cidade_n = (cidade or "").strip()
+    estado_n = (estado or "").strip()
+    rua_n = (rua or "").strip()
+    if not cidade_n or not estado_n or len(rua_n) < 3:
+        return None
+
+    parts = [
+        rua_n,
+        f"número {numero}" if (numero or "").strip() else None,
+        (bairro or "").strip() or None,
+        cidade_n,
+        estado_n,
+        normalize_cep(cep) or None,
+        "Brasil",
+    ]
+    query = ", ".join(p for p in parts if p)
+    url = "https://nominatim.openstreetmap.org/search"
+    try:
+        r = requests.get(
+            url,
+            params={
+                "q": query,
+                "format": "json",
+                "addressdetails": 1,
+                "limit": 5,
+                "dedupe": 1,
+                "countrycodes": "br",
+            },
+            headers={"User-Agent": "TrackSaidasApp/1.0 (https://github.com/track-saidas; contato@track-saidas.com)"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return None
+        for item in data:
+            if not validate_nominatim_candidate(
+                item, cidade=cidade_n, estado=estado_n, cep=cep
+            ):
+                continue
+            lat = float(item["lat"])
+            lon = float(item["lon"])
+            addr = item.get("address") or {}
+            house = str(addr.get("house_number") or "").strip()
+            precision = "rooftop" if house else "street"
+            score = 90.0 if precision == "rooftop" else 70.0
+            set_cached(db, query, lat, lon, "nominatim_strict")
+            return lat, lon, precision, "nominatim_strict", score
+    except Exception as e:
+        logger.warning("geocode_address_strict falhou: %s", e)
+    return None
+
+
 def geocode_address_with_fallbacks(
     rua: Optional[str] = None,
     numero: Optional[str] = None,

@@ -582,6 +582,9 @@ class SaidaDetail(Base):
     endereco_formatado = Column(Text, nullable=True)
     endereco_origem = Column(Text, nullable=True)  # manual | ocr | voz | suggestion | mapa | google_places
     coord_precision = Column(Text, nullable=True)  # rooftop | street | approx
+    geocode_source = Column(Text, nullable=True)
+    geocode_score = Column(Numeric(5, 2), nullable=True)
+    geocoded_at = Column(DateTime(timezone=False), nullable=True)
 
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 

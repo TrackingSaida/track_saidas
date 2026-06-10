@@ -28,6 +28,7 @@ from active_route_sync import (
     sync_active_route_after_delivery_update,
 )
 from geocode_utils import (
+    geocode_address_strict,
     geocode_address_with_fallbacks,
     haversine_m,
     normalize_address_text,
@@ -135,6 +136,9 @@ class EntregaListItem(BaseModel):
     endereco_formatado: Optional[str] = None
     endereco_origem: Optional[str] = None  # manual | ocr | voz | suggestion | autocomplete | mapa | google_places
     coord_precision: Optional[str] = None  # rooftop | street | approx
+    geocode_source: Optional[str] = None
+    geocode_score: Optional[float] = None
+    geocoded_at: Optional[datetime] = None
     possui_endereco: bool = False
     tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
     tem_comprovante: bool = False
@@ -222,6 +226,8 @@ class EnderecoBody(BaseModel):
     longitude: Optional[float] = None
     origem: str = "manual"  # manual | ocr | voz | suggestion | autocomplete | mapa | google_places
     coord_precision: Optional[str] = None  # rooftop | street | approx
+    geocode_source: Optional[str] = None
+    geocode_score: Optional[float] = None
 
 
 class EnderecoSugestoesHints(BaseModel):
@@ -493,6 +499,9 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "endereco_formatado": (detail.endereco_formatado or "").strip() or None if detail else None,
         "endereco_origem": (detail.endereco_origem or "").strip() or None if detail else None,
         "coord_precision": (detail.coord_precision or "").strip() or None if detail else None,
+        "geocode_source": (getattr(detail, "geocode_source", None) or "").strip() or None if detail else None,
+        "geocode_score": float(detail.geocode_score) if detail and detail.geocode_score is not None else None,
+        "geocoded_at": detail.geocoded_at if detail and getattr(detail, "geocoded_at", None) else None,
         "possui_endereco": _possui_endereco(detail),
         "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
         "tem_comprovante": tem_comprovante,
@@ -1658,6 +1667,9 @@ def atualizar_endereco(
     coord_precision = (body.coord_precision or "").strip().lower() or None
     if coord_precision not in ("rooftop", "street", "approx"):
         coord_precision = None
+    geocode_source = (body.geocode_source or "").strip() or None
+    geocode_score = float(body.geocode_score) if body.geocode_score is not None else None
+    geocoded_at = None
 
     def _server_geocode() -> Optional[Tuple[float, float, str]]:
         return geocode_address_with_fallbacks(
@@ -1712,6 +1724,13 @@ def atualizar_endereco(
                 coord_precision = "street"
             else:
                 coord_precision = "approx"
+        if not geocode_source:
+            geocode_source = origem if origem in ("google_places", "mapa") else (body.geocode_source or origem)
+        if geocode_score is None and coord_precision == "rooftop":
+            geocode_score = 95.0
+        elif geocode_score is None and coord_precision == "street":
+            geocode_score = 75.0
+        geocoded_at = datetime.now()
         log.info(
             "endereco_save latlon_from_client=true origem=%s id_saida=%s geocode_called=%s precision=%s",
             origem,
@@ -1721,36 +1740,34 @@ def atualizar_endereco(
         )
     elif endereco_formatado.strip():
         geocode_called = True
-        server = _server_geocode()
-        if server:
-            lat, lon, coord_precision = server
+        strict = geocode_address_strict(
+            rua=body.rua,
+            numero=body.numero,
+            bairro=body.bairro,
+            cidade=body.cidade,
+            estado=body.estado,
+            cep=body.cep,
+            db=db,
+        )
+        if strict:
+            lat, lon, coord_precision, geocode_source, geocode_score = strict
+            geocoded_at = datetime.now()
             log.info(
-                "endereco_save latlon_from_client=false origem=%s id_saida=%s geocode_called=true lat=%s lon=%s precision=%s",
-                origem,
+                "endereco_save strict ok id_saida=%s lat=%s lon=%s precision=%s",
                 id_saida,
                 lat,
                 lon,
                 coord_precision,
             )
         else:
+            lat, lon = None, None
+            coord_precision = None
+            geocode_source = None
+            geocode_score = None
             log.warning(
-                "Geocoding falhou após fallbacks: id_saida=%s, endereco=%s",
+                "endereco_save strict rejected coords id_saida=%s endereco=%s",
                 id_saida,
                 endereco_formatado[:80],
-            )
-            from address_telemetry import log_address_event
-
-            log_address_event(
-                db,
-                "address_geocode_failure",
-                user.sub_base,
-                user.motoboy_id,
-                endereco_formatado,
-                {"id_saida": id_saida},
-            )
-            raise HTTPException(
-                status_code=422,
-                detail="Não foi possível obter a localização deste endereço. Verifique o endereço (rua, número, bairro, cidade, estado) e tente novamente.",
             )
     else:
         log.info(
@@ -1771,10 +1788,17 @@ def atualizar_endereco(
         detail.endereco_formatado = endereco_formatado
         detail.endereco_origem = origem
         detail.coord_precision = coord_precision
+        detail.geocode_source = geocode_source
+        detail.geocode_score = geocode_score
+        detail.geocoded_at = geocoded_at
         if lat is not None:
             detail.latitude = lat
+        else:
+            detail.latitude = None
         if lon is not None:
             detail.longitude = lon
+        else:
+            detail.longitude = None
     else:
         detail = SaidaDetail(
             id_saida=id_saida,
@@ -1792,6 +1816,9 @@ def atualizar_endereco(
             endereco_formatado=endereco_formatado,
             endereco_origem=origem,
             coord_precision=coord_precision,
+            geocode_source=geocode_source,
+            geocode_score=geocode_score,
+            geocoded_at=geocoded_at,
             latitude=lat,
             longitude=lon,
         )
