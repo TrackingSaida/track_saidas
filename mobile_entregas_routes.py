@@ -29,9 +29,7 @@ from active_route_sync import (
 )
 from geocode_utils import (
     geocode_address_strict,
-    geocode_address_with_fallbacks,
     haversine_m,
-    normalize_address_text,
     otimizar_ordem_entregas,
     RoutePoint,
     StartPoint,
@@ -1597,31 +1595,17 @@ def _precision_rank(precision: Optional[str]) -> int:
     return PRECISION_RANK.get((precision or "").strip().lower(), -1)
 
 
-def _cidade_confere(expected_cidade: str, *texts: Optional[str]) -> bool:
-    expected = normalize_address_text(expected_cidade)
-    if not expected:
-        return False
-    for text in texts:
-        haystack = normalize_address_text(text or "")
-        if expected in haystack:
-            return True
-    return False
-
-
 def _should_replace_client_coords(
     *,
     origem: str,
     client_precision: Optional[str],
     dist_m: float,
-    body_cidade: str,
-    endereco_formatado: str,
     server_precision: str,
 ) -> bool:
+    """Só substitui coords do cliente por resultado strict validado (cidade/estado/CEP conferidos)."""
     if origem == "google_places" or client_precision == "rooftop":
         return False
     if dist_m <= REVALIDATE_COORDS_DISTANCE_M:
-        return False
-    if not _cidade_confere(body_cidade, endereco_formatado):
         return False
     return _precision_rank(server_precision) >= _precision_rank(client_precision)
 
@@ -1671,40 +1655,35 @@ def atualizar_endereco(
     geocode_score = float(body.geocode_score) if body.geocode_score is not None else None
     geocoded_at = None
 
-    def _server_geocode() -> Optional[Tuple[float, float, str]]:
-        return geocode_address_with_fallbacks(
-            rua=body.rua,
-            numero=body.numero,
-            complemento=body.complemento,
-            bairro=body.bairro,
-            cidade=body.cidade,
-            estado=body.estado,
-            cep=body.cep,
-            endereco_formatado=endereco_formatado,
-            db=db,
-        )
-
     if latlon_from_client:
         lat = float(lat)
         lon = float(lon)
         if origem in SUGGESTION_ORIGINS:
-            server = _server_geocode()
-            if server:
-                s_lat, s_lon, s_prec = server
+            strict = geocode_address_strict(
+                rua=body.rua,
+                numero=body.numero,
+                bairro=body.bairro,
+                cidade=body.cidade,
+                estado=body.estado,
+                cep=body.cep,
+                db=db,
+            )
+            if strict:
+                s_lat, s_lon, s_prec, s_source, s_score = strict
                 dist_m = haversine_m(lat, lon, s_lat, s_lon)
                 if _should_replace_client_coords(
                     origem=origem,
                     client_precision=coord_precision,
                     dist_m=dist_m,
-                    body_cidade=body.cidade,
-                    endereco_formatado=endereco_formatado,
                     server_precision=s_prec,
                 ):
                     lat, lon = s_lat, s_lon
                     coord_precision = s_prec
+                    geocode_source = s_source
+                    geocode_score = s_score
                     geocode_called = True
                     log.info(
-                        "endereco_save revalidated suggestion coords dist_m=%.0f id_saida=%s",
+                        "endereco_save replaced suggestion coords with strict dist_m=%.0f id_saida=%s",
                         dist_m,
                         id_saida,
                     )
@@ -1717,6 +1696,7 @@ def atualizar_endereco(
                     )
                 elif coord_precision is None:
                     coord_precision = s_prec if s_prec != "approx" else "street"
+            # strict None → manter coords do cliente (nunca degradar por geocode fraco)
         if coord_precision is None:
             if origem in ("mapa", "google_places"):
                 coord_precision = "rooftop"
