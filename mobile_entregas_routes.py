@@ -1694,6 +1694,17 @@ def atualizar_endereco(
                         id_saida,
                         origem,
                     )
+                elif s_prec == "rooftop" and _precision_rank(coord_precision) < _precision_rank("rooftop"):
+                    # Strict confirmou o número da casa perto das coords do cliente:
+                    # mantém coords do cliente, promove precisão.
+                    coord_precision = "rooftop"
+                    geocode_source = s_source
+                    geocode_score = s_score
+                    log.info(
+                        "endereco_save upgraded precision to rooftop dist_m=%.0f id_saida=%s",
+                        dist_m,
+                        id_saida,
+                    )
                 elif coord_precision is None:
                     coord_precision = s_prec if s_prec != "approx" else "street"
             # strict None → manter coords do cliente (nunca degradar por geocode fraco)
