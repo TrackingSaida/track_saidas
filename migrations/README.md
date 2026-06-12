@@ -55,3 +55,30 @@ Executar:
 ```sql
 -- arquivo: migrations/pedido_campos_obrigatorios_config.sql
 ```
+
+## Busca inteligente de endereços (mobile — sugestões Google)
+
+**Obrigatório** após deploy da PR #19 (`mobile/enderecos/sugestoes`). Sem estas tabelas o endpoint responde, mas com sugestões degradadas/vazias.
+
+Executar **nesta ordem** no Postgres (Render Shell ou cliente externo):
+
+1. `geocode_cache.sql`
+2. `suggestion_cache.sql`
+3. `enderecos_conhecidos.sql`
+4. `address_telemetry.sql`
+5. `geocode_metadata.sql`
+6. `coord_precision.sql`
+
+**Variáveis de ambiente no Render (recomendado):**
+
+- `GOOGLE_PLACES_API_KEY` — fallback Google Places para autocomplete
+
+**Validar deploy da API:**
+
+```bash
+./scripts/verify_openapi.sh
+# ou:
+curl -s https://track-saidas-api.onrender.com/api/openapi.json | grep enderecos/sugestoes
+```
+
+Deve aparecer `/api/mobile/enderecos/sugestoes`. Se não aparecer, o Render ainda está em versão antiga — faça **Manual Deploy → Deploy latest commit** na branch `main`.
