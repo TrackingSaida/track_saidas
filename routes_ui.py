@@ -93,7 +93,7 @@ MENU_DEFS = [
         "roles": [0, 1],
         "items": [
             {"label": "Owners", "href": "admin-owners.html", "roles": [0]},
-            {"label": "Campos obrigatórios por serviço", "href": "tracking-campos-obrigatorios-servico.html", "roles": [0, 1]},
+            {"label": "Campos Obrigatórios", "href": "tracking-campos-obrigatorios-servico.html", "roles": [0, 1]},
         ]
     },
 ]
