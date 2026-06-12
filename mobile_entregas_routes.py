@@ -146,6 +146,9 @@ class EntregaListItem(BaseModel):
     numero_documento: Optional[str] = None
     observacao_entrega: Optional[str] = None
     observacao_ocorrencia: Optional[str] = None
+    motivo_ocorrencia: Optional[str] = None
+    complemento: Optional[str] = None
+    data_hora_ocorrencia: Optional[datetime] = None
     campos_obrigatorios: List[str] = Field(default_factory=list)
     campos_obrigatorios_entregue: List[str] = Field(default_factory=list)
     campos_obrigatorios_ausente: List[str] = Field(default_factory=list)
@@ -468,7 +471,24 @@ def _possui_endereco(detail: Optional[SaidaDetail]) -> bool:
     return bool((detail.dest_rua or "").strip() and (detail.dest_numero or "").strip())
 
 
-def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
+def _carregar_data_hora_ocorrencia_map(db: Session, ids: List[int]) -> Dict[int, datetime]:
+    if not ids:
+        return {}
+    rows = db.execute(
+        select(SaidaHistorico.id_saida, func.max(SaidaHistorico.timestamp)).where(
+            SaidaHistorico.id_saida.in_(ids),
+            SaidaHistorico.evento.in_(("ausente", "entregue", "cancelado")),
+        ).group_by(SaidaHistorico.id_saida)
+    ).all()
+    return {int(r[0]): r[1] for r in rows}
+
+
+def _saida_to_item(
+    s: Saida,
+    detail: Optional[SaidaDetail],
+    *,
+    data_hora_ocorrencia: Optional[datetime] = None,
+) -> dict:
     endereco = None
     if detail and (detail.dest_rua or detail.dest_numero):
         parts = [p for p in [detail.dest_rua, detail.dest_numero, detail.dest_complemento] if p]
@@ -509,6 +529,9 @@ def _saida_to_item(s: Saida, detail: Optional[SaidaDetail]) -> dict:
         "numero_documento": (detail.numero_documento or "").strip() or None if detail else None,
         "observacao_entrega": (detail.observacao_entrega or "").strip() or None if detail else None,
         "observacao_ocorrencia": (detail.observacao_ocorrencia or "").strip() or None if detail else None,
+        "motivo_ocorrencia": (detail.motivo_ocorrencia or "").strip() or None if detail else None,
+        "complemento": (detail.dest_complemento or "").strip() or None if detail else None,
+        "data_hora_ocorrencia": data_hora_ocorrencia,
         "campos_obrigatorios": [],
         "campos_obrigatorios_entregue": [],
         "campos_obrigatorios_ausente": [],
@@ -801,11 +824,18 @@ def listar_entregas(
     rows = db.scalars(q).all()
     if status == "pendente" and hoje is not None:
         rows = _filtrar_por_data_operacional(db, rows, hoje)
-    details_map = _carregar_details_por_saida_ids(db, [s.id_saida for s in rows])
+    ids = [int(s.id_saida) for s in rows]
+    details_map = _carregar_details_por_saida_ids(db, ids)
+    ocorrencia_map = _carregar_data_hora_ocorrencia_map(db, ids)
     campos_cache = build_campos_cache_for_sub_base(db, sub_base=sub_base)
     out = []
     for s in rows:
-        item = _saida_to_item(s, details_map.get(int(s.id_saida)))
+        sid = int(s.id_saida)
+        item = _saida_to_item(
+            s,
+            details_map.get(sid),
+            data_hora_ocorrencia=ocorrencia_map.get(sid),
+        )
         campos_entregue = resolve_campos_obrigatorios_from_cache(
             cache=campos_cache,
             servico=s.servico,
@@ -1497,7 +1527,8 @@ def detalhe_entrega(
     """Detalhe de uma entrega para o app."""
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     detail = _get_detail_for_saida(db, s.id_saida)
-    item = _saida_to_item(s, detail)
+    ocorrencia_map = _carregar_data_hora_ocorrencia_map(db, [id_saida])
+    item = _saida_to_item(s, detail, data_hora_ocorrencia=ocorrencia_map.get(id_saida))
     campos_entregue = resolve_campos_obrigatorios_ativos(
         db,
         sub_base=s.sub_base,
