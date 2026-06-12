@@ -2449,7 +2449,31 @@ def scan_codigo(
     # ——— Existe: validar status (não permitir cancelado, entregue, em_rota de outro) ———
     status_norm = normalizar_status_saida(saida.status)
 
-    if _status_esta_finalizado(status_norm):
+    if status_norm == STATUS_ENTREGUE:
+        if motoboy_id is not None and saida.motoboy_id is not None and saida.motoboy_id != motoboy_id:
+            nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=getattr(user, "username", None),
+                origem=origem,
+                tipo="saida",
+                codigo=saida.codigo,
+                resultado="atribuido_a_outro",
+                role=role,
+                motoboy_id=motoboy_id,
+                id_saida=saida.id_saida,
+                origem_app="mobile",
+                endpoint="/mobile/scan",
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "conflito": True,
+                    "motoboy_atual": nome_atual,
+                    "id_saida": saida.id_saida,
+                    "status_atual": status_norm,
+                },
+            )
         registrar_log_leitura_critico(
             sub_base=sub_base,
             username=getattr(user, "username", None),
@@ -2465,12 +2489,26 @@ def scan_codigo(
         )
         return JSONResponse(
             status_code=422,
-            content={
-                "code": "STATUS_FINALIZADO",
-                "id_saida": saida.id_saida,
-                "status_atual": saida.status,
-                "message": f"Pedido com status finalizado: {saida.status}.",
-            },
+            content=_status_finalizado_detail(saida, status_norm),
+        )
+
+    if status_norm == STATUS_CANCELADO:
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=getattr(user, "username", None),
+            origem=origem,
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="bloqueio_status_finalizado",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/scan",
+        )
+        return JSONResponse(
+            status_code=422,
+            content=_status_finalizado_detail(saida, status_norm),
         )
 
     # Em rota / saiu:
@@ -2833,11 +2871,18 @@ def assumir_entrega(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Reatribui a entrega para o motoboy logado (após conflito no scan). Não permite se cancelado/entregue."""
+    """Reatribui a entrega para o motoboy logado (após conflito no scan). Permite reassumir ENTREGUE de outro motoboy."""
     s = db.get(Saida, id_saida)
     if not s or s.sub_base != user.sub_base:
         raise HTTPException(status_code=404, detail="Entrega não encontrada.")
     status_norm = normalizar_status_saida(s.status)
+    if status_norm == STATUS_CANCELADO:
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
+    if status_norm == STATUS_ENTREGUE and s.motoboy_id == user.motoboy_id:
+        owner_valor = _owner_valor_por_sub_base(db, user, user.sub_base or "")
+        _garantir_cobranca_owner_saida(db, s, owner_valor)
+        db.commit()
+        return {"ok": True, "id_saida": id_saida}
     if _status_esta_finalizado(status_norm):
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     owner_valor = _owner_valor_por_sub_base(db, user, user.sub_base or "")
@@ -2852,17 +2897,25 @@ def assumir_entrega(
     if motoboy:
         s.entregador = _get_motoboy_nome(db, motoboy)
         s.entregador_id = None
-    s.status = STATUS_SAIU_PARA_ENTREGA
-    if status_norm == STATUS_AUSENTE:
+    if status_norm == STATUS_ENTREGUE:
+        s.status = STATUS_EM_ROTA
+        s.data_hora_entrega = None
+        status_novo = STATUS_EM_ROTA
+    else:
+        s.status = STATUS_SAIU_PARA_ENTREGA
+        status_novo = STATUS_SAIU_PARA_ENTREGA
+    if status_norm in (STATUS_AUSENTE, STATUS_ENTREGUE):
         detail = _get_detail_for_saida(db, id_saida)
         if detail:
+            detail.status = status_novo
+            detail.id_entregador = user.motoboy_id
             detail.tentativa = (detail.tentativa or 1) + 1
         else:
             db.add(
                 SaidaDetail(
                     id_saida=id_saida,
                     id_entregador=user.motoboy_id,
-                    status=STATUS_SAIU_PARA_ENTREGA,
+                    status=status_novo,
                     tentativa=2,
                 )
             )
@@ -2871,7 +2924,7 @@ def assumir_entrega(
             id_saida=id_saida,
             evento="reatribuicao",
             status_anterior=status_norm,
-            status_novo=STATUS_SAIU_PARA_ENTREGA,
+            status_novo=status_novo,
             motoboy_id_anterior=antigo,
             motoboy_id_novo=user.motoboy_id,
             user_id=user.id,
