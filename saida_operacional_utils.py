@@ -20,6 +20,7 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "reatribuicao",
     "reatribuido",
     "nova_saida_mesmo_entregador",
+    "lancar_avulso",
 }
 
 EVENTOS_REATRIBUICAO = {
@@ -52,6 +53,7 @@ ROTULOS_ACAO = {
     "reatribuicao": "Reatribuiu pedido",
     "reatribuido": "Reatribuiu pedido",
     "nova_saida_mesmo_entregador": "Nova saída confirmada com mesmo motoboy",
+    "lancar_avulso": "Lançou avulso",
     "reatribuido_em_rota": "Reatribuído -> Iniciou rota",
     "removido_sem_inicio": "Removeu sem iniciar rota",
     "em_rota": "Iniciou rota",
@@ -225,6 +227,23 @@ def carregar_contexto_operacional(
     return out
 
 
+def deve_excluir_saida_operacional(ctx: Optional[SaidaOperacionalContext]) -> bool:
+    """Exclui apenas casos invalidantes explícitos (ex.: removido sem iniciar rota)."""
+    return bool(ctx and ctx.removido_sem_inicio_ativo)
+
+
+def timestamp_operacional_saida(
+    ctx: Optional[SaidaOperacionalContext],
+    saida_ts: Optional[datetime],
+) -> Optional[datetime]:
+    """Referência de data operacional: atribuição válida, última ação ou timestamp da saída."""
+    if ctx and ctx.removido_sem_inicio_ativo:
+        return None
+    if ctx:
+        return ctx.operacional_ts or ctx.ultimo_evento_ts or saida_ts
+    return saida_ts
+
+
 def filtrar_saidas_por_periodo_operacional(
     db: Session,
     saidas: Sequence[object],
@@ -244,9 +263,9 @@ def filtrar_saidas_por_periodo_operacional(
         # Mantém exclusão apenas para casos invalidantes explícitos.
         # Em bases legadas, ausência de leitura válida no histórico não deve remover
         # o registro se houver timestamp base em Saida.
-        if ctx and ctx.removido_sem_inicio_ativo:
+        if deve_excluir_saida_operacional(ctx):
             continue
-        ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or getattr(s, "timestamp", None)
+        ts = timestamp_operacional_saida(ctx, getattr(s, "timestamp", None))
         if ts is None:
             continue
         dia = ts.date()

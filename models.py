@@ -9,6 +9,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Boolean,
+    JSON,
     text,
     UniqueConstraint,
     ForeignKey,
@@ -313,6 +314,7 @@ class EntregadorPrecoGlobal(Base):
     shopee_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     ml_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     avulso_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    considerar_pacote_g_adicional = Column(Boolean, nullable=False, server_default=text("false"))
 
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
@@ -578,7 +580,11 @@ class SaidaDetail(Base):
     latitude = Column(Numeric(12, 8), nullable=True)
     longitude = Column(Numeric(12, 8), nullable=True)
     endereco_formatado = Column(Text, nullable=True)
-    endereco_origem = Column(Text, nullable=True)  # manual | ocr | voz
+    endereco_origem = Column(Text, nullable=True)  # manual | ocr | voz | suggestion | mapa | google_places
+    coord_precision = Column(Text, nullable=True)  # rooftop | street | approx
+    geocode_source = Column(Text, nullable=True)
+    geocode_score = Column(Numeric(5, 2), nullable=True)
+    geocoded_at = Column(DateTime(timezone=False), nullable=True)
 
     timestamp = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
@@ -598,6 +604,28 @@ class MotivoAusencia(Base):
 
     def __repr__(self) -> str:
         return f"<MotivoAusencia id={self.id} descricao={self.descricao!r}>"
+
+
+# ==========================
+# Tabela: pedido_campos_obrigatorios_config
+# ==========================
+class PedidoCamposObrigatoriosConfig(Base):
+    __tablename__ = "pedido_campos_obrigatorios_config"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    servico = Column(Text, nullable=False)
+    contexto = Column(Text, nullable=False, server_default=text("'AMBOS'"))
+    campos_obrigatorios = Column(Text, nullable=False, server_default=text("'[]'"))
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<PedidoCamposObrigatoriosConfig id={self.id} sub_base={self.sub_base!r} "
+            f"servico={self.servico!r} contexto={self.contexto!r} ativo={self.ativo}>"
+        )
 
 
 # ==========================
@@ -763,3 +791,77 @@ class LogLeitura(Base):
             f"<LogLeitura id={self.id} tipo={self.tipo} "
             f"origem={self.origem} resultado={self.resultado}>"
         )
+
+
+# ==========================
+# Tabela: geocode_cache
+# ==========================
+class GeocodeCache(Base):
+    __tablename__ = "geocode_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key_hash = Column(Text, nullable=False, unique=True)
+    query_normalizada = Column(Text, nullable=False)
+    latitude = Column(Numeric(12, 8), nullable=False)
+    longitude = Column(Numeric(12, 8), nullable=False)
+    provider = Column(Text, nullable=True)
+    confidence = Column(Numeric(6, 4), nullable=True)
+    hit_count = Column(Integer, nullable=False, server_default=text("0"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<GeocodeCache id={self.id} key_hash={self.key_hash[:8]}…>"
+
+
+# ==========================
+# Tabela: enderecos_conhecidos
+# ==========================
+class EnderecoConhecido(Base):
+    __tablename__ = "enderecos_conhecidos"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(Integer, nullable=True)
+    rua = Column(Text, nullable=False)
+    numero = Column(Text, nullable=True)
+    bairro = Column(Text, nullable=True)
+    cidade = Column(Text, nullable=False)
+    estado = Column(Text, nullable=False)
+    cep = Column(Text, nullable=True)
+    latitude = Column(Numeric(12, 8), nullable=False)
+    longitude = Column(Numeric(12, 8), nullable=False)
+    qtd_utilizacoes = Column(Integer, nullable=False, server_default=text("1"))
+    ultima_utilizacao = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ==========================
+# Tabela: suggestion_cache
+# ==========================
+class SuggestionCache(Base):
+    __tablename__ = "suggestion_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key_hash = Column(Text, nullable=False, unique=True)
+    sub_base = Column(Text, nullable=False)
+    query_normalizada = Column(Text, nullable=False)
+    payload_json = Column(Text, nullable=False)
+    hit_count = Column(Integer, nullable=False, server_default=text("0"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ==========================
+# Tabela: address_telemetry
+# ==========================
+class AddressTelemetry(Base):
+    __tablename__ = "address_telemetry"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(Text, nullable=False)
+    sub_base = Column(Text, nullable=True)
+    motoboy_id = Column(Integer, nullable=True)
+    query_hash = Column(Text, nullable=True)
+    event_metadata = Column("metadata", JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

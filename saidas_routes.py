@@ -15,7 +15,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import select, func, or_, exists
+from sqlalchemy import select, func, or_, exists, text
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -30,6 +30,10 @@ from saida_operacional_utils import (
 )
 from codigo_normalizer import canonicalize_servico
 from log_leitura_service import registrar_log_leitura_critico
+from pedido_campos_obrigatorios_service import (
+    validate_campos_obrigatorios_conclusao,
+    raise_if_campos_obrigatorios_faltando,
+)
 
 
 # ============================================================
@@ -37,6 +41,7 @@ from log_leitura_service import registrar_log_leitura_critico
 # ============================================================
 
 router = APIRouter(prefix="/saidas", tags=["Saídas"])
+pedidos_router = APIRouter(prefix="/pedidos", tags=["Pedidos"])
 MAX_IDS_POR_LOTE = 5000
 OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -118,6 +123,21 @@ class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     origem: str = "web"
+
+
+class LancarAvulsoIn(BaseModel):
+    identificacao: Optional[str] = None
+    quantidade: int = Field(default=1, ge=1)
+    entregador_id: Optional[int] = None
+    entregador: Optional[str] = None
+    motoboy_id: Optional[int] = None
+
+
+class LancarAvulsoOut(BaseModel):
+    quantidade_criada: int
+    codigos: List[str]
+    saidas: List[dict]
+    mensagem: str
 
 
 class SaidaDetailOut(BaseModel):
@@ -480,6 +500,29 @@ def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
     if re.search(r"4[5-9]\d{9}", raw):
         return True
     return False
+
+
+def _normalizar_label_avulso(label: Optional[str]) -> str:
+    raw = unicodedata.normalize("NFD", (label or "").strip().upper())
+    ascii_only = "".join(c for c in raw if unicodedata.category(c) != "Mn")
+    ascii_only = re.sub(r"[^A-Z0-9]+", "-", ascii_only).strip("-")
+    ascii_only = re.sub(r"-{2,}", "-", ascii_only)
+    return ascii_only[:48]
+
+
+def _next_avulso_seq(db: Session) -> int:
+    db.execute(text("CREATE SEQUENCE IF NOT EXISTS avulso_codigo_seq START WITH 1 INCREMENT BY 1"))
+    return int(db.execute(text("SELECT nextval('avulso_codigo_seq')")).scalar_one())
+
+
+def _gerar_codigo_avulso(db: Session, label_norm: str) -> str:
+    while True:
+        seq = _next_avulso_seq(db)
+        sufixo = f"{seq:06d}"
+        codigo = f"AVULSO-{label_norm}-{sufixo}" if label_norm else f"AVULSO-{sufixo}"
+        existe = db.scalar(select(Saida.id_saida).where(Saida.codigo == codigo).limit(1))
+        if not existe:
+            return codigo
 
 
 def _servico_text_expr(expr):
@@ -1129,6 +1172,136 @@ def confirmar_nova_saida_mesmo_entregador(
     return SaidaOut.model_validate(saida)
 
 
+def _lancar_avulso_impl(
+    payload: LancarAvulsoIn,
+    db: Session,
+    current_user: User,
+):
+    sub_base = current_user.sub_base
+    username = current_user.username
+    if not sub_base or not username:
+        raise HTTPException(401, "Usuário inválido.")
+
+    owner_valor = Decimal(getattr(current_user, "owner_valor", 0))
+    role = int(getattr(current_user, "role", 0) or 0)
+
+    motoboy_id: Optional[int] = None
+    entregador_id: Optional[int] = None
+    entregador_nome = ""
+
+    if payload.motoboy_id is not None:
+        motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        motoboy_id = motoboy.id_motoboy
+        entregador_nome = _get_motoboy_nome(db, motoboy)
+    elif payload.entregador_id is not None or (payload.entregador and payload.entregador.strip()):
+        entregador_id, entregador_nome = _resolve_entregador(
+            db,
+            sub_base,
+            entregador_id=payload.entregador_id,
+            entregador_nome=payload.entregador,
+        )
+    elif role == 4 and getattr(current_user, "motoboy_id", None):
+        motoboy = _resolve_motoboy_for_subbase(db, sub_base, int(current_user.motoboy_id))
+        motoboy_id = motoboy.id_motoboy
+        entregador_nome = _get_motoboy_nome(db, motoboy)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe motoboy_id ou entregador_id/entregador."},
+        )
+
+    quantidade = int(payload.quantidade or 0)
+    if quantidade < 1:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "QUANTIDADE_INVALIDA", "message": "Quantidade mínima é 1."},
+        )
+
+    label_norm = _normalizar_label_avulso(payload.identificacao)
+    codigos: List[str] = []
+    saidas_criadas: List[dict] = []
+    status_inicial = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+    servico = canonicalize_servico("Avulso")
+
+    try:
+        for _ in range(quantidade):
+            codigo = _gerar_codigo_avulso(db, label_norm)
+            row = Saida(
+                sub_base=sub_base,
+                username=username,
+                entregador=entregador_nome,
+                entregador_id=entregador_id,
+                motoboy_id=motoboy_id,
+                codigo=codigo,
+                servico=servico,
+                status=status_inicial,
+                base=(payload.identificacao or "").strip() or None,
+            )
+            db.add(row)
+            db.flush()
+            db.add(
+                SaidaHistorico(
+                    id_saida=row.id_saida,
+                    evento="lancar_avulso",
+                    status_novo=status_inicial,
+                    user_id=getattr(current_user, "id", None),
+                    payload=json.dumps(
+                        {
+                            "identificacao": (payload.identificacao or "").strip() or None,
+                            "codigo": codigo,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+            db.add(
+                OwnerCobrancaItem(
+                    sub_base=sub_base,
+                    id_coleta=None,
+                    id_saida=row.id_saida,
+                    valor=owner_valor,
+                )
+            )
+            codigos.append(codigo)
+            saidas_criadas.append(
+                {
+                    "id_saida": int(row.id_saida),
+                    "codigo": codigo,
+                    "servico": servico,
+                    "status": status_inicial,
+                }
+            )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro ao lançar avulso: {e}")
+
+    qtd = len(codigos)
+    msg = "1 avulso lançado com sucesso." if qtd == 1 else f"{qtd} avulsos lançados com sucesso."
+    return {"quantidade_criada": qtd, "codigos": codigos, "saidas": saidas_criadas, "mensagem": msg}
+
+
+@router.post("/pedidos/lancar-avulso", response_model=LancarAvulsoOut)
+def lancar_avulso_legacy(
+    payload: LancarAvulsoIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _lancar_avulso_impl(payload, db, current_user)
+
+
+@pedidos_router.post("/lancar-avulso", response_model=LancarAvulsoOut)
+def lancar_avulso(
+    payload: LancarAvulsoIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _lancar_avulso_impl(payload, db, current_user)
+
+
 # ============================================================
 # GET — LISTAR SAÍDAS (COM CONTADORES)
 # ============================================================
@@ -1444,7 +1617,10 @@ def get_saida_detalhe(
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     obj = _get_owned_saida(db, sub_base, id_saida)
     detail_row = db.scalar(
-        select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).limit(1)
+        select(SaidaDetail)
+        .where(SaidaDetail.id_saida == id_saida)
+        .order_by(SaidaDetail.id_detail.desc())
+        .limit(1)
     )
     detail_out = None
     if detail_row:
@@ -1512,6 +1688,8 @@ def get_saida_detalhe(
 class SaidaFotoPatchBody(BaseModel):
     foto_url: str = Field(min_length=1)
     status: str = Field(pattern="^(entregue|ausente)$")
+    validar_campos_obrigatorios: bool = True
+    alterar_status: bool = True
 
 
 def _normalize_foto_url_to_key(foto_url: str) -> str:
@@ -1542,7 +1720,7 @@ def patch_saida_foto(
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     obj = _get_owned_saida(db, sub_base, id_saida)
     status_norm = normalizar_status_saida(obj.status)
-    if _status_esta_finalizado(status_norm):
+    if _status_esta_finalizado(status_norm) and body.alterar_status:
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_norm))
     detail_row = db.scalar(
         select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).order_by(SaidaDetail.id_detail.desc()).limit(1)
@@ -1585,17 +1763,29 @@ def patch_saida_foto(
         )
         db.add(detail_row)
 
-    status_anterior = obj.status
-    obj.status = status_canon
-    db.add(
-        SaidaHistorico(
-            id_saida=id_saida,
-            evento=body.status.lower(),
-            status_anterior=status_anterior,
-            status_novo=status_canon,
-            user_id=current_user.id,
+    if body.validar_campos_obrigatorios and body.alterar_status:
+        contexto_validacao = "ENTREGUE" if status_canon == STATUS_ENTREGUE else "AUSENTE"
+        faltantes = validate_campos_obrigatorios_conclusao(
+            db,
+            saida=obj,
+            contexto=contexto_validacao,
+            detail=detail_row,
+            overrides={"foto_url": payload},
         )
-    )
+        raise_if_campos_obrigatorios_faltando(faltantes)
+
+    if body.alterar_status:
+        status_anterior = obj.status
+        obj.status = status_canon
+        db.add(
+            SaidaHistorico(
+                id_saida=id_saida,
+                evento=body.status.lower(),
+                status_anterior=status_anterior,
+                status_novo=status_canon,
+                user_id=current_user.id,
+            )
+        )
     db.commit()
     logger.info(
         "PATCH foto: id_saida=%s object_key=%s status=%s foto_urls_count=%s user_id=%s",
@@ -1737,6 +1927,21 @@ def atualizar_saida(
 
     if payload.status is not None:
         novo_status = normalizar_status_saida(payload.status)
+        if novo_status in (STATUS_ENTREGUE, STATUS_AUSENTE):
+            detail_row = db.scalar(
+                select(SaidaDetail)
+                .where(SaidaDetail.id_saida == id_saida)
+                .order_by(SaidaDetail.id_detail.desc())
+                .limit(1)
+            )
+            contexto_validacao = "ENTREGUE" if novo_status == STATUS_ENTREGUE else "AUSENTE"
+            faltantes = validate_campos_obrigatorios_conclusao(
+                db,
+                saida=obj,
+                contexto=contexto_validacao,
+                detail=detail_row,
+            )
+            raise_if_campos_obrigatorios_faltando(faltantes)
         payload_changed["status"] = payload_changed["status"] or (novo_status != normalizar_status_saida(obj.status))
         obj.status = novo_status
         # Se alterou para cancelado, marcar cobrança como cancelada (não contabilizada)

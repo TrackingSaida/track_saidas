@@ -147,12 +147,14 @@ class PrecoGlobalOut(BaseModel):
     shopee_valor: Decimal
     ml_valor: Decimal
     avulso_valor: Decimal
+    considerar_pacote_g_adicional: bool = False
 
 
 class PrecoGlobalUpdate(BaseModel):
     shopee_valor: Optional[Decimal] = Field(None, ge=0)
     ml_valor: Optional[Decimal] = Field(None, ge=0)
     avulso_valor: Optional[Decimal] = Field(None, ge=0)
+    considerar_pacote_g_adicional: Optional[bool] = None
 
 
 class PrecoIndividualItem(BaseModel):
@@ -373,6 +375,13 @@ def resolver_precos_motoboy(
             "avulso_valor": global_row.avulso_valor or zero,
         }
     return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero}
+
+
+def _toggle_pacote_g_ativo(db: Session, sub_base: str) -> bool:
+    row = db.scalars(
+        select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
+    ).first()
+    return bool(getattr(row, "considerar_pacote_g_adicional", False)) if row else False
 
 
 # =========================================================
@@ -917,6 +926,7 @@ def _calcular_valor_base_motoboy_periodo(
     rows_raw = db.scalars(stmt).all()
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     precos = resolver_precos_motoboy(db, sub_base_user, motoboy_id=motoboy_id)
+    toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base_user)
     total = Decimal("0.00")
     for saida in rows:
         status_norm = (saida.status or "").strip().lower()
@@ -930,6 +940,8 @@ def _calcular_valor_base_motoboy_periodo(
         else:
             delta = precos["avulso_valor"]
         total += (-delta if is_cancelado else delta)
+        if toggle_pacote_g and bool(getattr(saida, "is_grande", False)):
+            total += (-delta if is_cancelado else delta)
     return total.quantize(Decimal("0.01"))
 
 
@@ -1272,8 +1284,14 @@ def get_preco_global(
             shopee_valor=row.shopee_valor,
             ml_valor=row.ml_valor,
             avulso_valor=row.avulso_valor,
+            considerar_pacote_g_adicional=bool(getattr(row, "considerar_pacote_g_adicional", False)),
         )
-    return PrecoGlobalOut(shopee_valor=_zero, ml_valor=_zero, avulso_valor=_zero)
+    return PrecoGlobalOut(
+        shopee_valor=_zero,
+        ml_valor=_zero,
+        avulso_valor=_zero,
+        considerar_pacote_g_adicional=False,
+    )
 
 
 @router.patch("/precos/global", response_model=PrecoGlobalOut)
@@ -1283,8 +1301,16 @@ def patch_preco_global(
     current_user=Depends(get_current_user),
 ):
     """Cria ou atualiza valores globais da sub_base do owner. Payload não vazio."""
-    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
-        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
+    if (
+        body.shopee_valor is None
+        and body.ml_valor is None
+        and body.avulso_valor is None
+        and body.considerar_pacote_g_adicional is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Envie ao menos um campo: shopee_valor, ml_valor, avulso_valor ou considerar_pacote_g_adicional.",
+        )
     sub_base_user = _resolve_user_base(db, current_user)
     row = db.scalars(
         select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base_user)
@@ -1296,17 +1322,25 @@ def patch_preco_global(
             row.ml_valor = body.ml_valor
         if body.avulso_valor is not None:
             row.avulso_valor = body.avulso_valor
+        if body.considerar_pacote_g_adicional is not None:
+            row.considerar_pacote_g_adicional = bool(body.considerar_pacote_g_adicional)
     else:
         row = EntregadorPrecoGlobal(
             sub_base=sub_base_user,
             shopee_valor=body.shopee_valor if body.shopee_valor is not None else _zero,
             ml_valor=body.ml_valor if body.ml_valor is not None else _zero,
             avulso_valor=body.avulso_valor if body.avulso_valor is not None else _zero,
+            considerar_pacote_g_adicional=bool(body.considerar_pacote_g_adicional) if body.considerar_pacote_g_adicional is not None else False,
         )
         db.add(row)
     db.commit()
     db.refresh(row)
-    return PrecoGlobalOut(shopee_valor=row.shopee_valor, ml_valor=row.ml_valor, avulso_valor=row.avulso_valor)
+    return PrecoGlobalOut(
+        shopee_valor=row.shopee_valor,
+        ml_valor=row.ml_valor,
+        avulso_valor=row.avulso_valor,
+        considerar_pacote_g_adicional=bool(getattr(row, "considerar_pacote_g_adicional", False)),
+    )
 
 
 @router.get("/precos/individuais", response_model=PrecoIndividuaisResponse)
