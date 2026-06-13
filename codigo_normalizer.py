@@ -33,6 +33,14 @@ def _is_codigo_shopee(codigo: str) -> bool:
     return bool(re.match(r"^BR(\d{13}|\d{12}[A-Z])$", c))
 
 
+_AVULSO_CODIGO_RE = re.compile(r"^AVULSO(-[A-Z0-9-]+)?$")
+
+
+def _is_codigo_avulso_gerado(raw: str) -> bool:
+    """Código avulso gerado pelo sistema (ex.: AVULSO-9JULHO-000019 ou AVULSO-000019)."""
+    return bool(_AVULSO_CODIGO_RE.match(_to_ascii_digits(str(raw or "")).upper().strip()))
+
+
 def _extract_ml_codigo(value: str) -> Optional[str]:
     """Extrai código Mercado Livre (45-49) normalizado para 11 dígitos."""
     if not value:
@@ -83,6 +91,8 @@ def is_qr_like_scan_payload(raw_input: str) -> bool:
     if re.search(r"(?:^|[^A-Z0-9])(BR(?:\d{13}|\d{12}[A-Z]))(?=$|[^A-Z0-9])", raw, re.I):
         return True
     if _extract_ml_codigo(all_digits):
+        return True
+    if _is_codigo_avulso_gerado(raw_input_str):
         return True
     return False
 
@@ -173,6 +183,9 @@ def normalize_codigo(raw_input: str, strict_qr: bool = False) -> tuple[Optional[
     if ml_codigo:
         codigo = ml_codigo
         return codigo, "Mercado Livre", raw_input_str
+
+    if _is_codigo_avulso_gerado(raw):
+        return raw.strip().upper(), "Avulso", None
 
     if strict_qr:
         return None, None, None

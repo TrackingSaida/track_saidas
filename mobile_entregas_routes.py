@@ -2450,8 +2450,9 @@ def scan_codigo(
     status_norm = normalizar_status_saida(saida.status)
 
     if status_norm == STATUS_ENTREGUE:
-        if motoboy_id is not None and saida.motoboy_id is not None and saida.motoboy_id != motoboy_id:
-            nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
+        mesmo_ent = motoboy_id is not None and saida.motoboy_id == motoboy_id
+        if not mesmo_ent and motoboy_id is not None:
+            nome_atual = _nome_motoboy_atual(db, saida) or saida.entregador or "outro motoboy"
             registrar_log_leitura_critico(
                 sub_base=sub_base,
                 username=getattr(user, "username", None),
@@ -2883,7 +2884,7 @@ def assumir_entrega(
         _garantir_cobranca_owner_saida(db, s, owner_valor)
         db.commit()
         return {"ok": True, "id_saida": id_saida}
-    if _status_esta_finalizado(status_norm):
+    if _status_esta_finalizado(status_norm) and status_norm != STATUS_ENTREGUE:
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     owner_valor = _owner_valor_por_sub_base(db, user, user.sub_base or "")
     if s.motoboy_id == user.motoboy_id:
