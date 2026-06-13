@@ -38,7 +38,7 @@ else:
 # App
 app = FastAPI(
     title="API Saídas",
-    version="0.2.1",  # bump leve (opcional)
+    version="1.2.0",
     openapi_url=f"{API_PREFIX}/openapi.json",
     docs_url=f"{API_PREFIX}/docs",
     redoc_url=f"{API_PREFIX}/redoc",
@@ -242,7 +242,7 @@ def startup_event():
 # Healthcheck
 @app.get(f"{API_PREFIX}/health", tags=["Health"])
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": app.version}
 
 # ──────────────────────────────────────────────────────────────────
 # Endpoint interno: refresh de tokens (Cron Render — a cada ~5h)
