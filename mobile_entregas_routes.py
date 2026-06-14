@@ -379,6 +379,7 @@ class ExtratoPedidoItem(BaseModel):
     status: str
     exibicao: str
     servico: str
+    valor: Decimal = Decimal("0.00")
 
 
 class ExtratoFinanceiroOut(BaseModel):
@@ -960,6 +961,7 @@ def extrato_financeiro_motoboy(
         if not passa_filtro:
             continue
         total_filtrados += 1
+        item_valor = Decimal("0.00") if is_cancelado else _valor_saida(precos_mobile, s)
         if d:
             dias_map[d]["total_pacotes_filtrados"] += 1
             dias_map[d]["itens"].append(
@@ -969,6 +971,7 @@ def extrato_financeiro_motoboy(
                     status=s.status or "",
                     exibicao=_status_exibicao(s.status),
                     servico=_servico_tipo(s.servico),
+                    valor=item_valor.quantize(Decimal("0.01")),
                 )
             )
 
@@ -978,7 +981,7 @@ def extrato_financeiro_motoboy(
 
         if is_cancelado:
             continue
-        valor = _valor_saida(precos_mobile, s)
+        valor = item_valor
         valor_total += valor
         if d:
             dias_map[d]["valor_dia"] += valor
