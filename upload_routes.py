@@ -15,7 +15,7 @@ from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from botocore.client import Config
@@ -83,6 +83,7 @@ class PresignGetIn(BaseModel):
 
 class WatermarkFotoOut(BaseModel):
     tem_comprovante: bool
+    image_count: int = 0
     image_url: Optional[str] = None
 
 
@@ -272,10 +273,11 @@ def get_comprovante_watermark(
 
     keys = _extract_foto_keys(detail.foto_url if detail else None)
     if not keys:
-        return {"tem_comprovante": False, "image_url": None}
+        return {"tem_comprovante": False, "image_count": 0, "image_url": None}
 
     return {
         "tem_comprovante": True,
+        "image_count": len(keys),
         "image_url": f"/api/upload/saida/{id_saida}/comprovante-watermark/image",
     }
 
@@ -283,6 +285,7 @@ def get_comprovante_watermark(
 @router.get("/saida/{id_saida}/comprovante-watermark/image")
 def get_comprovante_watermark_image(
     id_saida: int,
+    index: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -303,8 +306,10 @@ def get_comprovante_watermark_image(
     keys = _extract_foto_keys(detail.foto_url if detail else None)
     if not keys:
         raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
+    if index >= len(keys):
+        raise HTTPException(status_code=404, detail="Índice de comprovante inválido.")
 
-    object_key = _extract_object_key(keys[-1], B2_BUCKET_NAME)
+    object_key = _extract_object_key(keys[index], B2_BUCKET_NAME)
     client = _get_s3_client()
     try:
         obj = client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
