@@ -28,7 +28,7 @@ from saida_operacional_utils import (
     resolver_chave_acao,
     rotulo_acao_evento,
 )
-from codigo_normalizer import canonicalize_servico
+from codigo_normalizer import canonicalize_servico, normalize_codigo
 from log_leitura_service import registrar_log_leitura_critico
 from pedido_campos_obrigatorios_service import (
     validate_campos_obrigatorios_conclusao,
@@ -732,8 +732,20 @@ def ler_saida(
             detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe motoboy_id ou entregador_id/entregador."},
         )
 
-    codigo = payload.codigo.strip()
-    servico = canonicalize_servico(payload.servico)
+    codigo_norm, servico_norm, qr_from_norm = normalize_codigo(payload.codigo.strip(), strict_qr=False)
+    if codigo_norm is None or servico_norm is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "CODIGO_INVALIDO",
+                "message": "Código inválido. Use etiqueta Shopee, Mercado Livre, telefone válido ou AVULSO-*.",
+            },
+        )
+    codigo = codigo_norm
+    servico = canonicalize_servico(servico_norm)
+    qr_payload_raw = payload.qr_payload_raw
+    if qr_from_norm and not qr_payload_raw:
+        qr_payload_raw = qr_from_norm
 
     # 1 SELECT por (sub_base, codigo) — índice existente, O(1)
     existente = db.scalar(
@@ -755,8 +767,7 @@ def ler_saida(
         status_inicial = "não coletado" if payload.registrar_nao_coletado else (
             STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
         )
-        qr_raw = getattr(payload, "qr_payload_raw", None)
-        store_qr = _should_store_qr_payload_raw(servico, qr_raw)
+        store_qr = _should_store_qr_payload_raw(servico, qr_payload_raw)
         try:
             row = Saida(
                 sub_base=sub_base,
@@ -767,7 +778,7 @@ def ler_saida(
                 codigo=codigo,
                 servico=servico,
                 status=status_inicial,
-                qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
+                qr_payload_raw=qr_payload_raw.strip() if store_qr and qr_payload_raw else None,
             )
             db.add(row)
             db.flush()
