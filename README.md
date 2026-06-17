@@ -70,32 +70,50 @@ As alterações de schema (colunas, tabelas) são aplicadas manualmente. Veja [m
 
 ## Rotina de limpeza de histórico D-60 (Render)
 
-### Escopo da v1
+### Escopo da v2
 
-- Tabelas: `saidas` e `saida_historico`.
-- Política de retenção: 60 dias.
-- Execução: endpoint interno protegido + Cron Job diário no Render.
-- Política default armazenada em `history_retention_policy.sub_base='__global__'`.
+Fase A (por lote de `id_saida` antigo):
+
+1. Purge B2 de comprovantes (`foto_url` em `saidas_detail`)
+2. `saida_historico`
+3. `saidas_detail`
+4. `owner_cobranca_itens`
+5. `logs_leitura` (por `id_saida`)
+6. `saidas`
+
+Fase B (tempo restante do cron, por data):
+
+- `logs_leitura` (`created_at`)
+- `rotas_motoboy` (finalizadas/canceladas)
+- `address_telemetry`
+- `geocode_cache`, `suggestion_cache`, `enderecos_conhecidos`
+- `saidas_detail` / `owner_cobranca_itens` órfãos
+- `coletas` órfãs (sem saídas filhas)
+
+Fora do escopo: fechamentos financeiros, cadastro, tokens e configs.
+
+Política de retenção: 60 dias (configurável). Execução: endpoint interno + Cron Job diário no Render. Política default em `history_retention_policy.sub_base='__global__'`.
 
 ### Pré-requisitos
 
 1. Aplicar migração `migrations/history_cleanup_state.sql`.
-2. Configurar variáveis no Web Service e no Cron Job:
+2. (Opcional) Índices de performance: `migrations/cleanup_v2_optional_indexes.sql`.
+3. Configurar variáveis no Web Service e no Cron Job:
    - `CRON_CLEANUP_SECRET` (obrigatória)
    - `HISTORY_RETENTION_DAYS` (default `60`)
    - `HISTORY_CLEANUP_BATCH_SIZE` (default `3000`)
    - `HISTORY_CLEANUP_MAX_RUNTIME_SECONDS` (default `540`)
+   - `HISTORY_CLEANUP_B2_ENABLED` (default `true`; purge best-effort se credenciais B2 existirem)
 
 ### Endpoint interno
 
 - `POST /api/internal/cleanup-history`
 - Header obrigatório: `X-Cron-Secret: <CRON_CLEANUP_SECRET>`
-- Resposta inclui:
-  - `deleted.saidas`
-  - `deleted.saida_historico`
-  - `partial` (quando não termina na janela)
-  - `last_saida_id_checkpoint` (retomada automática)
-  - `remaining_estimate.before/after`
+- Resposta inclui `deleted.*` por tabela, `b2_objects.deleted/failed`, `partial`, `last_saida_id_checkpoint` e `remaining_estimate.before/after`
+
+### Auditoria antes/depois
+
+Rodar `scripts/cleanup_orphans_audit.sql` no Postgres para baseline de órfãos e volume antigo.
 
 ### Agendamento recomendado no Render
 

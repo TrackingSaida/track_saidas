@@ -5,21 +5,16 @@ Prefixo: /upload. Auth: get_current_user (web e mobile).
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-import re
 import uuid
 from io import BytesIO
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from botocore.client import Config
-import boto3
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -27,37 +22,24 @@ from sqlalchemy import select
 from auth import get_current_user
 from db import get_db
 from models import User, Saida, SaidaDetail
+from upload_storage_utils import (
+    B2_BUCKET_NAME,
+    extract_foto_keys,
+    extract_object_key,
+    get_s3_client_optional,
+)
 
 router = APIRouter(prefix="/upload", tags=["Upload - Fotos entrega"])
 
-# Env: B2_BUCKET_NAME, B2_ACCESS_KEY_ID, B2_SECRET_ACCESS_KEY, B2_ENDPOINT_URL
-B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "ts-prod-entregas-fotos")
-B2_ACCESS_KEY_ID = os.getenv("B2_ACCESS_KEY_ID", "")
-B2_SECRET_ACCESS_KEY = os.getenv("B2_SECRET_ACCESS_KEY", "")
-B2_ENDPOINT_URL = os.getenv("B2_ENDPOINT_URL", "https://s3.us-east-005.backblazeb2.com")
-
-# Region extraída do endpoint (ex: s3.us-east-005.backblazeb2.com -> us-east-005)
-_B2_REGION = "us-east-005"
-if "backblazeb2.com" in B2_ENDPOINT_URL:
-    m = re.search(r"s3\.([a-z0-9-]+)\.backblazeb2\.com", B2_ENDPOINT_URL)
-    if m:
-        _B2_REGION = m.group(1)
-
 
 def _get_s3_client():
-    if not B2_ACCESS_KEY_ID or not B2_SECRET_ACCESS_KEY:
+    client = get_s3_client_optional()
+    if client is None:
         raise HTTPException(
             status_code=503,
             detail="Upload não configurado (B2 credentials ausentes).",
         )
-    return boto3.client(
-        "s3",
-        endpoint_url=B2_ENDPOINT_URL.rstrip("/"),
-        aws_access_key_id=B2_ACCESS_KEY_ID,
-        aws_secret_access_key=B2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4"),
-        region_name=_B2_REGION,
-    )
+    return client
 
 
 def _ensure_saida_owned(db, sub_base: str, id_saida: int) -> None:
@@ -85,36 +67,6 @@ class WatermarkFotoOut(BaseModel):
     tem_comprovante: bool
     image_count: int = 0
     image_url: Optional[str] = None
-
-
-def _extract_object_key(foto_url: str, bucket_name: str) -> str:
-    """De foto_url (object_key ou URL completa) retorna o object_key."""
-    s = (foto_url or "").strip()
-    if not s:
-        raise ValueError("foto_url vazia")
-    if s.startswith("http://") or s.startswith("https://"):
-        # Extrair key após /bucket_name/
-        prefix = f"/{bucket_name}/"
-        idx = s.find(prefix)
-        if idx != -1:
-            return s[idx + len(prefix) :].split("?")[0]
-        # Fallback: path após o último /
-        return s.split("/")[-1].split("?")[0] or s
-    return s
-
-
-def _extract_foto_keys(detail_foto_url: Optional[str]) -> List[str]:
-    raw = (detail_foto_url or "").strip()
-    if not raw:
-        return []
-    if raw.startswith("["):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
-        except Exception:
-            return [raw]
-    return [raw]
 
 
 def _build_watermark_image_bytes(*, image_bytes: bytes, codigo: str) -> bytes:
@@ -219,12 +171,12 @@ def upload_presign_get(
         for u in body.foto_urls:
             if u and str(u).strip():
                 try:
-                    keys.append(_extract_object_key(str(u).strip(), B2_BUCKET_NAME))
+                    keys.append(extract_object_key(str(u).strip(), B2_BUCKET_NAME))
                 except ValueError:
                     pass
     elif body.foto_url and str(body.foto_url).strip():
         try:
-            keys.append(_extract_object_key(str(body.foto_url).strip(), B2_BUCKET_NAME))
+            keys.append(extract_object_key(str(body.foto_url).strip(), B2_BUCKET_NAME))
         except ValueError:
             raise HTTPException(status_code=422, detail="foto_url inválida.")
 
@@ -271,7 +223,7 @@ def get_comprovante_watermark(
         .limit(1)
     ).scalar_one_or_none()
 
-    keys = _extract_foto_keys(detail.foto_url if detail else None)
+    keys = extract_foto_keys(detail.foto_url if detail else None)
     if not keys:
         return {"tem_comprovante": False, "image_count": 0, "image_url": None}
 
@@ -303,13 +255,13 @@ def get_comprovante_watermark_image(
         .order_by(SaidaDetail.id_detail.desc())
         .limit(1)
     ).scalar_one_or_none()
-    keys = _extract_foto_keys(detail.foto_url if detail else None)
+    keys = extract_foto_keys(detail.foto_url if detail else None)
     if not keys:
         raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
     if index >= len(keys):
         raise HTTPException(status_code=404, detail="Índice de comprovante inválido.")
 
-    object_key = _extract_object_key(keys[index], B2_BUCKET_NAME)
+    object_key = extract_object_key(keys[index], B2_BUCKET_NAME)
     client = _get_s3_client()
     try:
         obj = client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
