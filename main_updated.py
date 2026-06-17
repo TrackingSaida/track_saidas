@@ -272,7 +272,7 @@ def internal_refresh_tokens(request: Request):
 @app.post(f"{API_PREFIX}/internal/cleanup-history", tags=["Internal"])
 def internal_cleanup_history(request: Request):
     """
-    Limpa histórico > D-60 (v1: saidas e saida_historico), em lotes e com limite de janela.
+    Limpa histórico > D-60 (v2): saidas, filhas, logs, rotas, caches e purge B2.
     Protegido por header X-Cron-Secret (CRON_CLEANUP_SECRET, fallback CRON_REFRESH_SECRET).
     """
     secret = os.getenv("CRON_CLEANUP_SECRET") or os.getenv("CRON_REFRESH_SECRET")
@@ -303,8 +303,21 @@ def internal_cleanup_history(request: Request):
             "retention_days": result.retention_days,
             "cutoff_utc": result.cutoff.isoformat(),
             "deleted": {
-                "saidas": result.rows_saidas,
                 "saida_historico": result.rows_historico,
+                "saidas_detail": result.rows_detail,
+                "owner_cobranca_itens": result.rows_cobranca,
+                "logs_leitura": result.rows_logs_leitura,
+                "saidas": result.rows_saidas,
+                "coletas": result.rows_coletas,
+                "rotas_motoboy": result.rows_rotas,
+                "address_telemetry": result.rows_address_telemetry,
+                "geocode_cache": result.rows_geocode_cache,
+                "suggestion_cache": result.rows_suggestion_cache,
+                "enderecos_conhecidos": result.rows_enderecos_conhecidos,
+                "b2_objects": {
+                    "deleted": result.b2_objects_deleted,
+                    "failed": result.b2_objects_failed,
+                },
             },
             "processed_saida_ids": result.processed_saida_ids,
             "last_saida_id_checkpoint": result.last_saida_id,

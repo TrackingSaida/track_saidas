@@ -41,6 +41,14 @@ Executar:
 -- arquivo: migrations/history_cleanup_state.sql
 ```
 
+## cleanup_v2_optional_indexes.sql
+
+**Opcional** após deploy da limpeza D-60 v2. Acelera deletes por data na Fase B (`logs_leitura`, `rotas_motoboy`).
+
+```sql
+-- arquivo: migrations/cleanup_v2_optional_indexes.sql
+```
+
 ## pedido_campos_obrigatorios_config.sql
 
 Cria a tabela de configuração por sub-base para campos obrigatórios na conclusão de pedido:
