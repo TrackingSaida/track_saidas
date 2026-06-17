@@ -220,7 +220,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 from db import SessionLocal
 from ml_int_service import refresh_all_ml_int_tokens
 from shopee_routes import refresh_all_shopee_tokens
-from cleanup_service import run_history_cleanup, estimate_old_volume
+from cleanup_service import run_history_cleanup, estimate_old_volume, _CleanupContext
 
 @app.on_event("startup")
 def startup_event():
@@ -288,15 +288,17 @@ def internal_cleanup_history(request: Request):
     retention_days = int(os.getenv("HISTORY_RETENTION_DAYS", "60"))
 
     db = SessionLocal()
+    ctx = _CleanupContext()
     try:
-        before = estimate_old_volume(db, retention_days=retention_days)
+        before = estimate_old_volume(db, retention_days=retention_days, ctx=ctx)
         result = run_history_cleanup(
             db,
             retention_days=retention_days,
             batch_size=batch_size,
             max_runtime_seconds=max_runtime_seconds,
+            ctx=ctx,
         )
-        after = estimate_old_volume(db, retention_days=result.retention_days)
+        after = estimate_old_volume(db, retention_days=result.retention_days, ctx=ctx)
         payload = {
             "status": result.status,
             "partial": result.partial,
@@ -319,6 +321,7 @@ def internal_cleanup_history(request: Request):
                     "failed": result.b2_objects_failed,
                 },
             },
+            "skipped_tables": ctx.skipped_list(),
             "processed_saida_ids": result.processed_saida_ids,
             "last_saida_id_checkpoint": result.last_saida_id,
             "duration_ms": result.duration_ms,

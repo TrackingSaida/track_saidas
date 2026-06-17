@@ -109,7 +109,9 @@ Política de retenção: 60 dias (configurável). Execução: endpoint interno +
 
 - `POST /api/internal/cleanup-history`
 - Header obrigatório: `X-Cron-Secret: <CRON_CLEANUP_SECRET>`
-- Resposta inclui `deleted.*` por tabela, `b2_objects.deleted/failed`, `partial`, `last_saida_id_checkpoint` e `remaining_estimate.before/after`
+- Resposta inclui `deleted.*` por tabela, `b2_objects.deleted/failed`, `partial`, `last_saida_id_checkpoint`, `remaining_estimate.before/after` e `skipped_tables` (tabelas opcionais ausentes no banco — ex.: caches de endereço não migrados)
+
+Tabelas opcionais (`geocode_cache`, `suggestion_cache`, `enderecos_conhecidos`, `address_telemetry`, `rotas_motoboy`, `coletas`, etc.) são ignoradas com `deleted.*=0` quando não existem; o job continua e retorna HTTP 200 com o nome em `skipped_tables`.
 
 ### Auditoria antes/depois
 

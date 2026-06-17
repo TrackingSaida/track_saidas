@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
 import os
 import time
+from typing import Any
 
-from sqlalchemy import delete, exists, func, select
+from sqlalchemy import delete, exists, func, inspect as sa_inspect, select, text
+from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.orm import Session
 
 from models import (
@@ -31,6 +33,70 @@ logger = logging.getLogger("cleanup_service")
 JOB_NAME = "history_cleanup_v1"
 DEFAULT_RETENTION_DAYS = 60
 
+OPTIONAL_TABLES = frozenset({
+    "saida_historico",
+    "saidas_detail",
+    "owner_cobranca_itens",
+    "logs_leitura",
+    "rotas_motoboy",
+    "address_telemetry",
+    "geocode_cache",
+    "suggestion_cache",
+    "enderecos_conhecidos",
+    "coletas",
+})
+
+CRITICAL_TABLES = frozenset({
+    "saidas",
+    "maintenance_job_state",
+    "history_retention_policy",
+})
+
+
+@dataclass
+class _CleanupContext:
+    skipped_tables: set[str] = field(default_factory=set)
+    _exists_cache: dict[str, bool] = field(default_factory=dict)
+
+    def skipped_list(self) -> list[str]:
+        return sorted(self.skipped_tables)
+
+    def table_exists(self, db: Session, table_name: str) -> bool:
+        if table_name in self._exists_cache:
+            return self._exists_cache[table_name]
+
+        exists_flag = False
+        try:
+            bind = db.get_bind()
+            exists_flag = sa_inspect(bind).has_table(table_name, schema="public")
+        except Exception:
+            exists_flag = False
+
+        if not exists_flag:
+            regclass = db.execute(
+                text("SELECT to_regclass(:name)"),
+                {"name": f"public.{table_name}"},
+            ).scalar_one()
+            exists_flag = regclass is not None
+
+        self._exists_cache[table_name] = exists_flag
+        return exists_flag
+
+    def mark_skipped(self, table_name: str) -> None:
+        if table_name not in self.skipped_tables:
+            self.skipped_tables.add(table_name)
+            logger.warning("cleanup_table_skipped table=%s reason=missing", table_name)
+
+    def require_table(self, db: Session, table_name: str) -> bool:
+        if self.table_exists(db, table_name):
+            return True
+        if table_name in OPTIONAL_TABLES:
+            self.mark_skipped(table_name)
+            return False
+        if table_name in CRITICAL_TABLES:
+            raise RuntimeError(f"Tabela crítica ausente: {table_name}")
+        raise RuntimeError(f"Tabela ausente: {table_name}")
+
 
 @dataclass
 class CleanupResult:
@@ -54,6 +120,7 @@ class CleanupResult:
     last_saida_id: int = 0
     duration_ms: int = 0
     partial: bool = False
+    skipped_tables: list[str] = field(default_factory=list)
     error: str | None = None
 
 
@@ -79,6 +146,61 @@ def _utc_now() -> datetime:
 def _b2_purge_enabled() -> bool:
     raw = os.getenv("HISTORY_CLEANUP_B2_ENABLED", "true").strip().lower()
     return raw not in ("0", "false", "no", "off")
+
+
+def _safe_scalar_count(ctx: _CleanupContext, db: Session, table_name: str, stmt) -> int:
+    if not ctx.require_table(db, table_name):
+        return 0
+    try:
+        return int(db.execute(stmt).scalar_one() or 0)
+    except (ProgrammingError, OperationalError) as exc:
+        db.rollback()
+        ctx.mark_skipped(table_name)
+        logger.warning("cleanup_count_failed table=%s error=%s", table_name, exc)
+        return 0
+
+
+def _safe_execute_delete(ctx: _CleanupContext, db: Session, table_name: str, delete_stmt) -> int:
+    if not ctx.require_table(db, table_name):
+        return 0
+    try:
+        result = db.execute(delete_stmt)
+        return int(result.rowcount or 0)
+    except (ProgrammingError, OperationalError) as exc:
+        db.rollback()
+        ctx.mark_skipped(table_name)
+        logger.warning("cleanup_delete_failed table=%s error=%s", table_name, exc)
+        return 0
+
+
+def _safe_select_ids(
+    ctx: _CleanupContext,
+    db: Session,
+    table_name: str,
+    stmt,
+) -> list[Any]:
+    if not ctx.require_table(db, table_name):
+        return []
+    try:
+        return list(db.execute(stmt).scalars().all())
+    except (ProgrammingError, OperationalError) as exc:
+        db.rollback()
+        ctx.mark_skipped(table_name)
+        logger.warning("cleanup_select_failed table=%s error=%s", table_name, exc)
+        return []
+
+
+def _safe_delete_by_ids(
+    ctx: _CleanupContext,
+    db: Session,
+    table_name: str,
+    model,
+    id_column,
+    ids: list,
+) -> int:
+    if not ids:
+        return 0
+    return _safe_execute_delete(ctx, db, table_name, delete(model).where(id_column.in_(ids)))
 
 
 def _load_retention_days(db: Session, fallback_days: int) -> int:
@@ -121,15 +243,9 @@ def _purge_detail_photos(foto_urls: list[str | None]) -> tuple[int, int]:
     return purge_b2_keys(keys)
 
 
-def _delete_ids_subquery(db: Session, model, id_column, ids: list) -> int:
-    if not ids:
-        return 0
-    result = db.execute(delete(model).where(id_column.in_(ids)))
-    return int(result.rowcount or 0)
-
-
 def _run_phase_b(
     db: Session,
+    ctx: _CleanupContext,
     *,
     cutoff: datetime,
     batch_size: int,
@@ -158,7 +274,14 @@ def _run_phase_b(
         for step in steps:
             if time.perf_counter() >= deadline:
                 return True
-            deleted = step(db, cutoff=cutoff, cutoff_date=cutoff_date, batch_size=batch_size, counters=counters)
+            deleted = step(
+                db,
+                ctx,
+                cutoff=cutoff,
+                cutoff_date=cutoff_date,
+                batch_size=batch_size,
+                counters=counters,
+            )
             if deleted > 0:
                 db.commit()
                 progress = True
@@ -167,129 +290,176 @@ def _run_phase_b(
     return False
 
 
-def _phase_b_logs_leitura(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_logs_leitura(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "logs_leitura",
         select(LogLeitura.id)
         .where(LogLeitura.created_at < cutoff)
         .order_by(LogLeitura.id.asc())
-        .limit(batch_size)
-    ).scalars().all()
-    count = _delete_ids_subquery(db, LogLeitura, LogLeitura.id, ids)
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(ctx, db, "logs_leitura", LogLeitura, LogLeitura.id, ids)
     counters.rows_logs_leitura += count
     return count
 
 
-def _phase_b_rotas_motoboy(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_rotas_motoboy(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "rotas_motoboy",
         select(RotasMotoboy.id)
         .where(RotasMotoboy.data < cutoff_date)
         .where(RotasMotoboy.status.in_(("finalizada", "cancelada")))
         .order_by(RotasMotoboy.id.asc())
-        .limit(batch_size)
-    ).scalars().all()
-    count = _delete_ids_subquery(db, RotasMotoboy, RotasMotoboy.id, ids)
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(ctx, db, "rotas_motoboy", RotasMotoboy, RotasMotoboy.id, ids)
     counters.rows_rotas += count
     return count
 
 
-def _phase_b_address_telemetry(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_address_telemetry(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "address_telemetry",
         select(AddressTelemetry.id)
         .where(AddressTelemetry.created_at < cutoff)
         .order_by(AddressTelemetry.id.asc())
-        .limit(batch_size)
-    ).scalars().all()
-    count = _delete_ids_subquery(db, AddressTelemetry, AddressTelemetry.id, ids)
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(ctx, db, "address_telemetry", AddressTelemetry, AddressTelemetry.id, ids)
     counters.rows_address_telemetry += count
     return count
 
 
-def _phase_b_geocode_cache(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_geocode_cache(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "geocode_cache",
         select(GeocodeCache.id)
         .where(GeocodeCache.updated_at < cutoff)
         .order_by(GeocodeCache.id.asc())
-        .limit(batch_size)
-    ).scalars().all()
-    count = _delete_ids_subquery(db, GeocodeCache, GeocodeCache.id, ids)
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(ctx, db, "geocode_cache", GeocodeCache, GeocodeCache.id, ids)
     counters.rows_geocode_cache += count
     return count
 
 
-def _phase_b_suggestion_cache(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_suggestion_cache(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "suggestion_cache",
         select(SuggestionCache.id)
         .where(SuggestionCache.updated_at < cutoff)
         .order_by(SuggestionCache.id.asc())
-        .limit(batch_size)
-    ).scalars().all()
-    count = _delete_ids_subquery(db, SuggestionCache, SuggestionCache.id, ids)
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(ctx, db, "suggestion_cache", SuggestionCache, SuggestionCache.id, ids)
     counters.rows_suggestion_cache += count
     return count
 
 
-def _phase_b_enderecos_conhecidos(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_enderecos_conhecidos(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "enderecos_conhecidos",
         select(EnderecoConhecido.id)
         .where(EnderecoConhecido.ultima_utilizacao < cutoff)
         .order_by(EnderecoConhecido.id.asc())
-        .limit(batch_size)
-    ).scalars().all()
-    count = _delete_ids_subquery(db, EnderecoConhecido, EnderecoConhecido.id, ids)
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(ctx, db, "enderecos_conhecidos", EnderecoConhecido, EnderecoConhecido.id, ids)
     counters.rows_enderecos_conhecidos += count
     return count
 
 
-def _phase_b_orphan_details(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_orphan_details(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    if not ctx.require_table(db, "saidas_detail"):
+        return 0
+
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "saidas_detail",
         select(SaidaDetail.id_detail)
         .where(SaidaDetail.timestamp < cutoff)
         .where(~exists(select(Saida.id_saida).where(Saida.id_saida == SaidaDetail.id_saida)))
         .order_by(SaidaDetail.id_detail.asc())
-        .limit(batch_size)
-    ).scalars().all()
+        .limit(batch_size),
+    )
     if not ids:
         return 0
 
-    foto_urls = db.execute(
-        select(SaidaDetail.foto_url).where(SaidaDetail.id_detail.in_(ids))
-    ).scalars().all()
+    foto_urls = _safe_select_ids(
+        ctx,
+        db,
+        "saidas_detail",
+        select(SaidaDetail.foto_url).where(SaidaDetail.id_detail.in_(ids)),
+    )
     batch_b2_deleted, batch_b2_failed = _purge_detail_photos(list(foto_urls))
     counters.b2_objects_deleted += batch_b2_deleted
     counters.b2_objects_failed += batch_b2_failed
-    counters.rows_detail_orphans += len(ids)
-    db.execute(delete(SaidaDetail).where(SaidaDetail.id_detail.in_(ids)))
-    return len(ids)
+    count = _safe_delete_by_ids(ctx, db, "saidas_detail", SaidaDetail, SaidaDetail.id_detail, ids)
+    counters.rows_detail_orphans += count
+    return count
 
 
-def _phase_b_orphan_cobranca(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_orphan_cobranca(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "owner_cobranca_itens",
         select(OwnerCobrancaItem.id)
         .where(OwnerCobrancaItem.timestamp < cutoff)
         .where(OwnerCobrancaItem.id_saida.isnot(None))
         .where(~exists(select(Saida.id_saida).where(Saida.id_saida == OwnerCobrancaItem.id_saida)))
         .order_by(OwnerCobrancaItem.id.asc())
-        .limit(batch_size)
-    ).scalars().all()
-    count = _delete_ids_subquery(db, OwnerCobrancaItem, OwnerCobrancaItem.id, ids)
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(ctx, db, "owner_cobranca_itens", OwnerCobrancaItem, OwnerCobrancaItem.id, ids)
     counters.rows_cobranca_orphans += count
     return count
 
 
-def _phase_b_orphan_coletas(db, *, cutoff, cutoff_date, batch_size, counters) -> int:
-    ids = db.execute(
+def _phase_b_orphan_coletas(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    if not ctx.require_table(db, "coletas"):
+        return 0
+
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "coletas",
         select(Coleta.id_coleta)
         .where(Coleta.timestamp < cutoff)
         .where(~exists(select(Saida.id_saida).where(Saida.id_coleta == Coleta.id_coleta)))
         .order_by(Coleta.id_coleta.asc())
-        .limit(batch_size)
-    ).scalars().all()
+        .limit(batch_size),
+    )
     if not ids:
         return 0
 
-    db.execute(delete(OwnerCobrancaItem).where(OwnerCobrancaItem.id_coleta.in_(ids)))
-    result = db.execute(delete(Coleta).where(Coleta.id_coleta.in_(ids)))
-    count = int(result.rowcount or 0)
+    if ctx.require_table(db, "owner_cobranca_itens"):
+        _safe_execute_delete(
+            ctx,
+            db,
+            "owner_cobranca_itens",
+            delete(OwnerCobrancaItem).where(OwnerCobrancaItem.id_coleta.in_(ids)),
+        )
+
+    count = _safe_execute_delete(
+        ctx,
+        db,
+        "coletas",
+        delete(Coleta).where(Coleta.id_coleta.in_(ids)),
+    )
     counters.rows_coletas += count
     return count
 
@@ -300,7 +470,9 @@ def run_history_cleanup(
     retention_days: int = DEFAULT_RETENTION_DAYS,
     batch_size: int = 3000,
     max_runtime_seconds: int = 540,
+    ctx: _CleanupContext | None = None,
 ) -> CleanupResult:
+    ctx = ctx or _CleanupContext()
     started = time.perf_counter()
     started_at = _utc_now()
     rows_historico = 0
@@ -328,6 +500,8 @@ def run_history_cleanup(
     last_saida_id = int(state.last_saida_id or 0)
 
     try:
+        ctx.require_table(db, "saidas")
+
         while True:
             if time.perf_counter() >= deadline:
                 partial = True
@@ -350,38 +524,46 @@ def run_history_cleanup(
             first_saida_id = int(old_saida_ids[0])
             current_last = int(old_saida_ids[-1])
 
-            foto_urls = db.execute(
-                select(SaidaDetail.foto_url).where(SaidaDetail.id_saida.in_(old_saida_ids))
-            ).scalars().all()
-            batch_b2_deleted, batch_b2_failed = _purge_detail_photos(list(foto_urls))
-            b2_deleted += batch_b2_deleted
-            b2_failed += batch_b2_failed
+            if ctx.require_table(db, "saidas_detail"):
+                foto_urls = db.execute(
+                    select(SaidaDetail.foto_url).where(SaidaDetail.id_saida.in_(old_saida_ids))
+                ).scalars().all()
+                batch_b2_deleted, batch_b2_failed = _purge_detail_photos(list(foto_urls))
+                b2_deleted += batch_b2_deleted
+                b2_failed += batch_b2_failed
 
-            deleted_hist = db.execute(
+            rows_historico += _safe_execute_delete(
+                ctx,
+                db,
+                "saida_historico",
                 delete(SaidaHistorico).where(
                     SaidaHistorico.id_saida >= first_saida_id,
                     SaidaHistorico.id_saida <= current_last,
                     SaidaHistorico.id_saida.in_(old_saida_ids),
-                )
+                ),
             )
-            deleted_detail = db.execute(
-                delete(SaidaDetail).where(SaidaDetail.id_saida.in_(old_saida_ids))
+            rows_detail += _safe_execute_delete(
+                ctx,
+                db,
+                "saidas_detail",
+                delete(SaidaDetail).where(SaidaDetail.id_saida.in_(old_saida_ids)),
             )
-            deleted_cobranca = db.execute(
-                delete(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida.in_(old_saida_ids))
+            rows_cobranca += _safe_execute_delete(
+                ctx,
+                db,
+                "owner_cobranca_itens",
+                delete(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida.in_(old_saida_ids)),
             )
-            deleted_logs = db.execute(
-                delete(LogLeitura).where(LogLeitura.id_saida.in_(old_saida_ids))
+            rows_logs_leitura += _safe_execute_delete(
+                ctx,
+                db,
+                "logs_leitura",
+                delete(LogLeitura).where(LogLeitura.id_saida.in_(old_saida_ids)),
             )
-            deleted_saida = db.execute(
-                delete(Saida).where(Saida.id_saida.in_(old_saida_ids))
-            )
+
+            deleted_saida = db.execute(delete(Saida).where(Saida.id_saida.in_(old_saida_ids)))
             db.commit()
 
-            rows_historico += int(deleted_hist.rowcount or 0)
-            rows_detail += int(deleted_detail.rowcount or 0)
-            rows_cobranca += int(deleted_cobranca.rowcount or 0)
-            rows_logs_leitura += int(deleted_logs.rowcount or 0)
             rows_saidas += int(deleted_saida.rowcount or 0)
             processed_saida_ids += len(old_saida_ids)
             last_saida_id = current_last
@@ -395,6 +577,7 @@ def run_history_cleanup(
         if time.perf_counter() < deadline:
             phase_b_partial = _run_phase_b(
                 db,
+                ctx,
                 cutoff=cutoff,
                 batch_size=batch_size,
                 deadline=deadline,
@@ -449,11 +632,18 @@ def run_history_cleanup(
         last_saida_id=last_saida_id,
         duration_ms=state.last_duration_ms,
         partial=(status == "partial"),
+        skipped_tables=ctx.skipped_list(),
         error=error_message,
     )
 
 
-def estimate_old_volume(db: Session, *, retention_days: int = DEFAULT_RETENTION_DAYS) -> dict[str, int]:
+def estimate_old_volume(
+    db: Session,
+    *,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
+    ctx: _CleanupContext | None = None,
+) -> dict[str, int]:
+    ctx = ctx or _CleanupContext()
     retention_days = _load_retention_days(db, retention_days)
     cutoff = _utc_now() - timedelta(days=retention_days)
     cutoff_date = cutoff.date()
@@ -461,72 +651,84 @@ def estimate_old_volume(db: Session, *, retention_days: int = DEFAULT_RETENTION_
     old_saidas = db.execute(
         select(func.count()).select_from(Saida).where(Saida.timestamp < cutoff)
     ).scalar_one()
-    old_historico = db.execute(
-        select(func.count())
-        .select_from(SaidaHistorico)
-        .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
-        .where(Saida.timestamp < cutoff)
-    ).scalar_one()
-    old_detail = db.execute(
-        select(func.count())
-        .select_from(SaidaDetail)
-        .join(Saida, Saida.id_saida == SaidaDetail.id_saida)
-        .where(Saida.timestamp < cutoff)
-    ).scalar_one()
-    orphan_detail = db.execute(
-        select(func.count())
-        .select_from(SaidaDetail)
-        .where(~exists(select(Saida.id_saida).where(Saida.id_saida == SaidaDetail.id_saida)))
-    ).scalar_one()
-    old_logs = db.execute(
-        select(func.count()).select_from(LogLeitura).where(LogLeitura.created_at < cutoff)
-    ).scalar_one()
-    old_rotas = db.execute(
-        select(func.count())
-        .select_from(RotasMotoboy)
-        .where(RotasMotoboy.data < cutoff_date)
-        .where(RotasMotoboy.status.in_(("finalizada", "cancelada")))
-    ).scalar_one()
-    old_coletas = db.execute(
-        select(func.count())
-        .select_from(Coleta)
-        .where(Coleta.timestamp < cutoff)
-        .where(~exists(select(Saida.id_saida).where(Saida.id_coleta == Coleta.id_coleta)))
-    ).scalar_one()
 
     return {
         "retention_days": retention_days,
         "old_saidas": int(old_saidas or 0),
-        "old_saida_historico": int(old_historico or 0),
-        "old_saidas_detail": int(old_detail or 0),
-        "orphan_saidas_detail": int(orphan_detail or 0),
-        "old_logs_leitura": int(old_logs or 0),
-        "old_rotas_motoboy": int(old_rotas or 0),
-        "old_coletas_orfas": int(old_coletas or 0),
-        "old_address_telemetry": int(
-            db.execute(
-                select(func.count()).select_from(AddressTelemetry).where(AddressTelemetry.created_at < cutoff)
-            ).scalar_one()
-            or 0
+        "old_saida_historico": _safe_scalar_count(
+            ctx,
+            db,
+            "saida_historico",
+            select(func.count())
+            .select_from(SaidaHistorico)
+            .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
+            .where(Saida.timestamp < cutoff),
         ),
-        "old_geocode_cache": int(
-            db.execute(
-                select(func.count()).select_from(GeocodeCache).where(GeocodeCache.updated_at < cutoff)
-            ).scalar_one()
-            or 0
+        "old_saidas_detail": _safe_scalar_count(
+            ctx,
+            db,
+            "saidas_detail",
+            select(func.count())
+            .select_from(SaidaDetail)
+            .join(Saida, Saida.id_saida == SaidaDetail.id_saida)
+            .where(Saida.timestamp < cutoff),
         ),
-        "old_suggestion_cache": int(
-            db.execute(
-                select(func.count()).select_from(SuggestionCache).where(SuggestionCache.updated_at < cutoff)
-            ).scalar_one()
-            or 0
+        "orphan_saidas_detail": _safe_scalar_count(
+            ctx,
+            db,
+            "saidas_detail",
+            select(func.count())
+            .select_from(SaidaDetail)
+            .where(~exists(select(Saida.id_saida).where(Saida.id_saida == SaidaDetail.id_saida))),
         ),
-        "old_enderecos_conhecidos": int(
-            db.execute(
-                select(func.count())
-                .select_from(EnderecoConhecido)
-                .where(EnderecoConhecido.ultima_utilizacao < cutoff)
-            ).scalar_one()
-            or 0
+        "old_logs_leitura": _safe_scalar_count(
+            ctx,
+            db,
+            "logs_leitura",
+            select(func.count()).select_from(LogLeitura).where(LogLeitura.created_at < cutoff),
+        ),
+        "old_rotas_motoboy": _safe_scalar_count(
+            ctx,
+            db,
+            "rotas_motoboy",
+            select(func.count())
+            .select_from(RotasMotoboy)
+            .where(RotasMotoboy.data < cutoff_date)
+            .where(RotasMotoboy.status.in_(("finalizada", "cancelada"))),
+        ),
+        "old_coletas_orfas": _safe_scalar_count(
+            ctx,
+            db,
+            "coletas",
+            select(func.count())
+            .select_from(Coleta)
+            .where(Coleta.timestamp < cutoff)
+            .where(~exists(select(Saida.id_saida).where(Saida.id_coleta == Coleta.id_coleta))),
+        ),
+        "old_address_telemetry": _safe_scalar_count(
+            ctx,
+            db,
+            "address_telemetry",
+            select(func.count()).select_from(AddressTelemetry).where(AddressTelemetry.created_at < cutoff),
+        ),
+        "old_geocode_cache": _safe_scalar_count(
+            ctx,
+            db,
+            "geocode_cache",
+            select(func.count()).select_from(GeocodeCache).where(GeocodeCache.updated_at < cutoff),
+        ),
+        "old_suggestion_cache": _safe_scalar_count(
+            ctx,
+            db,
+            "suggestion_cache",
+            select(func.count()).select_from(SuggestionCache).where(SuggestionCache.updated_at < cutoff),
+        ),
+        "old_enderecos_conhecidos": _safe_scalar_count(
+            ctx,
+            db,
+            "enderecos_conhecidos",
+            select(func.count())
+            .select_from(EnderecoConhecido)
+            .where(EnderecoConhecido.ultima_utilizacao < cutoff),
         ),
     }
