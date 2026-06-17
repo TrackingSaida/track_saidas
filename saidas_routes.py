@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import unicodedata
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Tuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,9 @@ from saida_operacional_utils import (
     filtrar_saidas_por_periodo_operacional,
     resolver_chave_acao,
     rotulo_acao_evento,
+    deve_excluir_saida_operacional,
+    timestamp_operacional_saida,
+    SaidaOperacionalContext,
 )
 from codigo_normalizer import canonicalize_servico, normalize_codigo
 from log_leitura_service import registrar_log_leitura_critico
@@ -520,6 +523,8 @@ def _gerar_codigo_avulso(db: Session, label_norm: str) -> str:
         seq = _next_avulso_seq(db)
         sufixo = f"{seq:06d}"
         codigo = f"AVULSO-{label_norm}-{sufixo}" if label_norm else f"AVULSO-{sufixo}"
+        # Checagem global (sem sub_base): avulso_codigo_seq é cluster-wide; garante unicidade do código gerado.
+        # TODO: remover SELECT defensivo e confiar em sequence + constraint UNIQUE quando existir.
         existe = db.scalar(select(Saida.id_saida).where(Saida.codigo == codigo).limit(1))
         if not existe:
             return codigo
@@ -1314,6 +1319,271 @@ def lancar_avulso(
 
 
 # ============================================================
+# LISTAR — helpers (fast path por código exato + item JSON)
+# ============================================================
+
+def _listar_resposta_vazia() -> Dict[str, Any]:
+    return {"total": 0, "sumShopee": 0, "sumMercado": 0, "sumAvulso": 0, "items": []}
+
+
+def _normalizar_codigo_busca_listar(codigo: str) -> str:
+    codigo_norm, _, _ = normalize_codigo(codigo.strip(), strict_qr=False)
+    if codigo_norm is None:
+        codigo_norm = codigo.strip().upper()
+    return codigo_norm
+
+
+def _buscar_saida_codigo_exato(db: Session, sub_base: str, codigo_norm: str) -> Optional[Saida]:
+    row = db.scalar(
+        select(Saida)
+        .where(
+            Saida.sub_base == sub_base,
+            Saida.codigo == codigo_norm,
+        )
+        .limit(1)
+    )
+    if row is not None:
+        return row
+    codigo_upper = codigo_norm.upper()
+    return db.scalar(
+        select(Saida)
+        .where(
+            Saida.sub_base == sub_base,
+            func.upper(Saida.codigo) == codigo_upper,
+        )
+        .limit(1)
+    )
+
+
+def _contar_servico_listar(servico: Optional[str]) -> Tuple[int, int, int]:
+    srv = (servico or "").strip().lower()
+    if ("shopee" in srv) or ("spx" in srv):
+        return 1, 0, 0
+    if (
+        ("mercado livre" in srv)
+        or ("mercado_livre" in srv)
+        or ("mercadolivre" in srv)
+        or (" ml" in f" {srv}")
+        or ("flex" in srv)
+    ):
+        return 0, 1, 0
+    return 0, 0, 1
+
+
+def _montar_item_listar_saida(
+    row: Saida,
+    op_ctx: Optional[SaidaOperacionalContext],
+    nome_executor: Optional[str],
+) -> Dict[str, Any]:
+    return {
+        "id_saida": row.id_saida,
+        "timestamp": row.timestamp,
+        "data_hora_acao": (op_ctx.ultimo_evento_ts if op_ctx else None) or row.timestamp,
+        "acao": (op_ctx.acao_label if op_ctx else None) or "Sem ação",
+        "executado_por": (op_ctx.executado_por if op_ctx else None) or "—",
+        "sub_base": row.sub_base,
+        "username": (op_ctx.ultimo_ator_username if op_ctx else None) or row.username,
+        "entregador": nome_executor or row.entregador,
+        "entregador_id": getattr(row, "entregador_id", None),
+        "motoboy_id": getattr(row, "motoboy_id", None),
+        "codigo": row.codigo,
+        "servico": row.servico,
+        "status": row.status,
+        "base": row.base,
+        "is_grande": getattr(row, "is_grande", False) or False,
+    }
+
+
+def _status_aliases_from_tokens(status_: Optional[List[str]]) -> List[str]:
+    status_tokens_raw = [
+        t for t in _parse_multi_values(status_) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    return sorted(
+        {
+            alias
+            for token in status_tokens_raw
+            for alias in _status_group_aliases(token)
+        }
+    )
+
+
+def _servico_tokens_from_param(servico: Optional[List[str]]) -> List[str]:
+    return [
+        _norm_text(t)
+        for t in _parse_multi_values(servico)
+        if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+
+
+def _saida_passa_filtro_status(row: Saida, status_aliases: List[str]) -> bool:
+    if not status_aliases:
+        return True
+    status_norm = _norm_text(row.status or "")
+    return any(_norm_text(alias) == status_norm for alias in status_aliases)
+
+
+def _saida_passa_filtro_servico(row: Saida, servico_tokens: List[str]) -> bool:
+    if not servico_tokens:
+        return True
+    srv = (row.servico or "").strip().lower()
+    for srv_norm in servico_tokens:
+        if srv_norm == "shopee":
+            if ("shopee" in srv) or ("spx" in srv):
+                return True
+        elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
+            if (
+                ("mercado livre" in srv)
+                or ("mercado_livre" in srv)
+                or ("mercadolivre" in srv)
+                or (" ml" in f" {srv}")
+                or ("flex" in srv)
+            ):
+                return True
+        elif srv_norm == "avulso":
+            if ("shopee" not in srv and "spx" not in srv) and not (
+                ("mercado livre" in srv)
+                or ("mercado_livre" in srv)
+                or ("mercadolivre" in srv)
+                or (" ml" in f" {srv}")
+                or ("flex" in srv)
+            ):
+                return True
+        elif _norm_text(row.servico or "") == srv_norm:
+            return True
+    return False
+
+
+def _saida_passa_filtro_base(row: Saida, base: Optional[str]) -> bool:
+    if not base or not base.strip() or base.lower() == "(todas)":
+        return True
+    return _norm_text(row.base or "") == _norm_text(base.strip())
+
+
+def _saida_passa_filtro_periodo(
+    row: Saida,
+    ctx: Optional[SaidaOperacionalContext],
+    de: Optional[date],
+    ate: Optional[date],
+) -> bool:
+    if deve_excluir_saida_operacional(ctx):
+        return False
+    ts = timestamp_operacional_saida(ctx, row.timestamp)
+    if ts is None:
+        return False
+    dia = ts.date()
+    if de is not None and dia < de:
+        return False
+    if ate is not None and dia > ate:
+        return False
+    return True
+
+
+def _build_acao_filter_sets(acao: Optional[List[str]]) -> Tuple[set, set]:
+    acao_tokens = [
+        _norm_text(t).replace("_", " ") for t in _parse_multi_values(acao)
+        if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    allowed_eventos: set = set()
+    allowed_labels: set = set()
+    for token in acao_tokens:
+        token_norm = " ".join(token.split())
+        token_key = token_norm.replace(" ", "_")
+        allowed_eventos.add(token_key)
+        allowed_labels.add(token_norm)
+        label_canonico = rotulo_acao_evento(token_key)
+        if label_canonico:
+            allowed_labels.add(_norm_text(label_canonico))
+        if token_key in {"reatribuido", "reatribuido_em_rota"}:
+            allowed_eventos.add("reatribuido")
+            allowed_eventos.add("reatribuido_em_rota")
+            allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido") or ""))
+            allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido_em_rota") or ""))
+    return allowed_eventos, allowed_labels
+
+
+def _saida_passa_filtro_acao(
+    ctx: Optional[SaidaOperacionalContext],
+    allowed_eventos: set,
+    allowed_labels: set,
+) -> bool:
+    if not allowed_eventos and not allowed_labels:
+        return True
+    if ctx is None:
+        return False
+    equiv = _norm_text(_acao_equivalente(ctx.ultimo_evento)).replace("_", " ")
+    if equiv in allowed_labels:
+        return True
+    if _norm_text(ctx.acao_label or "") in allowed_labels:
+        return True
+    if _acao_equivalente(ctx.ultimo_evento) in allowed_eventos:
+        return True
+    return False
+
+
+def _listar_saidas_codigo_exato(
+    db: Session,
+    sub_base: str,
+    codigo: str,
+    de: Optional[date],
+    ate: Optional[date],
+    base: Optional[str],
+    entregador: Optional[str],
+    status_: Optional[List[str]],
+    servico: Optional[List[str]],
+    acao: Optional[List[str]],
+    somente_g: Optional[bool],
+    limit: Optional[int],
+    offset: int,
+) -> Dict[str, Any]:
+    codigo_norm = _normalizar_codigo_busca_listar(codigo)
+    row = _buscar_saida_codigo_exato(db, sub_base, codigo_norm)
+    if row is None:
+        return _listar_resposta_vazia()
+
+    op_ctx_map = carregar_contexto_operacional(db, [row.id_saida])
+    ctx = op_ctx_map.get(int(row.id_saida))
+
+    entregador_filter_norm = ""
+    if entregador and entregador.strip() and entregador.lower() != "(todos)":
+        entregador_filter_norm = _norm_text(entregador)
+
+    status_aliases = _status_aliases_from_tokens(status_)
+    servico_tokens = _servico_tokens_from_param(servico)
+    allowed_eventos, allowed_labels = _build_acao_filter_sets(acao)
+
+    if somente_g and not (getattr(row, "is_grande", False) or False):
+        return _listar_resposta_vazia()
+    if not _saida_passa_filtro_base(row, base):
+        return _listar_resposta_vazia()
+    if not _saida_passa_filtro_status(row, status_aliases):
+        return _listar_resposta_vazia()
+    if not _saida_passa_filtro_servico(row, servico_tokens):
+        return _listar_resposta_vazia()
+    if not _saida_passa_filtro_periodo(row, ctx, de, ate):
+        return _listar_resposta_vazia()
+    if entregador_filter_norm:
+        nome_exec = _nome_executor_atual(db, row) or row.entregador
+        if _norm_text(nome_exec or "") != entregador_filter_norm:
+            return _listar_resposta_vazia()
+    if not _saida_passa_filtro_acao(ctx, allowed_eventos, allowed_labels):
+        return _listar_resposta_vazia()
+
+    sumShopee, sumMercado, sumAvulso = _contar_servico_listar(row.servico)
+    items: List[Dict[str, Any]] = []
+    if offset == 0 and (limit is None or limit > 0):
+        nome_executor = _nome_executor_atual(db, row)
+        items = [_montar_item_listar_saida(row, ctx, nome_executor)]
+
+    return {
+        "total": 1,
+        "sumShopee": sumShopee,
+        "sumMercado": sumMercado,
+        "sumAvulso": sumAvulso,
+        "items": items,
+    }
+
+
+# ============================================================
 # GET — LISTAR SAÍDAS (COM CONTADORES)
 # ============================================================
 
@@ -1337,6 +1607,26 @@ def listar_saidas(
     current_user: User = Depends(get_current_user),
 ):
     sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+
+    if codigo and codigo.strip() and codigo_exato:
+        return _listar_saidas_codigo_exato(
+            db=db,
+            sub_base=sub_base,
+            codigo=codigo,
+            de=de,
+            ate=ate,
+            base=base,
+            entregador=entregador,
+            status_=status_,
+            servico=servico,
+            acao=acao,
+            somente_g=somente_g,
+            limit=limit,
+            offset=offset,
+        )
+
     stmt = select(Saida).where(Saida.sub_base == sub_base)
     # Pré-filtro por janela de timestamp para reduzir cardinalidade antes do
     # processamento operacional em memória.
@@ -1590,23 +1880,11 @@ def listar_saidas(
         "sumMercado": sumMercado,
         "sumAvulso": sumAvulso,
         "items": [
-            {
-                "id_saida": r.id_saida,
-                "timestamp": r.timestamp,
-                "data_hora_acao": (op_ctx_map.get(r.id_saida).ultimo_evento_ts if op_ctx_map.get(r.id_saida) else None) or r.timestamp,
-                "acao": (op_ctx_map.get(r.id_saida).acao_label if op_ctx_map.get(r.id_saida) else None) or "Sem ação",
-                "executado_por": (op_ctx_map.get(r.id_saida).executado_por if op_ctx_map.get(r.id_saida) else None) or "—",
-                "sub_base": r.sub_base,
-                "username": (op_ctx_map.get(r.id_saida).ultimo_ator_username if op_ctx_map.get(r.id_saida) else None) or r.username,
-                "entregador": nomes_executor.get(int(r.id_saida)) or r.entregador,
-                "entregador_id": getattr(r, "entregador_id", None),
-                "motoboy_id": getattr(r, "motoboy_id", None),
-                "codigo": r.codigo,
-                "servico": r.servico,
-                "status": r.status,
-                "base": r.base,
-                "is_grande": getattr(r, "is_grande", False) or False,
-            }
+            _montar_item_listar_saida(
+                r,
+                op_ctx_map.get(r.id_saida),
+                nomes_executor.get(int(r.id_saida)) or r.entregador,
+            )
             for r in rows
         ],
     }

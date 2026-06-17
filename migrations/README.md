@@ -90,3 +90,16 @@ curl -s https://track-saidas-api.onrender.com/api/openapi.json | grep enderecos/
 ```
 
 Deve aparecer `/api/mobile/enderecos/sugestoes`. Se não aparecer, o Render ainda está em versão antiga — faça **Manual Deploy → Deploy latest commit** na branch `main`.
+
+## saidas_listar_performance_indexes.sql
+
+**Recomendado** para performance da tela **Registros** (`GET /saidas/listar`), especialmente busca exata por código (`codigo_exato=true`).
+
+Inclui índice composto `(sub_base, codigo)` usado pelo fast path do endpoint.
+
+Antes de criar índice **UNIQUE** em `(sub_base, codigo)`, rodar a auditoria de duplicados em [`scripts/saidas_codigo_index_audit.sql`](../scripts/saidas_codigo_index_audit.sql).
+
+```sql
+-- arquivo: migrations/saidas_listar_performance_indexes.sql
+```
+
