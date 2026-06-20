@@ -14,7 +14,7 @@ from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from db import get_db
-from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD
+from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD, revoke_motoboy_refresh_tokens_for_user
 from models import User, Owner, Motoboy, MotoboySubBase
 from base import _resolve_user_sub_base
 
@@ -934,5 +934,6 @@ def change_password(
 
     db_user.password_hash = get_password_hash(payload.new_password)
     db_user.must_change_password = False
+    revoke_motoboy_refresh_tokens_for_user(db, int(db_user.id))
     db.commit()
     return {"ok": True, "message": "Senha alterada com sucesso"}

@@ -4,6 +4,7 @@ from sqlalchemy import (
     Column,
     BigInteger,
     Integer,
+    String,
     Text,
     Numeric,
     Date,
@@ -709,15 +710,35 @@ class RotasMotoboy(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    sub_base = Column(Text, nullable=True)
     data = Column(Date, nullable=False)
     status = Column(Text, nullable=False, server_default=text("'ativa'"))  # preparando | ativa | finalizada | cancelada
     ordem_json = Column(Text, nullable=False)  # JSON array de id_saida
     parada_atual = Column(Integer, nullable=False, server_default=text("0"))
     iniciado_em = Column(DateTime(timezone=False), nullable=True)
     finalizado_em = Column(DateTime(timezone=False), nullable=True)
+    updated_at = Column(DateTime(timezone=False), nullable=True)
 
     def __repr__(self) -> str:
         return f"<RotasMotoboy id={self.id} motoboy_id={self.motoboy_id} status={self.status!r}>"
+
+
+# ==========================
+# Tabela: motoboy_refresh_tokens
+# ==========================
+class MotoboyRefreshToken(Base):
+    __tablename__ = "motoboy_refresh_tokens"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=False), nullable=False)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    revoked_at = Column(DateTime(timezone=False), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<MotoboyRefreshToken id={self.id} user_id={self.user_id} motoboy_id={self.motoboy_id}>"
 
 
 @event.listens_for(Saida, "after_update")

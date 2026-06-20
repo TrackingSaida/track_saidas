@@ -32,11 +32,12 @@ from saida_operacional_utils import (
     SaidaOperacionalContext,
 )
 from codigo_normalizer import canonicalize_servico, normalize_codigo
-from log_leitura_service import registrar_log_leitura_critico
+from saida_historico_service import SaidaHistoricoItemOut, listar_historico_saida
 from pedido_campos_obrigatorios_service import (
     validate_campos_obrigatorios_conclusao,
     raise_if_campos_obrigatorios_faltando,
 )
+from log_leitura_service import registrar_log_leitura_critico
 
 
 # ============================================================
@@ -187,22 +188,6 @@ class SaidaDetalheCompletoOut(BaseModel):
     base: Optional[str] = None
     is_grande: bool = False
     detail: Optional[SaidaDetailOut] = None
-    model_config = ConfigDict(from_attributes=True)
-
-
-class SaidaHistoricoItemOut(BaseModel):
-    """Um item do histórico para GET /saidas/{id_saida}/historico."""
-    id: int
-    id_saida: int
-    evento: str
-    timestamp: datetime
-    status_anterior: Optional[str] = None
-    status_novo: Optional[str] = None
-    user_id: Optional[int] = None
-    usuario_nome: Optional[str] = None
-    motoboy_id_anterior: Optional[int] = None
-    motoboy_id_novo: Optional[int] = None
-    acao_label: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -2102,30 +2087,7 @@ def get_saida_historico(
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     _get_owned_saida(db, sub_base, id_saida)
-    rows = db.execute(
-        select(SaidaHistorico, User.username)
-        .outerjoin(User, SaidaHistorico.user_id == User.id)
-        .where(SaidaHistorico.id_saida == id_saida)
-        .order_by(SaidaHistorico.timestamp.asc())
-    ).all()
-    out = []
-    for row in rows:
-        h, username = row[0], row[1]
-        evento_norm = (h.evento or "").strip().lower()
-        out.append(SaidaHistoricoItemOut(
-            id=h.id,
-            id_saida=h.id_saida,
-            evento=h.evento,
-            timestamp=h.timestamp,
-            status_anterior=h.status_anterior,
-            status_novo=h.status_novo,
-            user_id=h.user_id,
-            usuario_nome=username,
-            motoboy_id_anterior=h.motoboy_id_anterior,
-            motoboy_id_novo=h.motoboy_id_novo,
-            acao_label=rotulo_acao_evento(evento_norm),
-        ))
-    return out
+    return listar_historico_saida(db, id_saida)
 
 
 # ============================================================
