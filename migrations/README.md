@@ -2,7 +2,29 @@
 
 Execute no **banco do Render** (e em qualquer ambiente) após deploy que inclua a coluna correspondente no modelo.
 
-## owner_nome_fantasia.sql
+## motoboy_refresh_tokens.sql + rotas_motoboy_continuidade.sql
+
+**Obrigatório** após deploy da sessão estável + continuidade de rota (PR backend).
+
+1. `migrations/motoboy_refresh_tokens.sql` — tabela de refresh tokens mobile
+2. `migrations/rotas_motoboy_continuidade.sql` — colunas `sub_base`, `updated_at`, índice UNIQUE parcial
+
+Ordem sugerida no Render Shell:
+
+```bash
+psql "$DATABASE_URL" -f migrations/motoboy_refresh_tokens.sql
+psql "$DATABASE_URL" -f migrations/rotas_motoboy_continuidade.sql
+```
+
+Se o índice UNIQUE falhar com duplicatas, rode antes `scripts/fix_rotas_motoboy_duplicadas_abertas.sql` e tente o `CREATE UNIQUE INDEX` novamente.
+
+Variáveis de ambiente novas (`.env.example`):
+
+- `MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS=30`
+- `MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS=90`
+
+Auditar em produção: `ACCESS_TOKEN_EXPIRE_MINUTES` e estabilidade de `SECRET_KEY`.
+
 
 Adiciona a coluna opcional `nome_fantasia` na tabela `owner` para o campo institucional "Emitido por" no relatório de fechamento. Não afeta registros nem índices existentes.
 

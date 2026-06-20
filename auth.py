@@ -4,6 +4,7 @@ import os
 import uuid
 import hashlib
 import logging
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from decimal import Decimal
@@ -27,7 +28,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, or_
 
 from db import get_db
-from models import User, Owner, Motoboy, MotoboySubBase
+from models import User, Owner, Motoboy, MotoboySubBase, MotoboyRefreshToken
 
 
 # ======================================================
@@ -46,6 +47,8 @@ ALGORITHM = "HS256"
 
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
 REMEMBER_ME_EXPIRE_DAYS = int(os.getenv("REMEMBER_ME_EXPIRE_DAYS", "200"))
+MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS", "30"))
+MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS", "90"))
 
 # Cookies
 ACCESS_COOKIE_NAME = os.getenv("ACCESS_COOKIE_NAME", "access_token")
@@ -112,6 +115,16 @@ class Token(BaseModel):
     access_token: str
     token_type: str
     must_change_password: Optional[bool] = None
+    refresh_token: Optional[str] = None
+    expires_in: Optional[int] = None
+
+
+class MotoboyRefreshBody(BaseModel):
+    refresh_token: str = Field(min_length=16)
+
+
+class MotoboyLogoutBody(BaseModel):
+    refresh_token: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -167,6 +180,118 @@ def create_access_token(data: dict, expires_delta: timedelta) -> str:
     to_encode = data.copy()
     to_encode["exp"] = datetime.utcnow() + expires_delta
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _motoboy_access_expires() -> timedelta:
+    return timedelta(days=MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS)
+
+
+def _motoboy_refresh_expires() -> timedelta:
+    return timedelta(days=MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS)
+
+
+def _hash_refresh_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _generate_refresh_token_plain() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def revoke_motoboy_refresh_tokens_for_user(db: Session, user_id: int, *, commit: bool = True) -> None:
+    now = datetime.utcnow()
+    rows = db.scalars(
+        select(MotoboyRefreshToken).where(
+            MotoboyRefreshToken.user_id == user_id,
+            MotoboyRefreshToken.revoked_at.is_(None),
+        )
+    ).all()
+    for row in rows:
+        row.revoked_at = now
+    if rows and commit:
+        db.commit()
+
+
+def _store_motoboy_refresh_token(
+    db: Session,
+    *,
+    user_id: int,
+    motoboy_id: int,
+    plain_token: str,
+) -> None:
+    expires_at = datetime.utcnow() + _motoboy_refresh_expires()
+    db.add(
+        MotoboyRefreshToken(
+            user_id=user_id,
+            motoboy_id=motoboy_id,
+            token_hash=_hash_refresh_token(plain_token),
+            expires_at=expires_at,
+        )
+    )
+
+
+def _issue_motoboy_auth_response(
+    db: Session,
+    user: User,
+    motoboy: Motoboy,
+    owner: Owner,
+    sub_base: str,
+) -> Dict[str, Any]:
+    access_delta = _motoboy_access_expires()
+    access_token = create_access_token(
+        _claims_motoboy(user, motoboy, owner, sub_base),
+        access_delta,
+    )
+    revoke_motoboy_refresh_tokens_for_user(db, int(user.id), commit=False)
+    refresh_plain = _generate_refresh_token_plain()
+    _store_motoboy_refresh_token(
+        db,
+        user_id=int(user.id),
+        motoboy_id=int(motoboy.id_motoboy),
+        plain_token=refresh_plain,
+    )
+    db.commit()
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "refresh_token": refresh_plain,
+        "expires_in": int(access_delta.total_seconds()),
+        "must_change_password": _must_change_password_from_user(user),
+    }
+
+
+def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, Any]:
+    token_hash = _hash_refresh_token(plain_refresh.strip())
+    row = db.scalar(
+        select(MotoboyRefreshToken).where(
+            MotoboyRefreshToken.token_hash == token_hash,
+            MotoboyRefreshToken.revoked_at.is_(None),
+        )
+    )
+    if not row or row.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
+
+    user = db.get(User, row.user_id)
+    motoboy = db.get(Motoboy, row.motoboy_id)
+    if not user or not motoboy or user.role != 4:
+        raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
+
+    sub_bases_rows = db.scalars(
+        select(MotoboySubBase.sub_base).where(
+            MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+            MotoboySubBase.ativo.is_(True),
+        )
+    ).all()
+    sub_bases = [s for s in sub_bases_rows if s]
+    sub_base = user.sub_base or (sub_bases[0] if len(sub_bases) == 1 else None)
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Motoboy sem sub_base ativa vinculada.")
+
+    owner = _owner_for_sub_base(db, sub_base)
+
+    row.revoked_at = datetime.utcnow()
+    response = _issue_motoboy_auth_response(db, user, motoboy, owner, sub_base)
+    return response
 
 
 def _subject(user: User) -> str:
@@ -502,13 +627,11 @@ async def motoboy_login(
             meta["attempt_id"], sub_base, exc.status_code, exc.detail
         )
         raise
-    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token = create_access_token(_claims_motoboy(user, motoboy, owner, sub_base), expires)
     logger.info(
         "motoboy_login_success attempt_id=%s user_id=%s motoboy_id=%s sub_base=%s must_change_password=%s",
         meta["attempt_id"], user.id, motoboy.id_motoboy, sub_base, must_change_password
     )
-    return {"access_token": token, "token_type": "bearer", "must_change_password": must_change_password}
+    return _issue_motoboy_auth_response(db, user, motoboy, owner, sub_base)
 
 
 @router.post("/motoboy-select-subbase", response_model=Token)
@@ -572,17 +695,34 @@ async def motoboy_select_subbase(
             meta["attempt_id"], selected_sub_base, exc.status_code, exc.detail
         )
         raise
-    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token = create_access_token(
-        _claims_motoboy(user, motoboy, owner, selected_sub_base),
-        expires,
-    )
-    must_change_password = _must_change_password_from_user(user)
     logger.info(
         "motoboy_select_subbase_success attempt_id=%s user_id=%s motoboy_id=%s sub_base=%s must_change_password=%s",
-        meta["attempt_id"], user.id, motoboy.id_motoboy, selected_sub_base, must_change_password
+        meta["attempt_id"], user.id, motoboy.id_motoboy, selected_sub_base, _must_change_password_from_user(user)
     )
-    return {"access_token": token, "token_type": "bearer", "must_change_password": must_change_password}
+    return _issue_motoboy_auth_response(db, user, motoboy, owner, selected_sub_base)
+
+
+@router.post("/motoboy-refresh", response_model=Token)
+async def motoboy_refresh(body: MotoboyRefreshBody, db: Session = Depends(get_db)):
+    """Renova access token usando refresh token (app mobile)."""
+    return _rotate_motoboy_refresh_token(db, body.refresh_token)
+
+
+@router.post("/motoboy-logout")
+async def motoboy_logout(body: MotoboyLogoutBody, db: Session = Depends(get_db)):
+    """Revoga refresh token do motoboy (logout manual app mobile)."""
+    if body.refresh_token:
+        token_hash = _hash_refresh_token(body.refresh_token.strip())
+        row = db.scalar(
+            select(MotoboyRefreshToken).where(
+                MotoboyRefreshToken.token_hash == token_hash,
+                MotoboyRefreshToken.revoked_at.is_(None),
+            )
+        )
+        if row:
+            row.revoked_at = datetime.utcnow()
+            db.commit()
+    return {"ok": True}
 
 
 def _nome_exibicao(user: User) -> tuple[Optional[str], Optional[str]]:

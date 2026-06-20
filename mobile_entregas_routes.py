@@ -13,12 +13,17 @@ from decimal import Decimal
 from typing import Optional, List, Dict, Tuple, Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, exists
 from sqlalchemy.orm import Session
 
+from saida_historico_service import (
+    EntregaHistoricoItemOut,
+    listar_historico_saida,
+    projetar_historico_mobile,
+)
 from db import get_db
 from db_utils import db_rollback_safe
 from auth import get_current_user
@@ -128,6 +133,9 @@ class EntregaListItem(BaseModel):
     estado: Optional[str] = None
     contato: Optional[str] = None
     data: Optional[date] = None
+    data_hora_cadastro: Optional[datetime] = None
+    data_operacional: Optional[date] = None
+    data_hora_operacional: Optional[datetime] = None
     data_hora_entrega: Optional[datetime] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -340,10 +348,16 @@ class RotasAvancarOut(BaseModel):
 
 
 class RotasAtivaOut(BaseModel):
-    rota_id: str
-    ordem: List[int]
-    parada_atual: int
+    status: str = "sem_rota"
+    rota_id: Optional[str] = None
+    ordem: List[int] = Field(default_factory=list)
+    parada_atual: int = 0
     data: Optional[str] = None
+    sub_base: Optional[str] = None
+    entregador_id: Optional[int] = None
+    sequencia_preservada: bool = True
+    started_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class RotasOrdemBody(BaseModel):
@@ -482,6 +496,15 @@ def _carregar_data_hora_ocorrencia_map(db: Session, ids: List[int]) -> Dict[int,
         ).group_by(SaidaHistorico.id_saida)
     ).all()
     return {int(r[0]): r[1] for r in rows}
+
+
+def _enrich_datas_detalhe(db: Session, s: Saida, item: dict) -> None:
+    ctx_map = carregar_contexto_operacional(db, [s.id_saida])
+    ctx = ctx_map.get(s.id_saida)
+    ts_op = timestamp_operacional_saida(ctx, s.timestamp)
+    item["data_hora_cadastro"] = s.timestamp
+    item["data_operacional"] = _ctx_data_operacional_saida(db, s)
+    item["data_hora_operacional"] = ts_op
 
 
 def _saida_to_item(
@@ -1185,6 +1208,85 @@ def iniciar_rota(
     return {"atualizados": len(rows)}
 
 
+def _parse_route_updated_at_header(value: Optional[str]) -> Optional[datetime]:
+    if not value or not str(value).strip():
+        return None
+    raw = str(value).strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _rota_updated_at(rota: RotasMotoboy) -> datetime:
+    if getattr(rota, "updated_at", None):
+        return rota.updated_at
+    if getattr(rota, "iniciado_em", None):
+        return rota.iniciado_em
+    return datetime.utcnow()
+
+
+def _find_open_rota(
+    db: Session,
+    *,
+    motoboy_id: int,
+    sub_base: str,
+    ref_date: date,
+) -> Optional[RotasMotoboy]:
+    for status in ("ativa", "preparando"):
+        rota = db.scalar(
+            select(RotasMotoboy)
+            .where(
+                RotasMotoboy.motoboy_id == motoboy_id,
+                RotasMotoboy.data == ref_date,
+                RotasMotoboy.status == status,
+                RotasMotoboy.finalizado_em.is_(None),
+            )
+            .where(
+                (RotasMotoboy.sub_base == sub_base) | (RotasMotoboy.sub_base.is_(None))
+            )
+            .order_by(RotasMotoboy.updated_at.desc().nullslast(), RotasMotoboy.iniciado_em.desc().nullslast())
+            .limit(1)
+        )
+        if rota:
+            if rota.sub_base is None:
+                rota.sub_base = sub_base
+            return rota
+    return None
+
+
+def _upsert_rota_preparando(
+    db: Session,
+    *,
+    motoboy_id: int,
+    sub_base: str,
+    ref_date: date,
+    ordem: List[int],
+) -> None:
+    existing = _find_open_rota(db, motoboy_id=motoboy_id, sub_base=sub_base, ref_date=ref_date)
+    now = datetime.utcnow()
+    if existing and existing.status == "ativa":
+        return
+    if existing and existing.status == "preparando":
+        existing.ordem_json = json.dumps(ordem)
+        existing.parada_atual = 0
+        existing.updated_at = now
+        existing.sub_base = sub_base
+        db.commit()
+        return
+    rota = RotasMotoboy(
+        motoboy_id=motoboy_id,
+        sub_base=sub_base,
+        data=ref_date,
+        status="preparando",
+        ordem_json=json.dumps(ordem),
+        parada_atual=0,
+        updated_at=now,
+    )
+    db.add(rota)
+    db.commit()
+
+
 # ============================================================
 # POST /mobile/rotas/otimizar
 # ============================================================
@@ -1253,8 +1355,16 @@ def rotas_otimizar(
         start = (float(body.start.latitude), float(body.start.longitude))
 
     if not com_coord:
+        ordem_result = list(sem_coordenadas)
+        _upsert_rota_preparando(
+            db,
+            motoboy_id=int(motoboy_id),
+            sub_base=sub_base,
+            ref_date=_hoje_operacional(),
+            ordem=ordem_result,
+        )
         return RotasOtimizarOut(
-            ordem=list(sem_coordenadas),
+            ordem=ordem_result,
             modo="nearest_fallback",
             sem_coordenadas=sem_coordenadas,
             distancia_total_m=None,
@@ -1297,6 +1407,14 @@ def rotas_otimizar(
     ordem_otimizada = list(result.get("ordem") or [])
     ordem_expandida = expand_stop_order(ordem_otimizada, stops)
     ordem_final = ordem_expandida + sem_coordenadas
+
+    _upsert_rota_preparando(
+        db,
+        motoboy_id=int(motoboy_id),
+        sub_base=sub_base,
+        ref_date=_hoje_operacional(),
+        ordem=ordem_final,
+    )
 
     return RotasOtimizarOut(
         ordem=ordem_final,
@@ -1352,13 +1470,35 @@ def rotas_iniciar(
             )
 
     hoje = _hoje_operacional()
+    now = datetime.utcnow()
+    existing = _find_open_rota(db, motoboy_id=int(motoboy_id), sub_base=sub_base, ref_date=hoje)
+    if existing and existing.status == "preparando":
+        existing.status = "ativa"
+        existing.ordem_json = json.dumps(ids)
+        existing.parada_atual = 0
+        existing.iniciado_em = now
+        existing.updated_at = now
+        existing.sub_base = sub_base
+        db.commit()
+        db.refresh(existing)
+        return RotasIniciarOut(rota_id=str(existing.id))
+
+    if existing and existing.status == "ativa":
+        existing.ordem_json = json.dumps(ids)
+        existing.updated_at = now
+        db.commit()
+        db.refresh(existing)
+        return RotasIniciarOut(rota_id=str(existing.id))
+
     rota = RotasMotoboy(
         motoboy_id=motoboy_id,
+        sub_base=sub_base,
         data=hoje,
         status="ativa",
         ordem_json=json.dumps(ids),
         parada_atual=0,
-        iniciado_em=datetime.utcnow(),
+        iniciado_em=now,
+        updated_at=now,
     )
     db.add(rota)
     db.commit()
@@ -1369,15 +1509,17 @@ def rotas_iniciar(
 # ============================================================
 # GET /mobile/rotas/ativa
 # ============================================================
-@router.get("/rotas/ativa", response_model=Optional[RotasAtivaOut])
+@router.get("/rotas/ativa", response_model=RotasAtivaOut)
 def rotas_ativa(
     data: Optional[str] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Retorna a rota ativa do motoboy (status=ativa e data=hoje). Rotas finalizadas ou de outros dias não são retornadas.
-    data (opcional, YYYY-MM-DD): data local do app; quando enviado, só retorna rota desse dia."""
+    """Retorna estado unificado da rota do motoboy (ativa > preparando > sem_rota)."""
     motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
     if data:
         try:
             hoje = date.fromisoformat(data.strip())
@@ -1385,30 +1527,25 @@ def rotas_ativa(
             hoje = _hoje_operacional()
     else:
         hoje = _hoje_operacional()
-    # Só retorna rota realmente ativa: status=ativa, sem finalizado_em (evita dados manuais/desatualizados)
-    rota = db.scalar(
-        select(RotasMotoboy).where(
-            RotasMotoboy.motoboy_id == motoboy_id,
-            RotasMotoboy.status == "ativa",
-            RotasMotoboy.data == hoje,
-            RotasMotoboy.finalizado_em.is_(None),
-        ).order_by(RotasMotoboy.iniciado_em.desc()).limit(1)
-    )
+
+    rota = _find_open_rota(db, motoboy_id=int(motoboy_id), sub_base=sub_base, ref_date=hoje)
     if not rota:
-        return None
-    if not refresh_active_route_if_stale(db, rota):
-        return None
+        return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
+
+    if map_rota_to_api_status(rota) == API_STATUS_EM_ENTREGA:
+        if not refresh_active_route_if_stale(db, rota):
+            return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
+        ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
+        if not isinstance(ordem, list):
+            ordem = []
+        if len(ordem) > 0 and rota.parada_atual >= len(ordem):
+            return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
+        return RotasAtivaOut(**build_rotas_ativa_out(rota, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat(), ordem=ordem))
+
     ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
     if not isinstance(ordem, list):
         ordem = []
-    if len(ordem) > 0 and rota.parada_atual >= len(ordem):
-        return None
-    return RotasAtivaOut(
-        rota_id=str(rota.id),
-        ordem=ordem,
-        parada_atual=rota.parada_atual,
-        data=rota.data.isoformat() if rota.data else None,
-    )
+    return RotasAtivaOut(**build_rotas_ativa_out(rota, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat(), ordem=ordem))
 
 
 # ============================================================
@@ -1442,14 +1579,33 @@ def rotas_atualizar_ordem(
     body: RotasOrdemBody,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
+    x_route_updated_at: Optional[str] = Header(None, alias="X-Route-Updated-At"),
 ):
-    """Atualiza a ordem das entregas na rota ativa. Paradas já concluídas não podem mudar."""
+    """Atualiza a ordem das entregas na rota (ativa ou preparando). Paradas já concluídas não podem mudar."""
     motoboy_id = user.motoboy_id
     rota = db.get(RotasMotoboy, rota_id)
     if not rota or rota.motoboy_id != motoboy_id:
         raise HTTPException(status_code=404, detail="Rota não encontrada.")
-    if rota.status != "ativa":
-        raise HTTPException(status_code=400, detail="Rota não está ativa.")
+    if rota.status not in ("ativa", "preparando"):
+        raise HTTPException(status_code=400, detail="Rota não está aberta.")
+
+    client_ts = _parse_route_updated_at_header(x_route_updated_at)
+    server_ts = _rota_updated_at(rota)
+    if client_ts and server_ts and client_ts < server_ts:
+        ordem_srv = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
+        if not isinstance(ordem_srv, list):
+            ordem_srv = []
+        payload = build_rotas_ativa_out(
+            rota,
+            sub_base=user.sub_base or rota.sub_base or "",
+            motoboy_id=int(motoboy_id),
+            data_iso=rota.data.isoformat() if rota.data else _hoje_operacional().isoformat(),
+            ordem=ordem_srv,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={"code": "ROTA_DESATUALIZADA", "rota": payload},
+        )
 
     ordem_atual = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
     if not isinstance(ordem_atual, list):
@@ -1463,13 +1619,14 @@ def rotas_atualizar_ordem(
         )
 
     parada_atual = rota.parada_atual or 0
-    if ordem_atual[:parada_atual] != nova_ordem[:parada_atual]:
+    if rota.status == "ativa" and ordem_atual[:parada_atual] != nova_ordem[:parada_atual]:
         raise HTTPException(
             status_code=400,
             detail="Não é possível alterar a ordem das paradas já concluídas.",
         )
 
     rota.ordem_json = json.dumps(nova_ordem)
+    rota.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(rota)
     return RotasOrdemOut(ordem=nova_ordem, parada_atual=parada_atual)
@@ -1493,6 +1650,29 @@ def rotas_finalizar(
         raise HTTPException(status_code=400, detail="Rota não está ativa.")
     rota.status = "finalizada"
     rota.finalizado_em = datetime.utcnow()
+    rota.updated_at = datetime.utcnow()
+    db.commit()
+
+
+# ============================================================
+# POST /mobile/rotas/{id}/cancelar
+# ============================================================
+@router.post("/rotas/{rota_id}/cancelar", status_code=204)
+def rotas_cancelar(
+    rota_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Cancela rota aberta (preparando ou ativa) antes de recriar otimização."""
+    motoboy_id = user.motoboy_id
+    rota = db.get(RotasMotoboy, rota_id)
+    if not rota or rota.motoboy_id != motoboy_id:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+    if rota.status not in ("ativa", "preparando"):
+        raise HTTPException(status_code=400, detail="Rota não está aberta.")
+    rota.status = "cancelada"
+    rota.finalizado_em = datetime.utcnow()
+    rota.updated_at = datetime.utcnow()
     db.commit()
 
 
@@ -1547,7 +1727,23 @@ def detalhe_entrega(
     item["campos_obrigatorios"] = sorted(set((campos_entregue or []) + (campos_ausente or [])))
     item["campos_obrigatorios_entregue"] = campos_entregue or []
     item["campos_obrigatorios_ausente"] = campos_ausente or []
+    _enrich_datas_detalhe(db, s, item)
     return item
+
+
+# ============================================================
+# GET /mobile/entrega/{id}/historico
+# ============================================================
+@router.get("/entrega/{id_saida}/historico", response_model=List[EntregaHistoricoItemOut])
+def historico_entrega(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Linha do tempo da entrega (escopo motoboy + sub_base)."""
+    _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    items = listar_historico_saida(db, id_saida)
+    return projetar_historico_mobile(items)
 
 
 # ============================================================
