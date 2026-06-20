@@ -734,7 +734,7 @@ class MotoboyRefreshToken(Base):
     motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
     token_hash = Column(String(64), nullable=False, unique=True)
     expires_at = Column(DateTime(timezone=False), nullable=False)
-    created_at = Column(DateTime(timezone=False, server_default=text("NOW()")), nullable=False)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
     revoked_at = Column(DateTime(timezone=False), nullable=True)
 
     def __repr__(self) -> str:
