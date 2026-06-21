@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, func, exists
 from sqlalchemy.orm import Session
 
+logger = logging.getLogger(__name__)
+
 from saida_historico_service import (
     EntregaHistoricoItemOut,
     listar_historico_saida,
@@ -2304,9 +2306,17 @@ def marcar_entregue(
     body: Optional[EntregueBody] = Body(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
+    x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
     """Marca entrega como ENTREGUE e registra data_hora_entrega. Só permite se status for EM_ROTA.
     Se body for enviado, preenche tipo_recebedor, nome_recebedor, tipo_documento, numero_documento, observacao_entrega em saidas_detail."""
+    if x_client_action_id:
+        logger.info(
+            "marcar_entregue client_action_id=%s id_saida=%s user_id=%s",
+            x_client_action_id.strip()[:64],
+            id_saida,
+            user.id,
+        )
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
 
@@ -2400,8 +2410,16 @@ def marcar_ausente(
     body: AusenteBody,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
+    x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
     """Marca entrega como AUSENTE com motivo. Só permite se status for EM_ROTA."""
+    if x_client_action_id:
+        logger.info(
+            "marcar_ausente client_action_id=%s id_saida=%s user_id=%s",
+            x_client_action_id.strip()[:64],
+            id_saida,
+            user.id,
+        )
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
     if _status_esta_finalizado(status_norm):
