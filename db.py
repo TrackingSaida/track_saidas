@@ -34,7 +34,7 @@ engine = create_engine(
     pool_pre_ping=True,   # evita conexões zumbis
     pool_size=5,          # ajuste conforme carga
     max_overflow=10,      # conexões extras temporárias
-    pool_recycle=1800,    # recicla após 30min (mitiga timeouts)
+    pool_recycle=300,     # recicla após 5min (mitiga SSL idle no Postgres gerenciado)
     echo=ECHO_SQL,
 )
 

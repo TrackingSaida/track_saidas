@@ -5,10 +5,9 @@ from datetime import date, datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 from sqlalchemy import select
-from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
-from db_utils import db_rollback_safe
+from db_utils import run_db_query_with_retry
 from models import SaidaHistorico, User
 
 MAX_IDS_POR_LOTE = 250
@@ -95,33 +94,6 @@ def _chunked(values: Sequence[T], chunk_size: int) -> Iterable[Sequence[T]]:
         yield values[i : i + chunk_size]
 
 
-def _is_transient_db_error(exc: BaseException) -> bool:
-    orig = getattr(exc, "orig", exc)
-    msg = str(orig or exc).lower()
-    return any(
-        token in msg
-        for token in (
-            "ssl connection has been closed",
-            "connection reset",
-            "server closed the connection",
-            "could not receive data",
-            "connection timed out",
-            "broken pipe",
-            "consuming input failed",
-        )
-    )
-
-
-def _run_db_query_with_retry(db: Session, fn):
-    try:
-        return fn()
-    except (OperationalError, DBAPIError) as exc:
-        if not _is_transient_db_error(exc):
-            raise
-        db_rollback_safe(db)
-        return fn()
-
-
 def resolver_chave_acao(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
     if not evento:
         return None
@@ -153,7 +125,7 @@ def carregar_contexto_operacional(
     )
     historicos = []
     for ids_lote in _chunked(ids, MAX_IDS_POR_LOTE):
-        rows_lote = _run_db_query_with_retry(
+        rows_lote = run_db_query_with_retry(
             db,
             lambda ids_lote=ids_lote: db.execute(
                 select(SaidaHistorico)
@@ -206,7 +178,7 @@ def carregar_contexto_operacional(
     if user_ids:
         rows_user = []
         for user_ids_lote in _chunked(sorted(user_ids), MAX_IDS_POR_LOTE):
-            rows_lote = _run_db_query_with_retry(
+            rows_lote = run_db_query_with_retry(
                 db,
                 lambda user_ids_lote=user_ids_lote: db.execute(
                     select(User.id, User.username).where(User.id.in_(user_ids_lote))

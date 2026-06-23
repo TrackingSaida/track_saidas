@@ -19,6 +19,7 @@ from sqlalchemy import select, func, or_, exists, text
 from sqlalchemy.orm import Session
 
 from db import get_db
+from db_utils import run_db_query_with_retry
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
 from saida_operacional_utils import (
@@ -1729,7 +1730,7 @@ def listar_saidas(
         )
         stmt = stmt.where(or_conds)
 
-    rows_all = db.execute(stmt).scalars().all()
+    rows_all = run_db_query_with_retry(db, lambda: db.execute(stmt).scalars().all())
     rows_filtradas, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_all, de, ate)
     executor_nome_cache: Dict[int, Optional[str]] = {}
 
@@ -1745,9 +1746,12 @@ def listar_saidas(
     if motoboy_ids:
         rows_motoboy = []
         for motoboy_ids_lote in _chunked_ids(motoboy_ids):
-            rows_lote = db.execute(
-                select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(motoboy_ids_lote))
-            ).all()
+            rows_lote = run_db_query_with_retry(
+                db,
+                lambda motoboy_ids_lote=motoboy_ids_lote: db.execute(
+                    select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(motoboy_ids_lote))
+                ).all(),
+            )
             rows_motoboy.extend(rows_lote)
         motoboy_user_map = {
             int(mid): (int(uid) if uid is not None else None)
@@ -1758,9 +1762,12 @@ def listar_saidas(
         if user_ids:
             rows_user = []
             for user_ids_lote in _chunked_ids(user_ids):
-                rows_lote = db.execute(
-                    select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids_lote))
-                ).all()
+                rows_lote = run_db_query_with_retry(
+                    db,
+                    lambda user_ids_lote=user_ids_lote: db.execute(
+                        select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids_lote))
+                    ).all(),
+                )
                 rows_user.extend(rows_lote)
             user_map = {
                 int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
