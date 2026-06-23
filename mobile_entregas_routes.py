@@ -72,6 +72,11 @@ from codigo_normalizer import (
     is_qr_like_scan_payload,
 )
 from entregador_routes import resolver_precos_motoboy
+from route_api_status import (
+    API_STATUS_EM_ENTREGA,
+    build_rotas_ativa_out,
+    map_rota_to_api_status,
+)
 from saida_operacional_utils import (
     carregar_contexto_operacional,
     EVENTOS_ATRIBUICAO_VALIDOS,
