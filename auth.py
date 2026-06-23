@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, or_
 
 from db import get_db
+from db_utils import run_db_query_with_retry
 from models import User, Owner, Motoboy, MotoboySubBase, MotoboyRefreshToken
 
 
@@ -299,7 +300,10 @@ def _subject(user: User) -> str:
 
 
 def _owner_for_sub_base(db: Session, sub_base: str) -> Owner:
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    owner = run_db_query_with_retry(
+        db,
+        lambda: db.scalar(select(Owner).where(Owner.sub_base == sub_base)),
+    )
     if not owner:
         raise HTTPException(403, "Nenhum Owner encontrado para esta sub_base")
     if owner.ativo is False:
@@ -414,7 +418,7 @@ def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
             User.contato == identifier
         )
     )
-    return db.scalars(stmt).first()
+    return run_db_query_with_retry(db, lambda: db.scalars(stmt).first())
 
 
 def authenticate_user(db: Session, identifier: str, password: str) -> Optional[User]:

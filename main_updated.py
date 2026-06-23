@@ -5,7 +5,7 @@ import time
 import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
 logger = logging.getLogger("main")
@@ -63,8 +63,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 class CORSFallbackMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
+        start = time.perf_counter()
         try:
             response = await call_next(request)
+        except RuntimeError as exc:
+            if str(exc) == "No response returned." and await request.is_disconnected():
+                logger.warning(
+                    "client_disconnected method=%s path=%s",
+                    request.method,
+                    request.url.path,
+                )
+                return Response(status_code=499)
+            raise
         except Exception as exc:
             logger.exception(
                 "cors_fallback_exception method=%s path=%s",
@@ -77,6 +87,10 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
                 headers["Access-Control-Allow-Origin"] = origin
                 headers["Access-Control-Allow-Credentials"] = "true"
             return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=headers)
+
+        end = time.perf_counter()
+        response.headers["X-Backend-Process-Time"] = f"{(end - start) * 1000:.3f}"
+
         origin = request.headers.get("origin")
         if origin and "access-control-allow-origin" not in [k.lower() for k in response.headers.keys()]:
             response.headers["Access-Control-Allow-Origin"] = origin
@@ -84,18 +98,6 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(CORSFallbackMiddleware)
-
-# ──────────────────────────────────────────────────────────────────
-# 🔥 Middleware — tempo real de processamento do BACKEND
-@app.middleware("http")
-async def backend_timing_middleware(request, call_next):
-    start = time.perf_counter()
-    response = await call_next(request)
-    end = time.perf_counter()
-
-    # tempo em ms, apenas processamento interno do backend
-    response.headers["X-Backend-Process-Time"] = f"{(end - start) * 1000:.3f}"
-    return response
 
 
 # ──────────────────────────────────────────────────────────────────
