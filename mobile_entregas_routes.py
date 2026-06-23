@@ -27,7 +27,7 @@ from saida_historico_service import (
     projetar_historico_mobile,
 )
 from db import get_db
-from db_utils import db_rollback_safe
+from db_utils import db_rollback_safe, run_db_query_with_retry
 from auth import get_current_user
 from active_route_sync import (
     get_active_route_delivery_ids,
@@ -930,7 +930,7 @@ def extrato_financeiro_motoboy(
         )
         | exists(subq_hist_periodo),
     ).order_by(Saida.data.desc(), Saida.timestamp.desc())
-    rows_all = db.scalars(q).all()
+    rows_all = run_db_query_with_retry(db, lambda: db.scalars(q).all())
     rows_periodo = list(rows_all)
     op_ctx_map = carregar_contexto_operacional(db, [s.id_saida for s in rows_periodo])
     rows: List[Saida] = []
