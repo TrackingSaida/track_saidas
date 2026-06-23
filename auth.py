@@ -201,16 +201,19 @@ def _generate_refresh_token_plain() -> str:
 
 def revoke_motoboy_refresh_tokens_for_user(db: Session, user_id: int, *, commit: bool = True) -> None:
     now = datetime.utcnow()
-    rows = db.scalars(
-        select(MotoboyRefreshToken).where(
-            MotoboyRefreshToken.user_id == user_id,
-            MotoboyRefreshToken.revoked_at.is_(None),
-        )
-    ).all()
+    rows = run_db_query_with_retry(
+        db,
+        lambda: db.scalars(
+            select(MotoboyRefreshToken).where(
+                MotoboyRefreshToken.user_id == user_id,
+                MotoboyRefreshToken.revoked_at.is_(None),
+            )
+        ).all(),
+    )
     for row in rows:
         row.revoked_at = now
     if rows and commit:
-        db.commit()
+        run_db_query_with_retry(db, db.commit)
 
 
 def _store_motoboy_refresh_token(
@@ -251,7 +254,7 @@ def _issue_motoboy_auth_response(
         motoboy_id=int(motoboy.id_motoboy),
         plain_token=refresh_plain,
     )
-    db.commit()
+    run_db_query_with_retry(db, db.commit)
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -263,26 +266,32 @@ def _issue_motoboy_auth_response(
 
 def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, Any]:
     token_hash = _hash_refresh_token(plain_refresh.strip())
-    row = db.scalar(
-        select(MotoboyRefreshToken).where(
-            MotoboyRefreshToken.token_hash == token_hash,
-            MotoboyRefreshToken.revoked_at.is_(None),
-        )
+    row = run_db_query_with_retry(
+        db,
+        lambda: db.scalar(
+            select(MotoboyRefreshToken).where(
+                MotoboyRefreshToken.token_hash == token_hash,
+                MotoboyRefreshToken.revoked_at.is_(None),
+            )
+        ),
     )
     if not row or row.expires_at < datetime.utcnow():
         raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
 
-    user = db.get(User, row.user_id)
-    motoboy = db.get(Motoboy, row.motoboy_id)
+    user = run_db_query_with_retry(db, lambda: db.get(User, row.user_id))
+    motoboy = run_db_query_with_retry(db, lambda: db.get(Motoboy, row.motoboy_id))
     if not user or not motoboy or user.role != 4:
         raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
 
-    sub_bases_rows = db.scalars(
-        select(MotoboySubBase.sub_base).where(
-            MotoboySubBase.motoboy_id == motoboy.id_motoboy,
-            MotoboySubBase.ativo.is_(True),
-        )
-    ).all()
+    sub_bases_rows = run_db_query_with_retry(
+        db,
+        lambda: db.scalars(
+            select(MotoboySubBase.sub_base).where(
+                MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+                MotoboySubBase.ativo.is_(True),
+            )
+        ).all(),
+    )
     sub_bases = [s for s in sub_bases_rows if s]
     sub_base = user.sub_base or (sub_bases[0] if len(sub_bases) == 1 else None)
     if not sub_base:
@@ -589,7 +598,10 @@ async def motoboy_login(
         )
         raise HTTPException(403, "Acesso restrito a motoboys.")
 
-    motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == user.id))
+    motoboy = run_db_query_with_retry(
+        db,
+        lambda: db.scalar(select(Motoboy).where(Motoboy.user_id == user.id)),
+    )
     if not motoboy:
         logger.warning(
             "motoboy_login_failed attempt_id=%s reason=motoboy_profile_not_found user_id=%s",
@@ -597,12 +609,15 @@ async def motoboy_login(
         )
         raise HTTPException(404, "Perfil de motoboy não encontrado.")
 
-    sub_bases_rows = db.scalars(
-        select(MotoboySubBase.sub_base).where(
-            MotoboySubBase.motoboy_id == motoboy.id_motoboy,
-            MotoboySubBase.ativo.is_(True),
-        )
-    ).all()
+    sub_bases_rows = run_db_query_with_retry(
+        db,
+        lambda: db.scalars(
+            select(MotoboySubBase.sub_base).where(
+                MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+                MotoboySubBase.ativo.is_(True),
+            )
+        ).all(),
+    )
     sub_bases = [s for s in sub_bases_rows if s]
 
     # Política de troca obrigatória de senha baseada em flag persistido + senha padrão
@@ -669,7 +684,10 @@ async def motoboy_select_subbase(
         )
         raise HTTPException(403, "Acesso restrito a motoboys.")
 
-    motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == user.id))
+    motoboy = run_db_query_with_retry(
+        db,
+        lambda: db.scalar(select(Motoboy).where(Motoboy.user_id == user.id)),
+    )
     if not motoboy:
         logger.warning(
             "motoboy_select_subbase_failed attempt_id=%s reason=motoboy_profile_not_found user_id=%s",
@@ -677,12 +695,15 @@ async def motoboy_select_subbase(
         )
         raise HTTPException(404, "Perfil de motoboy não encontrado.")
 
-    existe = db.scalar(
-        select(MotoboySubBase).where(
-            MotoboySubBase.motoboy_id == motoboy.id_motoboy,
-            MotoboySubBase.sub_base == selected_sub_base,
-            MotoboySubBase.ativo.is_(True),
-        )
+    existe = run_db_query_with_retry(
+        db,
+        lambda: db.scalar(
+            select(MotoboySubBase).where(
+                MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+                MotoboySubBase.sub_base == selected_sub_base,
+                MotoboySubBase.ativo.is_(True),
+            )
+        ),
     )
     if not existe:
         logger.warning(
@@ -717,15 +738,19 @@ async def motoboy_logout(body: MotoboyLogoutBody, db: Session = Depends(get_db))
     """Revoga refresh token do motoboy (logout manual app mobile)."""
     if body.refresh_token:
         token_hash = _hash_refresh_token(body.refresh_token.strip())
-        row = db.scalar(
-            select(MotoboyRefreshToken).where(
-                MotoboyRefreshToken.token_hash == token_hash,
-                MotoboyRefreshToken.revoked_at.is_(None),
+
+        def _revoke_token() -> None:
+            row = db.scalar(
+                select(MotoboyRefreshToken).where(
+                    MotoboyRefreshToken.token_hash == token_hash,
+                    MotoboyRefreshToken.revoked_at.is_(None),
+                )
             )
-        )
-        if row:
-            row.revoked_at = datetime.utcnow()
-            db.commit()
+            if row:
+                row.revoked_at = datetime.utcnow()
+                db.commit()
+
+        run_db_query_with_retry(db, _revoke_token)
     return {"ok": True}
 
 
@@ -746,7 +771,7 @@ async def read_users_me(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    db_user = db.get(User, current_user.id)
+    db_user = run_db_query_with_retry(db, lambda: db.get(User, current_user.id))
     if not db_user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
 
