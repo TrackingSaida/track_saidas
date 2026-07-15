@@ -2,89 +2,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from db_utils import run_db_query_with_retry
 from models import SaidaHistorico, User
+from saida_operacional_pure import (
+    EVENTOS_ATRIBUICAO_VALIDOS,
+    EVENTOS_INVALIDANTES,
+    EVENTOS_REATRIBUICAO,
+    EVENTOS_UI_ULTIMA_ACAO,
+    ROTULOS_ACAO,
+    SaidaOperacionalContext,
+    deve_excluir_saida_operacional,
+    resolver_chave_acao,
+    rotulo_acao_evento,
+    timestamp_operacional_saida,
+)
 
 MAX_IDS_POR_LOTE = 250
 T = TypeVar("T")
 
-EVENTOS_ATRIBUICAO_VALIDOS = {
-    "lido",
-    "scan",
-    "assumir",
-    "assumido",
-    "reatribuicao",
-    "reatribuido",
-    "nova_saida_mesmo_entregador",
-    "lancar_avulso",
-}
-
-EVENTOS_REATRIBUICAO = {
-    "assumir",
-    "assumido",
-    "reatribuicao",
-    "reatribuido",
-}
-
-EVENTOS_INVALIDANTES = {
-    "removido_sem_inicio",
-    "desatribuido",
-}
-
-EVENTOS_UI_ULTIMA_ACAO = {
-    "em_rota",
-    "entregue",
-    "ausente",
-    "cancelado",
-    "status_saiu_manual",
-    "status_coletado_manual",
-    "status_nao_coletado_manual",
-}
-
-ROTULOS_ACAO = {
-    "lido": "Leu pedido",
-    "scan": "Escaneou pedido",
-    "assumir": "Reatribuiu pedido",
-    "assumido": "Reatribuiu pedido",
-    "reatribuicao": "Reatribuiu pedido",
-    "reatribuido": "Reatribuiu pedido",
-    "nova_saida_mesmo_entregador": "Nova saída confirmada com mesmo motoboy",
-    "lancar_avulso": "Lançou avulso",
-    "reatribuido_em_rota": "Reatribuído -> Iniciou rota",
-    "removido_sem_inicio": "Removeu sem iniciar rota",
-    "em_rota": "Iniciou rota",
-    "entregue": "Finalizou entrega",
-    "ausente": "Registrou ausência",
-    "cancelado": "Registrou cancelamento",
-    "desatribuido": "Desatribuiu pedido",
-    "status_saiu_manual": "Atualizou status para Saiu para entrega",
-    "status_coletado_manual": "Atualizou status para Coletado",
-    "status_nao_coletado_manual": "Atualizou status para Não Coletado",
-}
-
-
-@dataclass
-class SaidaOperacionalContext:
-    id_saida: int
-    ultimo_evento: Optional[str]
-    ultimo_evento_ts: Optional[datetime]
-    acao_label: Optional[str]
-    executado_por: Optional[str]
-    ultimo_ator_username: Optional[str]
-    ultimo_ator_user_id: Optional[int]
-    operacional_evento: Optional[str]
-    operacional_ts: Optional[datetime]
-    leitura_valida: bool
-    removido_sem_inicio_ativo: bool
-
-
-def _normalizar_evento(evento: Optional[str]) -> str:
-    return (evento or "").strip().lower().replace(" ", "_")
+# Reexport para compatibilidade com imports existentes
+__all__ = [
+    "EVENTOS_ATRIBUICAO_VALIDOS",
+    "EVENTOS_REATRIBUICAO",
+    "EVENTOS_INVALIDANTES",
+    "EVENTOS_UI_ULTIMA_ACAO",
+    "ROTULOS_ACAO",
+    "SaidaOperacionalContext",
+    "resolver_chave_acao",
+    "rotulo_acao_evento",
+    "carregar_contexto_operacional",
+    "deve_excluir_saida_operacional",
+    "timestamp_operacional_saida",
+    "filtrar_saidas_por_periodo_operacional",
+]
 
 
 def _chunked(values: Sequence[T], chunk_size: int) -> Iterable[Sequence[T]]:
@@ -92,24 +47,6 @@ def _chunked(values: Sequence[T], chunk_size: int) -> Iterable[Sequence[T]]:
         raise ValueError("chunk_size deve ser maior que zero")
     for i in range(0, len(values), chunk_size):
         yield values[i : i + chunk_size]
-
-
-def resolver_chave_acao(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
-    if not evento:
-        return None
-    key = _normalizar_evento(evento)
-    if key in EVENTOS_REATRIBUICAO:
-        return "reatribuido"
-    if key == "em_rota" and houve_reatribuicao:
-        return "reatribuido_em_rota"
-    return key
-
-
-def rotulo_acao_evento(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
-    key = resolver_chave_acao(evento, houve_reatribuicao=houve_reatribuicao)
-    if not key:
-        return None
-    return ROTULOS_ACAO.get(key, (evento or "").replace("_", " ").strip().capitalize())
 
 
 def carregar_contexto_operacional(
@@ -239,23 +176,6 @@ def carregar_contexto_operacional(
     return out
 
 
-def deve_excluir_saida_operacional(ctx: Optional[SaidaOperacionalContext]) -> bool:
-    """Exclui apenas casos invalidantes explícitos (ex.: removido sem iniciar rota)."""
-    return bool(ctx and ctx.removido_sem_inicio_ativo)
-
-
-def timestamp_operacional_saida(
-    ctx: Optional[SaidaOperacionalContext],
-    saida_ts: Optional[datetime],
-) -> Optional[datetime]:
-    """Referência de data operacional: atribuição válida, última ação ou timestamp da saída."""
-    if ctx and ctx.removido_sem_inicio_ativo:
-        return None
-    if ctx:
-        return ctx.operacional_ts or ctx.ultimo_evento_ts or saida_ts
-    return saida_ts
-
-
 def filtrar_saidas_por_periodo_operacional(
     db: Session,
     saidas: Sequence[object],
@@ -272,9 +192,6 @@ def filtrar_saidas_por_periodo_operacional(
         if sid is None:
             continue
         ctx = ctx_map.get(int(sid))
-        # Mantém exclusão apenas para casos invalidantes explícitos.
-        # Em bases legadas, ausência de leitura válida no histórico não deve remover
-        # o registro se houver timestamp base em Saida.
         if deve_excluir_saida_operacional(ctx):
             continue
         ts = timestamp_operacional_saida(ctx, getattr(s, "timestamp", None))
