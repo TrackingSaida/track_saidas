@@ -15,5 +15,5 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_saidas_sub_base_motoboy_ts
 CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_saida_historico_saida_ts
   ON saida_historico (id_saida, timestamp DESC);
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_saida_historico_evento_ts
-  ON saida_historico (evento, timestamp DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_saida_historico_saida_evento_ts
+  ON saida_historico (id_saida, evento, timestamp DESC);

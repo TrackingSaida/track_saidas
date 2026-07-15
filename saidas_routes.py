@@ -32,7 +32,7 @@ from saida_operacional_utils import (
     timestamp_operacional_saida,
     SaidaOperacionalContext,
 )
-from saidas_listar_service import listar_saidas_paginado
+from saidas_listar_service import invalidate_listar_cache, listar_saidas_paginado
 from codigo_normalizer import canonicalize_servico, normalize_codigo
 from saida_historico_service import SaidaHistoricoItemOut, listar_historico_saida
 from pedido_campos_obrigatorios_service import (
@@ -1616,7 +1616,7 @@ def listar_saidas(
 
     # Caminho otimizado: colunas leves + histórico em tuplas + paginação/totais
     # no mesmo conjunto lógico, enriquecendo apenas a página.
-    return listar_saidas_paginado(
+    result = listar_saidas_paginado(
         db,
         sub_base=sub_base,
         de=de,
@@ -1634,6 +1634,9 @@ def listar_saidas(
         offset=offset,
         montar_item=_montar_item_listar_saida,
     )
+    # Campo interno de diagnóstico — não faz parte do contrato da API.
+    result.pop("_cache", None)
+    return result
 
 
 # ============================================================
@@ -2009,6 +2012,7 @@ def atualizar_saida(
         db.rollback()
         raise HTTPException(500, "Erro ao atualizar saída.")
 
+    invalidate_listar_cache(sub_base)
     return SaidaOut.model_validate(obj)
 
 
@@ -2034,4 +2038,5 @@ def deletar_saida(
         db.rollback()
         raise HTTPException(500, "Erro ao deletar saída.")
 
+    invalidate_listar_cache(sub_base)
     return

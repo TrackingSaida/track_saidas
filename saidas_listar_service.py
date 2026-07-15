@@ -596,6 +596,95 @@ def _sql_servico_mercado(alias: str = "f") -> str:
     )
 
 
+# Cache in-process curto (por processo/instância Render). Chave sempre inclui sub_base.
+_LISTAR_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_LISTAR_CACHE_TTL_SEC = 45.0
+_LISTAR_CACHE_MAX = 80
+
+
+def _listar_cache_key(
+    *,
+    sub_base: str,
+    de: Optional[date],
+    ate: Optional[date],
+    base: Optional[str],
+    entregador: Optional[str],
+    status_: Optional[List[str]],
+    codigo: Optional[str],
+    servico: Optional[List[str]],
+    acao: Optional[List[str]],
+    localizar: Optional[str],
+    somente_g: Optional[bool],
+    codigo_exato: bool,
+    limit: Optional[int],
+    offset: int,
+) -> str:
+    import json
+
+    payload = {
+        "sub_base": sub_base,
+        "de": de.isoformat() if de else None,
+        "ate": ate.isoformat() if ate else None,
+        "base": base,
+        "entregador": entregador,
+        "status": sorted(_parse_multi_values(status_)),
+        "codigo": (codigo or "").strip().upper() or None,
+        "servico": sorted(_parse_multi_values(servico)),
+        "acao": sorted(_parse_multi_values(acao)),
+        "localizar": (localizar or "").strip() or None,
+        "somente_g": bool(somente_g),
+        "codigo_exato": bool(codigo_exato),
+        "limit": limit,
+        "offset": int(offset or 0),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _listar_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    import copy
+    import time
+
+    entry = _LISTAR_CACHE.get(key)
+    if not entry:
+        return None
+    ts, payload = entry
+    if (time.monotonic() - ts) > _LISTAR_CACHE_TTL_SEC:
+        _LISTAR_CACHE.pop(key, None)
+        return None
+    return copy.deepcopy(payload)
+
+
+def _listar_cache_set(key: str, payload: Dict[str, Any]) -> None:
+    import copy
+    import time
+
+    if len(_LISTAR_CACHE) >= _LISTAR_CACHE_MAX:
+        # Remove entradas mais antigas
+        oldest = sorted(_LISTAR_CACHE.items(), key=lambda kv: kv[1][0])[: max(1, _LISTAR_CACHE_MAX // 4)]
+        for k, _ in oldest:
+            _LISTAR_CACHE.pop(k, None)
+    _LISTAR_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+
+
+def invalidate_listar_cache(sub_base: Optional[str] = None) -> None:
+    """Invalida cache de listagem (toda a instância ou por sub_base)."""
+    if not sub_base:
+        _LISTAR_CACHE.clear()
+        return
+    prefix = f'"sub_base":"{sub_base}"'
+    # chave JSON contém sub_base; remove entradas do tenant
+    for key in list(_LISTAR_CACHE.keys()):
+        if prefix in key or f'"sub_base": "{sub_base}"' in key:
+            _LISTAR_CACHE.pop(key, None)
+    # fallback: limpa tudo se formato mudar
+    dead = []
+    for key in _LISTAR_CACHE:
+        if sub_base in key:
+            dead.append(key)
+    for key in dead:
+        _LISTAR_CACHE.pop(key, None)
+
+
 def listar_saidas_paginado(
     db,
     *,
@@ -619,13 +708,35 @@ def listar_saidas_paginado(
 
     Hidrata histórico/nomes apenas dos IDs da página (não do período inteiro).
     """
-    from sqlalchemy import text
+    from sqlalchemy import bindparam, text
 
     from db_utils import run_db_query_with_retry
 
     limit = clamp_listar_limit(limit)
     offset = max(0, int(offset or 0))
 
+    cache_key = _listar_cache_key(
+        sub_base=sub_base,
+        de=de,
+        ate=ate,
+        base=base,
+        entregador=entregador,
+        status_=status_,
+        codigo=codigo,
+        servico=servico,
+        acao=acao,
+        localizar=localizar,
+        somente_g=somente_g,
+        codigo_exato=codigo_exato,
+        limit=limit,
+        offset=offset,
+    )
+    cached = _listar_cache_get(cache_key)
+    if cached is not None:
+        cached["_cache"] = "HIT"
+        return cached
+
+    # Eventos canônicos já são lowercase no banco — evitar lower()/trim() para usar índice.
     eventos_atr = sorted(EVENTOS_ATRIBUICAO_VALIDOS)
     eventos_inv = sorted(EVENTOS_INVALIDANTES)
     eventos_filtro = sorted(EVENTOS_ATRIBUICAO_VALIDOS | EVENTOS_INVALIDANTES | EVENTOS_UI_ULTIMA_ACAO)
@@ -649,7 +760,6 @@ def listar_saidas_paginado(
         "offset": offset,
     }
 
-    # Pré-filtro de período (candidatas): timestamp da saída OU evento de atribuição no intervalo.
     if de is not None and ate is not None:
         where_extra.append(
             """(
@@ -657,7 +767,7 @@ def listar_saidas_paginado(
               OR EXISTS (
                 SELECT 1 FROM saida_historico h0
                 WHERE h0.id_saida = s.id_saida
-                  AND lower(trim(h0.evento)) = ANY(:eventos_atr)
+                  AND h0.evento IN :eventos_atr
                   AND h0.timestamp >= :dt_inicio
                   AND h0.timestamp < :dt_fim_exclusivo
               )
@@ -670,7 +780,7 @@ def listar_saidas_paginado(
               OR EXISTS (
                 SELECT 1 FROM saida_historico h0
                 WHERE h0.id_saida = s.id_saida
-                  AND lower(trim(h0.evento)) = ANY(:eventos_atr)
+                  AND h0.evento IN :eventos_atr
                   AND h0.timestamp >= :dt_inicio
               )
             )"""
@@ -682,7 +792,7 @@ def listar_saidas_paginado(
               OR EXISTS (
                 SELECT 1 FROM saida_historico h0
                 WHERE h0.id_saida = s.id_saida
-                  AND lower(trim(h0.evento)) = ANY(:eventos_atr)
+                  AND h0.evento IN :eventos_atr
                   AND h0.timestamp < :dt_fim_exclusivo
               )
             )"""
@@ -764,8 +874,11 @@ def listar_saidas_paginado(
 
     where_sql = (" AND " + " AND ".join(where_extra)) if where_extra else ""
 
-    entregador_sql = ""
     if entregador_filter_norm:
+        entregador_join = """
+      LEFT JOIN motoboys mb ON mb.id_motoboy = c.motoboy_id
+      LEFT JOIN users mu ON mu.id = mb.user_id
+        """
         entregador_sql = """
           AND unaccent(lower(trim(both FROM coalesce(
             NULLIF(trim(both FROM coalesce(mu.nome, '') || ' ' || coalesce(mu.sobrenome, '')), ''),
@@ -774,19 +887,19 @@ def listar_saidas_paginado(
             ''
           )))) = unaccent(lower(:entregador_norm))
         """
+    else:
+        entregador_join = ""
+        entregador_sql = ""
 
     acao_sql = ""
     if acao_eventos:
-        acao_sql = " AND lower(coalesce(ops.ult_evento, '')) IN :acao_eventos "
+        acao_sql = " AND coalesce(ops.ult_evento, '') IN :acao_eventos "
 
     de_sql = " AND (:de IS NULL OR (ops.operacional_ts)::date >= :de) "
     ate_sql = " AND (:ate IS NULL OR (ops.operacional_ts)::date <= :ate) "
 
     limit_sql = " LIMIT :limit " if limit is not None else ""
     offset_sql = " OFFSET :offset "
-
-    # Pré-filtro: IN expansível (SQLAlchemy) em vez de ANY(array)
-    where_sql = where_sql.replace("= ANY(:eventos_atr)", "IN :eventos_atr")
 
     sql = f"""
     WITH candidatos AS (
@@ -801,12 +914,12 @@ def listar_saidas_paginado(
       SELECT
         h.id,
         h.id_saida,
-        lower(trim(h.evento)) AS evento,
+        h.evento,
         h.timestamp,
         h.user_id
       FROM saida_historico h
       INNER JOIN candidatos c ON c.id_saida = h.id_saida
-      WHERE lower(trim(h.evento)) IN :eventos_filtro
+      WHERE h.evento IN :eventos_filtro
     ),
     last_inv AS (
       SELECT DISTINCT ON (id_saida)
@@ -856,8 +969,7 @@ def listar_saidas_paginado(
       LEFT JOIN last_inv li ON li.id_saida = c.id_saida
       LEFT JOIN last_atr la ON la.id_saida = c.id_saida
       LEFT JOIN ultimo u ON u.id_saida = c.id_saida
-      LEFT JOIN motoboys mb ON mb.id_motoboy = c.motoboy_id
-      LEFT JOIN users mu ON mu.id = mb.user_id
+      {entregador_join}
       WHERE TRUE
       {entregador_sql}
     ),
@@ -914,8 +1026,6 @@ def listar_saidas_paginado(
     ORDER BY p.operacional_ts DESC NULLS LAST, p.id_saida DESC NULLS LAST
     """
 
-    from sqlalchemy import bindparam
-
     stmt = text(sql).bindparams(
         bindparam("eventos_atr", expanding=True),
         bindparam("eventos_inv", expanding=True),
@@ -932,13 +1042,16 @@ def listar_saidas_paginado(
 
     rows = run_db_query_with_retry(db, _run)
     if not rows:
-        return {
+        empty = {
             "total": 0,
             "sumShopee": 0,
             "sumMercado": 0,
             "sumAvulso": 0,
             "items": [],
+            "_cache": "MISS",
         }
+        _listar_cache_set(cache_key, {k: v for k, v in empty.items() if k != "_cache"})
+        return empty
 
     totals = {
         "total": int(rows[0]["total"] or 0),
@@ -949,13 +1062,16 @@ def listar_saidas_paginado(
 
     page_rows_raw = [r for r in rows if r.get("id_saida") is not None]
     if not page_rows_raw:
-        return {
+        result = {
             "total": totals["total"],
             "sumShopee": totals["sumShopee"],
             "sumMercado": totals["sumMercado"],
             "sumAvulso": totals["sumAvulso"],
             "items": [],
+            "_cache": "MISS",
         }
+        _listar_cache_set(cache_key, {k: v for k, v in result.items() if k != "_cache"})
+        return result
 
     page_ids = [int(r["id_saida"]) for r in page_rows_raw]
     historicos = _load_historico_tuples(db, page_ids)
@@ -995,10 +1111,13 @@ def listar_saidas_paginado(
             nome_exec = row.entregador
         items.append(montar_item(row, ctx, nome_exec))
 
-    return {
+    result = {
         "total": totals["total"],
         "sumShopee": totals["sumShopee"],
         "sumMercado": totals["sumMercado"],
         "sumAvulso": totals["sumAvulso"],
         "items": items,
+        "_cache": "MISS",
     }
+    _listar_cache_set(cache_key, {k: v for k, v in result.items() if k != "_cache"})
+    return result
