@@ -4,9 +4,21 @@
 
 | Repositório | Conteúdo |
 |-------------|----------|
-| `track_saidas` | Paginação/agregação via `saidas_listar_service`, equivalência operacional, baseline/scripts |
+| `track_saidas` | Paginação/agregação **no SQL** via `saidas_listar_service` (histórico só da página), equivalência operacional, baseline/scripts |
 | `track_saidas_html` | Listagem sem esperar combos (5A); `ensureAuthUser` compartilhado (5B) |
 | `track_saida_mobile` | Sem alteração; validar se algum fluxo chama `GET /saidas/listar` |
+
+## Corte crítico de performance (pós-medição 9–11s)
+
+A primeira versão ainda hidratava histórico do D-15 inteiro em Python. O corte atual:
+
+1. Resolve `operacional_ts` / `removido` em CTEs no Postgres
+2. Calcula `total` + totalizadores no mesmo conjunto
+3. Aplica `ORDER BY` + `LIMIT/OFFSET` no SQL
+4. Só então carrega histórico das **≤50** saídas da página
+
+Meta de validação: `X-Backend-Process-Time` de `GET /saidas/listar` bem abaixo dos 9–11s observados antes deste corte.
+
 
 ## Ordem de deploy
 

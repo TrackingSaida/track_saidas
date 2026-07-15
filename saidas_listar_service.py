@@ -1,9 +1,8 @@
 """Helper interno da listagem de Registros (GET /saidas/listar).
 
 Objetivos:
-- paginar com LIMIT/OFFSET após filtro operacional;
-- agregar totalizadores sem hidratar ORM completo do período;
-- enriquecer histórico/nomes apenas da página;
+- filtrar data operacional, ordenar, agregar e paginar no PostgreSQL;
+- hidratar histórico/nomes apenas dos IDs da página;
 - preservar semântica operacional e isolamento por sub_base.
 """
 from __future__ import annotations
@@ -555,6 +554,48 @@ def _build_candidate_stmt(
     return stmt
 
 
+def _eventos_from_acao_tokens(acao_tokens: Sequence[str]) -> List[str]:
+    """Expande tokens de ação (rótulo ou chave) para eventos de histórico."""
+    from saida_operacional_pure import ROTULOS_ACAO
+
+    label_to_keys: Dict[str, List[str]] = {}
+    for key, label in ROTULOS_ACAO.items():
+        label_to_keys.setdefault(_norm_text(label), []).append(key)
+
+    out: List[str] = []
+    for token in acao_tokens:
+        token_norm = " ".join(_norm_text(token).split())
+        token_key = token_norm.replace(" ", "_")
+        if token_key in ROTULOS_ACAO:
+            out.append(token_key)
+        out.extend(label_to_keys.get(token_norm, []))
+        if token_key in {"reatribuido", "reatribuido_em_rota"} or token_norm in {
+            _norm_text(ROTULOS_ACAO.get("reatribuido") or ""),
+            _norm_text(ROTULOS_ACAO.get("reatribuido_em_rota") or ""),
+        }:
+            out.extend(["assumir", "assumido", "reatribuicao", "reatribuido", "em_rota"])
+        if token_key == "lido" or token_norm == "leu pedido":
+            out.append("lido")
+    # únicos preservando ordem
+    return list(dict.fromkeys(e for e in out if e))
+
+
+def _sql_servico_shopee(alias: str = "f") -> str:
+    return f"(lower(coalesce({alias}.servico, '')) LIKE '%%shopee%%' OR lower(coalesce({alias}.servico, '')) LIKE '%%spx%%')"
+
+
+def _sql_servico_mercado(alias: str = "f") -> str:
+    return (
+        f"("
+        f"lower(coalesce({alias}.servico, '')) LIKE '%%mercado livre%%' "
+        f"OR lower(coalesce({alias}.servico, '')) LIKE '%%mercado_livre%%' "
+        f"OR lower(coalesce({alias}.servico, '')) LIKE '%%mercadolivre%%' "
+        f"OR lower(' ' || coalesce({alias}.servico, '')) LIKE '%% ml%%' "
+        f"OR lower(coalesce({alias}.servico, '')) LIKE '%%flex%%'"
+        f")"
+    )
+
+
 def listar_saidas_paginado(
     db,
     *,
@@ -574,106 +615,385 @@ def listar_saidas_paginado(
     offset: int = 0,
     montar_item,
 ) -> Dict[str, Any]:
-    """Lista saídas com paginação determinística e totalizadores no mesmo conjunto lógico."""
-    limit = clamp_listar_limit(limit)
-    offset = max(0, int(offset or 0))
+    """Lista saídas com filtro operacional, totais e página resolvidos no SQL.
 
-    stmt = _build_candidate_stmt(
-        sub_base=sub_base,
-        de=de,
-        ate=ate,
-        base=base,
-        status_=status_,
-        servico=servico,
-        somente_g=somente_g,
-        codigo=codigo,
-        codigo_exato=codigo_exato,
-        localizar=localizar,
-    )
+    Hidrata histórico/nomes apenas dos IDs da página (não do período inteiro).
+    """
+    from sqlalchemy import text
 
     from db_utils import run_db_query_with_retry
 
-    raw_rows = run_db_query_with_retry(db, lambda: db.execute(stmt).all())
-    candidates = [
-        SaidaListRow(
-            id_saida=int(r.id_saida),
-            timestamp=r.timestamp,
-            sub_base=r.sub_base,
-            username=r.username,
-            entregador=r.entregador,
-            entregador_id=r.entregador_id,
-            motoboy_id=r.motoboy_id,
-            codigo=r.codigo,
-            servico=r.servico,
-            status=r.status,
-            base=r.base,
-            is_grande=bool(r.is_grande or False),
-        )
-        for r in raw_rows
-    ]
+    limit = clamp_listar_limit(limit)
+    offset = max(0, int(offset or 0))
 
-    ids = [c.id_saida for c in candidates]
-    historicos = _load_historico_tuples(db, ids)
-    user_ids = [
-        int(getattr(h, "user_id"))
-        for h in historicos
-        if getattr(h, "user_id", None) is not None
+    eventos_atr = sorted(EVENTOS_ATRIBUICAO_VALIDOS)
+    eventos_inv = sorted(EVENTOS_INVALIDANTES)
+    eventos_filtro = sorted(EVENTOS_ATRIBUICAO_VALIDOS | EVENTOS_INVALIDANTES | EVENTOS_UI_ULTIMA_ACAO)
+
+    dt_inicio = datetime.combine(de, datetime.min.time()) if de is not None else None
+    dt_fim_exclusivo = (
+        datetime.combine(ate + timedelta(days=1), datetime.min.time()) if ate is not None else None
+    )
+
+    where_extra: List[str] = []
+    params: Dict[str, Any] = {
+        "sub_base": sub_base,
+        "eventos_atr": eventos_atr,
+        "eventos_inv": eventos_inv,
+        "eventos_filtro": eventos_filtro,
+        "de": de,
+        "ate": ate,
+        "dt_inicio": dt_inicio,
+        "dt_fim_exclusivo": dt_fim_exclusivo,
+        "limit": limit,
+        "offset": offset,
+    }
+
+    # Pré-filtro de período (candidatas): timestamp da saída OU evento de atribuição no intervalo.
+    if de is not None and ate is not None:
+        where_extra.append(
+            """(
+              (s.timestamp >= :dt_inicio AND s.timestamp < :dt_fim_exclusivo)
+              OR EXISTS (
+                SELECT 1 FROM saida_historico h0
+                WHERE h0.id_saida = s.id_saida
+                  AND lower(trim(h0.evento)) = ANY(:eventos_atr)
+                  AND h0.timestamp >= :dt_inicio
+                  AND h0.timestamp < :dt_fim_exclusivo
+              )
+            )"""
+        )
+    elif de is not None:
+        where_extra.append(
+            """(
+              s.timestamp >= :dt_inicio
+              OR EXISTS (
+                SELECT 1 FROM saida_historico h0
+                WHERE h0.id_saida = s.id_saida
+                  AND lower(trim(h0.evento)) = ANY(:eventos_atr)
+                  AND h0.timestamp >= :dt_inicio
+              )
+            )"""
+        )
+    elif ate is not None:
+        where_extra.append(
+            """(
+              s.timestamp < :dt_fim_exclusivo
+              OR EXISTS (
+                SELECT 1 FROM saida_historico h0
+                WHERE h0.id_saida = s.id_saida
+                  AND lower(trim(h0.evento)) = ANY(:eventos_atr)
+                  AND h0.timestamp < :dt_fim_exclusivo
+              )
+            )"""
+        )
+
+    if base and base.strip() and base.lower() != "(todas)":
+        where_extra.append("unaccent(lower(coalesce(s.base, ''))) = unaccent(lower(:base_filter))")
+        params["base_filter"] = base.strip()
+
+    status_tokens_raw = [
+        t for t in _parse_multi_values(status_) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
     ]
-    user_map = _load_user_map(db, user_ids)
-    ctx_map = build_operacional_ctx_from_historico_rows(ids, historicos, user_map)
+    status_aliases = sorted(
+        {alias for token in status_tokens_raw for alias in _status_group_aliases(token)}
+    )
+    if status_aliases:
+        placeholders = []
+        for i, alias in enumerate(status_aliases):
+            key = f"status_alias_{i}"
+            params[key] = alias
+            placeholders.append(f"unaccent(lower(:{key}))")
+        where_extra.append(
+            f"unaccent(lower(coalesce(s.status, ''))) IN ({', '.join(placeholders)})"
+        )
+
+    servico_tokens = [
+        _norm_text(t)
+        for t in _parse_multi_values(servico)
+        if _norm_text(t) not in {"", "(todos)", "todos", "all"}
+    ]
+    if servico_tokens:
+        srv_conds = []
+        for i, srv_norm in enumerate(servico_tokens):
+            if srv_norm == "shopee":
+                srv_conds.append(_sql_servico_shopee("s"))
+            elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
+                srv_conds.append(_sql_servico_mercado("s"))
+            elif srv_norm == "avulso":
+                srv_conds.append(f"(NOT {_sql_servico_shopee('s')} AND NOT {_sql_servico_mercado('s')})")
+            else:
+                key = f"servico_exact_{i}"
+                params[key] = srv_norm
+                srv_conds.append(f"unaccent(lower(coalesce(s.servico, ''))) = unaccent(lower(:{key}))")
+        where_extra.append("(" + " OR ".join(srv_conds) + ")")
+
+    if somente_g:
+        where_extra.append("s.is_grande IS TRUE")
+
+    if codigo and codigo.strip():
+        params["codigo_trim"] = codigo.strip().upper()
+        if codigo_exato:
+            where_extra.append("s.codigo = :codigo_trim")
+        else:
+            where_extra.append("(s.codigo = :codigo_trim OR s.codigo ILIKE :codigo_prefix)")
+            params["codigo_prefix"] = params["codigo_trim"] + "%"
+    elif localizar and localizar.strip():
+        params["localizar_q"] = f"%{localizar.strip()}%"
+        where_extra.append(
+            """(
+              s.base ILIKE :localizar_q OR s.username ILIKE :localizar_q
+              OR s.entregador ILIKE :localizar_q OR s.codigo ILIKE :localizar_q
+              OR s.servico ILIKE :localizar_q OR s.status ILIKE :localizar_q
+            )"""
+        )
 
     entregador_filter_norm = ""
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
         entregador_filter_norm = _norm_text(entregador)
-
-    # Nomes de executor: apenas quando filtro de entregador exige comparação por nome de motoboy.
-    executor_nome_map: Dict[int, Optional[str]] = {}
-    if entregador_filter_norm:
-        motoboy_ids = [int(c.motoboy_id) for c in candidates if c.motoboy_id is not None]
-        motoboy_nome_map = _load_motoboy_nome_map(db, motoboy_ids)
-        for c in candidates:
-            if c.motoboy_id is not None:
-                executor_nome_map[c.id_saida] = motoboy_nome_map.get(int(c.motoboy_id)) or c.entregador
-            else:
-                executor_nome_map[c.id_saida] = c.entregador
+        params["entregador_norm"] = entregador_filter_norm
 
     acao_tokens = [
         _norm_text(t).replace("_", " ")
         for t in _parse_multi_values(acao)
         if _norm_text(t) not in {"", "(todos)", "todos", "all"}
     ]
+    acao_eventos = _eventos_from_acao_tokens(acao_tokens) if acao_tokens else []
+    if acao_eventos:
+        params["acao_eventos"] = acao_eventos
 
-    page_rows, totals, ctx_map = filtrar_ordenar_agregar_listagem(
-        candidates,
-        ctx_map,
-        de=de,
-        ate=ate,
-        entregador_filter_norm=entregador_filter_norm,
-        executor_nome_map=executor_nome_map,
-        acao_tokens=acao_tokens or None,
-        limit=limit,
-        offset=offset,
+    where_sql = (" AND " + " AND ".join(where_extra)) if where_extra else ""
+
+    entregador_sql = ""
+    if entregador_filter_norm:
+        entregador_sql = """
+          AND unaccent(lower(trim(both FROM coalesce(
+            NULLIF(trim(both FROM coalesce(mu.nome, '') || ' ' || coalesce(mu.sobrenome, '')), ''),
+            NULLIF(trim(both FROM coalesce(mu.username, '')), ''),
+            c.entregador,
+            ''
+          )))) = unaccent(lower(:entregador_norm))
+        """
+
+    acao_sql = ""
+    if acao_eventos:
+        acao_sql = " AND lower(coalesce(ops.ult_evento, '')) IN :acao_eventos "
+
+    de_sql = " AND (:de IS NULL OR (ops.operacional_ts)::date >= :de) "
+    ate_sql = " AND (:ate IS NULL OR (ops.operacional_ts)::date <= :ate) "
+
+    limit_sql = " LIMIT :limit " if limit is not None else ""
+    offset_sql = " OFFSET :offset "
+
+    # Pré-filtro: IN expansível (SQLAlchemy) em vez de ANY(array)
+    where_sql = where_sql.replace("= ANY(:eventos_atr)", "IN :eventos_atr")
+
+    sql = f"""
+    WITH candidatos AS (
+      SELECT
+        s.id_saida, s.timestamp, s.sub_base, s.username, s.entregador,
+        s.entregador_id, s.motoboy_id, s.codigo, s.servico, s.status, s.base, s.is_grande
+      FROM saidas s
+      WHERE s.sub_base = :sub_base
+      {where_sql}
+    ),
+    hist AS (
+      SELECT
+        h.id,
+        h.id_saida,
+        lower(trim(h.evento)) AS evento,
+        h.timestamp,
+        h.user_id
+      FROM saida_historico h
+      INNER JOIN candidatos c ON c.id_saida = h.id_saida
+      WHERE lower(trim(h.evento)) IN :eventos_filtro
+    ),
+    last_inv AS (
+      SELECT DISTINCT ON (id_saida)
+        id_saida, timestamp AS inv_ts, id AS inv_id
+      FROM hist
+      WHERE evento IN :eventos_inv
+      ORDER BY id_saida, timestamp DESC, id DESC
+    ),
+    last_atr AS (
+      SELECT DISTINCT ON (h.id_saida)
+        h.id_saida,
+        h.timestamp AS atr_ts,
+        h.id AS atr_id,
+        h.evento AS atr_evento,
+        h.user_id AS atr_user_id
+      FROM hist h
+      LEFT JOIN last_inv li ON li.id_saida = h.id_saida
+      WHERE h.evento IN :eventos_atr
+        AND (
+          li.id_saida IS NULL
+          OR h.timestamp > li.inv_ts
+          OR (h.timestamp = li.inv_ts AND h.id > li.inv_id)
+        )
+      ORDER BY h.id_saida, h.timestamp DESC, h.id DESC
+    ),
+    ultimo AS (
+      SELECT DISTINCT ON (id_saida)
+        id_saida,
+        evento AS ult_evento,
+        timestamp AS ult_ts,
+        user_id AS ult_user_id
+      FROM hist
+      ORDER BY id_saida, timestamp DESC, id DESC
+    ),
+    ops AS (
+      SELECT
+        c.*,
+        la.atr_ts,
+        la.atr_evento,
+        la.atr_user_id,
+        u.ult_evento,
+        u.ult_ts,
+        u.ult_user_id,
+        CASE WHEN li.id_saida IS NOT NULL AND la.id_saida IS NULL THEN TRUE ELSE FALSE END AS removido_ativo,
+        COALESCE(la.atr_ts, u.ult_ts, c.timestamp) AS operacional_ts
+      FROM candidatos c
+      LEFT JOIN last_inv li ON li.id_saida = c.id_saida
+      LEFT JOIN last_atr la ON la.id_saida = c.id_saida
+      LEFT JOIN ultimo u ON u.id_saida = c.id_saida
+      LEFT JOIN motoboys mb ON mb.id_motoboy = c.motoboy_id
+      LEFT JOIN users mu ON mu.id = mb.user_id
+      WHERE TRUE
+      {entregador_sql}
+    ),
+    filtradas AS (
+      SELECT ops.*
+      FROM ops
+      WHERE ops.removido_ativo = FALSE
+        AND ops.operacional_ts IS NOT NULL
+        {de_sql}
+        {ate_sql}
+        {acao_sql}
+    ),
+    totals AS (
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE {_sql_servico_shopee('f')})::int AS sum_shopee,
+        COUNT(*) FILTER (WHERE (NOT {_sql_servico_shopee('f')}) AND {_sql_servico_mercado('f')})::int AS sum_mercado,
+        COUNT(*) FILTER (WHERE (NOT {_sql_servico_shopee('f')}) AND (NOT {_sql_servico_mercado('f')}))::int AS sum_avulso
+      FROM filtradas f
+    ),
+    page AS (
+      SELECT f.*
+      FROM filtradas f
+      ORDER BY f.operacional_ts DESC, f.id_saida DESC
+      {limit_sql}
+      {offset_sql}
     )
+    SELECT
+      t.total,
+      t.sum_shopee,
+      t.sum_mercado,
+      t.sum_avulso,
+      p.id_saida,
+      p.timestamp,
+      p.sub_base,
+      p.username,
+      p.entregador,
+      p.entregador_id,
+      p.motoboy_id,
+      p.codigo,
+      p.servico,
+      p.status,
+      p.base,
+      p.is_grande,
+      p.operacional_ts,
+      p.ult_evento,
+      p.ult_ts,
+      p.ult_user_id,
+      p.atr_ts,
+      p.atr_evento,
+      p.atr_user_id
+    FROM totals t
+    LEFT JOIN page p ON TRUE
+    ORDER BY p.operacional_ts DESC NULLS LAST, p.id_saida DESC NULLS LAST
+    """
 
-    # Enriquecimento de nomes apenas da página.
-    page_motoboy_ids = [int(r.motoboy_id) for r in page_rows if r.motoboy_id is not None]
+    from sqlalchemy import bindparam
+
+    stmt = text(sql).bindparams(
+        bindparam("eventos_atr", expanding=True),
+        bindparam("eventos_inv", expanding=True),
+        bindparam("eventos_filtro", expanding=True),
+    )
+    if acao_eventos:
+        stmt = stmt.bindparams(bindparam("acao_eventos", expanding=True))
+
+    if limit is None:
+        params.pop("limit", None)
+
+    def _run():
+        return db.execute(stmt, params).mappings().all()
+
+    rows = run_db_query_with_retry(db, _run)
+    if not rows:
+        return {
+            "total": 0,
+            "sumShopee": 0,
+            "sumMercado": 0,
+            "sumAvulso": 0,
+            "items": [],
+        }
+
+    totals = {
+        "total": int(rows[0]["total"] or 0),
+        "sumShopee": int(rows[0]["sum_shopee"] or 0),
+        "sumMercado": int(rows[0]["sum_mercado"] or 0),
+        "sumAvulso": int(rows[0]["sum_avulso"] or 0),
+    }
+
+    page_rows_raw = [r for r in rows if r.get("id_saida") is not None]
+    if not page_rows_raw:
+        return {
+            "total": totals["total"],
+            "sumShopee": totals["sumShopee"],
+            "sumMercado": totals["sumMercado"],
+            "sumAvulso": totals["sumAvulso"],
+            "items": [],
+        }
+
+    page_ids = [int(r["id_saida"]) for r in page_rows_raw]
+    historicos = _load_historico_tuples(db, page_ids)
+    user_ids = [
+        int(getattr(h, "user_id"))
+        for h in historicos
+        if getattr(h, "user_id", None) is not None
+    ]
+    user_map = _load_user_map(db, user_ids)
+    ctx_map = build_operacional_ctx_from_historico_rows(page_ids, historicos, user_map)
+
+    page_motoboy_ids = [
+        int(r["motoboy_id"]) for r in page_rows_raw if r.get("motoboy_id") is not None
+    ]
     page_motoboy_map = _load_motoboy_nome_map(db, page_motoboy_ids)
-    page_user_ids = []
-    for r in page_rows:
-        ctx = ctx_map.get(r.id_saida)
-        if ctx and ctx.ultimo_ator_user_id is not None:
-            page_user_ids.append(int(ctx.ultimo_ator_user_id))
-    # executado_por já veio do user_map completo do histórico; garantir usernames da página
-    # (já resolvidos em ctx). Completar nomes de motoboy na página.
+
     items = []
-    for r in page_rows:
-        ctx = ctx_map.get(r.id_saida)
-        if r.motoboy_id is not None:
-            nome_exec = page_motoboy_map.get(int(r.motoboy_id)) or r.entregador
+    for r in page_rows_raw:
+        row = SaidaListRow(
+            id_saida=int(r["id_saida"]),
+            timestamp=r["timestamp"],
+            sub_base=r["sub_base"],
+            username=r["username"],
+            entregador=r["entregador"],
+            entregador_id=r["entregador_id"],
+            motoboy_id=r["motoboy_id"],
+            codigo=r["codigo"],
+            servico=r["servico"],
+            status=r["status"],
+            base=r["base"],
+            is_grande=bool(r["is_grande"] or False),
+        )
+        ctx = ctx_map.get(row.id_saida)
+        if row.motoboy_id is not None:
+            nome_exec = page_motoboy_map.get(int(row.motoboy_id)) or row.entregador
         else:
-            nome_exec = r.entregador
-        # Adaptador mínimo compatível com _montar_item_listar_saida (atributos de Saida)
-        items.append(montar_item(r, ctx, nome_exec))
+            nome_exec = row.entregador
+        items.append(montar_item(row, ctx, nome_exec))
 
     return {
         "total": totals["total"],
