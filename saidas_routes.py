@@ -32,6 +32,7 @@ from saida_operacional_utils import (
     timestamp_operacional_saida,
     SaidaOperacionalContext,
 )
+from saidas_listar_service import invalidate_listar_cache, listar_saidas_paginado
 from codigo_normalizer import canonicalize_servico, normalize_codigo
 from saida_historico_service import SaidaHistoricoItemOut, listar_historico_saida
 from pedido_campos_obrigatorios_service import (
@@ -1613,273 +1614,29 @@ def listar_saidas(
             offset=offset,
         )
 
-    stmt = select(Saida).where(Saida.sub_base == sub_base)
-    # Pré-filtro por janela de timestamp para reduzir cardinalidade antes do
-    # processamento operacional em memória.
-    dt_inicio = datetime.combine(de, datetime.min.time()) if de is not None else None
-    dt_fim_exclusivo = datetime.combine(ate + timedelta(days=1), datetime.min.time()) if ate is not None else None
-    eventos_operacionais = tuple(EVENTOS_ATRIBUICAO_VALIDOS)
-    if de is not None:
-        if dt_fim_exclusivo is not None:
-            subq_hist_periodo = select(1).where(
-                SaidaHistorico.id_saida == Saida.id_saida,
-                SaidaHistorico.evento.in_(eventos_operacionais),
-                SaidaHistorico.timestamp >= dt_inicio,
-                SaidaHistorico.timestamp < dt_fim_exclusivo,
-            )
-            stmt = stmt.where(
-                (
-                    (Saida.timestamp >= dt_inicio)
-                    & (Saida.timestamp < dt_fim_exclusivo)
-                )
-                | exists(subq_hist_periodo)
-            )
-        else:
-            stmt = stmt.where(
-                (Saida.timestamp >= dt_inicio)
-                | exists(
-                    select(1).where(
-                        SaidaHistorico.id_saida == Saida.id_saida,
-                        SaidaHistorico.evento.in_(eventos_operacionais),
-                        SaidaHistorico.timestamp >= dt_inicio,
-                    )
-                )
-            )
-    elif ate is not None:
-        subq_hist_ate = select(1).where(
-            SaidaHistorico.id_saida == Saida.id_saida,
-            SaidaHistorico.evento.in_(eventos_operacionais),
-            SaidaHistorico.timestamp < dt_fim_exclusivo,
-        )
-        stmt = stmt.where(
-            (Saida.timestamp < dt_fim_exclusivo)
-            | exists(subq_hist_ate)
-        )
-
-    if base and base.strip() and base.lower() != "(todas)":
-        base_norm = base.strip().lower()
-        stmt = stmt.where(func.unaccent(func.lower(Saida.base)) == func.unaccent(base_norm))
-
-
-    entregador_filter_norm = ""
-    if entregador and entregador.strip() and entregador.lower() != "(todos)":
-        entregador_filter_norm = _norm_text(entregador)
-
-    status_tokens_raw = [
-        t for t in _parse_multi_values(status_) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
-    ]
-    status_aliases = sorted(
-        {
-            alias
-            for token in status_tokens_raw
-            for alias in _status_group_aliases(token)
-        }
+    # Caminho otimizado: colunas leves + histórico em tuplas + paginação/totais
+    # no mesmo conjunto lógico, enriquecendo apenas a página.
+    result = listar_saidas_paginado(
+        db,
+        sub_base=sub_base,
+        de=de,
+        ate=ate,
+        base=base,
+        entregador=entregador,
+        status_=status_,
+        codigo=codigo,
+        servico=servico,
+        acao=acao,
+        localizar=localizar,
+        somente_g=somente_g,
+        codigo_exato=codigo_exato,
+        limit=limit,
+        offset=offset,
+        montar_item=_montar_item_listar_saida,
     )
-    if status_aliases:
-        conds_status = [
-            func.unaccent(func.lower(Saida.status)) == func.unaccent(alias)
-            for alias in status_aliases
-        ]
-        stmt = stmt.where(or_(*conds_status))
-
-    servico_tokens = [
-        _norm_text(t) for t in _parse_multi_values(servico) if _norm_text(t) not in {"", "(todos)", "todos", "all"}
-    ]
-    if servico_tokens:
-        conds_srv = []
-        for srv_norm in servico_tokens:
-            if srv_norm == "shopee":
-                conds_srv.append(_servico_is_shopee_expr(Saida.servico))
-            elif srv_norm in ("mercado livre", "mercadolivre", "mercado_livre", "mercado", "ml", "flex"):
-                conds_srv.append(_servico_is_mercado_expr(Saida.servico))
-            elif srv_norm == "avulso":
-                conds_srv.append(
-                    (~_servico_is_shopee_expr(Saida.servico))
-                    & (~_servico_is_mercado_expr(Saida.servico))
-                )
-            else:
-                conds_srv.append(func.unaccent(func.lower(Saida.servico)) == func.unaccent(srv_norm))
-        if conds_srv:
-            stmt = stmt.where(or_(*conds_srv))
-
-    if somente_g:
-        stmt = stmt.where(Saida.is_grande.is_(True))
-
-    if codigo and codigo.strip():
-        codigo_trim = codigo.strip().upper()
-        if codigo_exato:
-            # Caminho otimizado para busca por código exato (aproveita índice em saidas.codigo).
-            stmt = stmt.where(Saida.codigo == codigo_trim)
-        else:
-            # Fallback sem wildcard inicial para reduzir custo quando houver busca parcial.
-            stmt = stmt.where(
-                or_(
-                    Saida.codigo == codigo_trim,
-                    Saida.codigo.ilike(f"{codigo_trim}%"),
-                )
-            )
-    elif localizar and localizar.strip():
-        q = f"%{localizar.strip()}%"
-        or_conds = or_(
-            Saida.base.ilike(q),
-            Saida.username.ilike(q),
-            Saida.entregador.ilike(q),
-            Saida.codigo.ilike(q),
-            Saida.servico.ilike(q),
-            Saida.status.ilike(q),
-        )
-        stmt = stmt.where(or_conds)
-
-    rows_all = run_db_query_with_retry(db, lambda: db.execute(stmt).scalars().all())
-    rows_filtradas, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_all, de, ate)
-    executor_nome_cache: Dict[int, Optional[str]] = {}
-
-    # Evita N+1 em bases grandes: resolve nomes de motoboy em lote.
-    motoboy_ids = sorted(
-        {
-            int(getattr(r, "motoboy_id"))
-            for r in rows_filtradas
-            if getattr(r, "motoboy_id", None) is not None
-        }
-    )
-    motoboy_nome_map: Dict[int, str] = {}
-    if motoboy_ids:
-        rows_motoboy = []
-        for motoboy_ids_lote in _chunked_ids(motoboy_ids):
-            rows_lote = run_db_query_with_retry(
-                db,
-                lambda motoboy_ids_lote=motoboy_ids_lote: db.execute(
-                    select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(motoboy_ids_lote))
-                ).all(),
-            )
-            rows_motoboy.extend(rows_lote)
-        motoboy_user_map = {
-            int(mid): (int(uid) if uid is not None else None)
-            for mid, uid in rows_motoboy
-        }
-        user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
-        user_map: Dict[int, tuple] = {}
-        if user_ids:
-            rows_user = []
-            for user_ids_lote in _chunked_ids(user_ids):
-                rows_lote = run_db_query_with_retry(
-                    db,
-                    lambda user_ids_lote=user_ids_lote: db.execute(
-                        select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids_lote))
-                    ).all(),
-                )
-                rows_user.extend(rows_lote)
-            user_map = {
-                int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
-                for uid, nome, sobrenome, username in rows_user
-            }
-
-        for mid, uid in motoboy_user_map.items():
-            if uid is None:
-                motoboy_nome_map[mid] = f"Motoboy {mid}"
-                continue
-            nome, sobrenome, username_val = user_map.get(uid, ("", "", ""))
-            nome_fmt = f"{nome} {sobrenome}".strip() or username_val or f"Motoboy {mid}"
-            motoboy_nome_map[mid] = nome_fmt
-
-    def _nome_executor_cached(saida: Saida) -> Optional[str]:
-        sid = int(saida.id_saida)
-        if sid not in executor_nome_cache:
-            mid = getattr(saida, "motoboy_id", None)
-            nome_motoboy = None
-            if mid is not None:
-                nome_motoboy = motoboy_nome_map.get(int(mid))
-            executor_nome_cache[sid] = nome_motoboy or getattr(saida, "entregador", None)
-        return executor_nome_cache[sid]
-
-    if entregador_filter_norm:
-        rows_filtradas = [
-            r for r in rows_filtradas
-            if _norm_text(_nome_executor_cached(r)) == entregador_filter_norm
-        ]
-    acao_tokens = [
-        _norm_text(t).replace("_", " ") for t in _parse_multi_values(acao)
-        if _norm_text(t) not in {"", "(todos)", "todos", "all"}
-    ]
-    if acao_tokens:
-        allowed_eventos = set()
-        allowed_labels = set()
-        for token in acao_tokens:
-            token_norm = " ".join(token.split())
-            token_key = token_norm.replace(" ", "_")
-            allowed_eventos.add(token_key)
-            allowed_labels.add(token_norm)
-            label_canonico = rotulo_acao_evento(token_key)
-            if label_canonico:
-                allowed_labels.add(_norm_text(label_canonico))
-            if token_key in {"reatribuido", "reatribuido_em_rota"}:
-                allowed_eventos.add("reatribuido")
-                allowed_eventos.add("reatribuido_em_rota")
-                allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido") or ""))
-                allowed_labels.add(_norm_text(rotulo_acao_evento("reatribuido_em_rota") or ""))
-        rows_filtradas = [
-            r for r in rows_filtradas
-            if (
-                (
-                    (ctx := op_ctx_map.get(r.id_saida)) is not None
-                    and _norm_text(_acao_equivalente(ctx.ultimo_evento)).replace("_", " ") in allowed_labels
-                )
-                or (
-                    (ctx := op_ctx_map.get(r.id_saida)) is not None
-                    and _norm_text(ctx.acao_label) in allowed_labels
-                )
-                or (
-                    (ctx := op_ctx_map.get(r.id_saida)) is not None
-                    and _acao_equivalente(ctx.ultimo_evento) in allowed_eventos
-                )
-            )
-        ]
-    rows_filtradas.sort(
-        key=lambda r: (
-            ((op_ctx_map.get(r.id_saida).operacional_ts if op_ctx_map.get(r.id_saida) and op_ctx_map.get(r.id_saida).operacional_ts else None) or r.timestamp)
-        ),
-        reverse=True,
-    )
-    total = len(rows_filtradas)
-    sumShopee = 0
-    sumMercado = 0
-    sumAvulso = 0
-    for r in rows_filtradas:
-        srv = (r.servico or "").strip().lower()
-        if ("shopee" in srv) or ("spx" in srv):
-            sumShopee += 1
-        elif (
-            ("mercado livre" in srv)
-            or ("mercado_livre" in srv)
-            or ("mercadolivre" in srv)
-            or (" ml" in f" {srv}")
-            or ("flex" in srv)
-        ):
-            sumMercado += 1
-        else:
-            sumAvulso += 1
-    if limit is not None:
-        start_idx = max(0, int(offset))
-        end_idx = start_idx + max(0, int(limit))
-        rows = rows_filtradas[start_idx:end_idx]
-    else:
-        rows = rows_filtradas[max(0, int(offset)):]
-
-    nomes_executor = {int(r.id_saida): _nome_executor_cached(r) for r in rows}
-    return {
-        "total": total,
-        "sumShopee": sumShopee,
-        "sumMercado": sumMercado,
-        "sumAvulso": sumAvulso,
-        "items": [
-            _montar_item_listar_saida(
-                r,
-                op_ctx_map.get(r.id_saida),
-                nomes_executor.get(int(r.id_saida)) or r.entregador,
-            )
-            for r in rows
-        ],
-    }
+    # Campo interno de diagnóstico — não faz parte do contrato da API.
+    result.pop("_cache", None)
+    return result
 
 
 # ============================================================
@@ -2255,6 +2012,7 @@ def atualizar_saida(
         db.rollback()
         raise HTTPException(500, "Erro ao atualizar saída.")
 
+    invalidate_listar_cache(sub_base)
     return SaidaOut.model_validate(obj)
 
 
@@ -2280,4 +2038,5 @@ def deletar_saida(
         db.rollback()
         raise HTTPException(500, "Erro ao deletar saída.")
 
+    invalidate_listar_cache(sub_base)
     return

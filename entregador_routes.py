@@ -9,6 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from db import get_db
+from name_normalizer import normalize_person_name
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
@@ -415,7 +416,7 @@ def create_entregador(
     sub_base_user = _resolve_user_base(db, current_user)
 
     # normalização (obrigatórios)
-    nome        = (body.nome or "").strip()
+    nome        = normalize_person_name((body.nome or "").strip()) or ""
     telefone    = (body.telefone or "").strip()
     documento   = (body.documento or "").strip()
 
@@ -1451,7 +1452,7 @@ def patch_entregador(
         # 1) Atualiza ENTREGADOR
         # =======================
         if body.nome is not None:
-            obj.nome = _optional(body.nome)
+            obj.nome = normalize_person_name(_optional(body.nome))
 
         if body.telefone is not None:
             obj.telefone = _optional(body.telefone)
@@ -1559,7 +1560,7 @@ def patch_entregador(
 
             # sincronizar nome/telefone (quando enviados)
             if body.nome is not None:
-                nome_val = _optional(body.nome)
+                nome_val = normalize_person_name(_optional(body.nome))
                 if nome_val and user.nome != nome_val:
                     user.nome = nome_val
                     mudou = True

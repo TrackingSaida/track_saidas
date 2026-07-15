@@ -10,6 +10,7 @@ import unicodedata
 import re
 
 from db import get_db
+from name_normalizer import normalize_person_name
 from auth import get_password_hash
 from models import Owner, User
 
@@ -106,8 +107,8 @@ def public_signup(
         username=body.username,
         password_hash=get_password_hash(body.password),
         contato=body.contato,
-        nome=body.nome,
-        sobrenome=body.sobrenome,
+        nome=normalize_person_name(body.nome),
+        sobrenome=normalize_person_name(body.sobrenome),
         status=True,
         role=1,         # admin
         coletador=False,

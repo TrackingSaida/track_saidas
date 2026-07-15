@@ -14,6 +14,7 @@ from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from db import get_db
+from name_normalizer import normalize_person_name
 from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD, revoke_motoboy_refresh_tokens_for_user
 from models import User, Owner, Motoboy, MotoboySubBase
 from base import _resolve_user_sub_base
@@ -360,8 +361,8 @@ def _user_to_out(user: User) -> UserOut:
             "contato": contato_val,
             "status": getattr(user, "status", True),
             "sub_base": user.sub_base,
-            "nome": user.nome,
-            "sobrenome": user.sobrenome,
+            "nome": normalize_person_name(user.nome),
+            "sobrenome": normalize_person_name(user.sobrenome),
             "role": getattr(user, "role", 2),
             "coletador": getattr(user, "coletador", False),
             "motoboy": None,
@@ -386,8 +387,8 @@ def _user_to_out(user: User) -> UserOut:
             contato="—",
             status=getattr(user, "status", True),
             sub_base=getattr(user, "sub_base", None),
-            nome=getattr(user, "nome", None),
-            sobrenome=getattr(user, "sobrenome", None),
+            nome=normalize_person_name(getattr(user, "nome", None)),
+            sobrenome=normalize_person_name(getattr(user, "sobrenome", None)),
             role=getattr(user, "role", 2),
             coletador=getattr(user, "coletador", False),
             motoboy=None,
@@ -490,8 +491,8 @@ def create_user(
             password_hash=password_hash_val,
             username=username_val,
             contato=contato_val,
-            nome=body.nome,
-            sobrenome=body.sobrenome,
+            nome=normalize_person_name(body.nome),
+            sobrenome=normalize_person_name(body.sobrenome),
             status=True,
             role=body.role,
             coletador=coletador,
@@ -741,6 +742,11 @@ def admin_update_user(
 
         updates["username"] = new_username
 
+    if "nome" in updates:
+        updates["nome"] = normalize_person_name(updates.get("nome"))
+    if "sobrenome" in updates:
+        updates["sobrenome"] = normalize_person_name(updates.get("sobrenome"))
+
     for field, value in updates.items():
         if field in user_fields:
             setattr(user, field, value)
@@ -876,10 +882,10 @@ def update_current_user(
     db_user = _db_user_from_token(db, current_user)
 
     if payload.nome is not None:
-        db_user.nome = payload.nome.strip() or None
+        db_user.nome = normalize_person_name(payload.nome)
 
     if payload.sobrenome is not None:
-        db_user.sobrenome = payload.sobrenome.strip() or None
+        db_user.sobrenome = normalize_person_name(payload.sobrenome)
 
     if payload.contato is not None:
         contato = payload.contato.strip()
