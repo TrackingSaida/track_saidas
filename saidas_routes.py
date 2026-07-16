@@ -1614,6 +1614,25 @@ def listar_saidas(
             offset=offset,
         )
 
+    # Defesa: busca por código sem flag (ex.: clientes antigos / localizar mal classificado)
+    # ainda usa o caminho indexado, sem materializar o D-15.
+    if codigo and codigo.strip() and not (localizar and localizar.strip()):
+        return _listar_saidas_codigo_exato(
+            db=db,
+            sub_base=sub_base,
+            codigo=codigo,
+            de=de,
+            ate=ate,
+            base=base,
+            entregador=entregador,
+            status_=status_,
+            servico=servico,
+            acao=acao,
+            somente_g=somente_g,
+            limit=limit,
+            offset=offset,
+        )
+
     # Caminho otimizado: colunas leves + histórico em tuplas + paginação/totais
     # no mesmo conjunto lógico, enriquecendo apenas a página.
     result = listar_saidas_paginado(
