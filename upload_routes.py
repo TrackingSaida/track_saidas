@@ -27,6 +27,7 @@ from upload_storage_utils import (
     extract_foto_keys,
     extract_object_key,
     get_s3_client_optional,
+    parse_id_saida_from_object_key,
 )
 
 router = APIRouter(prefix="/upload", tags=["Upload - Fotos entrega"])
@@ -42,10 +43,27 @@ def _get_s3_client():
     return client
 
 
-def _ensure_saida_owned(db, sub_base: str, id_saida: int) -> None:
+def _ensure_saida_owned(db, sub_base: str, id_saida: int) -> Saida:
     s = db.get(Saida, id_saida)
     if not s or s.sub_base != sub_base:
         raise HTTPException(status_code=404, detail="Saída não encontrada.")
+    return s
+
+
+def _ensure_motoboy_owns_saida(current_user: User, saida: Saida) -> None:
+    role = getattr(current_user, "role", None)
+    if role != 4:
+        return
+    motoboy_id = getattr(current_user, "motoboy_id", None)
+    if not motoboy_id or int(saida.motoboy_id or 0) != int(motoboy_id):
+        raise HTTPException(status_code=404, detail="Saída não encontrada.")
+
+
+def _ensure_object_key_owned(db: Session, sub_base: str, object_key: str) -> None:
+    id_saida = parse_id_saida_from_object_key(object_key)
+    if id_saida is None:
+        raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
+    _ensure_saida_owned(db, sub_base, id_saida)
 
 
 # ---------- Schemas ----------
@@ -56,6 +74,7 @@ class PresignIn(BaseModel):
     id_saida: int = Field(gt=0)
     tipo: str = Field(pattern="^(entregue|ausente)$")
     content_type: str = Field(default="image/jpeg")
+    photo_id: Optional[str] = Field(default=None, max_length=80)
 
 
 class PresignGetIn(BaseModel):
@@ -67,6 +86,10 @@ class WatermarkFotoOut(BaseModel):
     tem_comprovante: bool
     image_count: int = 0
     image_url: Optional[str] = None
+
+
+class ComprovanteExportIn(BaseModel):
+    index: int = Field(default=0, ge=0)
 
 
 def _build_watermark_image_bytes(*, image_bytes: bytes, codigo: str) -> bytes:
@@ -103,6 +126,41 @@ def _build_watermark_image_bytes(*, image_bytes: bytes, codigo: str) -> bytes:
         return buf.getvalue()
 
 
+def _status_amigavel(status: Optional[str]) -> str:
+    norm = (status or "").strip().upper().replace(" ", "_")
+    mapping = {
+        "ENTREGUE": "Entregue",
+        "AUSENTE": "Ausente",
+        "EM_ROTA": "Em rota",
+        "SAIU_PARA_ENTREGA": "Saiu para entrega",
+        "CANCELADO": "Cancelado",
+    }
+    return mapping.get(norm, (status or "—").strip() or "—")
+
+
+def _load_comprovante_image_bytes(db: Session, *, saida: Saida, index: int) -> tuple[bytes, int]:
+    detail = db.execute(
+        select(SaidaDetail)
+        .where(SaidaDetail.id_saida == saida.id_saida)
+        .order_by(SaidaDetail.id_detail.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    keys = extract_foto_keys(detail.foto_url if detail else None)
+    if not keys:
+        raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
+    if index >= len(keys):
+        raise HTTPException(status_code=404, detail="Índice de comprovante inválido.")
+
+    object_key = extract_object_key(keys[index], B2_BUCKET_NAME)
+    client = _get_s3_client()
+    try:
+        obj = client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
+        image_bytes = obj["Body"].read()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Erro ao baixar comprovante: {e}")
+    return image_bytes, len(keys)
+
+
 # ---------- POST /upload/presign ----------
 
 
@@ -116,14 +174,14 @@ def upload_presign(
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
-    _ensure_saida_owned(db, sub_base, body.id_saida)
+    saida = _ensure_saida_owned(db, sub_base, body.id_saida)
+    _ensure_motoboy_owns_saida(current_user, saida)
 
     ext = "jpg"
     if body.filename and "." in body.filename:
         ext = body.filename.rsplit(".", 1)[-1].lower()
         if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
             ext = "jpg"
-    # object_key: saida/{id_saida}/{tipo}/{uuid}.ext (prefixo saida/ obrigatório na Application Key)
     object_key = f"saida/{body.id_saida}/{body.tipo}/{uuid.uuid4().hex}.{ext}"
 
     client = _get_s3_client()
@@ -141,9 +199,10 @@ def upload_presign(
         raise HTTPException(status_code=503, detail=f"Erro ao gerar presigned URL: {e}")
 
     logger.info(
-        "upload presign: id_saida=%s tipo=%s object_key=%s user_id=%s",
+        "upload presign: id_saida=%s tipo=%s photo_id=%s object_key=%s user_id=%s",
         body.id_saida,
         body.tipo,
+        (body.photo_id or "").strip() or None,
         object_key,
         getattr(current_user, "id", None),
     )
@@ -160,10 +219,12 @@ def upload_presign(
 @router.post("/presign-get")
 def upload_presign_get(
     body: PresignGetIn,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Retorna URL(s) presigned GET para exibir imagem(ns) do bucket privado."""
-    if not current_user.sub_base:
+    sub_base = current_user.sub_base
+    if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
 
     keys: List[str] = []
@@ -182,6 +243,9 @@ def upload_presign_get(
 
     if not keys:
         raise HTTPException(status_code=422, detail="Informe foto_url ou foto_urls.")
+
+    for key in keys:
+        _ensure_object_key_owned(db, sub_base, key)
 
     client = _get_s3_client()
     expires_in = 60
@@ -214,7 +278,8 @@ def get_comprovante_watermark(
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
-    _ensure_saida_owned(db, sub_base, id_saida)
+    saida = _ensure_saida_owned(db, sub_base, id_saida)
+    _ensure_motoboy_owns_saida(current_user, saida)
 
     detail = db.execute(
         select(SaidaDetail)
@@ -245,29 +310,9 @@ def get_comprovante_watermark_image(
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
 
-    saida = db.get(Saida, id_saida)
-    if not saida or saida.sub_base != sub_base:
-        raise HTTPException(status_code=404, detail="Saída não encontrada.")
-
-    detail = db.execute(
-        select(SaidaDetail)
-        .where(SaidaDetail.id_saida == id_saida)
-        .order_by(SaidaDetail.id_detail.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-    keys = extract_foto_keys(detail.foto_url if detail else None)
-    if not keys:
-        raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
-    if index >= len(keys):
-        raise HTTPException(status_code=404, detail="Índice de comprovante inválido.")
-
-    object_key = extract_object_key(keys[index], B2_BUCKET_NAME)
-    client = _get_s3_client()
-    try:
-        obj = client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
-        image_bytes = obj["Body"].read()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Erro ao baixar comprovante: {e}")
+    saida = _ensure_saida_owned(db, sub_base, id_saida)
+    _ensure_motoboy_owns_saida(current_user, saida)
+    image_bytes, _ = _load_comprovante_image_bytes(db, saida=saida, index=index)
 
     try:
         watermarked = _build_watermark_image_bytes(image_bytes=image_bytes, codigo=saida.codigo or "")
@@ -278,4 +323,55 @@ def get_comprovante_watermark_image(
         BytesIO(watermarked),
         media_type="image/jpeg",
         headers={"Cache-Control": "private, max-age=30"},
+    )
+
+
+@router.post("/saida/{id_saida}/comprovante-export")
+def export_comprovante(
+    id_saida: int,
+    body: ComprovanteExportIn = ComprovanteExportIn(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Exporta JPEG watermarkado com metadados mínimos (sem PII)."""
+    sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+    saida = _ensure_saida_owned(db, sub_base, id_saida)
+    _ensure_motoboy_owns_saida(current_user, saida)
+
+    image_bytes, total = _load_comprovante_image_bytes(db, saida=saida, index=body.index)
+    try:
+        watermarked = _build_watermark_image_bytes(image_bytes=image_bytes, codigo=saida.codigo or "")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar watermark: {e}")
+
+    status_label = _status_amigavel(saida.status)
+    data_hora = ""
+    if saida.data_hora_entrega:
+        data_hora = saida.data_hora_entrega.isoformat()
+    elif saida.timestamp:
+        data_hora = saida.timestamp.isoformat()
+
+    logger.info(
+        "export_share: id_saida=%s index=%s total=%s status=%s user_id=%s",
+        id_saida,
+        body.index,
+        total,
+        status_label,
+        getattr(current_user, "id", None),
+    )
+
+    filename = f"comprovante-{(saida.codigo or id_saida)}.jpg".replace("/", "-")
+    return StreamingResponse(
+        BytesIO(watermarked),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Comprovante-Codigo": (saida.codigo or "").strip(),
+            "X-Comprovante-Status": status_label,
+            "X-Comprovante-Data": data_hora,
+            "X-Comprovante-Index": str(body.index),
+        },
     )

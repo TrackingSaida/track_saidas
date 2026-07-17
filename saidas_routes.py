@@ -40,6 +40,21 @@ from pedido_campos_obrigatorios_service import (
     raise_if_campos_obrigatorios_faltando,
 )
 from log_leitura_service import registrar_log_leitura_critico
+from leitura_manual_auth import ensure_manual_code_entry_allowed
+from ausencia_bloqueio_service import (
+    EVENTO_LIBERACAO,
+    raise_if_bloqueado_ausencias,
+    snapshot_bloqueio_ausencias,
+)
+from upload_storage_utils import (
+    MAX_FOTOS_POR_EVENTO_TENTATIVA,
+    build_foto_item,
+    count_fotos_for_evento_tentativa,
+    extract_foto_keys,
+    find_foto_item,
+    parse_foto_items,
+    serialize_foto_items,
+)
 
 
 # ============================================================
@@ -121,6 +136,7 @@ class SaidaLerIn(BaseModel):
     # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
     registrar_nao_coletado: bool = False
     qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
+    origem: Optional[str] = "manual"  # camera | manual — motoboy precisa de permissão para manual
 
 
 class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
@@ -132,8 +148,8 @@ class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
 
 
 class LancarAvulsoIn(BaseModel):
-    identificacao: Optional[str] = None
-    quantidade: int = Field(default=1, ge=1)
+    identificacao: Optional[str] = Field(default=None, max_length=32)
+    quantidade: int = Field(default=1, ge=1, le=50)
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
@@ -184,6 +200,8 @@ class SaidaDetalheCompletoOut(BaseModel):
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
     data_hora_entrega: Optional[datetime] = None
+    ausencias_total: int = 0
+    bloqueado_ausencias: bool = False
     codigo: Optional[str] = None
     servico: Optional[str] = None
     status: Optional[str] = None
@@ -467,6 +485,19 @@ def _get_owned_saida(db: Session, sub_base: str, id_saida: int) -> Saida:
     return obj
 
 
+def _ensure_motoboy_owns_saida(current_user: User, saida: Saida) -> None:
+    """Motoboy só opera saídas atribuídas a ele; staff segue com escopo de sub_base."""
+    role = getattr(current_user, "role", None)
+    if role != 4:
+        return
+    motoboy_id = getattr(current_user, "motoboy_id", None)
+    if not motoboy_id or int(saida.motoboy_id or 0) != int(motoboy_id):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."},
+        )
+
+
 def _check_delete_window_or_409(ts: datetime):
     if ts is None or datetime.utcnow() - ts > timedelta(days=1):
         raise HTTPException(
@@ -497,11 +528,11 @@ def _normalizar_label_avulso(label: Optional[str]) -> str:
     ascii_only = "".join(c for c in raw if unicodedata.category(c) != "Mn")
     ascii_only = re.sub(r"[^A-Z0-9]+", "-", ascii_only).strip("-")
     ascii_only = re.sub(r"-{2,}", "-", ascii_only)
-    return ascii_only[:48]
+    # Novos labels limitados a 24 chars para manter legibilidade no mobile.
+    return ascii_only[:24]
 
 
 def _next_avulso_seq(db: Session) -> int:
-    db.execute(text("CREATE SEQUENCE IF NOT EXISTS avulso_codigo_seq START WITH 1 INCREMENT BY 1"))
     return int(db.execute(text("SELECT nextval('avulso_codigo_seq')")).scalar_one())
 
 
@@ -703,6 +734,18 @@ def ler_saida(
 
     if not sub_base or not username:
         raise HTTPException(401, "Usuário inválido.")
+
+    origem_leitura = ensure_manual_code_entry_allowed(
+        db,
+        current_user,
+        origem=getattr(payload, "origem", None) or "manual",
+    )
+    logger.info(
+        "ler_saida origem=%s user_id=%s role=%s",
+        origem_leitura,
+        getattr(current_user, "id", None),
+        role,
+    )
 
     motoboy_id: Optional[int] = None
     entregador_id: Optional[int] = None
@@ -1681,19 +1724,7 @@ def get_saida_detalhe(
     )
     detail_out = None
     if detail_row:
-        foto_urls_list: List[str] = []
-        if detail_row.foto_url:
-            raw = (detail_row.foto_url or "").strip()
-            if raw.startswith("["):
-                try:
-                    foto_urls_list = json.loads(raw)
-                    if not isinstance(foto_urls_list, list):
-                        foto_urls_list = [raw]
-                except (json.JSONDecodeError, TypeError):
-                    foto_urls_list = [raw]
-            else:
-                foto_urls_list = [raw]
-        foto_urls_list = [k for k in foto_urls_list if k][:3]
+        foto_urls_list = extract_foto_keys(detail_row.foto_url)
         detail_out = SaidaDetailOut(
             id_saida=detail_row.id_saida,
             id_entregador=detail_row.id_entregador,
@@ -1720,6 +1751,7 @@ def get_saida_detalhe(
             foto_urls=foto_urls_list or None,
         )
     executor_nome = _nome_executor_atual(db, obj) or obj.entregador
+    bloqueio = snapshot_bloqueio_ausencias(db, obj.id_saida)
     return SaidaDetalheCompletoOut(
         id_saida=obj.id_saida,
         timestamp=obj.timestamp,
@@ -1729,6 +1761,8 @@ def get_saida_detalhe(
         entregador=executor_nome,
         motoboy_id=obj.motoboy_id,
         data_hora_entrega=obj.data_hora_entrega,
+        ausencias_total=bloqueio["ausencias_total"],
+        bloqueado_ausencias=bloqueio["bloqueado_ausencias"],
         codigo=obj.codigo,
         servico=obj.servico,
         status=obj.status,
@@ -1745,23 +1779,22 @@ def get_saida_detalhe(
 class SaidaFotoPatchBody(BaseModel):
     foto_url: str = Field(min_length=1)
     status: str = Field(pattern="^(entregue|ausente)$")
+    photo_id: Optional[str] = Field(default=None, max_length=80)
     validar_campos_obrigatorios: bool = True
     alterar_status: bool = True
 
 
 def _normalize_foto_url_to_key(foto_url: str) -> str:
     """Se for URL completa, extrai object_key; senão retorna como está."""
+    from upload_storage_utils import extract_object_key as _extract_key
+
     s = (foto_url or "").strip()
     if not s:
         return s
-    if s.startswith("http://") or s.startswith("https://"):
-        bucket = os.getenv("B2_BUCKET_NAME", "ts-prod-entregas-fotos")
-        prefix = f"/{bucket}/"
-        idx = s.find(prefix)
-        if idx != -1:
-            return s[idx + len(prefix) :].split("?")[0]
-        return s.split("/")[-1].split("?")[0] or s
-    return s
+    try:
+        return _extract_key(s)
+    except ValueError:
+        return s
 
 
 @router.patch("/{id_saida}/foto")
@@ -1771,11 +1804,12 @@ def patch_saida_foto(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Append uma foto (object_key) à lista em saidas_detail; atualiza status da saída. Máx. 3 fotos."""
+    """Append tipado de foto por evento/tentativa; idempotente por photo_id/key."""
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     obj = _get_owned_saida(db, sub_base, id_saida)
+    _ensure_motoboy_owns_saida(current_user, obj)
     status_norm = normalizar_status_saida(obj.status)
     if _status_esta_finalizado(status_norm) and body.alterar_status:
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_norm))
@@ -1786,36 +1820,60 @@ def patch_saida_foto(
     if not key:
         raise HTTPException(status_code=422, detail="foto_url inválida.")
 
-    status_canon = STATUS_ENTREGUE if body.status.lower() == "entregue" else STATUS_AUSENTE
-    current_list: List[str] = []
-    if detail_row and detail_row.foto_url:
-        raw = (detail_row.foto_url or "").strip()
-        if raw.startswith("["):
-            try:
-                current_list = json.loads(raw)
-                if not isinstance(current_list, list):
-                    current_list = [raw]
-            except (json.JSONDecodeError, TypeError):
-                current_list = [raw]
-        else:
-            current_list = [raw]
-    current_list = [k for k in current_list if k]
+    evento = body.status.lower().strip()
+    status_canon = STATUS_ENTREGUE if evento == "entregue" else STATUS_AUSENTE
+    tentativa_atual = int(getattr(detail_row, "tentativa", None) or 1) if detail_row else 1
+    photo_id = (body.photo_id or "").strip() or None
+    current_items = parse_foto_items(detail_row.foto_url if detail_row else None)
 
-    if len(current_list) >= 3:
-        raise HTTPException(status_code=422, detail="Máximo de 3 fotos por entrega.")
+    existing = find_foto_item(current_items, key=key, photo_id=photo_id)
+    if existing:
+        foto_urls = extract_foto_keys(serialize_foto_items(current_items))
+        logger.info(
+            "PATCH foto idempotente: id_saida=%s key=%s photo_id=%s evento=%s tentativa=%s user_id=%s",
+            id_saida,
+            key,
+            photo_id,
+            evento,
+            tentativa_atual,
+            getattr(current_user, "id", None),
+        )
+        return {
+            "ok": True,
+            "idempotent": True,
+            "foto_urls": foto_urls,
+            "fotos": current_items,
+        }
 
-    current_list.append(key)
-    payload = json.dumps(current_list)
+    if count_fotos_for_evento_tentativa(current_items, evento, tentativa_atual) >= MAX_FOTOS_POR_EVENTO_TENTATIVA:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "MAX_FOTOS_EVENTO",
+                "message": f"Máximo de {MAX_FOTOS_POR_EVENTO_TENTATIVA} fotos por evento e tentativa.",
+            },
+        )
+
+    current_items.append(
+        build_foto_item(
+            key=key,
+            evento=evento,
+            tentativa=tentativa_atual,
+            photo_id=photo_id,
+        )
+    )
+    payload = serialize_foto_items(current_items)
 
     if detail_row:
         detail_row.foto_url = payload
-        detail_row.status = status_canon
+        if body.alterar_status:
+            detail_row.status = status_canon
     else:
         detail_row = SaidaDetail(
             id_saida=id_saida,
             id_entregador=getattr(obj, "motoboy_id", None) or 0,
-            status=status_canon,
-            tentativa=1,
+            status=status_canon if body.alterar_status else (obj.status or status_canon),
+            tentativa=tentativa_atual,
             foto_url=payload,
         )
         db.add(detail_row)
@@ -1837,22 +1895,82 @@ def patch_saida_foto(
         db.add(
             SaidaHistorico(
                 id_saida=id_saida,
-                evento=body.status.lower(),
+                evento=evento,
                 status_anterior=status_anterior,
                 status_novo=status_canon,
                 user_id=current_user.id,
             )
         )
     db.commit()
+    foto_urls = extract_foto_keys(payload)
     logger.info(
-        "PATCH foto: id_saida=%s object_key=%s status=%s foto_urls_count=%s user_id=%s",
+        "PATCH foto: id_saida=%s object_key=%s photo_id=%s status=%s tentativa=%s foto_urls_count=%s user_id=%s",
         id_saida,
         key,
+        photo_id,
         body.status,
-        len(current_list),
+        tentativa_atual,
+        len(foto_urls),
         getattr(current_user, "id", None),
     )
-    return {"ok": True, "foto_urls": current_list}
+    return {"ok": True, "idempotent": False, "foto_urls": foto_urls, "fotos": current_items}
+
+
+@router.post("/{id_saida}/liberar-nova-tentativa")
+def liberar_nova_tentativa(
+    id_saida: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Operador/admin/root libera pedido bloqueado por limite de ausências."""
+    role = getattr(current_user, "role", None)
+    if role not in (0, 1, 2):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "Apenas root, admin ou operador podem liberar nova tentativa.",
+            },
+        )
+    sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+    obj = _get_owned_saida(db, sub_base, id_saida)
+    bloqueio = snapshot_bloqueio_ausencias(db, obj.id_saida)
+    if not bloqueio["bloqueado_ausencias"]:
+        return {
+            "ok": True,
+            "id_saida": obj.id_saida,
+            "ausencias_total": bloqueio["ausencias_total"],
+            "bloqueado_ausencias": False,
+            "message": "Pedido já estava liberado para nova tentativa.",
+        }
+    db.add(
+        SaidaHistorico(
+            id_saida=obj.id_saida,
+            evento=EVENTO_LIBERACAO,
+            status_anterior=obj.status,
+            status_novo=obj.status,
+            motoboy_id_anterior=obj.motoboy_id,
+            motoboy_id_novo=obj.motoboy_id,
+            user_id=current_user.id,
+            payload=json.dumps({"ausencias_total": bloqueio["ausencias_total"]}, ensure_ascii=False),
+        )
+    )
+    db.commit()
+    logger.info(
+        "liberacao_ausencias: id_saida=%s ausencias=%s user_id=%s",
+        obj.id_saida,
+        bloqueio["ausencias_total"],
+        getattr(current_user, "id", None),
+    )
+    return {
+        "ok": True,
+        "id_saida": obj.id_saida,
+        "ausencias_total": 0,
+        "bloqueado_ausencias": False,
+        "message": "Nova tentativa liberada pela operação.",
+    }
 
 
 # ============================================================
@@ -1939,6 +2057,19 @@ def atualizar_saida(
         and payload.motoboy_id is not None
         and int(payload.motoboy_id) != int(motoboy_anterior or 0)
     )
+    reabre_ausente = (
+        status_anterior == STATUS_AUSENTE
+        and (
+            payload.motoboy_id is not None
+            or (
+                payload.status is not None
+                and normalizar_status_saida(payload.status)
+                in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA)
+            )
+        )
+    )
+    if reabre_ausente:
+        raise_if_bloqueado_ausencias(db, obj.id_saida)
     if reatribuicao_entregue:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         obj.motoboy_id = motoboy.id_motoboy
