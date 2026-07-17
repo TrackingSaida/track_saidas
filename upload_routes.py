@@ -327,6 +327,24 @@ def _load_comprovante_logo(max_width: int = 220, max_height: int = 56):
     return None
 
 
+def _header_latin1_safe(value: Any, *, max_len: int = 200) -> str:
+    """HTTP headers só aceitam latin-1; evita 500 com em dash/unicode (ex.: —portaria)."""
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if not text:
+        return ""
+    for src, dst in (
+        ("\u2014", "-"),  # —
+        ("\u2013", "-"),  # –
+        ("\u2212", "-"),  # −
+        ("\u00a0", " "),
+    ):
+        text = text.replace(src, dst)
+    text = text.encode("latin-1", errors="ignore").decode("latin-1").strip()
+    if len(text) > max_len:
+        text = text[:max_len].rstrip()
+    return text
+
+
 def _build_comprovante_share_image_bytes(*, photo_bytes: bytes, resumo: Dict[str, Any]) -> bytes:
     """Monta cartão com logo + dados preenchidos + foto (ideal para WhatsApp)."""
     from PIL import Image, ImageDraw
@@ -617,22 +635,19 @@ def export_comprovante(
         getattr(current_user, "id", None),
     )
 
-    filename = f"comprovante-{(saida.codigo or id_saida)}.jpg".replace("/", "-")
-    # Headers ASCII-safe (sem acentos/quebras) para metadados; imagem já contém o texto completo.
-    header_codigo = (resumo.get("codigo") or "").replace("\n", " ").strip()
-    header_status = (resumo.get("status") or "").replace("\n", " ").strip()
-    header_data = (resumo.get("data_hora") or "").replace("\n", " ").strip()
-    header_recebedor = (resumo.get("nome_recebedor") or "").replace("\n", " ").strip()
+    raw_filename = f"comprovante-{(saida.codigo or id_saida)}.jpg".replace("/", "-")
+    filename = _header_latin1_safe(raw_filename, max_len=180) or "comprovante.jpg"
+    # Metadados em header precisam ser latin-1; o JPEG já traz o texto completo (Unicode).
     return StreamingResponse(
         BytesIO(share_image),
         media_type="image/jpeg",
         headers={
             "Cache-Control": "private, no-store",
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Comprovante-Codigo": header_codigo,
-            "X-Comprovante-Status": header_status,
-            "X-Comprovante-Data": header_data,
-            "X-Comprovante-Recebedor": header_recebedor,
+            "X-Comprovante-Codigo": _header_latin1_safe(resumo.get("codigo")),
+            "X-Comprovante-Status": _header_latin1_safe(resumo.get("status")),
+            "X-Comprovante-Data": _header_latin1_safe(resumo.get("data_hora")),
+            "X-Comprovante-Recebedor": _header_latin1_safe(resumo.get("nome_recebedor")),
             "X-Comprovante-Index": str(body.index),
         },
     )
