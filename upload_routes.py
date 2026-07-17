@@ -6,13 +6,18 @@ Prefixo: /upload. Auth: get_current_user (web e mobile).
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+_BASE_DIR = Path(__file__).resolve().parent
+_DEFAULT_LOGO_PATH = _BASE_DIR / "assets" / "logo-comprovante.png"
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -291,8 +296,39 @@ def _wrap_text(draw, text: str, font, max_width: int) -> List[str]:
     return lines
 
 
+def _load_comprovante_logo(max_width: int = 220, max_height: int = 56):
+    """Carrega o logo do sistema para o cartão; retorna None se indisponível."""
+    from PIL import Image
+
+    logo_env = (os.getenv("COMPROVANTE_LOGO_PATH") or "").strip()
+    candidates = []
+    if logo_env:
+        candidates.append(Path(logo_env))
+    candidates.append(_DEFAULT_LOGO_PATH)
+
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            with Image.open(path) as raw:
+                logo = raw.convert("RGBA")
+            if logo.width <= 0 or logo.height <= 0:
+                continue
+            ratio = min(max_width / float(logo.width), max_height / float(logo.height), 1.0)
+            if ratio < 1.0:
+                resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+                logo = logo.resize(
+                    (max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio))),
+                    resample,
+                )
+            return logo
+        except Exception:
+            logger.warning("comprovante_logo_load_failed path=%s", str(path), exc_info=True)
+    return None
+
+
 def _build_comprovante_share_image_bytes(*, photo_bytes: bytes, resumo: Dict[str, Any]) -> bytes:
-    """Monta cartão com dados preenchidos + foto (ideal para WhatsApp)."""
+    """Monta cartão com logo + dados preenchidos + foto (ideal para WhatsApp)."""
     from PIL import Image, ImageDraw
 
     with Image.open(BytesIO(photo_bytes)) as photo_raw:
@@ -313,12 +349,15 @@ def _build_comprovante_share_image_bytes(*, photo_bytes: bytes, resumo: Dict[str
     status = str(resumo.get("status") or "Comprovante")
     title = f"Comprovante — {status}"
     linhas: List[Tuple[str, str]] = list(resumo.get("linhas") or [])
+    logo = _load_comprovante_logo()
 
     # Mede altura do cabeçalho
     probe = Image.new("RGB", (target_width, 10), (255, 255, 255))
     probe_draw = ImageDraw.Draw(probe)
     content_width = target_width - (pad_x * 2)
     y = pad_y
+    if logo is not None:
+        y += logo.height + 14
     y += probe_draw.textbbox((0, 0), title, font=title_font)[3] + 16
     for label, value in linhas:
         y += probe_draw.textbbox((0, 0), label, font=label_font)[3] + 4
@@ -336,6 +375,10 @@ def _build_comprovante_share_image_bytes(*, photo_bytes: bytes, resumo: Dict[str
     draw.rectangle([(0, 0), (target_width, 8)], fill=accent)
 
     y = pad_y + 4
+    if logo is not None:
+        canvas.paste(logo, (pad_x, y), logo)
+        y += logo.height + 14
+
     draw.text((pad_x, y), title, font=title_font, fill=(15, 23, 42))
     y += draw.textbbox((0, 0), title, font=title_font)[3] + 16
 
