@@ -28,12 +28,13 @@ from sqlalchemy import select, func
 
 from auth import get_current_user
 from db import get_db
-from models import User, Saida, SaidaDetail, SaidaHistorico
+from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy
 from upload_storage_utils import (
     B2_BUCKET_NAME,
     extract_foto_keys,
     extract_object_key,
     get_s3_client_optional,
+    parse_foto_items,
     parse_id_saida_from_object_key,
 )
 
@@ -184,6 +185,28 @@ def _ultima_data_ocorrencia(db: Session, saida: Saida) -> Optional[datetime]:
     ).scalar_one_or_none()
 
 
+def _primeiro_nome(nome_completo: Optional[str]) -> str:
+    parts = (nome_completo or "").strip().split()
+    return parts[0] if parts else ""
+
+
+def _nome_entregador_saida(db: Session, saida: Saida) -> str:
+    """Nome completo do entregador/motoboy da saída (preferência: campo entregador)."""
+    nome = (saida.entregador or "").strip()
+    if nome:
+        return nome
+    mid = getattr(saida, "motoboy_id", None)
+    if not mid:
+        return ""
+    motoboy = db.get(Motoboy, int(mid))
+    if not motoboy or not motoboy.user_id:
+        return ""
+    user = db.get(User, motoboy.user_id)
+    if not user:
+        return ""
+    return f"{user.nome or ''} {user.sobrenome or ''}".strip() or (user.username or "").strip()
+
+
 def _build_comprovante_resumo(
     db: Session,
     *,
@@ -193,9 +216,6 @@ def _build_comprovante_resumo(
     status_label = _status_amigavel(saida.status)
     data_hora = _format_dt_br(_ultima_data_ocorrencia(db, saida))
     nome_recebedor = (getattr(detail, "nome_recebedor", None) or "").strip() if detail else ""
-    tipo_recebedor = (getattr(detail, "tipo_recebedor", None) or "").strip() if detail else ""
-    tipo_documento = (getattr(detail, "tipo_documento", None) or "").strip() if detail else ""
-    numero_documento = (getattr(detail, "numero_documento", None) or "").strip() if detail else ""
     motivo = (getattr(detail, "motivo_ocorrencia", None) or "").strip() if detail else ""
     observacao = ""
     if detail:
@@ -203,8 +223,8 @@ def _build_comprovante_resumo(
             observacao = (detail.observacao_ocorrencia or "").strip()
         else:
             observacao = (detail.observacao_entrega or "").strip()
-    documento = " ".join(p for p in [tipo_documento, numero_documento] if p).strip()
-    servico = (saida.servico or "").strip()
+    entregador_primeiro = _primeiro_nome(_nome_entregador_saida(db, saida))
+    label_entregador = "Entregue por" if status_label == "Entregue" else "Motoboy"
 
     linhas: List[Tuple[str, str]] = [("Código", (saida.codigo or "").strip() or "—")]
     linhas.append(("Status", status_label))
@@ -213,16 +233,12 @@ def _build_comprovante_resumo(
         linhas.append((label_dt, data_hora))
     if nome_recebedor:
         linhas.append(("Recebido por", nome_recebedor))
-    if tipo_recebedor:
-        linhas.append(("Tipo de recebedor", tipo_recebedor))
-    if documento:
-        linhas.append(("Documento", documento))
+    if entregador_primeiro:
+        linhas.append((label_entregador, entregador_primeiro))
     if motivo and status_label == "Ausente":
         linhas.append(("Motivo", motivo))
     if observacao:
         linhas.append(("Observação", observacao))
-    if servico:
-        linhas.append(("Serviço", servico))
 
     caption_parts = [
         f"Comprovante — {status_label}",
@@ -232,10 +248,8 @@ def _build_comprovante_resumo(
         caption_parts.append(f"{'Entrega' if status_label == 'Entregue' else 'Registro'}: {data_hora}")
     if nome_recebedor:
         caption_parts.append(f"Recebido por: {nome_recebedor}")
-    if tipo_recebedor:
-        caption_parts.append(f"Tipo: {tipo_recebedor}")
-    if documento:
-        caption_parts.append(f"Documento: {documento}")
+    if entregador_primeiro:
+        caption_parts.append(f"{label_entregador}: {entregador_primeiro}")
     if motivo and status_label == "Ausente":
         caption_parts.append(f"Motivo: {motivo}")
 
@@ -244,11 +258,9 @@ def _build_comprovante_resumo(
         "status": status_label,
         "data_hora": data_hora,
         "nome_recebedor": nome_recebedor or None,
-        "tipo_recebedor": tipo_recebedor or None,
-        "documento": documento or None,
+        "entregador": entregador_primeiro or None,
         "motivo": motivo or None,
         "observacao": observacao or None,
-        "servico": servico or None,
         "linhas": linhas,
         "caption": "\n".join(caption_parts),
     }
@@ -345,20 +357,34 @@ def _header_latin1_safe(value: Any, *, max_len: int = 200) -> str:
     return text
 
 
-def _build_comprovante_share_image_bytes(*, photo_bytes: bytes, resumo: Dict[str, Any]) -> bytes:
-    """Monta cartão com logo + dados preenchidos + foto (ideal para WhatsApp)."""
+def _build_comprovante_share_image_bytes(
+    *, photo_bytes_list: List[bytes], resumo: Dict[str, Any]
+) -> bytes:
+    """Monta cartão com logo + dados + até 3 fotos empilhadas (WhatsApp-friendly)."""
     from PIL import Image, ImageDraw
 
-    with Image.open(BytesIO(photo_bytes)) as photo_raw:
-        photo = photo_raw.convert("RGB")
+    if not photo_bytes_list:
+        raise ValueError("Nenhuma foto para montar o comprovante.")
 
-    target_width = max(720, min(1080, photo.width))
-    if photo.width != target_width:
-        ratio = target_width / float(photo.width)
-        photo = photo.resize((target_width, max(1, int(photo.height * ratio))))
+    photos: List[Any] = []
+    target_width = 720
+    for raw in photo_bytes_list[:3]:
+        with Image.open(BytesIO(raw)) as photo_raw:
+            photo = photo_raw.convert("RGB")
+        target_width = max(target_width, min(1080, photo.width))
+        photos.append(photo)
+
+    resized: List[Any] = []
+    for photo in photos:
+        if photo.width != target_width:
+            ratio = target_width / float(photo.width)
+            photo = photo.resize((target_width, max(1, int(photo.height * ratio))))
+        resized.append(photo)
+    photos = resized
 
     pad_x = 28
     pad_y = 24
+    gap = 10
     title_font = _load_font(34, bold=True)
     label_font = _load_font(22, bold=True)
     value_font = _load_font(24, bold=False)
@@ -385,7 +411,8 @@ def _build_comprovante_share_image_bytes(*, photo_bytes: bytes, resumo: Dict[str
     y += 8
     header_h = y + pad_y
 
-    canvas = Image.new("RGB", (target_width, header_h + photo.height), (248, 250, 252))
+    photos_h = sum(p.height for p in photos) + gap * max(0, len(photos) - 1)
+    canvas = Image.new("RGB", (target_width, header_h + photos_h), (248, 250, 252))
     draw = ImageDraw.Draw(canvas)
 
     # Faixa de status
@@ -411,9 +438,15 @@ def _build_comprovante_share_image_bytes(*, photo_bytes: bytes, resumo: Dict[str
     footer = "TrackingSaída — comprovante operacional"
     draw.text((pad_x, header_h - pad_y - 4), footer, font=footer_font, fill=(148, 163, 184))
 
-    canvas.paste(photo, (0, header_h))
+    y = header_h
+    for i, photo in enumerate(photos):
+        canvas.paste(photo, (0, y))
+        y += photo.height
+        if i < len(photos) - 1:
+            y += gap
+
     buf = BytesIO()
-    canvas.save(buf, format="JPEG", quality=88, optimize=True)
+    canvas.save(buf, format="JPEG", quality=85, optimize=True)
     buf.seek(0)
     return buf.getvalue()
 
@@ -436,6 +469,44 @@ def _load_comprovante_image_bytes(
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Erro ao baixar comprovante: {e}")
     return image_bytes, len(keys), detail
+
+
+def _select_keys_mesmo_evento(detail: Optional[SaidaDetail], index: int) -> List[str]:
+    """Seleciona até 3 fotos do mesmo evento/tentativa da foto escolhida (pacote + endereço etc.)."""
+    items = parse_foto_items(detail.foto_url if detail else None)
+    if not items:
+        return []
+    if index < 0 or index >= len(items):
+        raise HTTPException(status_code=404, detail="Índice de comprovante inválido.")
+    pivot = items[index]
+    evento = str(pivot.get("evento") or "legacy").lower()
+    tentativa = int(pivot.get("tentativa") or 1)
+    selected = [
+        str(item["key"])
+        for item in items
+        if item.get("key")
+        and str(item.get("evento") or "legacy").lower() == evento
+        and int(item.get("tentativa") or 1) == tentativa
+    ]
+    # Legado sem tipagem: inclui todas as keys (até 3).
+    if evento == "legacy" and len(selected) <= 1:
+        selected = [str(item["key"]) for item in items if item.get("key")]
+    return selected[:3]
+
+
+def _download_comprovante_keys(keys: List[str]) -> List[bytes]:
+    client = _get_s3_client()
+    out: List[bytes] = []
+    for key in keys:
+        object_key = extract_object_key(key, B2_BUCKET_NAME)
+        try:
+            obj = client.get_object(Bucket=B2_BUCKET_NAME, Key=object_key)
+            out.append(obj["Body"].read())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Erro ao baixar comprovante: {e}")
+    if not out:
+        raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
+    return out
 
 
 # ---------- POST /upload/presign ----------
@@ -610,26 +681,37 @@ def export_comprovante(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Exporta JPEG com cartão de dados preenchidos + foto watermarkada (WhatsApp-friendly)."""
+    """Exporta JPEG com cartão + até 3 fotos do mesmo evento (empilhadas, WhatsApp-friendly)."""
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
     saida = _ensure_saida_owned(db, sub_base, id_saida)
     _ensure_motoboy_owns_saida(current_user, saida)
 
-    image_bytes, total, detail = _load_comprovante_image_bytes(db, saida=saida, index=body.index)
+    detail = _load_detail_for_saida(db, saida.id_saida)
+    keys = _select_keys_mesmo_evento(detail, body.index)
+    if not keys:
+        raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
+    image_list = _download_comprovante_keys(keys)
     try:
-        watermarked = _build_watermark_image_bytes(image_bytes=image_bytes, codigo=saida.codigo or "")
+        watermarked_list = [
+            _build_watermark_image_bytes(image_bytes=img, codigo=saida.codigo or "")
+            for img in image_list
+        ]
         resumo = _build_comprovante_resumo(db, saida=saida, detail=detail)
-        share_image = _build_comprovante_share_image_bytes(photo_bytes=watermarked, resumo=resumo)
+        share_image = _build_comprovante_share_image_bytes(
+            photo_bytes_list=watermarked_list, resumo=resumo
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao gerar comprovante: {e}")
 
     logger.info(
-        "export_share: id_saida=%s index=%s total=%s status=%s has_recebedor=%s user_id=%s",
+        "export_share: id_saida=%s index=%s fotos=%s status=%s has_recebedor=%s user_id=%s",
         id_saida,
         body.index,
-        total,
+        len(watermarked_list),
         resumo.get("status"),
         bool(resumo.get("nome_recebedor")),
         getattr(current_user, "id", None),
@@ -648,6 +730,8 @@ def export_comprovante(
             "X-Comprovante-Status": _header_latin1_safe(resumo.get("status")),
             "X-Comprovante-Data": _header_latin1_safe(resumo.get("data_hora")),
             "X-Comprovante-Recebedor": _header_latin1_safe(resumo.get("nome_recebedor")),
+            "X-Comprovante-Entregador": _header_latin1_safe(resumo.get("entregador")),
             "X-Comprovante-Index": str(body.index),
+            "X-Comprovante-Fotos": str(len(watermarked_list)),
         },
     )
