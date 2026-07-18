@@ -1,8 +1,9 @@
 """Consulta compartilhada de histórico de saída (saida_historico)."""
 from __future__ import annotations
 
+import json
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
@@ -26,6 +27,9 @@ class SaidaHistoricoItemOut(BaseModel):
     motoboy_id_anterior: Optional[int] = None
     motoboy_id_novo: Optional[int] = None
     acao_label: Optional[str] = None
+    motivo_ocorrencia: Optional[str] = None
+    observacao_ocorrencia: Optional[str] = None
+    tentativa: Optional[int] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -37,7 +41,62 @@ class EntregaHistoricoItemOut(BaseModel):
     timestamp: datetime
     usuario_nome: Optional[str] = None
     acao_label: Optional[str] = None
+    motivo_ocorrencia: Optional[str] = None
+    observacao_ocorrencia: Optional[str] = None
+    tentativa: Optional[int] = None
     model_config = ConfigDict(from_attributes=True)
+
+
+def parse_historico_payload(raw: Optional[str]) -> Dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def build_ausencia_historico_payload(
+    *,
+    motivo: Optional[str] = None,
+    observacao: Optional[str] = None,
+    tentativa: Optional[int] = None,
+) -> Optional[str]:
+    """Serializa motivo/observação/tentativa no payload do histórico de ausência."""
+    data: Dict[str, Any] = {}
+    motivo_norm = (motivo or "").strip()
+    obs_norm = (observacao or "").strip()
+    if motivo_norm:
+        data["motivo_ocorrencia"] = motivo_norm
+    if obs_norm:
+        data["observacao_ocorrencia"] = obs_norm
+    if tentativa is not None:
+        try:
+            data["tentativa"] = max(1, int(tentativa))
+        except (TypeError, ValueError):
+            pass
+    if not data:
+        return None
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _campos_from_payload(raw: Optional[str]) -> Dict[str, Any]:
+    data = parse_historico_payload(raw)
+    motivo = str(data.get("motivo_ocorrencia") or "").strip() or None
+    obs = str(data.get("observacao_ocorrencia") or "").strip() or None
+    tentativa = None
+    if data.get("tentativa") is not None:
+        try:
+            tentativa = max(1, int(data.get("tentativa")))
+        except (TypeError, ValueError):
+            tentativa = None
+    return {
+        "motivo_ocorrencia": motivo,
+        "observacao_ocorrencia": obs,
+        "tentativa": tentativa,
+    }
 
 
 def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoItemOut]:
@@ -52,6 +111,7 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
     for row in rows:
         h, username = row[0], row[1]
         evento_norm = (h.evento or "").strip().lower()
+        extra = _campos_from_payload(getattr(h, "payload", None))
         out.append(
             SaidaHistoricoItemOut(
                 id=h.id,
@@ -65,6 +125,9 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
                 motoboy_id_anterior=h.motoboy_id_anterior,
                 motoboy_id_novo=h.motoboy_id_novo,
                 acao_label=rotulo_acao_evento(evento_norm),
+                motivo_ocorrencia=extra["motivo_ocorrencia"],
+                observacao_ocorrencia=extra["observacao_ocorrencia"],
+                tentativa=extra["tentativa"],
             )
         )
     return out
@@ -79,6 +142,9 @@ def projetar_historico_mobile(items: List[SaidaHistoricoItemOut]) -> List[Entreg
             timestamp=item.timestamp,
             usuario_nome=item.usuario_nome,
             acao_label=item.acao_label,
+            motivo_ocorrencia=item.motivo_ocorrencia,
+            observacao_ocorrencia=item.observacao_ocorrencia,
+            tentativa=item.tentativa,
         )
         for item in items
     ]

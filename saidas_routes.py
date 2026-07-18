@@ -46,6 +46,7 @@ from ausencia_bloqueio_service import (
     raise_if_bloqueado_ausencias,
     snapshot_bloqueio_ausencias,
 )
+from saida_historico_service import build_ausencia_historico_payload
 from upload_storage_utils import (
     MAX_FOTOS_POR_EVENTO_TENTATIVA,
     build_foto_item,
@@ -2171,6 +2172,19 @@ def atualizar_saida(
         evento_historico = "reatribuido"
 
     if evento_historico:
+        hist_payload = None
+        if evento_historico == "ausente":
+            detail_hist = db.scalar(
+                select(SaidaDetail)
+                .where(SaidaDetail.id_saida == obj.id_saida)
+                .order_by(SaidaDetail.id_detail.desc())
+                .limit(1)
+            )
+            hist_payload = build_ausencia_historico_payload(
+                motivo=getattr(detail_hist, "motivo_ocorrencia", None) if detail_hist else None,
+                observacao=getattr(detail_hist, "observacao_ocorrencia", None) if detail_hist else None,
+                tentativa=getattr(detail_hist, "tentativa", None) if detail_hist else None,
+            )
         db.add(
             SaidaHistorico(
                 id_saida=obj.id_saida,
@@ -2180,6 +2194,7 @@ def atualizar_saida(
                 motoboy_id_anterior=motoboy_anterior,
                 motoboy_id_novo=motoboy_novo,
                 user_id=current_user.id,
+                payload=hist_payload,
             )
         )
 

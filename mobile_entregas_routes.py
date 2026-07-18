@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 from saida_historico_service import (
     EntregaHistoricoItemOut,
+    build_ausencia_historico_payload,
     listar_historico_saida,
     projetar_historico_mobile,
 )
@@ -2163,6 +2164,7 @@ def _aplicar_ausente_lote(
 ) -> None:
     s.status = STATUS_AUSENTE
     obs = (observacao or "").strip() or None
+    tentativa_atual = int(getattr(detail, "tentativa", None) or 1) if detail else 1
     if detail:
         detail.motivo_ocorrencia = motivo.descricao
         detail.observacao_ocorrencia = obs
@@ -2183,6 +2185,11 @@ def _aplicar_ausente_lote(
             status_anterior=status_anterior,
             status_novo=STATUS_AUSENTE,
             user_id=user.id,
+            payload=build_ausencia_historico_payload(
+                motivo=motivo.descricao,
+                observacao=obs,
+                tentativa=tentativa_atual,
+            ),
         )
     )
 
@@ -2477,16 +2484,18 @@ def marcar_ausente(
     status_anterior = status_norm
     s.status = STATUS_AUSENTE
     detail = _get_detail_for_saida(db, id_saida)
+    obs = (body.observacao or "").strip() or None
+    tentativa_atual = int(getattr(detail, "tentativa", None) or 1) if detail else 1
     if detail:
         detail.motivo_ocorrencia = motivo.descricao
-        detail.observacao_ocorrencia = (body.observacao or "").strip() or None
+        detail.observacao_ocorrencia = obs
     else:
         detail = SaidaDetail(
             id_saida=id_saida,
             id_entregador=0,
             status=STATUS_AUSENTE,
             motivo_ocorrencia=motivo.descricao,
-            observacao_ocorrencia=(body.observacao or "").strip() or None,
+            observacao_ocorrencia=obs,
         )
         db.add(detail)
     db.add(
@@ -2496,6 +2505,11 @@ def marcar_ausente(
             status_anterior=status_anterior,
             status_novo=STATUS_AUSENTE,
             user_id=user.id,
+            payload=build_ausencia_historico_payload(
+                motivo=motivo.descricao,
+                observacao=obs,
+                tentativa=tentativa_atual,
+            ),
         )
     )
     db.commit()
