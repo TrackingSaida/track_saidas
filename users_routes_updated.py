@@ -41,7 +41,7 @@ class MotoboyOut(BaseModel):
     cep: Optional[str] = None
     pode_ler_coleta: bool = False
     pode_ler_saida: bool = True
-    pode_digitar_codigo_manual: bool = False
+    pode_digitar_codigo_manual: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -514,7 +514,7 @@ def create_user(
             pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else False
             pode_ler_saida = body.pode_ler_saida if body.pode_ler_saida is not None else True
             pode_digitar_codigo_manual = (
-                body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else False
+                body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else True
             )
             if owner.ignorar_coleta:
                 pode_ler_coleta = False
@@ -783,9 +783,9 @@ def admin_update_user(
             pode_ler_coleta = updates.get("pode_ler_coleta", False) or False
             pode_ler_saida = updates.get("pode_ler_saida", True) if updates.get("pode_ler_saida") is not None else True
             pode_digitar_codigo_manual = (
-                updates.get("pode_digitar_codigo_manual", False)
+                updates.get("pode_digitar_codigo_manual", True)
                 if updates.get("pode_digitar_codigo_manual") is not None
-                else False
+                else True
             )
             if owner and owner.ignorar_coleta:
                 pode_ler_coleta = False

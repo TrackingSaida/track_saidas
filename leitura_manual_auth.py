@@ -42,7 +42,7 @@ def ensure_manual_code_entry_allowed(
         )
 
     motoboy = db.get(Motoboy, int(motoboy_id))
-    if not motoboy or not bool(getattr(motoboy, "pode_digitar_codigo_manual", False)):
+    if not motoboy or not bool(getattr(motoboy, "pode_digitar_codigo_manual", True)):
         raise HTTPException(
             status_code=403,
             detail={
