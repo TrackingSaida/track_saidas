@@ -1570,6 +1570,121 @@ def _listar_saidas_codigo_exato(
     }
 
 
+def _listar_saidas_codigo_parcial(
+    db: Session,
+    *,
+    sub_base: str,
+    codigo: Optional[str],
+    localizar: Optional[str],
+    de: Optional[date],
+    ate: Optional[date],
+    base: Optional[str],
+    entregador: Optional[str],
+    status_: Optional[List[str]],
+    servico: Optional[List[str]],
+    acao: Optional[List[str]],
+    somente_g: Optional[bool],
+    limit: Optional[int],
+    offset: int,
+) -> Dict[str, Any]:
+    """Prefixo/contém em codigo — caminho leve para o cascade do app mobile.
+
+    Evita o CTE operacional da listagem D-15 (que sem período varre a sub_base inteira).
+    """
+    lim = 20 if limit is None else max(0, min(int(limit), 50))
+    off = max(0, int(offset or 0))
+
+    stmt = select(Saida).where(Saida.sub_base == sub_base)
+
+    if codigo and codigo.strip():
+        codigo_norm = _normalizar_codigo_busca_listar(codigo)
+        stmt = stmt.where(
+            or_(
+                Saida.codigo == codigo_norm,
+                Saida.codigo.ilike(f"{codigo_norm}%"),
+            )
+        )
+    elif localizar and localizar.strip():
+        q = f"%{localizar.strip()}%"
+        # Consulta mobile filtra por código no cliente; busca só em codigo.
+        stmt = stmt.where(Saida.codigo.ilike(q))
+    else:
+        return _listar_resposta_vazia()
+
+    if de is not None:
+        stmt = stmt.where(Saida.timestamp >= datetime.combine(de, datetime.min.time()))
+    if ate is not None:
+        stmt = stmt.where(
+            Saida.timestamp < datetime.combine(ate + timedelta(days=1), datetime.min.time())
+        )
+    if somente_g:
+        stmt = stmt.where(Saida.is_grande.is_(True))
+
+    stmt = stmt.order_by(Saida.timestamp.desc(), Saida.id_saida.desc())
+
+    # Busca um pouco além da página para saber se há mais resultados.
+    fetch_cap = min(off + lim + 30, 80)
+    rows = list(db.scalars(stmt.limit(fetch_cap)).all())
+
+    status_aliases = _status_aliases_from_tokens(status_)
+    servico_tokens = _servico_tokens_from_param(servico)
+    entregador_filter_norm = ""
+    if entregador and entregador.strip() and entregador.lower() != "(todos)":
+        entregador_filter_norm = _norm_text(entregador)
+    allowed_eventos, allowed_labels = _build_acao_filter_sets(acao)
+
+    ids = [int(r.id_saida) for r in rows]
+    op_ctx_map = carregar_contexto_operacional(db, ids) if ids else {}
+
+    filtradas: List[Saida] = []
+    for row in rows:
+        ctx = op_ctx_map.get(int(row.id_saida))
+        if deve_excluir_saida_operacional(ctx):
+            continue
+        if not _saida_passa_filtro_base(row, base):
+            continue
+        if not _saida_passa_filtro_status(row, status_aliases):
+            continue
+        if not _saida_passa_filtro_servico(row, servico_tokens):
+            continue
+        if not _saida_passa_filtro_periodo(row, ctx, de, ate):
+            continue
+        if entregador_filter_norm:
+            nome_exec = _nome_executor_atual(db, row) or row.entregador
+            if _norm_text(nome_exec or "") != entregador_filter_norm:
+                continue
+        if not _saida_passa_filtro_acao(ctx, allowed_eventos, allowed_labels):
+            continue
+        filtradas.append(row)
+
+    page_rows = filtradas[off : off + lim] if lim else filtradas[off:]
+    total = len(filtradas)
+    # Se ainda havia linhas no banco além do fetch_cap, total é pelo menos esse piso.
+    if len(rows) >= fetch_cap:
+        total = max(total, off + lim + 1)
+
+    sumShopee = sumMercado = sumAvulso = 0
+    for row in filtradas:
+        a, b, c = _contar_servico_listar(row.servico)
+        sumShopee += a
+        sumMercado += b
+        sumAvulso += c
+
+    items: List[Dict[str, Any]] = []
+    for row in page_rows:
+        ctx = op_ctx_map.get(int(row.id_saida))
+        nome_executor = _nome_executor_atual(db, row)
+        items.append(_montar_item_listar_saida(row, ctx, nome_executor))
+
+    return {
+        "total": int(total),
+        "sumShopee": sumShopee,
+        "sumMercado": sumMercado,
+        "sumAvulso": sumAvulso,
+        "items": items,
+    }
+
+
 # ============================================================
 # GET — LISTAR SAÍDAS (COM CONTADORES)
 # ============================================================
@@ -1614,13 +1729,15 @@ def listar_saidas(
             offset=offset,
         )
 
-    # Defesa: busca por código sem flag (ex.: clientes antigos / localizar mal classificado)
-    # ainda usa o caminho indexado, sem materializar o D-15.
-    if codigo and codigo.strip() and not (localizar and localizar.strip()):
-        return _listar_saidas_codigo_exato(
-            db=db,
+    # Prefixo (codigo sem codigo_exato) e contém (localizar) — usados pelo cascade
+    # do app mobile. Caminho leve: NÃO usar o CTE D-15 completo (sem período
+    # isso varria a sub_base inteira e gerava timeout / "Falha ao buscar registros").
+    if (codigo and codigo.strip() and not codigo_exato) or (localizar and localizar.strip() and not (codigo and codigo.strip())):
+        return _listar_saidas_codigo_parcial(
+            db,
             sub_base=sub_base,
             codigo=codigo,
+            localizar=localizar,
             de=de,
             ate=ate,
             base=base,
