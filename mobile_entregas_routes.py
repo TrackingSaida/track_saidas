@@ -2328,7 +2328,7 @@ def marcar_entregue(
     user: User = Depends(get_current_motoboy),
     x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
-    """Marca entrega como ENTREGUE e registra data_hora_entrega. Só permite se status for EM_ROTA.
+    """Marca entrega como ENTREGUE. Permite SAIU_PARA_ENTREGA ou EM_ROTA (roteirização opcional).
     Se body for enviado, preenche tipo_recebedor, nome_recebedor, tipo_documento, numero_documento, observacao_entrega em saidas_detail."""
     if x_client_action_id:
         logger.info(
@@ -2385,10 +2385,10 @@ def marcar_entregue(
                 "message": "Registre uma nova tentativa antes de marcar como entregue.",
             },
         )
-    if status_norm == STATUS_SAIU_PARA_ENTREGA:
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
         raise HTTPException(
             status_code=422,
-            detail="Inicie a rota antes de finalizar entregas.",
+            detail="Status atual não permite marcar como entregue.",
         )
 
     _upsert_detail_com_body()
@@ -2413,13 +2413,14 @@ def marcar_entregue(
     )
     raise_if_campos_obrigatorios_faltando(faltantes)
 
+    status_anterior = status_norm
     s.status = STATUS_ENTREGUE
     s.data_hora_entrega = datetime.utcnow()  # deprecated: mantido em transição; ver saida_historico evento "entregue"
     db.add(
         SaidaHistorico(
             id_saida=id_saida,
             evento="entregue",
-            status_anterior=STATUS_EM_ROTA,
+            status_anterior=status_anterior,
             status_novo=STATUS_ENTREGUE,
             user_id=user.id,
         )
@@ -2440,7 +2441,7 @@ def marcar_ausente(
     user: User = Depends(get_current_motoboy),
     x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
-    """Marca entrega como AUSENTE com motivo. Só permite se status for EM_ROTA."""
+    """Marca entrega como AUSENTE com motivo. Permite SAIU_PARA_ENTREGA ou EM_ROTA."""
     if x_client_action_id:
         logger.info(
             "marcar_ausente client_action_id=%s id_saida=%s user_id=%s",
@@ -2452,10 +2453,10 @@ def marcar_ausente(
     status_norm = normalizar_status_saida(s.status)
     if _status_esta_finalizado(status_norm):
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
-    if status_norm == STATUS_SAIU_PARA_ENTREGA:
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
         raise HTTPException(
             status_code=422,
-            detail="Inicie a rota antes de finalizar entregas.",
+            detail="Status atual não permite marcar como ausente.",
         )
     motivo = db.get(MotivoAusencia, body.motivo_id)
     if not motivo or not motivo.ativo:
@@ -2473,6 +2474,7 @@ def marcar_ausente(
     )
     raise_if_campos_obrigatorios_faltando(faltantes)
 
+    status_anterior = status_norm
     s.status = STATUS_AUSENTE
     detail = _get_detail_for_saida(db, id_saida)
     if detail:
@@ -2491,7 +2493,7 @@ def marcar_ausente(
         SaidaHistorico(
             id_saida=id_saida,
             evento="ausente",
-            status_anterior=STATUS_EM_ROTA,
+            status_anterior=status_anterior,
             status_novo=STATUS_AUSENTE,
             user_id=user.id,
         )
