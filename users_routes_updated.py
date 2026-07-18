@@ -41,6 +41,7 @@ class MotoboyOut(BaseModel):
     cep: Optional[str] = None
     pode_ler_coleta: bool = False
     pode_ler_saida: bool = True
+    pode_digitar_codigo_manual: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -71,6 +72,7 @@ class UserCreate(BaseModel):
     cep: Optional[str] = None
     pode_ler_coleta: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
+    pode_digitar_codigo_manual: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -120,6 +122,7 @@ class AdminUserUpdate(BaseModel):
     cep: Optional[str] = None
     pode_ler_coleta: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
+    pode_digitar_codigo_manual: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -510,6 +513,9 @@ def create_user(
         if body.role == 4:
             pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else False
             pode_ler_saida = body.pode_ler_saida if body.pode_ler_saida is not None else True
+            pode_digitar_codigo_manual = (
+                body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else False
+            )
             if owner.ignorar_coleta:
                 pode_ler_coleta = False
 
@@ -530,6 +536,7 @@ def create_user(
                 data_cadastro=date.today(),
                 pode_ler_coleta=pode_ler_coleta,
                 pode_ler_saida=pode_ler_saida,
+                pode_digitar_codigo_manual=pode_digitar_codigo_manual,
             )
             db.add(motoboy)
             db.flush()
@@ -754,7 +761,7 @@ def admin_update_user(
     # Campos Motoboy (role=4)
     motoboy_fields = {
         "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
-        "pode_ler_coleta", "pode_ler_saida"
+        "pode_ler_coleta", "pode_ler_saida", "pode_digitar_codigo_manual",
     }
     sub_base = current_user.sub_base or ""
     if user.role == 4:
@@ -775,6 +782,11 @@ def admin_update_user(
                 raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
             pode_ler_coleta = updates.get("pode_ler_coleta", False) or False
             pode_ler_saida = updates.get("pode_ler_saida", True) if updates.get("pode_ler_saida") is not None else True
+            pode_digitar_codigo_manual = (
+                updates.get("pode_digitar_codigo_manual", False)
+                if updates.get("pode_digitar_codigo_manual") is not None
+                else False
+            )
             if owner and owner.ignorar_coleta:
                 pode_ler_coleta = False
             motoboy = Motoboy(
@@ -794,6 +806,7 @@ def admin_update_user(
                 data_cadastro=date.today(),
                 pode_ler_coleta=pode_ler_coleta,
                 pode_ler_saida=pode_ler_saida,
+                pode_digitar_codigo_manual=bool(pode_digitar_codigo_manual),
             )
             db.add(motoboy)
             db.flush()

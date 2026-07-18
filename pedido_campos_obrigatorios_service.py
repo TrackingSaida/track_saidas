@@ -110,20 +110,15 @@ def resolve_campos_obrigatorios_from_cache(
 
 
 def _has_foto(detail: Optional[SaidaDetail], overrides: Optional[Dict[str, Optional[str]]] = None) -> bool:
+    from upload_storage_utils import extract_foto_keys
+
     if overrides and "foto_url" in overrides:
         value = (overrides.get("foto_url") or "").strip()
     else:
         value = (getattr(detail, "foto_url", None) or "").strip() if detail else ""
     if not value:
         return False
-    if value.startswith("["):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return any((str(v).strip() for v in parsed))
-        except Exception:
-            pass
-    return True
+    return bool(extract_foto_keys(value))
 
 
 def _pick_value(field_name: str, detail: Optional[SaidaDetail], overrides: Optional[Dict[str, Optional[str]]]) -> str:

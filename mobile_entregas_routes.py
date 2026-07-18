@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 from saida_historico_service import (
     EntregaHistoricoItemOut,
+    build_ausencia_historico_payload,
     listar_historico_saida,
     projetar_historico_mobile,
 )
@@ -66,6 +67,9 @@ from saidas_routes import (
     _status_esta_finalizado,
     _status_finalizado_detail,
 )
+from ausencia_bloqueio_service import raise_if_bloqueado_ausencias, snapshot_bloqueio_ausencias
+from leitura_manual_auth import ensure_manual_code_entry_allowed
+from upload_storage_utils import extract_foto_keys
 from codigo_normalizer import (
     normalize_codigo,
     canonicalize_servico,
@@ -155,6 +159,8 @@ class EntregaListItem(BaseModel):
     possui_endereco: bool = False
     tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
     tem_comprovante: bool = False
+    ausencias_total: int = 0
+    bloqueado_ausencias: bool = False
     tipo_recebedor: Optional[str] = None
     nome_recebedor: Optional[str] = None
     tipo_documento: Optional[str] = None
@@ -519,6 +525,7 @@ def _saida_to_item(
     detail: Optional[SaidaDetail],
     *,
     data_hora_ocorrencia: Optional[datetime] = None,
+    db: Optional[Session] = None,
 ) -> dict:
     endereco = None
     if detail and (detail.dest_rua or detail.dest_numero):
@@ -526,7 +533,13 @@ def _saida_to_item(
         endereco = ", ".join(parts) if parts else None
     lat = float(detail.latitude) if detail and detail.latitude is not None else None
     lon = float(detail.longitude) if detail and detail.longitude is not None else None
-    tem_comprovante = bool((detail.foto_url or "").strip()) if detail else False
+    tem_comprovante = bool(extract_foto_keys(detail.foto_url if detail else None))
+    ausencias_total = 0
+    bloqueado_ausencias = False
+    if db is not None and normalizar_status_saida(s.status) == STATUS_AUSENTE:
+        snap = snapshot_bloqueio_ausencias(db, s.id_saida)
+        ausencias_total = int(snap["ausencias_total"])
+        bloqueado_ausencias = bool(snap["bloqueado_ausencias"])
     return {
         "id_saida": s.id_saida,
         "codigo": s.codigo,
@@ -554,6 +567,8 @@ def _saida_to_item(
         "possui_endereco": _possui_endereco(detail),
         "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
         "tem_comprovante": tem_comprovante,
+        "ausencias_total": ausencias_total,
+        "bloqueado_ausencias": bloqueado_ausencias,
         "tipo_recebedor": (detail.tipo_recebedor or "").strip() or None if detail else None,
         "nome_recebedor": (detail.nome_recebedor or "").strip() or None if detail else None,
         "tipo_documento": (detail.tipo_documento or "").strip() or None if detail else None,
@@ -866,6 +881,7 @@ def listar_entregas(
             s,
             details_map.get(sid),
             data_hora_ocorrencia=ocorrencia_map.get(sid),
+            db=db,
         )
         campos_entregue = resolve_campos_obrigatorios_from_cache(
             cache=campos_cache,
@@ -1718,7 +1734,7 @@ def detalhe_entrega(
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     detail = _get_detail_for_saida(db, s.id_saida)
     ocorrencia_map = _carregar_data_hora_ocorrencia_map(db, [id_saida])
-    item = _saida_to_item(s, detail, data_hora_ocorrencia=ocorrencia_map.get(id_saida))
+    item = _saida_to_item(s, detail, data_hora_ocorrencia=ocorrencia_map.get(id_saida), db=db)
     campos_entregue = resolve_campos_obrigatorios_ativos(
         db,
         sub_base=s.sub_base,
@@ -2148,6 +2164,7 @@ def _aplicar_ausente_lote(
 ) -> None:
     s.status = STATUS_AUSENTE
     obs = (observacao or "").strip() or None
+    tentativa_atual = int(getattr(detail, "tentativa", None) or 1) if detail else 1
     if detail:
         detail.motivo_ocorrencia = motivo.descricao
         detail.observacao_ocorrencia = obs
@@ -2168,6 +2185,11 @@ def _aplicar_ausente_lote(
             status_anterior=status_anterior,
             status_novo=STATUS_AUSENTE,
             user_id=user.id,
+            payload=build_ausencia_historico_payload(
+                motivo=motivo.descricao,
+                observacao=obs,
+                tentativa=tentativa_atual,
+            ),
         )
     )
 
@@ -2313,7 +2335,7 @@ def marcar_entregue(
     user: User = Depends(get_current_motoboy),
     x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
-    """Marca entrega como ENTREGUE e registra data_hora_entrega. Só permite se status for EM_ROTA.
+    """Marca entrega como ENTREGUE. Permite SAIU_PARA_ENTREGA ou EM_ROTA (roteirização opcional).
     Se body for enviado, preenche tipo_recebedor, nome_recebedor, tipo_documento, numero_documento, observacao_entrega em saidas_detail."""
     if x_client_action_id:
         logger.info(
@@ -2362,10 +2384,18 @@ def marcar_entregue(
             db.refresh(s)
             return _marcacao_response(db, s, complemento=True)
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
-    if status_norm == STATUS_SAIU_PARA_ENTREGA:
+    if status_norm == STATUS_AUSENTE:
         raise HTTPException(
             status_code=422,
-            detail="Inicie a rota antes de finalizar entregas.",
+            detail={
+                "code": "REQUER_NOVA_TENTATIVA",
+                "message": "Registre uma nova tentativa antes de marcar como entregue.",
+            },
+        )
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+        raise HTTPException(
+            status_code=422,
+            detail="Status atual não permite marcar como entregue.",
         )
 
     _upsert_detail_com_body()
@@ -2390,13 +2420,14 @@ def marcar_entregue(
     )
     raise_if_campos_obrigatorios_faltando(faltantes)
 
+    status_anterior = status_norm
     s.status = STATUS_ENTREGUE
     s.data_hora_entrega = datetime.utcnow()  # deprecated: mantido em transição; ver saida_historico evento "entregue"
     db.add(
         SaidaHistorico(
             id_saida=id_saida,
             evento="entregue",
-            status_anterior=STATUS_EM_ROTA,
+            status_anterior=status_anterior,
             status_novo=STATUS_ENTREGUE,
             user_id=user.id,
         )
@@ -2417,7 +2448,7 @@ def marcar_ausente(
     user: User = Depends(get_current_motoboy),
     x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
-    """Marca entrega como AUSENTE com motivo. Só permite se status for EM_ROTA."""
+    """Marca entrega como AUSENTE com motivo. Permite SAIU_PARA_ENTREGA ou EM_ROTA."""
     if x_client_action_id:
         logger.info(
             "marcar_ausente client_action_id=%s id_saida=%s user_id=%s",
@@ -2429,10 +2460,10 @@ def marcar_ausente(
     status_norm = normalizar_status_saida(s.status)
     if _status_esta_finalizado(status_norm):
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
-    if status_norm == STATUS_SAIU_PARA_ENTREGA:
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
         raise HTTPException(
             status_code=422,
-            detail="Inicie a rota antes de finalizar entregas.",
+            detail="Status atual não permite marcar como ausente.",
         )
     motivo = db.get(MotivoAusencia, body.motivo_id)
     if not motivo or not motivo.ativo:
@@ -2450,27 +2481,35 @@ def marcar_ausente(
     )
     raise_if_campos_obrigatorios_faltando(faltantes)
 
+    status_anterior = status_norm
     s.status = STATUS_AUSENTE
     detail = _get_detail_for_saida(db, id_saida)
+    obs = (body.observacao or "").strip() or None
+    tentativa_atual = int(getattr(detail, "tentativa", None) or 1) if detail else 1
     if detail:
         detail.motivo_ocorrencia = motivo.descricao
-        detail.observacao_ocorrencia = (body.observacao or "").strip() or None
+        detail.observacao_ocorrencia = obs
     else:
         detail = SaidaDetail(
             id_saida=id_saida,
             id_entregador=0,
             status=STATUS_AUSENTE,
             motivo_ocorrencia=motivo.descricao,
-            observacao_ocorrencia=(body.observacao or "").strip() or None,
+            observacao_ocorrencia=obs,
         )
         db.add(detail)
     db.add(
         SaidaHistorico(
             id_saida=id_saida,
             evento="ausente",
-            status_anterior=STATUS_EM_ROTA,
+            status_anterior=status_anterior,
             status_novo=STATUS_AUSENTE,
             user_id=user.id,
+            payload=build_ausencia_historico_payload(
+                motivo=motivo.descricao,
+                observacao=obs,
+                tentativa=tentativa_atual,
+            ),
         )
     )
     db.commit()
@@ -2492,6 +2531,7 @@ def nova_tentativa(
     status_norm = normalizar_status_saida(s.status)
     if status_norm != STATUS_AUSENTE:
         raise HTTPException(status_code=422, detail="Só é possível nova tentativa para entregas ausentes.")
+    raise_if_bloqueado_ausencias(db, id_saida)
     s.status = STATUS_SAIU_PARA_ENTREGA
     detail = _get_detail_for_saida(db, id_saida)
     if detail:
@@ -2605,7 +2645,7 @@ def scan_codigo(
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
     owner_valor = _owner_valor_por_sub_base(db, user, sub_base)
 
-    origem = _scan_origem(getattr(body, "origem", None))
+    origem = ensure_manual_code_entry_allowed(db, user, origem=getattr(body, "origem", None))
     strict_qr = origem == "camera"
     if strict_qr and not is_qr_like_scan_payload(raw):
         raise HTTPException(
@@ -2852,6 +2892,7 @@ def scan_codigo(
     saida.motoboy_id = motoboy_id
     saida.status = status_scan
     if status_norm == STATUS_AUSENTE:
+        raise_if_bloqueado_ausencias(db, saida.id_saida)
         detail = _get_detail_for_saida(db, saida.id_saida)
         if detail:
             detail.tentativa = (detail.tentativa or 1) + 1
@@ -3114,6 +3155,8 @@ def assumir_entrega(
         db.commit()
         return {"ok": True, "id_saida": id_saida}
 
+    if status_norm == STATUS_AUSENTE:
+        raise_if_bloqueado_ausencias(db, id_saida)
     antigo = s.motoboy_id
     s.motoboy_id = user.motoboy_id
     motoboy = db.get(Motoboy, user.motoboy_id)
