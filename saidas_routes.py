@@ -2071,19 +2071,28 @@ def atualizar_saida(
             else:
                 raise
 
+    status_alvo = (
+        normalizar_status_saida(payload.status)
+        if payload.status is not None
+        else None
+    )
+    cancelando = status_alvo == STATUS_CANCELADO
     reatribuicao_entregue = (
         status_anterior == STATUS_ENTREGUE
         and payload.motoboy_id is not None
         and int(payload.motoboy_id) != int(motoboy_anterior or 0)
+        and not cancelando
     )
+    # Reabrir tentativa (motoboy/status em rota) só quando NÃO estiver cancelando.
+    # Cancelamento pela operação deve ser permitido mesmo com limite de ausências.
     reabre_ausente = (
         status_anterior == STATUS_AUSENTE
+        and not cancelando
         and (
             payload.motoboy_id is not None
             or (
-                payload.status is not None
-                and normalizar_status_saida(payload.status)
-                in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA)
+                status_alvo is not None
+                and status_alvo in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA)
             )
         )
     )
@@ -2100,7 +2109,7 @@ def atualizar_saida(
         payload_changed["motoboy"] = True
         payload_changed["executor"] = True
         payload_changed["status"] = True
-    elif payload.motoboy_id is not None:
+    elif payload.motoboy_id is not None and not cancelando:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
@@ -2110,7 +2119,7 @@ def atualizar_saida(
         payload_changed["status"] = True
 
     if payload.status is not None:
-        novo_status = normalizar_status_saida(payload.status)
+        novo_status = status_alvo if status_alvo is not None else normalizar_status_saida(payload.status)
         if novo_status in (STATUS_ENTREGUE, STATUS_AUSENTE):
             detail_row = db.scalar(
                 select(SaidaDetail)
