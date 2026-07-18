@@ -187,6 +187,8 @@ class SaidaDetailOut(BaseModel):
     endereco_formatado: Optional[str] = None
     endereco_origem: Optional[str] = None
     foto_urls: Optional[List[str]] = None
+    # Fotos tipadas para timeline (evento/tentativa); foto_urls permanece para compatibilidade.
+    fotos: Optional[List[Dict[str, Any]]] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -1724,7 +1726,23 @@ def get_saida_detalhe(
     )
     detail_out = None
     if detail_row:
-        foto_urls_list = extract_foto_keys(detail_row.foto_url)
+        foto_items = parse_foto_items(detail_row.foto_url)
+        foto_urls_list = [str(item.get("key")) for item in foto_items if item.get("key")]
+        fotos_out: List[Dict[str, Any]] = []
+        for item in foto_items:
+            key = str(item.get("key") or "").strip()
+            if not key:
+                continue
+            entry: Dict[str, Any] = {
+                "key": key,
+                "evento": str(item.get("evento") or "legacy"),
+                "tentativa": int(item.get("tentativa") or 1),
+            }
+            if item.get("photo_id"):
+                entry["photo_id"] = item["photo_id"]
+            if item.get("created_at"):
+                entry["created_at"] = item["created_at"]
+            fotos_out.append(entry)
         detail_out = SaidaDetailOut(
             id_saida=detail_row.id_saida,
             id_entregador=detail_row.id_entregador,
@@ -1749,6 +1767,7 @@ def get_saida_detalhe(
             endereco_formatado=detail_row.endereco_formatado,
             endereco_origem=detail_row.endereco_origem,
             foto_urls=foto_urls_list or None,
+            fotos=fotos_out or None,
         )
     executor_nome = _nome_executor_atual(db, obj) or obj.entregador
     bloqueio = snapshot_bloqueio_ausencias(db, obj.id_saida)
