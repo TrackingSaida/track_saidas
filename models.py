@@ -463,14 +463,86 @@ class EntregadorFechamento(Base):
 
     valor_final = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     status = Column(Text, nullable=False, server_default=text("'fechado'::text"))
+    # Critério usado na geração (snapshot). Não muda se a config da sub_base mudar depois.
+    modo_criterio = Column(Text, nullable=False, server_default=text("'operacional'"))
 
     criado_em = Column(DateTime(timezone=False), server_default=func.now())
+
+    itens = relationship(
+        "EntregadorFechamentoItem",
+        back_populates="fechamento",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return (
             f"<EntregadorFechamento id_fechamento={self.id_fechamento} "
             f"id_entregador={self.id_entregador} id_motoboy={self.id_motoboy} status={self.status!r}>"
         )
+
+
+# ==========================
+# Tabela: entregador_fechamento_itens
+# ==========================
+class EntregadorFechamentoItem(Base):
+    __tablename__ = "entregador_fechamento_itens"
+    __table_args__ = (
+        UniqueConstraint("id_fechamento", "id_saida", name="uq_entregador_fechamento_item_fechamento_saida"),
+        UniqueConstraint("id_saida", name="uq_entregador_fechamento_item_saida"),
+    )
+
+    id_item = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_fechamento = Column(
+        BigInteger,
+        ForeignKey("entregador_fechamentos.id_fechamento", ondelete="CASCADE"),
+        nullable=False,
+    )
+    id_saida = Column(BigInteger, nullable=False)
+    codigo = Column(Text, nullable=True)
+    id_motoboy = Column(BigInteger, nullable=True)
+    id_entregador = Column(BigInteger, nullable=True)
+    servico = Column(Text, nullable=True)
+    status_evento = Column(Text, nullable=False)
+    valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    is_grande = Column(Boolean, nullable=False, server_default=text("false"))
+    data_operacional = Column(Date, nullable=True)
+    data_confirmacao = Column(Date, nullable=True)
+    id_historico_atribuicao = Column(BigInteger, nullable=True)
+    id_historico_confirmacao = Column(BigInteger, nullable=True)
+    criado_em = Column(DateTime(timezone=False), server_default=func.now())
+
+    fechamento = relationship("EntregadorFechamento", back_populates="itens")
+
+    def __repr__(self) -> str:
+        return (
+            f"<EntregadorFechamentoItem id_item={self.id_item} "
+            f"id_fechamento={self.id_fechamento} id_saida={self.id_saida}>"
+        )
+
+
+# ==========================
+# Tabela: sub_base_fechamento_config
+# ==========================
+class SubBaseFechamentoConfig(Base):
+    __tablename__ = "sub_base_fechamento_config"
+    __table_args__ = (
+        UniqueConstraint("sub_base", name="uq_sub_base_fechamento_config_sub_base"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    modo = Column(Text, nullable=False, server_default=text("'operacional'"))
+    updated_by = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SubBaseFechamentoConfig sub_base={self.sub_base!r} modo={self.modo!r}>"
 
 
 # ==========================

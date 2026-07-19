@@ -3,12 +3,13 @@ Rotas de Fechamento de Entregador
 POST /entregadores/fechamentos — criar
 PATCH /entregadores/fechamentos/{id_fechamento} — editar/reabrir
 GET /entregadores/fechamentos/{id_fechamento} — obter um (para modal)
+GET/PUT /entregadores/fechamentos/config — critério por sub_base
 """
 from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
@@ -17,7 +18,15 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
+from models import (
+    Entregador,
+    EntregadorFechamento,
+    EntregadorFechamentoItem,
+    Motoboy,
+    MotoboySubBase,
+    Saida,
+    User,
+)
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
 from entregador_routes import (
@@ -27,7 +36,21 @@ from entregador_routes import (
     _calcular_valor_base_motoboy_periodo,
     _calcular_valor_base_periodo,
     _normalizar_servico,
+    _toggle_pacote_g_ativo,
     STATUS_VALOR_BASE_VALIDOS,
+)
+from fechamento_criterio_pure import (
+    MODO_CONFIRMACAO_ENTREGA,
+    MODO_OPERACIONAL,
+    MODOS_VALIDOS,
+    normalizar_modo,
+)
+from fechamento_criterio_service import (
+    calcular_itens_fechamento,
+    get_modo_fechamento,
+    persistir_itens_fechamento,
+    saidas_ja_fechadas,
+    upsert_modo_fechamento,
 )
 
 router = APIRouter(prefix="", tags=["Fechamentos"])
@@ -68,25 +91,12 @@ def _contar_g_por_servico_entregador(
     return {"shopee": g_shopee, "ml": g_ml, "avulso": g_avulso, "total": g_shopee + g_ml + g_avulso}
 
 
-def _contar_g_por_servico_motoboy(
-    db: Session,
-    sub_base: str,
-    motoboy_id: int,
-    periodo_inicio: date,
-    periodo_fim: date,
-) -> dict:
-    """Conta saídas com is_grande no período por serviço (shopee, ml, avulso)."""
-    stmt = select(Saida).where(
-        Saida.sub_base == sub_base,
-        Saida.motoboy_id == motoboy_id,
-        Saida.is_grande.is_(True),
-    )
-    stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
-    rows_raw = db.scalars(stmt).all()
-    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
+def _contar_g_de_itens(itens) -> dict:
     g_shopee = g_ml = g_avulso = 0
-    for s in rows:
-        t = _normalizar_servico(s.servico)
+    for it in itens:
+        if not it.is_grande:
+            continue
+        t = _normalizar_servico(it.servico)
         if t == "shopee":
             g_shopee += 1
         elif t == "flex":
@@ -94,6 +104,30 @@ def _contar_g_por_servico_motoboy(
         else:
             g_avulso += 1
     return {"shopee": g_shopee, "ml": g_ml, "avulso": g_avulso, "total": g_shopee + g_ml + g_avulso}
+
+
+def _contar_g_por_servico_motoboy(
+    db: Session,
+    sub_base: str,
+    motoboy_id: int,
+    periodo_inicio: date,
+    periodo_fim: date,
+    modo: Optional[str] = None,
+) -> dict:
+    """Conta saídas com is_grande no período por serviço (shopee, ml, avulso)."""
+    modo_norm = normalizar_modo(modo or get_modo_fechamento(db, sub_base))
+    precos = resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
+    itens, _, _ = calcular_itens_fechamento(
+        db,
+        sub_base=sub_base,
+        periodo_inicio=periodo_inicio,
+        periodo_fim=periodo_fim,
+        precos=precos,
+        modo=modo_norm,
+        motoboy_id=motoboy_id,
+        toggle_pacote_g=False,
+    )
+    return _contar_g_de_itens(itens)
 
 
 def _resolve_motoboy_subbase(db: Session, sub_base: str, motoboy_id: int) -> Motoboy:
@@ -131,21 +165,43 @@ def _get_motoboy_chave_pix(db: Session, motoboy_id: int) -> Optional[str]:
     return (getattr(motoboy, "chave_pix", None) or "").strip() or None
 
 
-def _buscar_fechamento_por_data(
-    db: Session,
-    sub_base: str,
-    id_entregador: int,
-    data_ref: date,
-) -> Optional[EntregadorFechamento]:
-    """Retorna o fechamento que cobre a data_ref para o entregador, se existir."""
-    return db.scalars(
-        select(EntregadorFechamento).where(
-            EntregadorFechamento.sub_base == sub_base,
-            EntregadorFechamento.id_entregador == id_entregador,
-            EntregadorFechamento.periodo_inicio <= data_ref,
-            EntregadorFechamento.periodo_fim >= data_ref,
+def _assert_admin_root(current_user: User) -> None:
+    role = int(getattr(current_user, "role", 0) or 0)
+    if role not in (0, 1):
+        raise HTTPException(status_code=403, detail="Acesso restrito a admin/root.")
+
+
+def _modo_do_fechamento(fech: EntregadorFechamento) -> str:
+    return normalizar_modo(getattr(fech, "modo_criterio", None) or MODO_OPERACIONAL)
+
+
+def _itens_out(db: Session, id_fechamento: int) -> List[Dict[str, Any]]:
+    rows = db.scalars(
+        select(EntregadorFechamentoItem)
+        .where(EntregadorFechamentoItem.id_fechamento == id_fechamento)
+        .order_by(
+            EntregadorFechamentoItem.data_confirmacao.nullslast(),
+            EntregadorFechamentoItem.data_operacional.nullslast(),
+            EntregadorFechamentoItem.id_item,
         )
-    ).first()
+    ).all()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id_item": r.id_item,
+                "id_saida": r.id_saida,
+                "codigo": r.codigo,
+                "id_motoboy": r.id_motoboy,
+                "servico": r.servico,
+                "status_evento": r.status_evento,
+                "valor": r.valor,
+                "is_grande": bool(r.is_grande),
+                "data_operacional": r.data_operacional.isoformat() if r.data_operacional else None,
+                "data_confirmacao": r.data_confirmacao.isoformat() if r.data_confirmacao else None,
+            }
+        )
+    return out
 
 
 # =========================================================
@@ -194,8 +250,94 @@ class FechamentoOut(BaseModel):
     valor_final: Decimal
     status: str
     criado_em: Optional[datetime] = None
-    divergencia_valor_base: Optional[bool] = None  # True = valor_base recalculado diferente do gravado
-    valor_base_recalculado: Optional[Decimal] = None  # quando há divergência
+    divergencia_valor_base: Optional[bool] = None
+    valor_base_recalculado: Optional[Decimal] = None
+    modo_criterio: str = MODO_OPERACIONAL
+    criterio_data_label: str = "Data da operação"
+    itens: Optional[List[Dict[str, Any]]] = None
+    previa: Optional[Dict[str, Any]] = None
+
+
+class FechamentoConfigOut(BaseModel):
+    sub_base: str
+    modo: str
+    criterio_data_label: str
+    modos_disponiveis: List[Dict[str, str]]
+    updated_at: Optional[datetime] = None
+
+
+class FechamentoConfigUpdate(BaseModel):
+    modo: str = Field(min_length=1)
+
+
+def _label_criterio(modo: str) -> str:
+    return "Data da entrega" if normalizar_modo(modo) == MODO_CONFIRMACAO_ENTREGA else "Data da operação"
+
+
+def _modos_disponiveis() -> List[Dict[str, str]]:
+    return [
+        {
+            "valor": MODO_OPERACIONAL,
+            "label": "Por saída operacional",
+            "descricao": "Considera bipagem/atribuição no período (comportamento atual).",
+        },
+        {
+            "valor": MODO_CONFIRMACAO_ENTREGA,
+            "label": "Por confirmação de entrega",
+            "descricao": "Considera somente entregas confirmadas no período. Ausentes não entram.",
+        },
+    ]
+
+
+# =========================================================
+# GET/PUT — Configuração do critério por sub_base
+# =========================================================
+
+@router.get("/fechamentos/config", response_model=FechamentoConfigOut)
+def obter_config_fechamento(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    sub_base = _resolve_user_base(db, current_user)
+    modo = get_modo_fechamento(db, sub_base)
+    from models import SubBaseFechamentoConfig
+
+    row = db.scalars(
+        select(SubBaseFechamentoConfig).where(SubBaseFechamentoConfig.sub_base == sub_base)
+    ).first()
+    return FechamentoConfigOut(
+        sub_base=sub_base,
+        modo=modo,
+        criterio_data_label=_label_criterio(modo),
+        modos_disponiveis=_modos_disponiveis(),
+        updated_at=row.updated_at if row else None,
+    )
+
+
+@router.put("/fechamentos/config", response_model=FechamentoConfigOut)
+def atualizar_config_fechamento(
+    payload: FechamentoConfigUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _assert_admin_root(current_user)
+    sub_base = _resolve_user_base(db, current_user)
+    modo = normalizar_modo(payload.modo)
+    if modo not in MODOS_VALIDOS:
+        raise HTTPException(400, "modo inválido. Use operacional ou confirmacao_entrega.")
+    row = upsert_modo_fechamento(
+        db,
+        sub_base=sub_base,
+        modo=modo,
+        updated_by=getattr(current_user, "id", None),
+    )
+    return FechamentoConfigOut(
+        sub_base=sub_base,
+        modo=row.modo,
+        criterio_data_label=_label_criterio(row.modo),
+        modos_disponiveis=_modos_disponiveis(),
+        updated_at=row.updated_at,
+    )
 
 
 # =========================================================
@@ -213,6 +355,7 @@ def calcular_valor_base_preview(
 ):
     """Retorna valor_base calculado para o período (sem criar fechamento). Informe entregador_id ou motoboy_id."""
     sub_base = _resolve_user_base(db, current_user)
+    modo = get_modo_fechamento(db, sub_base)
 
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
@@ -227,11 +370,21 @@ def calcular_valor_base_preview(
 
     if motoboy_id is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, motoboy_id)
-        valor_base = _calcular_valor_base_motoboy_periodo(
-            db, sub_base, motoboy_id, periodo_inicio, periodo_fim
+        precos = resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
+        itens, valor_base, previa = calcular_itens_fechamento(
+            db,
+            sub_base=sub_base,
+            periodo_inicio=periodo_inicio,
+            periodo_fim=periodo_fim,
+            precos=precos,
+            modo=modo,
+            motoboy_id=motoboy_id,
+            toggle_pacote_g=_toggle_pacote_g_ativo(db, sub_base),
+            com_preview=True,
         )
         executor_nome = _get_motoboy_username(db, motoboy)
-        g = _contar_g_por_servico_motoboy(db, sub_base, motoboy_id, periodo_inicio, periodo_fim)
+        g = _contar_g_de_itens(itens)
+        ja = saidas_ja_fechadas(db, [i.id_saida for i in itens])
         return {
             "valor_base": valor_base,
             "entregador_id": None,
@@ -241,6 +394,27 @@ def calcular_valor_base_preview(
             "periodo_fim": periodo_fim.isoformat(),
             "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
             "g_total": g["total"],
+            "modo_criterio": modo,
+            "criterio_data_label": _label_criterio(modo),
+            "qtde_itens": len(itens),
+            "itens_ja_fechados": [
+                {"id_saida": x.id_saida, "codigo": x.codigo, "id_fechamento": x.id_fechamento}
+                for x in ja
+            ],
+            "previa": previa,
+            "itens": [
+                {
+                    "id_saida": i.id_saida,
+                    "codigo": i.codigo,
+                    "servico": i.servico,
+                    "status_evento": i.status_evento,
+                    "valor": i.valor,
+                    "is_grande": i.is_grande,
+                    "data_operacional": i.data_operacional.isoformat() if i.data_operacional else None,
+                    "data_confirmacao": i.data_confirmacao.isoformat() if i.data_confirmacao else None,
+                }
+                for i in itens
+            ],
         }
 
     ent = db.get(Entregador, entregador_id)
@@ -248,7 +422,7 @@ def calcular_valor_base_preview(
         raise HTTPException(404, "Entregador não encontrado.")
 
     valor_base = _calcular_valor_base_periodo(
-        db, sub_base, entregador_id, periodo_inicio, periodo_fim
+        db, sub_base, entregador_id, periodo_inicio, periodo_fim, modo=modo
     )
     g = _contar_g_por_servico_entregador(db, sub_base, entregador_id, periodo_inicio, periodo_fim)
 
@@ -261,6 +435,10 @@ def calcular_valor_base_preview(
         "periodo_fim": periodo_fim.isoformat(),
         "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
         "g_total": g["total"],
+        "modo_criterio": modo,
+        "criterio_data_label": _label_criterio(modo),
+        "previa": None,
+        "itens": [],
     }
 
 
@@ -275,6 +453,7 @@ def criar_fechamento(
     current_user=Depends(get_current_user),
 ):
     sub_base = _resolve_user_base(db, current_user)
+    modo = get_modo_fechamento(db, sub_base)
 
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
@@ -286,6 +465,7 @@ def criar_fechamento(
         )
 
     chave_pix: Optional[str] = None
+    itens_calc = []
     if payload.id_motoboy is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, payload.id_motoboy)
         username_ent = _get_motoboy_username(db, motoboy)
@@ -300,9 +480,16 @@ def criar_fechamento(
                 EntregadorFechamento.periodo_fim == payload.periodo_fim,
             )
         )
-        valor_base = _calcular_valor_base_motoboy_periodo(
-            db, sub_base, payload.id_motoboy,
-            payload.periodo_inicio, payload.periodo_fim,
+        precos = resolver_precos_motoboy(db, sub_base, motoboy_id=payload.id_motoboy)
+        itens_calc, valor_base, _ = calcular_itens_fechamento(
+            db,
+            sub_base=sub_base,
+            periodo_inicio=payload.periodo_inicio,
+            periodo_fim=payload.periodo_fim,
+            precos=precos,
+            modo=modo,
+            motoboy_id=payload.id_motoboy,
+            toggle_pacote_g=_toggle_pacote_g_ativo(db, sub_base),
         )
     else:
         ent = db.get(Entregador, payload.id_entregador)
@@ -322,12 +509,35 @@ def criar_fechamento(
         valor_base = _calcular_valor_base_periodo(
             db, sub_base, payload.id_entregador,
             payload.periodo_inicio, payload.periodo_fim,
+            modo=modo,
         )
 
     if existente:
         raise HTTPException(
             409,
             "Já existe fechamento para este executor e período."
+        )
+
+    ja = saidas_ja_fechadas(db, [i.id_saida for i in itens_calc])
+    if ja:
+        codigos = ", ".join(sorted({(x.codigo or str(x.id_saida)) for x in ja})[:8])
+        raise HTTPException(
+            409,
+            detail={
+                "code": "ITENS_JA_FECHADOS",
+                "message": (
+                    "Há pedidos já incluídos em outro fechamento. "
+                    f"Exemplos: {codigos}"
+                ),
+                "itens": [
+                    {
+                        "id_saida": x.id_saida,
+                        "codigo": x.codigo,
+                        "id_fechamento": x.id_fechamento,
+                    }
+                    for x in ja
+                ],
+            },
         )
 
     valor_ad = Decimal(str(payload.valor_adicao or 0)).quantize(Decimal("0.01"))
@@ -348,8 +558,12 @@ def criar_fechamento(
         motivo_subtracao=(payload.motivo_subtracao or "").strip() or None,
         valor_final=valor_final,
         status=STATUS_GERADO,
+        modo_criterio=modo,
     )
     db.add(fech)
+    db.flush()
+    if itens_calc:
+        persistir_itens_fechamento(db, fech.id_fechamento, itens_calc)
     db.commit()
     db.refresh(fech)
 
@@ -370,6 +584,9 @@ def criar_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+        modo_criterio=_modo_do_fechamento(fech),
+        criterio_data_label=_label_criterio(_modo_do_fechamento(fech)),
+        itens=_itens_out(db, fech.id_fechamento),
     )
 
 
@@ -389,17 +606,20 @@ def obter_fechamento(
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
 
+    modo = _modo_do_fechamento(fech)
     chave_pix: Optional[str] = None
     if getattr(fech, "id_motoboy", None) is not None:
         chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
         valor_base_recalc = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
+            modo=modo,
         )
     else:
         valor_base_recalc = _calcular_valor_base_periodo(
             db, sub_base, fech.id_entregador,
             fech.periodo_inicio, fech.periodo_fim,
+            modo=modo,
         )
     divergencia = valor_base_recalc != fech.valor_base
 
@@ -422,6 +642,9 @@ def obter_fechamento(
         criado_em=fech.criado_em,
         divergencia_valor_base=divergencia if divergencia else None,
         valor_base_recalculado=valor_base_recalc if divergencia else None,
+        modo_criterio=modo,
+        criterio_data_label=_label_criterio(modo),
+        itens=_itens_out(db, fech.id_fechamento),
     )
 
 
@@ -447,17 +670,20 @@ def atualizar_fechamento(
             "Apenas fechamentos com status GERADO podem ser reajustados.",
         )
 
+    modo = _modo_do_fechamento(fech)
     chave_pix: Optional[str] = None
     if getattr(fech, "id_motoboy", None) is not None:
         chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
         valor_base_recalc = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
+            modo=modo,
         )
     else:
         valor_base_recalc = _calcular_valor_base_periodo(
             db, sub_base, fech.id_entregador,
             fech.periodo_inicio, fech.periodo_fim,
+            modo=modo,
         )
 
     if payload.atualizar_valor_base is True:
@@ -500,4 +726,7 @@ def atualizar_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+        modo_criterio=modo,
+        criterio_data_label=_label_criterio(modo),
+        itens=_itens_out(db, fech.id_fechamento),
     )

@@ -3158,6 +3158,26 @@ def assumir_entrega(
     if status_norm == STATUS_AUSENTE:
         raise_if_bloqueado_ausencias(db, id_saida)
     antigo = s.motoboy_id
+    if status_norm == STATUS_ENTREGUE:
+        from fechamento_criterio_service import impacto_reatribuicao_entregue
+
+        impacto = impacto_reatribuicao_entregue(
+            db,
+            sub_base=user.sub_base or "",
+            saida=s,
+            motoboy_anterior=antigo,
+        )
+        if impacto:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **impacto,
+                    "message": (
+                        impacto["message"]
+                        + " Peça a um admin para confirmar a reatribuição pela web."
+                    ),
+                },
+            )
     s.motoboy_id = user.motoboy_id
     motoboy = db.get(Motoboy, user.motoboy_id)
     if motoboy:

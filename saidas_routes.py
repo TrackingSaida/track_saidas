@@ -125,6 +125,8 @@ class SaidaUpdate(BaseModel):
     servico: Optional[str] = None
     base: Optional[str] = None
     is_grande: Optional[bool] = None  # apenas admin, root ou operador (role 0,1,2) podem alterar
+    # Confirma reatribuição de ENTREGUE que impacta fechamento de outra quinzena.
+    confirmar_impacto_fechamento: Optional[bool] = None
 
 
 class SaidaLerIn(BaseModel):
@@ -2217,6 +2219,45 @@ def atualizar_saida(
     if reabre_ausente:
         raise_if_bloqueado_ausencias(db, obj.id_saida)
     if reatribuicao_entregue:
+        from fechamento_criterio_service import impacto_reatribuicao_entregue
+
+        impacto = impacto_reatribuicao_entregue(
+            db,
+            sub_base=sub_base,
+            saida=obj,
+            motoboy_anterior=motoboy_anterior,
+        )
+        if impacto and not bool(payload.confirmar_impacto_fechamento):
+            role = int(getattr(current_user, "role", 0) or 0)
+            if role not in (0, 1):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        **impacto,
+                        "message": (
+                            impacto["message"]
+                            + " Solicite a um admin para confirmar a reatribuição."
+                        ),
+                    },
+                )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **impacto,
+                    "requires_confirmation": True,
+                    "message": (
+                        impacto["message"]
+                        + " Envie confirmar_impacto_fechamento=true para prosseguir."
+                    ),
+                },
+            )
+        if impacto and bool(payload.confirmar_impacto_fechamento):
+            role = int(getattr(current_user, "role", 0) or 0)
+            if role not in (0, 1):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Apenas admin/root podem confirmar reatribuição com impacto em fechamento.",
+                )
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
