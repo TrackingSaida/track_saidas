@@ -1109,18 +1109,12 @@ def resumo_entregas(
             hoje = _hoje_operacional()
     else:
         hoje = _hoje_operacional()
-    # Prefiltro: evita carregar anos de pendentes só para contar (app antigo / resumo).
-    cutoff = hoje - timedelta(days=14)
     rows_pendentes_all = db.scalars(
         select(Saida).where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
             Saida.codigo.isnot(None),
             Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
-            or_(
-                Saida.data >= cutoff,
-                func.date(Saida.timestamp) >= cutoff,
-            ),
         )
     ).all()
     ctx_map_pendentes = carregar_contexto_operacional(db, [s.id_saida for s in rows_pendentes_all])
