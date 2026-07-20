@@ -20,6 +20,17 @@ def _normalize_db_url(url: str) -> str:
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return url
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL não definido")
@@ -29,12 +40,21 @@ DATABASE_URL = _normalize_db_url(DATABASE_URL)
 # Opcional: logar SQL em dev
 ECHO_SQL = os.getenv("ECHO_SQL", "false").lower() in ("1", "true", "yes")
 
+# Defaults dimensionados para bipagem concorrente no mobile.
+# Ajuste no Render se o plano do Postgres tiver limite baixo de conexões.
+# Fórmula aproximada por instância web: pool_size + max_overflow.
+DB_POOL_SIZE = _env_int("DB_POOL_SIZE", 20)
+DB_MAX_OVERFLOW = _env_int("DB_MAX_OVERFLOW", 30)
+DB_POOL_TIMEOUT = _env_int("DB_POOL_TIMEOUT", 30)
+DB_POOL_RECYCLE = _env_int("DB_POOL_RECYCLE", 300)
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,   # evita conexões zumbis
-    pool_size=5,          # ajuste conforme carga
-    max_overflow=10,      # conexões extras temporárias
-    pool_recycle=300,     # recicla após 5min (mitiga SSL idle no Postgres gerenciado)
+    pool_size=DB_POOL_SIZE,
+    max_overflow=DB_MAX_OVERFLOW,
+    pool_timeout=DB_POOL_TIMEOUT,
+    pool_recycle=DB_POOL_RECYCLE,  # mitiga SSL idle no Postgres gerenciado
     echo=ECHO_SQL,
 )
 
