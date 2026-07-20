@@ -828,19 +828,14 @@ def listar_entregas(
 ):
     """Lista entregas do motoboy. status=pendente | finalizadas | ausentes.
     dia=hoje + data (YYYY-MM-DD): filtra finalizadas por data_hora_entrega e ausentes por data.
-    Pendente sem data: aplica dia operacional de hoje (protege app antigo sem filtro).
+    Sem data em pendente: retorna todos os pendentes (comportamento do filtro "todos").
     """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
-    # Filtro por data: quando dia=hoje (ou data enviada) para pendentes/finalizadas/ausentes.
-    # App antigo chama pendente sem dia/data e derruba o banco com milhares de históricos.
-    usar_filtro_hoje = (
-        (dia == "hoje")
-        or (status in ("pendente", "finalizadas", "ausentes") and data)
-        or (status == "pendente" and not data and dia != "todos")
-    )
+    # Filtro por data: quando dia=hoje (ou data enviada) para pendentes/finalizadas/ausentes
+    usar_filtro_hoje = (dia == "hoje") or (status in ("pendente", "finalizadas", "ausentes") and data)
     if usar_filtro_hoje:
         if data:
             try:
@@ -859,15 +854,6 @@ def listar_entregas(
     )
     if status == "pendente":
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
-        if hoje is not None:
-            # Prefiltro SQL: evita puxar milhares de pendentes históricos do app antigo.
-            cutoff = hoje - timedelta(days=1)
-            q = q.where(
-                or_(
-                    Saida.data >= cutoff,
-                    func.date(Saida.timestamp) >= cutoff,
-                )
-            )
     elif status == "finalizadas":
         subtipo_norm = (subtipo or "entregue").strip().lower()
         if subtipo_norm == "cancelado":
