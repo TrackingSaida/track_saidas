@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from db import SessionLocal
 from models import LogLeitura
@@ -35,17 +36,22 @@ def registrar_log_leitura_critico(
     id_saida: Optional[int] = None,
     origem_app: Optional[str] = None,
     endpoint: Optional[str] = None,
+    db: Optional[Session] = None,
 ) -> None:
     """
-    Grava log crítico de leitura em sessão isolada para não afetar o fluxo principal.
-    Falhas são silenciosas por design.
+    Grava log crítico de leitura.
+    Se `db` for passado, reutiliza a sessão do request (evita 2ª conexão do pool).
+    Caso contrário, usa sessão isolada. Falhas são silenciosas por design.
     """
     if not sub_base or not username:
         return
     if resultado not in RESULTADOS_CRITICOS:
         return
 
-    db = SessionLocal()
+    owns_session = db is None
+    if owns_session:
+        db = SessionLocal()
+    assert db is not None
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=DEDUP_WINDOW_SECONDS)
         dup = db.scalar(
@@ -82,4 +88,5 @@ def registrar_log_leitura_critico(
     except Exception:
         db.rollback()
     finally:
-        db.close()
+        if owns_session:
+            db.close()

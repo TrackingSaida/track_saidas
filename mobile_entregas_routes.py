@@ -2625,6 +2625,19 @@ def _scan_origem(raw: Optional[str]) -> str:
     return origem
 
 
+def _lock_saida_para_scan(db: Session, id_saida: int, sub_base: str) -> Saida:
+    """Trava a linha só no momento da escrita — evita segurar FOR UPDATE em conflitos/leituras."""
+    saida = db.scalar(
+        select(Saida).where(
+            Saida.id_saida == id_saida,
+            Saida.sub_base == sub_base,
+        ).with_for_update()
+    )
+    if not saida:
+        raise HTTPException(status_code=404, detail="Saída não encontrada.")
+    return saida
+
+
 @router.post("/scan")
 def scan_codigo(
     body: ScanBody,
@@ -2664,11 +2677,12 @@ def scan_codigo(
             ),
         )
 
+    # Leitura sem lock: conflitos/bloqueios não devem segurar conexão do pool.
     saida = db.scalar(
         select(Saida).where(
             Saida.codigo == codigo,
             Saida.sub_base == sub_base,
-        ).with_for_update()
+        )
     )
 
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
@@ -2727,6 +2741,7 @@ def scan_codigo(
                 id_saida=saida.id_saida,
                 origem_app="mobile",
                 endpoint="/mobile/scan",
+                db=db,
             )
             return JSONResponse(
                 status_code=409,
@@ -2749,6 +2764,7 @@ def scan_codigo(
             id_saida=saida.id_saida,
             origem_app="mobile",
             endpoint="/mobile/scan",
+            db=db,
         )
         return JSONResponse(
             status_code=422,
@@ -2768,6 +2784,7 @@ def scan_codigo(
             id_saida=saida.id_saida,
             origem_app="mobile",
             endpoint="/mobile/scan",
+            db=db,
         )
         return JSONResponse(
             status_code=422,
@@ -2781,6 +2798,7 @@ def scan_codigo(
     # - outro motoboy titular: conflito 409 para confirmar assumir
     if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         if motoboy_id is None:
+            saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
             if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
                 if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
                     saida.qr_payload_raw = qr_payload_raw.strip()
@@ -2800,6 +2818,7 @@ def scan_codigo(
                 id_saida=saida.id_saida,
                 origem_app="mobile",
                 endpoint="/mobile/scan",
+                db=db,
             )
             return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id == motoboy_id:
@@ -2818,6 +2837,7 @@ def scan_codigo(
                     id_saida=saida.id_saida,
                     origem_app="mobile",
                     endpoint="/mobile/scan",
+                    db=db,
                 )
                 return JSONResponse(
                     status_code=409,
@@ -2831,6 +2851,7 @@ def scan_codigo(
                         "conflito": False,
                     },
                 )
+            saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
             if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
                 if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
                     saida.qr_payload_raw = qr_payload_raw.strip()
@@ -2849,36 +2870,108 @@ def scan_codigo(
                 id_saida=saida.id_saida,
                 origem_app="mobile",
                 endpoint="/mobile/scan",
+                db=db,
             )
             return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
         if saida.motoboy_id is not None:
-            _garantir_cobranca_owner_saida(db, saida, owner_valor)
-            db.commit()
-            nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
-            registrar_log_leitura_critico(
-                sub_base=sub_base,
-                username=getattr(user, "username", None),
-                origem=origem,
-                tipo="saida",
-                codigo=saida.codigo,
-                resultado="atribuido_a_outro",
-                role=role,
-                motoboy_id=motoboy_id,
-                id_saida=saida.id_saida,
-                origem_app="mobile",
-                endpoint="/mobile/scan",
-            )
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "conflito": True,
-                    "motoboy_atual": nome_atual,
-                    "id_saida": saida.id_saida,
-                },
-            )
+            id_saida_lock = saida.id_saida
+            saida = _lock_saida_para_scan(db, id_saida_lock, sub_base)
+            status_norm = normalizar_status_saida(saida.status)
+            if status_norm in (STATUS_ENTREGUE, STATUS_CANCELADO):
+                return JSONResponse(
+                    status_code=422,
+                    content=_status_finalizado_detail(saida, status_norm),
+                )
+            if saida.motoboy_id is not None and saida.motoboy_id != motoboy_id:
+                _garantir_cobranca_owner_saida(db, saida, owner_valor)
+                db.commit()
+                nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
+                registrar_log_leitura_critico(
+                    sub_base=sub_base,
+                    username=getattr(user, "username", None),
+                    origem=origem,
+                    tipo="saida",
+                    codigo=saida.codigo,
+                    resultado="atribuido_a_outro",
+                    role=role,
+                    motoboy_id=motoboy_id,
+                    id_saida=saida.id_saida,
+                    origem_app="mobile",
+                    endpoint="/mobile/scan",
+                    db=db,
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "conflito": True,
+                        "motoboy_atual": nome_atual,
+                        "id_saida": saida.id_saida,
+                    },
+                )
+            if saida.motoboy_id == motoboy_id:
+                if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
+                    if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
+                        saida.qr_payload_raw = qr_payload_raw.strip()
+                _garantir_cobranca_owner_saida(db, saida, owner_valor)
+                db.commit()
+                detail = _get_detail_for_saida(db, saida.id_saida)
+                registrar_log_leitura_critico(
+                    sub_base=sub_base,
+                    username=getattr(user, "username", None),
+                    origem=origem,
+                    tipo="saida",
+                    codigo=saida.codigo,
+                    resultado="duplicado",
+                    role=role,
+                    motoboy_id=motoboy_id,
+                    id_saida=saida.id_saida,
+                    origem_app="mobile",
+                    endpoint="/mobile/scan",
+                    db=db,
+                )
+                return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+            # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
 
     # Coletado ou AUSENTE ou outro: atribuir ao motoboy logado
+    saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
+    status_norm = normalizar_status_saida(saida.status)
+    if status_norm in (STATUS_ENTREGUE, STATUS_CANCELADO):
+        return JSONResponse(
+            status_code=422,
+            content=_status_finalizado_detail(saida, status_norm),
+        )
+    if (
+        status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu")
+        and motoboy_id is not None
+        and saida.motoboy_id is not None
+        and saida.motoboy_id != motoboy_id
+    ):
+        _garantir_cobranca_owner_saida(db, saida, owner_valor)
+        db.commit()
+        nome_atual = _nome_motoboy_atual(db, saida) or "outro motoboy"
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=getattr(user, "username", None),
+            origem=origem,
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="atribuido_a_outro",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/scan",
+            db=db,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "conflito": True,
+                "motoboy_atual": nome_atual,
+                "id_saida": saida.id_saida,
+            },
+        )
     if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
         if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
             saida.qr_payload_raw = qr_payload_raw.strip()
