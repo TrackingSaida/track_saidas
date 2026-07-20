@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, exists
+from sqlalchemy import select, func, exists, or_
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -455,29 +455,39 @@ def _get_detail_for_saida(db: Session, id_saida: int) -> Optional[SaidaDetail]:
     )
 
 
+# Evita IN gigante (milhares de ids) que derruba SSL/proxy do Postgres gerenciado.
+_DETAILS_IN_CHUNK = 400
+
+
 def _carregar_details_por_saida_ids(db: Session, saida_ids: List[int]) -> Dict[int, SaidaDetail]:
     ids = sorted({int(i) for i in saida_ids if i is not None})
     if not ids:
         return {}
-    latest_ids_subq = (
-        select(
-            SaidaDetail.id_saida.label("id_saida"),
-            func.max(SaidaDetail.id_detail).label("max_id_detail"),
-        )
-        .where(SaidaDetail.id_saida.in_(ids))
-        .group_by(SaidaDetail.id_saida)
-        .subquery()
-    )
-    rows = db.execute(
-        select(SaidaDetail)
-        .join(latest_ids_subq, SaidaDetail.id_detail == latest_ids_subq.c.max_id_detail)
-        .order_by(SaidaDetail.id_saida.asc())
-    ).scalars().all()
     out: Dict[int, SaidaDetail] = {}
-    for d in rows:
-        sid = int(d.id_saida)
-        if sid not in out:
-            out[sid] = d
+
+    def _load_chunk(chunk: List[int]) -> None:
+        latest_ids_subq = (
+            select(
+                SaidaDetail.id_saida.label("id_saida"),
+                func.max(SaidaDetail.id_detail).label("max_id_detail"),
+            )
+            .where(SaidaDetail.id_saida.in_(chunk))
+            .group_by(SaidaDetail.id_saida)
+            .subquery()
+        )
+        rows = db.execute(
+            select(SaidaDetail)
+            .join(latest_ids_subq, SaidaDetail.id_detail == latest_ids_subq.c.max_id_detail)
+            .order_by(SaidaDetail.id_saida.asc())
+        ).scalars().all()
+        for d in rows:
+            sid = int(d.id_saida)
+            if sid not in out:
+                out[sid] = d
+
+    for i in range(0, len(ids), _DETAILS_IN_CHUNK):
+        chunk = ids[i : i + _DETAILS_IN_CHUNK]
+        run_db_query_with_retry(db, lambda c=chunk: _load_chunk(c))
     return out
 
 
@@ -500,15 +510,25 @@ def _possui_endereco(detail: Optional[SaidaDetail]) -> bool:
 
 
 def _carregar_data_hora_ocorrencia_map(db: Session, ids: List[int]) -> Dict[int, datetime]:
-    if not ids:
+    uniq = sorted({int(i) for i in ids if i is not None})
+    if not uniq:
         return {}
-    rows = db.execute(
-        select(SaidaHistorico.id_saida, func.max(SaidaHistorico.timestamp)).where(
-            SaidaHistorico.id_saida.in_(ids),
-            SaidaHistorico.evento.in_(("ausente", "entregue", "cancelado")),
-        ).group_by(SaidaHistorico.id_saida)
-    ).all()
-    return {int(r[0]): r[1] for r in rows}
+    out: Dict[int, datetime] = {}
+
+    def _load_chunk(chunk: List[int]) -> None:
+        rows = db.execute(
+            select(SaidaHistorico.id_saida, func.max(SaidaHistorico.timestamp)).where(
+                SaidaHistorico.id_saida.in_(chunk),
+                SaidaHistorico.evento.in_(("ausente", "entregue", "cancelado")),
+            ).group_by(SaidaHistorico.id_saida)
+        ).all()
+        for r in rows:
+            out[int(r[0])] = r[1]
+
+    for i in range(0, len(uniq), _DETAILS_IN_CHUNK):
+        chunk = uniq[i : i + _DETAILS_IN_CHUNK]
+        run_db_query_with_retry(db, lambda c=chunk: _load_chunk(c))
+    return out
 
 
 def _enrich_datas_detalhe(db: Session, s: Saida, item: dict) -> None:
@@ -808,14 +828,19 @@ def listar_entregas(
 ):
     """Lista entregas do motoboy. status=pendente | finalizadas | ausentes.
     dia=hoje + data (YYYY-MM-DD): filtra finalizadas por data_hora_entrega e ausentes por data.
-    Sem data, usa date.today() do servidor.
+    Pendente sem data: aplica dia operacional de hoje (protege app antigo sem filtro).
     """
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
-    # Filtro por data: quando dia=hoje (ou data enviada) para pendentes/finalizadas/ausentes
-    usar_filtro_hoje = (dia == "hoje") or (status in ("pendente", "finalizadas", "ausentes") and data)
+    # Filtro por data: quando dia=hoje (ou data enviada) para pendentes/finalizadas/ausentes.
+    # App antigo chama pendente sem dia/data e derruba o banco com milhares de históricos.
+    usar_filtro_hoje = (
+        (dia == "hoje")
+        or (status in ("pendente", "finalizadas", "ausentes") and data)
+        or (status == "pendente" and not data and dia != "todos")
+    )
     if usar_filtro_hoje:
         if data:
             try:
@@ -834,6 +859,15 @@ def listar_entregas(
     )
     if status == "pendente":
         q = q.where(Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]))
+        if hoje is not None:
+            # Prefiltro SQL: evita puxar milhares de pendentes históricos do app antigo.
+            cutoff = hoje - timedelta(days=1)
+            q = q.where(
+                or_(
+                    Saida.data >= cutoff,
+                    func.date(Saida.timestamp) >= cutoff,
+                )
+            )
     elif status == "finalizadas":
         subtipo_norm = (subtipo or "entregue").strip().lower()
         if subtipo_norm == "cancelado":
@@ -867,7 +901,7 @@ def listar_entregas(
             q = q.where(exists(subq_ausente))
     q = q.order_by(Saida.data.desc(), Saida.timestamp.desc())
 
-    rows = db.scalars(q).all()
+    rows = run_db_query_with_retry(db, lambda: db.scalars(q).all())
     if status == "pendente" and hoje is not None:
         rows = _filtrar_por_data_operacional(db, rows, hoje)
     ids = [int(s.id_saida) for s in rows]
@@ -1089,12 +1123,18 @@ def resumo_entregas(
             hoje = _hoje_operacional()
     else:
         hoje = _hoje_operacional()
+    # Prefiltro: evita carregar anos de pendentes só para contar (app antigo / resumo).
+    cutoff = hoje - timedelta(days=14)
     rows_pendentes_all = db.scalars(
         select(Saida).where(
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
             Saida.codigo.isnot(None),
             Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
+            or_(
+                Saida.data >= cutoff,
+                func.date(Saida.timestamp) >= cutoff,
+            ),
         )
     ).all()
     ctx_map_pendentes = carregar_contexto_operacional(db, [s.id_saida for s in rows_pendentes_all])
@@ -1207,14 +1247,22 @@ def iniciar_rota(
         )
         rows = result.scalars().all()
     else:
+        # Sem IDs: só o dia operacional atual (evita atualizar milhares de históricos).
+        # Prefiltro SQL reduz candidatos antes do contexto operacional.
+        hoje = _hoje_operacional()
+        cutoff = hoje - timedelta(days=1)
         result = db.execute(
             select(Saida).where(
                 Saida.sub_base == sub_base,
                 Saida.motoboy_id == motoboy_id,
                 Saida.status == STATUS_SAIU_PARA_ENTREGA,
+                or_(
+                    Saida.data >= cutoff,
+                    func.date(Saida.timestamp) >= cutoff,
+                ),
             )
         )
-        rows = result.scalars().all()
+        rows = _filtrar_por_data_operacional(db, list(result.scalars().all()), hoje)
     for s in rows:
         s.status = STATUS_EM_ROTA
     for s in rows:
