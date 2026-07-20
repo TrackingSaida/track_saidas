@@ -455,29 +455,39 @@ def _get_detail_for_saida(db: Session, id_saida: int) -> Optional[SaidaDetail]:
     )
 
 
+# Evita IN gigante (milhares de ids) que derruba SSL/proxy do Postgres gerenciado.
+_DETAILS_IN_CHUNK = 400
+
+
 def _carregar_details_por_saida_ids(db: Session, saida_ids: List[int]) -> Dict[int, SaidaDetail]:
     ids = sorted({int(i) for i in saida_ids if i is not None})
     if not ids:
         return {}
-    latest_ids_subq = (
-        select(
-            SaidaDetail.id_saida.label("id_saida"),
-            func.max(SaidaDetail.id_detail).label("max_id_detail"),
-        )
-        .where(SaidaDetail.id_saida.in_(ids))
-        .group_by(SaidaDetail.id_saida)
-        .subquery()
-    )
-    rows = db.execute(
-        select(SaidaDetail)
-        .join(latest_ids_subq, SaidaDetail.id_detail == latest_ids_subq.c.max_id_detail)
-        .order_by(SaidaDetail.id_saida.asc())
-    ).scalars().all()
     out: Dict[int, SaidaDetail] = {}
-    for d in rows:
-        sid = int(d.id_saida)
-        if sid not in out:
-            out[sid] = d
+
+    def _load_chunk(chunk: List[int]) -> None:
+        latest_ids_subq = (
+            select(
+                SaidaDetail.id_saida.label("id_saida"),
+                func.max(SaidaDetail.id_detail).label("max_id_detail"),
+            )
+            .where(SaidaDetail.id_saida.in_(chunk))
+            .group_by(SaidaDetail.id_saida)
+            .subquery()
+        )
+        rows = db.execute(
+            select(SaidaDetail)
+            .join(latest_ids_subq, SaidaDetail.id_detail == latest_ids_subq.c.max_id_detail)
+            .order_by(SaidaDetail.id_saida.asc())
+        ).scalars().all()
+        for d in rows:
+            sid = int(d.id_saida)
+            if sid not in out:
+                out[sid] = d
+
+    for i in range(0, len(ids), _DETAILS_IN_CHUNK):
+        chunk = ids[i : i + _DETAILS_IN_CHUNK]
+        run_db_query_with_retry(db, lambda c=chunk: _load_chunk(c))
     return out
 
 
@@ -500,15 +510,25 @@ def _possui_endereco(detail: Optional[SaidaDetail]) -> bool:
 
 
 def _carregar_data_hora_ocorrencia_map(db: Session, ids: List[int]) -> Dict[int, datetime]:
-    if not ids:
+    uniq = sorted({int(i) for i in ids if i is not None})
+    if not uniq:
         return {}
-    rows = db.execute(
-        select(SaidaHistorico.id_saida, func.max(SaidaHistorico.timestamp)).where(
-            SaidaHistorico.id_saida.in_(ids),
-            SaidaHistorico.evento.in_(("ausente", "entregue", "cancelado")),
-        ).group_by(SaidaHistorico.id_saida)
-    ).all()
-    return {int(r[0]): r[1] for r in rows}
+    out: Dict[int, datetime] = {}
+
+    def _load_chunk(chunk: List[int]) -> None:
+        rows = db.execute(
+            select(SaidaHistorico.id_saida, func.max(SaidaHistorico.timestamp)).where(
+                SaidaHistorico.id_saida.in_(chunk),
+                SaidaHistorico.evento.in_(("ausente", "entregue", "cancelado")),
+            ).group_by(SaidaHistorico.id_saida)
+        ).all()
+        for r in rows:
+            out[int(r[0])] = r[1]
+
+    for i in range(0, len(uniq), _DETAILS_IN_CHUNK):
+        chunk = uniq[i : i + _DETAILS_IN_CHUNK]
+        run_db_query_with_retry(db, lambda c=chunk: _load_chunk(c))
+    return out
 
 
 def _enrich_datas_detalhe(db: Session, s: Saida, item: dict) -> None:
@@ -867,7 +887,7 @@ def listar_entregas(
             q = q.where(exists(subq_ausente))
     q = q.order_by(Saida.data.desc(), Saida.timestamp.desc())
 
-    rows = db.scalars(q).all()
+    rows = run_db_query_with_retry(db, lambda: db.scalars(q).all())
     if status == "pendente" and hoje is not None:
         rows = _filtrar_por_data_operacional(db, rows, hoje)
     ids = [int(s.id_saida) for s in rows]
@@ -1207,6 +1227,7 @@ def iniciar_rota(
         )
         rows = result.scalars().all()
     else:
+        # Sem IDs: só o dia operacional atual (evita atualizar milhares de históricos).
         result = db.execute(
             select(Saida).where(
                 Saida.sub_base == sub_base,
@@ -1214,7 +1235,7 @@ def iniciar_rota(
                 Saida.status == STATUS_SAIU_PARA_ENTREGA,
             )
         )
-        rows = result.scalars().all()
+        rows = _filtrar_por_data_operacional(db, list(result.scalars().all()), _hoje_operacional())
     for s in rows:
         s.status = STATUS_EM_ROTA
     for s in rows:
