@@ -342,72 +342,111 @@ def acompanhamento_dia(
     )
 
 
+def _classificar_servico_saida(servico: Optional[str]) -> str:
+    srv = (servico or "").strip().lower()
+    if ("shopee" in srv) or ("spx" in srv):
+        return "shopee"
+    if (
+        ("mercado livre" in srv)
+        or ("mercado_livre" in srv)
+        or ("mercadolivre" in srv)
+        or (" ml" in f" {srv}")
+        or ("flex" in srv)
+    ):
+        return "mercado"
+    return "avulso"
+
+
+def _somar_servicos(rows: List[Saida]) -> Tuple[int, int, int]:
+    sum_shopee = 0
+    sum_mercado = 0
+    sum_avulso = 0
+    for s in rows:
+        kind = _classificar_servico_saida(s.servico)
+        if kind == "shopee":
+            sum_shopee += 1
+        elif kind == "mercado":
+            sum_mercado += 1
+        else:
+            sum_avulso += 1
+    return sum_shopee, sum_mercado, sum_avulso
+
+
 @router.get("/saidas-dia", response_model=AcompanhamentoSaidasDiaResponse)
 def acompanhamento_saidas_dia(
     motoboy_id: int = Query(..., description="Motoboy obrigatório"),
     data: Optional[date] = Query(None, description="Data de referência (YYYY-MM-DD)"),
     data_inicio: Optional[date] = Query(None, description="Início do período (YYYY-MM-DD)"),
     data_fim: Optional[date] = Query(None, description="Fim do período (YYYY-MM-DD)"),
+    modo: str = Query(
+        "pendentes",
+        description="pendentes = só abertos (web); saidas = todas as leituras do período por Saida.data",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Retorna os pendentes operacionais do motoboy na data/período, com a mesma
-    regra de período operacional das telas de Registros e Mobile.
+    Quantidades por serviço do motoboy.
+    - modo=pendentes: pendentes operacionais no período (compatível com a web).
+    - modo=saidas: todas as saídas/leituras com Saida.data no período (histórico).
     """
     sub_base = getattr(current_user, "sub_base", None)
     if not sub_base or not str(sub_base).strip():
         raise HTTPException(status_code=403, detail="Sub_base não definida.")
 
     inicio, fim = _resolver_periodo(data, data_inicio, data_fim)
-    rows_pendentes_all = db.scalars(
-        select(Saida).where(
-            Saida.sub_base == sub_base,
-            Saida.motoboy_id == motoboy_id,
-            Saida.codigo.isnot(None),
-            Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
-        )
-    ).all()
+    modo_norm = (modo or "pendentes").strip().lower()
+    if modo_norm not in ("pendentes", "saidas"):
+        raise HTTPException(status_code=400, detail="modo deve ser 'pendentes' ou 'saidas'.")
 
-    ctx_map = carregar_contexto_operacional(db, [s.id_saida for s in rows_pendentes_all])
-    rows_pendentes_validos = [
-        s
-        for s in rows_pendentes_all
-        if not (
-            ctx_map.get(s.id_saida)
-            and (
-                ctx_map[s.id_saida].removido_sem_inicio_ativo
-                or not ctx_map[s.id_saida].leitura_valida
+    if modo_norm == "saidas":
+        rows_periodo = list(
+            db.scalars(
+                select(Saida).where(
+                    Saida.sub_base == sub_base,
+                    Saida.motoboy_id == motoboy_id,
+                    Saida.codigo.isnot(None),
+                    Saida.data >= inicio,
+                    Saida.data <= fim,
+                )
+            ).all()
+        )
+    else:
+        rows_pendentes_all = db.scalars(
+            select(Saida).where(
+                Saida.sub_base == sub_base,
+                Saida.motoboy_id == motoboy_id,
+                Saida.codigo.isnot(None),
+                Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
             )
-        )
-    ]
-    rows_pendentes_periodo = [
-        s
-        for s in rows_pendentes_validos
-        if inicio
-        <= (
-            ((ctx_map.get(s.id_saida).operacional_ts if ctx_map.get(s.id_saida) else None) or s.timestamp).date()
-        )
-        <= fim
-    ]
+        ).all()
 
-    sum_shopee = 0
-    sum_mercado = 0
-    sum_avulso = 0
-    for s in rows_pendentes_periodo:
-        srv = (s.servico or "").strip().lower()
-        if ("shopee" in srv) or ("spx" in srv):
-            sum_shopee += 1
-        elif (
-            ("mercado livre" in srv)
-            or ("mercado_livre" in srv)
-            or ("mercadolivre" in srv)
-            or (" ml" in f" {srv}")
-            or ("flex" in srv)
-        ):
-            sum_mercado += 1
-        else:
-            sum_avulso += 1
+        ctx_map = carregar_contexto_operacional(db, [s.id_saida for s in rows_pendentes_all])
+        rows_pendentes_validos = [
+            s
+            for s in rows_pendentes_all
+            if not (
+                ctx_map.get(s.id_saida)
+                and (
+                    ctx_map[s.id_saida].removido_sem_inicio_ativo
+                    or not ctx_map[s.id_saida].leitura_valida
+                )
+            )
+        ]
+        rows_periodo = [
+            s
+            for s in rows_pendentes_validos
+            if inicio
+            <= (
+                (
+                    (ctx_map.get(s.id_saida).operacional_ts if ctx_map.get(s.id_saida) else None)
+                    or s.timestamp
+                ).date()
+            )
+            <= fim
+        ]
+
+    sum_shopee, sum_mercado, sum_avulso = _somar_servicos(rows_periodo)
 
     motoboy_nome = _carregar_nomes_motoboy_ids(db, [motoboy_id]).get(
         motoboy_id, f"Motoboy {motoboy_id}"
@@ -417,7 +456,7 @@ def acompanhamento_saidas_dia(
         data=fim.isoformat(),
         motoboy_id=motoboy_id,
         motoboy_nome=motoboy_nome,
-        pendentes_hoje=len(rows_pendentes_periodo),
+        pendentes_hoje=len(rows_periodo),
         sum_shopee=sum_shopee,
         sum_mercado=sum_mercado,
         sum_avulso=sum_avulso,
