@@ -5,7 +5,7 @@ Prefixo: /acompanhamento
 from __future__ import annotations
 
 from datetime import date
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -25,6 +25,40 @@ from saidas_routes import (
 from saida_operacional_utils import carregar_contexto_operacional
 
 router = APIRouter(prefix="/acompanhamento", tags=["Acompanhamento"])
+
+_MAX_DIAS_PERIODO = 31
+
+
+def _resolver_periodo(
+    data: Optional[date],
+    data_inicio: Optional[date],
+    data_fim: Optional[date],
+) -> Tuple[date, date]:
+    """
+    Resolve período inclusivo.
+    - data_inicio + data_fim → intervalo
+    - só data → dia único
+    - nada → hoje
+    """
+    if data_inicio is not None or data_fim is not None:
+        if data_inicio is None or data_fim is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Informe data_inicio e data_fim juntos.",
+            )
+        if data_inicio > data_fim:
+            raise HTTPException(
+                status_code=400,
+                detail="data_inicio não pode ser maior que data_fim.",
+            )
+        if (data_fim - data_inicio).days > _MAX_DIAS_PERIODO:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Período máximo de {_MAX_DIAS_PERIODO} dias.",
+            )
+        return data_inicio, data_fim
+    ref = data or date.today()
+    return ref, ref
 
 
 def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> dict[int, str]:
@@ -84,6 +118,8 @@ class AcompanhamentoTotais(BaseModel):
 class AcompanhamentoDiaResponse(BaseModel):
     items: List[AcompanhamentoItem]
     totais: AcompanhamentoTotais
+    data_inicio: Optional[str] = None
+    data_fim: Optional[str] = None
 
 
 class AcompanhamentoSaidasDiaResponse(BaseModel):
@@ -94,6 +130,8 @@ class AcompanhamentoSaidasDiaResponse(BaseModel):
     sum_shopee: int
     sum_mercado: int
     sum_avulso: int
+    data_inicio: Optional[str] = None
+    data_fim: Optional[str] = None
 
 
 class AcompanhamentoMapaItem(BaseModel):
@@ -166,23 +204,29 @@ def acompanhamento_mapa(
 
 @router.get("/dia", response_model=AcompanhamentoDiaResponse)
 def acompanhamento_dia(
-    data: date = Query(..., description="Data única (YYYY-MM-DD)"),
+    data: Optional[date] = Query(None, description="Data única (YYYY-MM-DD)"),
+    data_inicio: Optional[date] = Query(None, description="Início do período (YYYY-MM-DD)"),
+    data_fim: Optional[date] = Query(None, description="Fim do período (YYYY-MM-DD)"),
     motoboy_id: Optional[int] = Query(None, description="Filtrar por motoboy"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Retorna desempenho por motoboy na data informada.
+    Retorna desempenho por motoboy na data ou período informado.
     Agrupa Saida por motoboy_id; inclui totais e SLA.
     """
     sub_base = getattr(current_user, "sub_base", None)
     if not sub_base or not str(sub_base).strip():
         raise HTTPException(status_code=403, detail="Sub_base não definida.")
 
+    inicio, fim = _resolver_periodo(data, data_inicio, data_fim)
+    label_data = fim.isoformat() if inicio == fim else f"{inicio.isoformat()}_{fim.isoformat()}"
+
     stmt = (
         select(Saida)
         .where(Saida.sub_base == sub_base)
-        .where(Saida.data == data)
+        .where(Saida.data >= inicio)
+        .where(Saida.data <= fim)
         .where(Saida.motoboy_id.isnot(None))
     )
     if motoboy_id is not None:
@@ -211,17 +255,22 @@ def acompanhamento_dia(
             by_motoboy[mid] = []
         by_motoboy[mid].append(s)
 
-    # Rotas do dia por motoboy (ativa ou finalizada)
+    # Rotas no período por motoboy (ativa ou finalizada)
     rotas_map = {}  # motoboy_id -> "Rota" | "SEM ROTA"
     if by_motoboy:
         rota_stmt = (
             select(RotasMotoboy.motoboy_id, RotasMotoboy.status)
-            .where(RotasMotoboy.data == data)
+            .where(RotasMotoboy.data >= inicio)
+            .where(RotasMotoboy.data <= fim)
             .where(RotasMotoboy.motoboy_id.in_(list(by_motoboy.keys())))
         )
         for row in db.execute(rota_stmt).all():
             mid, status = row[0], (row[1] or "").strip().lower()
-            rotas_map[mid] = "Ativa" if status == "ativa" else "Rota"
+            current = rotas_map.get(mid)
+            if status == "ativa":
+                rotas_map[mid] = "Ativa"
+            elif current != "Ativa":
+                rotas_map[mid] = "Rota"
     for mid in by_motoboy:
         if mid not in rotas_map:
             rotas_map[mid] = "SEM ROTA"
@@ -259,7 +308,7 @@ def acompanhamento_dia(
 
         items.append(
             AcompanhamentoItem(
-                data=data.isoformat(),
+                data=label_data,
                 motoboy_id=mid,
                 motoboy_nome=motoboy_nome,
                 pedidos=pedidos,
@@ -288,6 +337,8 @@ def acompanhamento_dia(
             ausente_ou_ocorrencias=totais_ausente,
             sla=sla_total,
         ),
+        data_inicio=inicio.isoformat(),
+        data_fim=fim.isoformat(),
     )
 
 
@@ -295,18 +346,20 @@ def acompanhamento_dia(
 def acompanhamento_saidas_dia(
     motoboy_id: int = Query(..., description="Motoboy obrigatório"),
     data: Optional[date] = Query(None, description="Data de referência (YYYY-MM-DD)"),
+    data_inicio: Optional[date] = Query(None, description="Início do período (YYYY-MM-DD)"),
+    data_fim: Optional[date] = Query(None, description="Fim do período (YYYY-MM-DD)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Retorna os pendentes operacionais do motoboy na data, com a mesma
+    Retorna os pendentes operacionais do motoboy na data/período, com a mesma
     regra de período operacional das telas de Registros e Mobile.
     """
     sub_base = getattr(current_user, "sub_base", None)
     if not sub_base or not str(sub_base).strip():
         raise HTTPException(status_code=403, detail="Sub_base não definida.")
 
-    data_ref = data or date.today()
+    inicio, fim = _resolver_periodo(data, data_inicio, data_fim)
     rows_pendentes_all = db.scalars(
         select(Saida).where(
             Saida.sub_base == sub_base,
@@ -328,19 +381,20 @@ def acompanhamento_saidas_dia(
             )
         )
     ]
-    rows_pendentes_dia = [
+    rows_pendentes_periodo = [
         s
         for s in rows_pendentes_validos
-        if (
+        if inicio
+        <= (
             ((ctx_map.get(s.id_saida).operacional_ts if ctx_map.get(s.id_saida) else None) or s.timestamp).date()
-            == data_ref
         )
+        <= fim
     ]
 
     sum_shopee = 0
     sum_mercado = 0
     sum_avulso = 0
-    for s in rows_pendentes_dia:
+    for s in rows_pendentes_periodo:
         srv = (s.servico or "").strip().lower()
         if ("shopee" in srv) or ("spx" in srv):
             sum_shopee += 1
@@ -355,14 +409,18 @@ def acompanhamento_saidas_dia(
         else:
             sum_avulso += 1
 
-    motoboy_nome = _carregar_nomes_motoboy_ids(db, [motoboy_id]).get(motoboy_id, f"Motoboy {motoboy_id}")
+    motoboy_nome = _carregar_nomes_motoboy_ids(db, [motoboy_id]).get(
+        motoboy_id, f"Motoboy {motoboy_id}"
+    )
 
     return AcompanhamentoSaidasDiaResponse(
-        data=data_ref.isoformat(),
+        data=fim.isoformat(),
         motoboy_id=motoboy_id,
         motoboy_nome=motoboy_nome,
-        pendentes_hoje=len(rows_pendentes_dia),
+        pendentes_hoje=len(rows_pendentes_periodo),
         sum_shopee=sum_shopee,
         sum_mercado=sum_mercado,
         sum_avulso=sum_avulso,
+        data_inicio=inicio.isoformat(),
+        data_fim=fim.isoformat(),
     )
