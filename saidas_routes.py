@@ -262,7 +262,7 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return STATUS_AUSENTE
     if lower == "cancelado":
         return STATUS_CANCELADO
-    if lower in ("encerrado_sistema", "encerrado pelo sistema", "encerrado_pelo_sistema"):
+    if lower in ("encerrado", "encerrado_sistema", "encerrado pelo sistema", "encerrado_pelo_sistema"):
         return STATUS_ENCERRADO_SISTEMA
     return s
 

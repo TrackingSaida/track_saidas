@@ -132,6 +132,83 @@ curl -sf -X POST \
 
 Se o job não terminar no orçamento de tempo, ele retorna `partial=true` e continua no próximo dia a partir do checkpoint salvo.
 
+## Encerramento de pendentes por quinzena (1.5.0+)
+
+Encerra automaticamente pedidos ainda abertos (`SAIU_PARA_ENTREGA` / `EM_ROTA` / legado `saiu`) cuja **data operacional** está **antes** da janela viva de **2 quinzenas** (quinzena atual + quinzena anterior).
+
+- Status resultante: `ENCERRADO_SISTEMA` (UI do status: “Encerrado”; última ação: “Encerrado pelo sistema”)
+- Gera histórico com evento `encerrado_sistema`
+- **Não** altera Ausente / Entregue / Cancelado
+- Encerrado **não** conta como entrega paga; bipar de novo **pede confirmação** no app e, se confirmado, **reativa** o pedido
+
+Execução: endpoint interno + Cron Job no Render (mesmo padrão do cleanup).
+
+### Pré-requisitos
+
+1. Deploy da API com a versão que inclui o endpoint (1.5.0+).
+2. No Web Service (e no Cron Job, se usar variável própria), garantir ao menos um secret:
+   - `CRON_ENCERRAMENTO_SECRET` (opcional; dedicado)
+   - ou reutilizar `CRON_CLEANUP_SECRET` / `CRON_REFRESH_SECRET` (fallback já suportado pelo endpoint)
+
+Não há migração de banco obrigatória para este job.
+
+### Endpoint interno
+
+- `POST /api/internal/encerrar-pendentes-quinzena`
+- Header obrigatório: `X-Cron-Secret: <secret>`
+- Query params:
+  - `dry_run=true|false` (default `true` — só conta, **não** altera)
+  - `batch_size` (default `500`, entre 50 e 2000)
+  - `sub_base` (opcional — limita a uma sub_base)
+  - `data=YYYY-MM-DD` (opcional — data de referência da janela; default = hoje)
+
+Resposta útil para validar antes de aplicar:
+
+- `inicio_vivo`, `ref_date`
+- `candidatos`, `elegiveis`, `atualizados`
+- `por_sub_base`, `sample_ids`
+
+### Rollout recomendado no Render
+
+1. Criar um **Cron Job** novo (ou um one-off manual) apontando para o Web Service da API.
+2. **Primeira execução com dry-run** (obrigatório em produção):
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_CLEANUP_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/encerrar-pendentes-quinzena?dry_run=true"
+```
+
+3. Conferir `elegiveis` / `por_sub_base` / `sample_ids` nos logs ou na resposta.
+4. Só então aplicar:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_CLEANUP_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/encerrar-pendentes-quinzena?dry_run=false&batch_size=500"
+```
+
+### Agendamento recomendado
+
+Diário de madrugada (UTC), por exemplo perto de 04:00 BRT:
+
+- Schedule: `0 7 * * *`
+- Command (produção, após validar dry-run):
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_CLEANUP_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/encerrar-pendentes-quinzena?dry_run=false&batch_size=500"
+```
+
+Dica: no Cron Job do Render, use a mesma env do cleanup (`CRON_CLEANUP_SECRET`) ou defina `CRON_ENCERRAMENTO_SECRET` e troque o header.
+
+Filtro opcional por tenant na primeira limpeza grande:
+
+```bash
+".../encerrar-pendentes-quinzena?dry_run=true&sub_base=NOME_DA_SUB_BASE"
+```
+
 ## Benchmark de performance (Registros)
 
 Antes de ativar a limpeza e após alguns ciclos, rodar os mesmos testes em `GET /api/saidas/listar`:

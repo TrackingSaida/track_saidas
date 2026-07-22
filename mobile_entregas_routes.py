@@ -438,7 +438,7 @@ def _status_exibicao(status: Optional[str]) -> str:
     if s == STATUS_CANCELADO:
         return "Cancelado"
     if s == STATUS_ENCERRADO_SISTEMA:
-        return "Encerrado pelo sistema"
+        return "Encerrado"
     return status or "Pendente"
 
 
@@ -2872,43 +2872,34 @@ def scan_codigo(
             content=_status_finalizado_detail(saida, status_norm),
         )
 
-    # Encerrado pelo sistema: reativação explícita (não é status finalizado)
+    # Encerrado pelo sistema: exige confirmação explícita antes de reativar
     if status_norm == STATUS_ENCERRADO_SISTEMA:
-        saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
-        if normalizar_status_saida(saida.status) != STATUS_ENCERRADO_SISTEMA:
-            status_norm = normalizar_status_saida(saida.status)
-        else:
-            motoboy_id_anterior = saida.motoboy_id
-            if motoboy_id is not None:
-                motoboy = db.get(Motoboy, motoboy_id)
-                if motoboy:
-                    saida.entregador = _get_motoboy_nome(db, motoboy)
-                    saida.entregador_id = None
-            saida.motoboy_id = motoboy_id
-            saida.status = status_scan
-            _garantir_cobranca_owner_saida(db, saida, owner_valor)
-            db.add(
-                SaidaHistorico(
-                    id_saida=saida.id_saida,
-                    evento="assumir",
-                    status_anterior=STATUS_ENCERRADO_SISTEMA,
-                    status_novo=status_scan,
-                    motoboy_id_anterior=motoboy_id_anterior,
-                    motoboy_id_novo=motoboy_id,
-                    user_id=user.id,
-                    payload="reativado_de_encerrado_sistema",
-                )
-            )
-            db.commit()
-            db.refresh(saida)
-            detail = _get_detail_for_saida(db, saida.id_saida)
-            return {
-                "ok": True,
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=getattr(user, "username", None),
+            origem=origem,
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="leitura_encerrado_aguardando_confirmacao",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/scan",
+            db=db,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "LEITURA_ENCERRADO_SISTEMA",
+                "id_saida": saida.id_saida,
+                "status_atual": saida.status,
+                "motoboy_id": saida.motoboy_id,
+                "motoboy_nome": _nome_motoboy_atual(db, saida) or saida.entregador or "",
                 "conflito": False,
-                "ja_existia": False,
-                "reativado_de_encerrado": True,
-                "entrega": _saida_to_item(saida, detail),
-            }
+                "message": "Pedido encerrado pelo sistema. Confirme para abrir nova saída.",
+            },
+        )
 
     # Em rota / saiu:
     # - staff segue sem conflito
@@ -3143,6 +3134,110 @@ def scan_codigo(
         "ok": True,
         "conflito": False,
         "ja_existia": not houve_atribuicao_ou_progresso,
+        "entrega": _saida_to_item(saida, detail),
+    }
+
+
+@router.post("/entrega/{id_saida}/confirmar-reativacao-encerrado")
+def confirmar_reativacao_encerrado_mobile(
+    id_saida: int,
+    body: ConfirmarNovaSaidaMesmoEntregadorBody = Body(default=ConfirmarNovaSaidaMesmoEntregadorBody()),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_mobile_scan_user),
+):
+    """Confirma reativação de pedido ENCERRADO_SISTEMA após aviso no scan."""
+    sub_base = user.sub_base
+    role = int(getattr(user, "role", 0) or 0)
+    motoboy_id = getattr(user, "motoboy_id", None) if role == 4 else None
+    status_scan = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    saida = db.scalar(
+        select(Saida).where(
+            Saida.id_saida == id_saida,
+            Saida.sub_base == sub_base,
+        )
+    )
+    if not saida:
+        raise HTTPException(status_code=404, detail="Saída não encontrada.")
+
+    status_norm = normalizar_status_saida(saida.status)
+    if status_norm != STATUS_ENCERRADO_SISTEMA:
+        if _status_esta_finalizado(status_norm):
+            return JSONResponse(
+                status_code=422,
+                content=_status_finalizado_detail(saida, status_norm),
+            )
+        detail = _get_detail_for_saida(db, saida.id_saida)
+        return {
+            "ok": True,
+            "conflito": False,
+            "ja_existia": True,
+            "reativado_de_encerrado": False,
+            "entrega": _saida_to_item(saida, detail),
+        }
+
+    saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
+    if normalizar_status_saida(saida.status) != STATUS_ENCERRADO_SISTEMA:
+        detail = _get_detail_for_saida(db, saida.id_saida)
+        return {
+            "ok": True,
+            "conflito": False,
+            "ja_existia": True,
+            "reativado_de_encerrado": False,
+            "entrega": _saida_to_item(saida, detail),
+        }
+
+    motoboy_id_anterior = saida.motoboy_id
+    if motoboy_id is not None:
+        motoboy = db.get(Motoboy, motoboy_id)
+        if motoboy:
+            saida.entregador = _get_motoboy_nome(db, motoboy)
+            saida.entregador_id = None
+        saida.motoboy_id = motoboy_id
+    saida.status = status_scan
+    owner_valor = _owner_valor_por_sub_base(db, user, sub_base)
+    _garantir_cobranca_owner_saida(db, saida, owner_valor)
+    db.add(
+        SaidaHistorico(
+            id_saida=saida.id_saida,
+            evento="assumir",
+            status_anterior=STATUS_ENCERRADO_SISTEMA,
+            status_novo=status_scan,
+            motoboy_id_anterior=motoboy_id_anterior,
+            motoboy_id_novo=motoboy_id,
+            user_id=getattr(user, "id", None),
+            payload="reativado_de_encerrado_sistema",
+        )
+    )
+    try:
+        db.commit()
+        db.refresh(saida)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Erro ao confirmar reativação do pedido encerrado.")
+
+    registrar_log_leitura_critico(
+        sub_base=sub_base,
+        username=getattr(user, "username", None),
+        origem=(body.origem or "mobile"),
+        tipo="saida",
+        codigo=saida.codigo,
+        resultado="reativacao_encerrado_confirmada",
+        role=role,
+        motoboy_id=motoboy_id,
+        id_saida=saida.id_saida,
+        origem_app="mobile",
+        endpoint="/mobile/entrega/{id_saida}/confirmar-reativacao-encerrado",
+        db=db,
+    )
+    detail = _get_detail_for_saida(db, saida.id_saida)
+    return {
+        "ok": True,
+        "conflito": False,
+        "ja_existia": False,
+        "reativado_de_encerrado": True,
         "entrega": _saida_to_item(saida, detail),
     }
 
