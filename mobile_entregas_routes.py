@@ -60,6 +60,7 @@ from saidas_routes import (
     STATUS_ENTREGUE,
     STATUS_AUSENTE,
     STATUS_CANCELADO,
+    STATUS_ENCERRADO_SISTEMA,
     _check_delete_window_or_409,
     _should_store_qr_payload_raw,
     normalizar_status_saida,
@@ -427,8 +428,8 @@ class ExtratoFinanceiroOut(BaseModel):
 def _status_exibicao(status: Optional[str]) -> str:
     if not status:
         return "Pendente"
-    s = (status or "").strip().upper()
-    if s in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    s = normalizar_status_saida(status).strip().upper()
+    if s in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "SAIU"):
         return "Pendente"
     if s == STATUS_ENTREGUE:
         return "Entregue"
@@ -436,6 +437,8 @@ def _status_exibicao(status: Optional[str]) -> str:
         return "Ausente"
     if s == STATUS_CANCELADO:
         return "Cancelado"
+    if s == STATUS_ENCERRADO_SISTEMA:
+        return "Encerrado pelo sistema"
     return status or "Pendente"
 
 
@@ -998,6 +1001,8 @@ def extrato_financeiro_motoboy(
     for s in rows:
         status_up = _status_normalizado_upper(s.status)
         is_cancelado = status_up == STATUS_CANCELADO
+        is_encerrado = status_up == STATUS_ENCERRADO_SISTEMA
+        is_sem_valor = is_cancelado or is_encerrado
         is_grupo_entregue = status_up in grupo_entregue
         if modo == "cancelados":
             passa_filtro = is_cancelado
@@ -1027,7 +1032,7 @@ def extrato_financeiro_motoboy(
         if not passa_filtro:
             continue
         total_filtrados += 1
-        item_valor = Decimal("0.00") if is_cancelado else _valor_saida(precos_mobile, s)
+        item_valor = Decimal("0.00") if is_sem_valor else _valor_saida(precos_mobile, s)
         if d:
             dias_map[d]["total_pacotes_filtrados"] += 1
             dias_map[d]["itens"].append(
@@ -1045,7 +1050,7 @@ def extrato_financeiro_motoboy(
         if tipo in por_servico:
             por_servico[tipo] += 1
 
-        if is_cancelado:
+        if is_sem_valor:
             continue
         valor = item_valor
         valor_total += valor
@@ -1716,11 +1721,59 @@ def rotas_cancelar(
 ):
     """Cancela rota aberta (preparando ou ativa) antes de recriar otimização."""
     motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
     rota = db.get(RotasMotoboy, rota_id)
     if not rota or rota.motoboy_id != motoboy_id:
         raise HTTPException(status_code=404, detail="Rota não encontrada.")
     if rota.status not in ("ativa", "preparando"):
         raise HTTPException(status_code=400, detail="Rota não está aberta.")
+    if sub_base and (rota.sub_base or "") != sub_base:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+
+    ordem_ids: List[int] = []
+    raw_ordem = getattr(rota, "ordem_json", None)
+    if isinstance(raw_ordem, list):
+        for item in raw_ordem:
+            try:
+                ordem_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(raw_ordem, str) and raw_ordem.strip():
+        try:
+            parsed = json.loads(raw_ordem)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    try:
+                        ordem_ids.append(int(item))
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            ordem_ids = []
+
+    if ordem_ids:
+        q_saidas = select(Saida).where(
+            Saida.id_saida.in_(ordem_ids),
+            Saida.motoboy_id == motoboy_id,
+            Saida.status == STATUS_EM_ROTA,
+        )
+        if sub_base:
+            q_saidas = q_saidas.where(Saida.sub_base == sub_base)
+        rows = db.scalars(q_saidas).all()
+        for s in rows:
+            status_anterior = s.status
+            s.status = STATUS_SAIU_PARA_ENTREGA
+            db.add(
+                SaidaHistorico(
+                    id_saida=s.id_saida,
+                    evento="rota_cancelada",
+                    status_anterior=status_anterior,
+                    status_novo=STATUS_SAIU_PARA_ENTREGA,
+                    motoboy_id_anterior=motoboy_id,
+                    motoboy_id_novo=motoboy_id,
+                    user_id=getattr(user, "id", None),
+                )
+            )
+
     rota.status = "cancelada"
     rota.finalizado_em = datetime.utcnow()
     rota.updated_at = datetime.utcnow()
@@ -2818,6 +2871,44 @@ def scan_codigo(
             status_code=422,
             content=_status_finalizado_detail(saida, status_norm),
         )
+
+    # Encerrado pelo sistema: reativação explícita (não é status finalizado)
+    if status_norm == STATUS_ENCERRADO_SISTEMA:
+        saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
+        if normalizar_status_saida(saida.status) != STATUS_ENCERRADO_SISTEMA:
+            status_norm = normalizar_status_saida(saida.status)
+        else:
+            motoboy_id_anterior = saida.motoboy_id
+            if motoboy_id is not None:
+                motoboy = db.get(Motoboy, motoboy_id)
+                if motoboy:
+                    saida.entregador = _get_motoboy_nome(db, motoboy)
+                    saida.entregador_id = None
+            saida.motoboy_id = motoboy_id
+            saida.status = status_scan
+            _garantir_cobranca_owner_saida(db, saida, owner_valor)
+            db.add(
+                SaidaHistorico(
+                    id_saida=saida.id_saida,
+                    evento="assumir",
+                    status_anterior=STATUS_ENCERRADO_SISTEMA,
+                    status_novo=status_scan,
+                    motoboy_id_anterior=motoboy_id_anterior,
+                    motoboy_id_novo=motoboy_id,
+                    user_id=user.id,
+                    payload="reativado_de_encerrado_sistema",
+                )
+            )
+            db.commit()
+            db.refresh(saida)
+            detail = _get_detail_for_saida(db, saida.id_saida)
+            return {
+                "ok": True,
+                "conflito": False,
+                "ja_existia": False,
+                "reativado_de_encerrado": True,
+                "entrega": _saida_to_item(saida, detail),
+            }
 
     # Em rota / saiu:
     # - staff segue sem conflito

@@ -38,7 +38,7 @@ else:
 # App
 app = FastAPI(
     title="API Saídas",
-    version="1.4.0",
+    version="1.5.0",
     openapi_url=f"{API_PREFIX}/openapi.json",
     docs_url=f"{API_PREFIX}/docs",
     redoc_url=f"{API_PREFIX}/redoc",
@@ -340,6 +340,69 @@ def internal_cleanup_history(request: Request):
         return JSONResponse(status_code=500, content={"detail": str(e)})
     finally:
         db.close()
+
+@app.post(f"{API_PREFIX}/internal/encerrar-pendentes-quinzena", tags=["Internal"])
+def internal_encerrar_pendentes_quinzena(request: Request):
+    """
+    Encerra pendentes (SAIU/EM_ROTA) com data operacional anterior à janela de 2 quinzenas.
+    Protegido por X-Cron-Secret (CRON_ENCERRAMENTO_SECRET ou CRON_CLEANUP/REFRESH).
+    Query: dry_run=true|false, batch_size=500, sub_base=opcional, data=YYYY-MM-DD (ref).
+    """
+    from encerramento_quinzena_service import run_encerrar_pendentes_quinzena
+    from datetime import date as date_cls
+
+    secret = (
+        os.getenv("CRON_ENCERRAMENTO_SECRET")
+        or os.getenv("CRON_CLEANUP_SECRET")
+        or os.getenv("CRON_REFRESH_SECRET")
+    )
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_ENCERRAMENTO_SECRET não configurado"})
+    received = request.headers.get("X-Cron-Secret")
+    if received != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    dry_raw = (request.query_params.get("dry_run") or "true").strip().lower()
+    dry_run = dry_raw in ("1", "true", "yes", "sim")
+    try:
+        batch_size = int(request.query_params.get("batch_size") or "500")
+    except ValueError:
+        batch_size = 500
+    batch_size = max(50, min(batch_size, 2000))
+    sub_base = (request.query_params.get("sub_base") or "").strip() or None
+    ref = None
+    data_raw = (request.query_params.get("data") or "").strip()
+    if data_raw:
+        try:
+            ref = date_cls.fromisoformat(data_raw)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "data inválida (YYYY-MM-DD)"})
+
+    db = SessionLocal()
+    try:
+        result = run_encerrar_pendentes_quinzena(
+            db,
+            ref=ref,
+            dry_run=dry_run,
+            batch_size=batch_size,
+            sub_base=sub_base,
+        )
+        return {
+            "status": "ok",
+            "dry_run": result.dry_run,
+            "ref_date": result.ref_date.isoformat(),
+            "inicio_vivo": result.inicio_vivo.isoformat(),
+            "candidatos": result.candidatos,
+            "elegiveis": result.elegiveis,
+            "atualizados": result.atualizados,
+            "por_sub_base": result.por_sub_base,
+            "sample_ids": result.sample_ids,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
 
 # ──────────────────────────────────────────────────────────────────
 # Execução local

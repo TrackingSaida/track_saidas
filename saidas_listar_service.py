@@ -85,6 +85,18 @@ def _status_group_aliases(token: str) -> List[str]:
         "coletado": ["coletado"],
         "nao coletado": ["nao coletado", "não coletado"],
         "cancelado": ["cancelado", "cancelados"],
+        "encerrado sistema": [
+            "encerrado_sistema",
+            "encerrado sistema",
+            "encerrado pelo sistema",
+            "encerrado_pelo_sistema",
+        ],
+        "encerrado pelo sistema": [
+            "encerrado_sistema",
+            "encerrado sistema",
+            "encerrado pelo sistema",
+            "encerrado_pelo_sistema",
+        ],
     }
     normalized = groups.get(key, [key])
     return sorted({v for v in normalized if v})
