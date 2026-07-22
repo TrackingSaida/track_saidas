@@ -786,10 +786,32 @@ def _filtrar_por_data_operacional(
 
 
 def _ctx_data_operacional_saida(db: Session, saida: Saida) -> date:
+    hoje = _hoje_operacional()
+    # Fast path: saída do dia corrente não precisa carregar histórico inteiro.
+    if saida.data == hoje:
+        return hoje
+    ts = saida.timestamp
+    if ts is not None:
+        try:
+            if ts.date() == hoje:
+                return hoje
+        except Exception:
+            pass
     ctx_map = carregar_contexto_operacional(db, [saida.id_saida])
     ctx = ctx_map.get(saida.id_saida)
     ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or saida.timestamp
-    return ts_op.date() if ts_op else (saida.data or _hoje_operacional())
+    return ts_op.date() if ts_op else (saida.data or hoje)
+
+
+def _scan_needs_qr_update(saida: Saida, qr_payload_raw: Optional[str], servico: Optional[str]) -> bool:
+    if not qr_payload_raw or not _should_store_qr_payload_raw(servico or "", qr_payload_raw):
+        return False
+    return not (saida.qr_payload_raw or "").strip()
+
+
+def _scan_item_leve(saida: Saida, detail: Optional[SaidaDetail] = None) -> dict:
+    """Resposta de scan sem queries extras de detail quando não há endereço."""
+    return _saida_to_item(saida, detail)
 
 
 def _payload_nova_saida_mesmo_entregador(
@@ -2742,10 +2764,20 @@ def _owner_valor_por_sub_base(db: Session, user: User, sub_base: str) -> Decimal
         valor = Decimal("0")
     if valor > 0:
         return valor
+    # Cache por request via atributo efêmero no user (evita N SELECTs no mesmo request)
+    cache_key = "_owner_valor_cache"
+    cached = getattr(user, cache_key, None)
+    if isinstance(cached, dict) and sub_base in cached:
+        return cached[sub_base]
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    if not owner:
-        return Decimal("0")
-    return Decimal(getattr(owner, "valor", 0) or 0)
+    resolved = Decimal(getattr(owner, "valor", 0) or 0) if owner else Decimal("0")
+    bucket = cached if isinstance(cached, dict) else {}
+    bucket[sub_base] = resolved
+    try:
+        setattr(user, cache_key, bucket)
+    except Exception:
+        pass
+    return resolved
 
 
 def _garantir_cobranca_owner_saida(db: Session, saida: Saida, owner_valor: Decimal) -> None:
@@ -2865,8 +2897,8 @@ def scan_codigo(
             )
             db.commit()
             db.refresh(nova)
-            detail = _get_detail_for_saida(db, nova.id_saida)
-            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _saida_to_item(nova, detail)}
+            # INSERT novo: detail ainda não existe — evita SELECT inútil
+            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova)}
         except Exception as e:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Erro ao registrar leitura: {e}")
@@ -2976,29 +3008,24 @@ def scan_codigo(
     # - outro motoboy titular: conflito 409 para confirmar assumir
     if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         if motoboy_id is None:
+            if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                return {
+                    "ok": True,
+                    "conflito": False,
+                    "ja_existia": True,
+                    "entrega": _scan_item_leve(saida),
+                }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
-            if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-                if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
-                    saida.qr_payload_raw = qr_payload_raw.strip()
+            if _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                saida.qr_payload_raw = qr_payload_raw.strip()
             _garantir_cobranca_owner_saida(db, saida, owner_valor)
             db.commit()
-            db.refresh(saida)
-            detail = _get_detail_for_saida(db, saida.id_saida)
-            registrar_log_leitura_critico(
-                sub_base=sub_base,
-                username=getattr(user, "username", None),
-                origem=origem,
-                tipo="saida",
-                codigo=saida.codigo,
-                resultado="duplicado",
-                role=role,
-                motoboy_id=None,
-                id_saida=saida.id_saida,
-                origem_app="mobile",
-                endpoint="/mobile/scan",
-                db=db,
-            )
-            return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+            return {
+                "ok": True,
+                "conflito": False,
+                "ja_existia": True,
+                "entrega": _scan_item_leve(saida),
+            }
         if saida.motoboy_id == motoboy_id:
             data_operacional = _ctx_data_operacional_saida(db, saida)
             hoje = _hoje_operacional()
@@ -3029,28 +3056,25 @@ def scan_codigo(
                         "conflito": False,
                     },
                 )
+            # Mesmo motoboy + mesmo dia: se nada a gravar, responde sem lock/commit/log
+            if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                return {
+                    "ok": True,
+                    "conflito": False,
+                    "ja_existia": True,
+                    "entrega": _scan_item_leve(saida),
+                }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
-            if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-                if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
-                    saida.qr_payload_raw = qr_payload_raw.strip()
+            if _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                saida.qr_payload_raw = qr_payload_raw.strip()
             _garantir_cobranca_owner_saida(db, saida, owner_valor)
             db.commit()
-            detail = _get_detail_for_saida(db, saida.id_saida)
-            registrar_log_leitura_critico(
-                sub_base=sub_base,
-                username=getattr(user, "username", None),
-                origem=origem,
-                tipo="saida",
-                codigo=saida.codigo,
-                resultado="duplicado",
-                role=role,
-                motoboy_id=motoboy_id,
-                id_saida=saida.id_saida,
-                origem_app="mobile",
-                endpoint="/mobile/scan",
-                db=db,
-            )
-            return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+            return {
+                "ok": True,
+                "conflito": False,
+                "ja_existia": True,
+                "entrega": _scan_item_leve(saida),
+            }
         if saida.motoboy_id is not None:
             id_saida_lock = saida.id_saida
             saida = _lock_saida_para_scan(db, id_saida_lock, sub_base)
@@ -3087,27 +3111,23 @@ def scan_codigo(
                     },
                 )
             if saida.motoboy_id == motoboy_id:
-                if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-                    if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
-                        saida.qr_payload_raw = qr_payload_raw.strip()
+                if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                    return {
+                        "ok": True,
+                        "conflito": False,
+                        "ja_existia": True,
+                        "entrega": _scan_item_leve(saida),
+                    }
+                if _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                    saida.qr_payload_raw = qr_payload_raw.strip()
                 _garantir_cobranca_owner_saida(db, saida, owner_valor)
                 db.commit()
-                detail = _get_detail_for_saida(db, saida.id_saida)
-                registrar_log_leitura_critico(
-                    sub_base=sub_base,
-                    username=getattr(user, "username", None),
-                    origem=origem,
-                    tipo="saida",
-                    codigo=saida.codigo,
-                    resultado="duplicado",
-                    role=role,
-                    motoboy_id=motoboy_id,
-                    id_saida=saida.id_saida,
-                    origem_app="mobile",
-                    endpoint="/mobile/scan",
-                    db=db,
-                )
-                return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+                return {
+                    "ok": True,
+                    "conflito": False,
+                    "ja_existia": True,
+                    "entrega": _scan_item_leve(saida),
+                }
             # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
 
