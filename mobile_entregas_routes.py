@@ -1939,9 +1939,58 @@ def _should_replace_client_coords(
     """Só substitui coords do cliente por resultado strict validado (cidade/estado/CEP conferidos)."""
     if origem == "google_places" or client_precision == "rooftop":
         return False
+    if origem == "mapa" and client_precision == "rooftop":
+        return False
+    # Servidor claramente melhor (ex.: Google rooftop vs Nominatim approx)
+    if _precision_rank(server_precision) > _precision_rank(client_precision):
+        return True
     if dist_m <= REVALIDATE_COORDS_DISTANCE_M:
         return False
     return _precision_rank(server_precision) >= _precision_rank(client_precision)
+
+
+def _try_upgrade_from_strict(
+    *,
+    body: "EnderecoBody",
+    db: Session,
+    lat: float,
+    lon: float,
+    coord_precision: Optional[str],
+    origem: str,
+) -> Optional[Tuple[float, float, str, str, float]]:
+    """Tenta melhorar coords fracas do cliente com geocode strict (Google quando habilitado)."""
+    if origem in ("google_places", "mapa") and coord_precision == "rooftop":
+        return None
+    if _precision_rank(coord_precision) >= _precision_rank("rooftop"):
+        return None
+    strict = geocode_address_strict(
+        rua=body.rua,
+        numero=body.numero,
+        bairro=body.bairro,
+        cidade=body.cidade,
+        estado=body.estado,
+        cep=body.cep,
+        db=db,
+    )
+    if not strict:
+        return None
+    s_lat, s_lon, s_prec, s_source, s_score = strict
+    dist_m = haversine_m(lat, lon, s_lat, s_lon)
+    if _should_replace_client_coords(
+        origem=origem,
+        client_precision=coord_precision,
+        dist_m=dist_m,
+        server_precision=s_prec,
+    ):
+        return s_lat, s_lon, s_prec, s_source, s_score
+    if (
+        s_prec == "rooftop"
+        and dist_m <= REVALIDATE_COORDS_DISTANCE_M
+        and _precision_rank(coord_precision) < _precision_rank("rooftop")
+    ):
+        # Mantém pin do cliente se já está perto, só promove metadado
+        return lat, lon, "rooftop", s_source, s_score
+    return None
 
 
 @router.put("/entrega/{id_saida}/endereco", response_model=EntregaListItem)
@@ -2042,6 +2091,25 @@ def atualizar_endereco(
                 elif coord_precision is None:
                     coord_precision = s_prec if s_prec != "approx" else "street"
             # strict None → manter coords do cliente (nunca degradar por geocode fraco)
+        else:
+            # manual / ocr / voz / mapa com precisão fraca: tenta upgrade via Google
+            upgraded = _try_upgrade_from_strict(
+                body=body,
+                db=db,
+                lat=lat,
+                lon=lon,
+                coord_precision=coord_precision,
+                origem=origem,
+            )
+            if upgraded:
+                lat, lon, coord_precision, geocode_source, geocode_score = upgraded
+                geocode_called = True
+                log.info(
+                    "endereco_save upgraded weak client coords origem=%s precision=%s id_saida=%s",
+                    origem,
+                    coord_precision,
+                    id_saida,
+                )
         if coord_precision is None:
             if origem in ("mapa", "google_places"):
                 coord_precision = "rooftop"

@@ -101,10 +101,38 @@ def geocode_address(
         return None
 
 
+def _google_formatted_matches_place(
+    formatted: str,
+    *,
+    cidade: Optional[str] = None,
+    estado: Optional[str] = None,
+) -> bool:
+    """Valida se o formatted_address do Google bate com cidade/UF esperados."""
+    fmt_norm = normalize_address_text(formatted)
+    if not fmt_norm:
+        return False
+    cidade_n = normalize_address_text(cidade or "")
+    if cidade_n and cidade_n not in fmt_norm:
+        return False
+    estado_n = normalize_address_text(estado or "")
+    if len(estado_n) == 2:
+        # Ex.: "carapicuiba - sp, brasil" ou ", sp,"
+        if f" {estado_n} " not in f" {fmt_norm} " and not fmt_norm.endswith(f" {estado_n}"):
+            # aceita "sp," / "- sp"
+            if f" {estado_n}," not in fmt_norm and f"- {estado_n}" not in fmt_norm:
+                return False
+    elif estado_n and estado_n not in fmt_norm:
+        return False
+    return True
+
+
 def _geocode_with_google(
     address: str,
     api_key: str,
     expected_numero: Optional[str] = None,
+    *,
+    cidade: Optional[str] = None,
+    estado: Optional[str] = None,
 ) -> Optional[Tuple[float, float, str]]:
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     try:
@@ -126,13 +154,35 @@ def _geocode_with_google(
         results = data.get("results") or []
         if not results:
             return None
-        first = results[0]
-        location = (first.get("geometry") or {}).get("location") or {}
+
+        cidade_n = (cidade or "").strip()
+        estado_n = (estado or "").strip()
+        chosen = None
+        for item in results:
+            formatted = str(item.get("formatted_address") or "")
+            if cidade_n or estado_n:
+                if not _google_formatted_matches_place(
+                    formatted, cidade=cidade_n, estado=estado_n
+                ):
+                    continue
+            chosen = item
+            break
+        if chosen is None:
+            # Sem filtro de cidade/UF: usa o primeiro. Com filtro e nenhum match: rejeita.
+            if cidade_n or estado_n:
+                logger.warning(
+                    "Geocoding (google): nenhum resultado bate cidade/UF para %s",
+                    address[:80],
+                )
+                return None
+            chosen = results[0]
+
+        location = (chosen.get("geometry") or {}).get("location") or {}
         lat = location.get("lat")
         lon = location.get("lng")
         if lat is None or lon is None:
             return None
-        location_type = str((first.get("geometry") or {}).get("location_type") or "").upper()
+        location_type = str((chosen.get("geometry") or {}).get("location_type") or "").upper()
         precision_map = {
             "ROOFTOP": "rooftop",
             "RANGE_INTERPOLATED": "rooftop",
@@ -140,9 +190,9 @@ def _geocode_with_google(
             "APPROXIMATE": "approx",
         }
         precision = precision_map.get(location_type, "approx")
+        formatted = str(chosen.get("formatted_address") or "")
         if expected_numero and expected_numero.strip() and precision != "approx":
             exp_digits = re.sub(r"\D", "", expected_numero)
-            formatted = str(first.get("formatted_address") or "")
             fmt_digits = re.sub(r"\D", "", formatted)
             if exp_digits and exp_digits not in fmt_digits:
                 precision = "approx"
@@ -332,6 +382,9 @@ def geocode_address_any(
     address: str,
     db: Optional[Any] = None,
     expected_numero: Optional[str] = None,
+    *,
+    cidade: Optional[str] = None,
+    estado: Optional[str] = None,
 ) -> Optional[Tuple[float, float, str]]:
     """
     Wrapper de alto nível: tenta provedor externo configurável e faz fallback para OSM.
@@ -339,6 +392,7 @@ def geocode_address_any(
     Configuração via ambiente:
     - GEOCODER_PROVIDER: \"geoapify\" | \"locationiq\" | \"geocode_maps_co\" (default: \"geoapify\")
     - GEOCODER_API_KEY: chave do provedor externo (obrigatória para geoapify/locationiq/maps_co)
+    - GOOGLE_GEOCODING_ENABLED + GOOGLE_GEOCODING_API_KEY: prioriza Google Geocoding
     """
     addr = (address or "").strip()
     if not addr:
@@ -346,8 +400,15 @@ def geocode_address_any(
 
     cached = get_cached(db, addr)
     if cached:
-        precision = _external_provider_precision(expected_numero)
-        return cached[0], cached[1], precision
+        lat_c, lon_c, provider_c = cached[0], cached[1], cached[2] if len(cached) > 2 else None
+        # Cache antigo podia gravar google com precisão perdida; provider google + número → rooftop.
+        if (provider_c or "").lower() == "google" and (expected_numero or "").strip():
+            precision = "rooftop"
+        elif (provider_c or "").lower() == "google":
+            precision = "street"
+        else:
+            precision = _external_provider_precision(expected_numero)
+        return lat_c, lon_c, precision
 
     google_enabled = os.getenv("GOOGLE_GEOCODING_ENABLED", "false").strip().lower() in (
         "1",
@@ -359,7 +420,13 @@ def geocode_address_any(
         or os.getenv("GEOCODER_API_KEY", "").strip()
     )
     if google_enabled and google_key:
-        google_coords = _geocode_with_google(addr, google_key, expected_numero)
+        google_coords = _geocode_with_google(
+            addr,
+            google_key,
+            expected_numero,
+            cidade=cidade,
+            estado=estado,
+        )
         if google_coords:
             set_cached(db, addr, google_coords[0], google_coords[1], "google")
             logger.info("geocode_attempt query=%s provider=google success=true", addr[:80])
@@ -507,6 +574,8 @@ def geocode_address_strict(
     """
     Geocode com validação de cidade/estado/CEP. Retorna
     (lat, lon, precision, source, score) ou None.
+
+    Ordem: Google/provedor externo (quando habilitado) → Nominatim validado.
     """
     cidade_n = (cidade or "").strip()
     estado_n = (estado or "").strip()
@@ -524,6 +593,32 @@ def geocode_address_strict(
         "Brasil",
     ]
     query = ", ".join(p for p in parts if p)
+
+    # 1) Google / Geoapify / etc. — prioriza rooftop quando disponível
+    try:
+        any_result = geocode_address_any(
+            query,
+            db=db,
+            expected_numero=numero,
+            cidade=cidade_n,
+            estado=estado_n,
+        )
+        if any_result:
+            lat_a, lon_a, prec_a = any_result
+            # approx do provedor não é confiável o suficiente para pular o Nominatim
+            if prec_a in ("rooftop", "street"):
+                google_on = os.getenv("GOOGLE_GEOCODING_ENABLED", "false").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                source = "google" if google_on else "geocode_provider"
+                score = 95.0 if prec_a == "rooftop" else 80.0
+                return lat_a, lon_a, prec_a, source, score
+    except Exception as e:
+        logger.warning("geocode_address_strict provider path falhou: %s", e)
+
+    # 2) Nominatim com validação estruturada
     url = "https://nominatim.openstreetmap.org/search"
     try:
         r = requests.get(
@@ -543,17 +638,33 @@ def geocode_address_strict(
         data = r.json()
         if not isinstance(data, list):
             return None
+
+        expected_num = re.sub(r"\D", "", str(numero or ""))
+        ranked: List[Tuple[int, dict]] = []
         for item in data:
             if not validate_nominatim_candidate(
                 item, cidade=cidade_n, estado=estado_n, cep=cep
             ):
                 continue
+            addr = item.get("address") or {}
+            house = re.sub(r"\D", "", str(addr.get("house_number") or ""))
+            rank = 0
+            if expected_num and house and (
+                expected_num == house or expected_num in house or house in expected_num
+            ):
+                rank = 2
+            elif house or str(item.get("type") or "").lower() in ("house", "building"):
+                rank = 1
+            ranked.append((rank, item))
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        for rank, item in ranked:
             lat = float(item["lat"])
             lon = float(item["lon"])
-            addr = item.get("address") or {}
-            house = str(addr.get("house_number") or "").strip()
-            precision = "rooftop" if house else "street"
-            score = 90.0 if precision == "rooftop" else 70.0
+            precision = "rooftop" if rank >= 2 else ("street" if rank == 1 else "street")
+            if rank == 0 and expected_num:
+                precision = "approx"
+            score = 90.0 if precision == "rooftop" else (70.0 if precision == "street" else 50.0)
             set_cached(db, query, lat, lon, "nominatim_strict")
             return lat, lon, precision, "nominatim_strict", score
     except Exception as e:
@@ -587,7 +698,13 @@ def geocode_address_with_fallbacks(
         endereco_formatado=endereco_formatado,
     )
     for query in queries:
-        result = geocode_address_any(query, db=db, expected_numero=numero)
+        result = geocode_address_any(
+            query,
+            db=db,
+            expected_numero=numero,
+            cidade=cidade,
+            estado=estado,
+        )
         if result:
             return result
     return None
