@@ -54,6 +54,7 @@ def registrar_log_leitura_critico(
     assert db is not None
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=DEDUP_WINDOW_SECONDS)
+        # Dedup barato: só id + created_at com índice composto
         dup = db.scalar(
             select(LogLeitura.id).where(
                 LogLeitura.sub_base == sub_base,

@@ -60,6 +60,7 @@ from saidas_routes import (
     STATUS_ENTREGUE,
     STATUS_AUSENTE,
     STATUS_CANCELADO,
+    STATUS_ENCERRADO_SISTEMA,
     _check_delete_window_or_409,
     _should_store_qr_payload_raw,
     normalizar_status_saida,
@@ -427,8 +428,8 @@ class ExtratoFinanceiroOut(BaseModel):
 def _status_exibicao(status: Optional[str]) -> str:
     if not status:
         return "Pendente"
-    s = (status or "").strip().upper()
-    if s in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    s = normalizar_status_saida(status).strip().upper()
+    if s in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "SAIU"):
         return "Pendente"
     if s == STATUS_ENTREGUE:
         return "Entregue"
@@ -436,6 +437,8 @@ def _status_exibicao(status: Optional[str]) -> str:
         return "Ausente"
     if s == STATUS_CANCELADO:
         return "Cancelado"
+    if s == STATUS_ENCERRADO_SISTEMA:
+        return "Encerrado"
     return status or "Pendente"
 
 
@@ -783,10 +786,32 @@ def _filtrar_por_data_operacional(
 
 
 def _ctx_data_operacional_saida(db: Session, saida: Saida) -> date:
+    hoje = _hoje_operacional()
+    # Fast path: saída do dia corrente não precisa carregar histórico inteiro.
+    if saida.data == hoje:
+        return hoje
+    ts = saida.timestamp
+    if ts is not None:
+        try:
+            if ts.date() == hoje:
+                return hoje
+        except Exception:
+            pass
     ctx_map = carregar_contexto_operacional(db, [saida.id_saida])
     ctx = ctx_map.get(saida.id_saida)
     ts_op = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or saida.timestamp
-    return ts_op.date() if ts_op else (saida.data or _hoje_operacional())
+    return ts_op.date() if ts_op else (saida.data or hoje)
+
+
+def _scan_needs_qr_update(saida: Saida, qr_payload_raw: Optional[str], servico: Optional[str]) -> bool:
+    if not qr_payload_raw or not _should_store_qr_payload_raw(servico or "", qr_payload_raw):
+        return False
+    return not (saida.qr_payload_raw or "").strip()
+
+
+def _scan_item_leve(saida: Saida, detail: Optional[SaidaDetail] = None) -> dict:
+    """Resposta de scan sem queries extras de detail quando não há endereço."""
+    return _saida_to_item(saida, detail)
 
 
 def _payload_nova_saida_mesmo_entregador(
@@ -998,6 +1023,8 @@ def extrato_financeiro_motoboy(
     for s in rows:
         status_up = _status_normalizado_upper(s.status)
         is_cancelado = status_up == STATUS_CANCELADO
+        is_encerrado = status_up == STATUS_ENCERRADO_SISTEMA
+        is_sem_valor = is_cancelado or is_encerrado
         is_grupo_entregue = status_up in grupo_entregue
         if modo == "cancelados":
             passa_filtro = is_cancelado
@@ -1027,7 +1054,7 @@ def extrato_financeiro_motoboy(
         if not passa_filtro:
             continue
         total_filtrados += 1
-        item_valor = Decimal("0.00") if is_cancelado else _valor_saida(precos_mobile, s)
+        item_valor = Decimal("0.00") if is_sem_valor else _valor_saida(precos_mobile, s)
         if d:
             dias_map[d]["total_pacotes_filtrados"] += 1
             dias_map[d]["itens"].append(
@@ -1045,7 +1072,7 @@ def extrato_financeiro_motoboy(
         if tipo in por_servico:
             por_servico[tipo] += 1
 
-        if is_cancelado:
+        if is_sem_valor:
             continue
         valor = item_valor
         valor_total += valor
@@ -1716,11 +1743,59 @@ def rotas_cancelar(
 ):
     """Cancela rota aberta (preparando ou ativa) antes de recriar otimização."""
     motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
     rota = db.get(RotasMotoboy, rota_id)
     if not rota or rota.motoboy_id != motoboy_id:
         raise HTTPException(status_code=404, detail="Rota não encontrada.")
     if rota.status not in ("ativa", "preparando"):
         raise HTTPException(status_code=400, detail="Rota não está aberta.")
+    if sub_base and (rota.sub_base or "") != sub_base:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+
+    ordem_ids: List[int] = []
+    raw_ordem = getattr(rota, "ordem_json", None)
+    if isinstance(raw_ordem, list):
+        for item in raw_ordem:
+            try:
+                ordem_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(raw_ordem, str) and raw_ordem.strip():
+        try:
+            parsed = json.loads(raw_ordem)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    try:
+                        ordem_ids.append(int(item))
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            ordem_ids = []
+
+    if ordem_ids:
+        q_saidas = select(Saida).where(
+            Saida.id_saida.in_(ordem_ids),
+            Saida.motoboy_id == motoboy_id,
+            Saida.status == STATUS_EM_ROTA,
+        )
+        if sub_base:
+            q_saidas = q_saidas.where(Saida.sub_base == sub_base)
+        rows = db.scalars(q_saidas).all()
+        for s in rows:
+            status_anterior = s.status
+            s.status = STATUS_SAIU_PARA_ENTREGA
+            db.add(
+                SaidaHistorico(
+                    id_saida=s.id_saida,
+                    evento="rota_cancelada",
+                    status_anterior=status_anterior,
+                    status_novo=STATUS_SAIU_PARA_ENTREGA,
+                    motoboy_id_anterior=motoboy_id,
+                    motoboy_id_novo=motoboy_id,
+                    user_id=getattr(user, "id", None),
+                )
+            )
+
     rota.status = "cancelada"
     rota.finalizado_em = datetime.utcnow()
     rota.updated_at = datetime.utcnow()
@@ -1886,9 +1961,58 @@ def _should_replace_client_coords(
     """Só substitui coords do cliente por resultado strict validado (cidade/estado/CEP conferidos)."""
     if origem == "google_places" or client_precision == "rooftop":
         return False
+    if origem == "mapa" and client_precision == "rooftop":
+        return False
+    # Servidor claramente melhor (ex.: Google rooftop vs Nominatim approx)
+    if _precision_rank(server_precision) > _precision_rank(client_precision):
+        return True
     if dist_m <= REVALIDATE_COORDS_DISTANCE_M:
         return False
     return _precision_rank(server_precision) >= _precision_rank(client_precision)
+
+
+def _try_upgrade_from_strict(
+    *,
+    body: "EnderecoBody",
+    db: Session,
+    lat: float,
+    lon: float,
+    coord_precision: Optional[str],
+    origem: str,
+) -> Optional[Tuple[float, float, str, str, float]]:
+    """Tenta melhorar coords fracas do cliente com geocode strict (Google quando habilitado)."""
+    if origem in ("google_places", "mapa") and coord_precision == "rooftop":
+        return None
+    if _precision_rank(coord_precision) >= _precision_rank("rooftop"):
+        return None
+    strict = geocode_address_strict(
+        rua=body.rua,
+        numero=body.numero,
+        bairro=body.bairro,
+        cidade=body.cidade,
+        estado=body.estado,
+        cep=body.cep,
+        db=db,
+    )
+    if not strict:
+        return None
+    s_lat, s_lon, s_prec, s_source, s_score = strict
+    dist_m = haversine_m(lat, lon, s_lat, s_lon)
+    if _should_replace_client_coords(
+        origem=origem,
+        client_precision=coord_precision,
+        dist_m=dist_m,
+        server_precision=s_prec,
+    ):
+        return s_lat, s_lon, s_prec, s_source, s_score
+    if (
+        s_prec == "rooftop"
+        and dist_m <= REVALIDATE_COORDS_DISTANCE_M
+        and _precision_rank(coord_precision) < _precision_rank("rooftop")
+    ):
+        # Mantém pin do cliente se já está perto, só promove metadado
+        return lat, lon, "rooftop", s_source, s_score
+    return None
 
 
 @router.put("/entrega/{id_saida}/endereco", response_model=EntregaListItem)
@@ -1989,6 +2113,25 @@ def atualizar_endereco(
                 elif coord_precision is None:
                     coord_precision = s_prec if s_prec != "approx" else "street"
             # strict None → manter coords do cliente (nunca degradar por geocode fraco)
+        else:
+            # manual / ocr / voz / mapa com precisão fraca: tenta upgrade via Google
+            upgraded = _try_upgrade_from_strict(
+                body=body,
+                db=db,
+                lat=lat,
+                lon=lon,
+                coord_precision=coord_precision,
+                origem=origem,
+            )
+            if upgraded:
+                lat, lon, coord_precision, geocode_source, geocode_score = upgraded
+                geocode_called = True
+                log.info(
+                    "endereco_save upgraded weak client coords origem=%s precision=%s id_saida=%s",
+                    origem,
+                    coord_precision,
+                    id_saida,
+                )
         if coord_precision is None:
             if origem in ("mapa", "google_places"):
                 coord_precision = "rooftop"
@@ -2621,10 +2764,20 @@ def _owner_valor_por_sub_base(db: Session, user: User, sub_base: str) -> Decimal
         valor = Decimal("0")
     if valor > 0:
         return valor
+    # Cache por request via atributo efêmero no user (evita N SELECTs no mesmo request)
+    cache_key = "_owner_valor_cache"
+    cached = getattr(user, cache_key, None)
+    if isinstance(cached, dict) and sub_base in cached:
+        return cached[sub_base]
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    if not owner:
-        return Decimal("0")
-    return Decimal(getattr(owner, "valor", 0) or 0)
+    resolved = Decimal(getattr(owner, "valor", 0) or 0) if owner else Decimal("0")
+    bucket = cached if isinstance(cached, dict) else {}
+    bucket[sub_base] = resolved
+    try:
+        setattr(user, cache_key, bucket)
+    except Exception:
+        pass
+    return resolved
 
 
 def _garantir_cobranca_owner_saida(db: Session, saida: Saida, owner_valor: Decimal) -> None:
@@ -2744,8 +2897,8 @@ def scan_codigo(
             )
             db.commit()
             db.refresh(nova)
-            detail = _get_detail_for_saida(db, nova.id_saida)
-            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _saida_to_item(nova, detail)}
+            # INSERT novo: detail ainda não existe — evita SELECT inútil
+            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova)}
         except Exception as e:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Erro ao registrar leitura: {e}")
@@ -2819,6 +2972,35 @@ def scan_codigo(
             content=_status_finalizado_detail(saida, status_norm),
         )
 
+    # Encerrado pelo sistema: exige confirmação explícita antes de reativar
+    if status_norm == STATUS_ENCERRADO_SISTEMA:
+        registrar_log_leitura_critico(
+            sub_base=sub_base,
+            username=getattr(user, "username", None),
+            origem=origem,
+            tipo="saida",
+            codigo=saida.codigo,
+            resultado="leitura_encerrado_aguardando_confirmacao",
+            role=role,
+            motoboy_id=motoboy_id,
+            id_saida=saida.id_saida,
+            origem_app="mobile",
+            endpoint="/mobile/scan",
+            db=db,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "LEITURA_ENCERRADO_SISTEMA",
+                "id_saida": saida.id_saida,
+                "status_atual": saida.status,
+                "motoboy_id": saida.motoboy_id,
+                "motoboy_nome": _nome_motoboy_atual(db, saida) or saida.entregador or "",
+                "conflito": False,
+                "message": "Pedido encerrado pelo sistema. Confirme para abrir nova saída.",
+            },
+        )
+
     # Em rota / saiu:
     # - staff segue sem conflito
     # - mesmo motoboy segue sem conflito
@@ -2826,29 +3008,24 @@ def scan_codigo(
     # - outro motoboy titular: conflito 409 para confirmar assumir
     if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         if motoboy_id is None:
+            if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                return {
+                    "ok": True,
+                    "conflito": False,
+                    "ja_existia": True,
+                    "entrega": _scan_item_leve(saida),
+                }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
-            if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-                if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
-                    saida.qr_payload_raw = qr_payload_raw.strip()
+            if _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                saida.qr_payload_raw = qr_payload_raw.strip()
             _garantir_cobranca_owner_saida(db, saida, owner_valor)
             db.commit()
-            db.refresh(saida)
-            detail = _get_detail_for_saida(db, saida.id_saida)
-            registrar_log_leitura_critico(
-                sub_base=sub_base,
-                username=getattr(user, "username", None),
-                origem=origem,
-                tipo="saida",
-                codigo=saida.codigo,
-                resultado="duplicado",
-                role=role,
-                motoboy_id=None,
-                id_saida=saida.id_saida,
-                origem_app="mobile",
-                endpoint="/mobile/scan",
-                db=db,
-            )
-            return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+            return {
+                "ok": True,
+                "conflito": False,
+                "ja_existia": True,
+                "entrega": _scan_item_leve(saida),
+            }
         if saida.motoboy_id == motoboy_id:
             data_operacional = _ctx_data_operacional_saida(db, saida)
             hoje = _hoje_operacional()
@@ -2879,28 +3056,25 @@ def scan_codigo(
                         "conflito": False,
                     },
                 )
+            # Mesmo motoboy + mesmo dia: se nada a gravar, responde sem lock/commit/log
+            if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                return {
+                    "ok": True,
+                    "conflito": False,
+                    "ja_existia": True,
+                    "entrega": _scan_item_leve(saida),
+                }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
-            if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-                if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
-                    saida.qr_payload_raw = qr_payload_raw.strip()
+            if _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                saida.qr_payload_raw = qr_payload_raw.strip()
             _garantir_cobranca_owner_saida(db, saida, owner_valor)
             db.commit()
-            detail = _get_detail_for_saida(db, saida.id_saida)
-            registrar_log_leitura_critico(
-                sub_base=sub_base,
-                username=getattr(user, "username", None),
-                origem=origem,
-                tipo="saida",
-                codigo=saida.codigo,
-                resultado="duplicado",
-                role=role,
-                motoboy_id=motoboy_id,
-                id_saida=saida.id_saida,
-                origem_app="mobile",
-                endpoint="/mobile/scan",
-                db=db,
-            )
-            return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+            return {
+                "ok": True,
+                "conflito": False,
+                "ja_existia": True,
+                "entrega": _scan_item_leve(saida),
+            }
         if saida.motoboy_id is not None:
             id_saida_lock = saida.id_saida
             saida = _lock_saida_para_scan(db, id_saida_lock, sub_base)
@@ -2937,27 +3111,23 @@ def scan_codigo(
                     },
                 )
             if saida.motoboy_id == motoboy_id:
-                if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-                    if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
-                        saida.qr_payload_raw = qr_payload_raw.strip()
+                if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                    return {
+                        "ok": True,
+                        "conflito": False,
+                        "ja_existia": True,
+                        "entrega": _scan_item_leve(saida),
+                    }
+                if _scan_needs_qr_update(saida, qr_payload_raw, servico):
+                    saida.qr_payload_raw = qr_payload_raw.strip()
                 _garantir_cobranca_owner_saida(db, saida, owner_valor)
                 db.commit()
-                detail = _get_detail_for_saida(db, saida.id_saida)
-                registrar_log_leitura_critico(
-                    sub_base=sub_base,
-                    username=getattr(user, "username", None),
-                    origem=origem,
-                    tipo="saida",
-                    codigo=saida.codigo,
-                    resultado="duplicado",
-                    role=role,
-                    motoboy_id=motoboy_id,
-                    id_saida=saida.id_saida,
-                    origem_app="mobile",
-                    endpoint="/mobile/scan",
-                    db=db,
-                )
-                return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+                return {
+                    "ok": True,
+                    "conflito": False,
+                    "ja_existia": True,
+                    "entrega": _scan_item_leve(saida),
+                }
             # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
 
@@ -3052,6 +3222,110 @@ def scan_codigo(
         "ok": True,
         "conflito": False,
         "ja_existia": not houve_atribuicao_ou_progresso,
+        "entrega": _saida_to_item(saida, detail),
+    }
+
+
+@router.post("/entrega/{id_saida}/confirmar-reativacao-encerrado")
+def confirmar_reativacao_encerrado_mobile(
+    id_saida: int,
+    body: ConfirmarNovaSaidaMesmoEntregadorBody = Body(default=ConfirmarNovaSaidaMesmoEntregadorBody()),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_mobile_scan_user),
+):
+    """Confirma reativação de pedido ENCERRADO_SISTEMA após aviso no scan."""
+    sub_base = user.sub_base
+    role = int(getattr(user, "role", 0) or 0)
+    motoboy_id = getattr(user, "motoboy_id", None) if role == 4 else None
+    status_scan = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    saida = db.scalar(
+        select(Saida).where(
+            Saida.id_saida == id_saida,
+            Saida.sub_base == sub_base,
+        )
+    )
+    if not saida:
+        raise HTTPException(status_code=404, detail="Saída não encontrada.")
+
+    status_norm = normalizar_status_saida(saida.status)
+    if status_norm != STATUS_ENCERRADO_SISTEMA:
+        if _status_esta_finalizado(status_norm):
+            return JSONResponse(
+                status_code=422,
+                content=_status_finalizado_detail(saida, status_norm),
+            )
+        detail = _get_detail_for_saida(db, saida.id_saida)
+        return {
+            "ok": True,
+            "conflito": False,
+            "ja_existia": True,
+            "reativado_de_encerrado": False,
+            "entrega": _saida_to_item(saida, detail),
+        }
+
+    saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
+    if normalizar_status_saida(saida.status) != STATUS_ENCERRADO_SISTEMA:
+        detail = _get_detail_for_saida(db, saida.id_saida)
+        return {
+            "ok": True,
+            "conflito": False,
+            "ja_existia": True,
+            "reativado_de_encerrado": False,
+            "entrega": _saida_to_item(saida, detail),
+        }
+
+    motoboy_id_anterior = saida.motoboy_id
+    if motoboy_id is not None:
+        motoboy = db.get(Motoboy, motoboy_id)
+        if motoboy:
+            saida.entregador = _get_motoboy_nome(db, motoboy)
+            saida.entregador_id = None
+        saida.motoboy_id = motoboy_id
+    saida.status = status_scan
+    owner_valor = _owner_valor_por_sub_base(db, user, sub_base)
+    _garantir_cobranca_owner_saida(db, saida, owner_valor)
+    db.add(
+        SaidaHistorico(
+            id_saida=saida.id_saida,
+            evento="assumir",
+            status_anterior=STATUS_ENCERRADO_SISTEMA,
+            status_novo=status_scan,
+            motoboy_id_anterior=motoboy_id_anterior,
+            motoboy_id_novo=motoboy_id,
+            user_id=getattr(user, "id", None),
+            payload="reativado_de_encerrado_sistema",
+        )
+    )
+    try:
+        db.commit()
+        db.refresh(saida)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Erro ao confirmar reativação do pedido encerrado.")
+
+    registrar_log_leitura_critico(
+        sub_base=sub_base,
+        username=getattr(user, "username", None),
+        origem=(body.origem or "mobile"),
+        tipo="saida",
+        codigo=saida.codigo,
+        resultado="reativacao_encerrado_confirmada",
+        role=role,
+        motoboy_id=motoboy_id,
+        id_saida=saida.id_saida,
+        origem_app="mobile",
+        endpoint="/mobile/entrega/{id_saida}/confirmar-reativacao-encerrado",
+        db=db,
+    )
+    detail = _get_detail_for_saida(db, saida.id_saida)
+    return {
+        "ok": True,
+        "conflito": False,
+        "ja_existia": False,
+        "reativado_de_encerrado": True,
         "entrega": _saida_to_item(saida, detail),
     }
 

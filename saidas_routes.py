@@ -231,6 +231,7 @@ STATUS_EM_ROTA = "EM_ROTA"
 STATUS_ENTREGUE = "ENTREGUE"
 STATUS_AUSENTE = "AUSENTE"
 STATUS_CANCELADO = "CANCELADO"
+STATUS_ENCERRADO_SISTEMA = "ENCERRADO_SISTEMA"
 
 
 def normalizar_status_saida(raw: Optional[str]) -> str:
@@ -261,6 +262,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return STATUS_AUSENTE
     if lower == "cancelado":
         return STATUS_CANCELADO
+    if lower in ("encerrado", "encerrado_sistema", "encerrado pelo sistema", "encerrado_pelo_sistema"):
+        return STATUS_ENCERRADO_SISTEMA
     return s
 
 
@@ -1088,6 +1091,33 @@ def ler_saida(
                 "entregador_atual": existente.entregador,
             },
         )
+
+    if status_norm == STATUS_ENCERRADO_SISTEMA:
+        status_anterior = existente.status
+        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.entregador_id = entregador_id
+        existente.entregador = entregador_nome
+        if motoboy_id is not None:
+            existente.motoboy_id = motoboy_id
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="assumir",
+                status_anterior=status_anterior,
+                status_novo=existente.status,
+                motoboy_id_anterior=None,
+                motoboy_id_novo=motoboy_id,
+                user_id=getattr(current_user, "id", None),
+                payload="reativado_de_encerrado_sistema",
+            )
+        )
+        try:
+            db.commit()
+            db.refresh(existente)
+            return SaidaOut.model_validate(existente)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao reativar saída encerrada.")
 
     # status cancelado ou outro: retornar como está (idempotente) ou 422 conforme regra de negócio
     return SaidaOut.model_validate(existente)
