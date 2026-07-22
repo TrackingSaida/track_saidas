@@ -158,15 +158,20 @@ Não há migração de banco obrigatória para este job.
 - Header obrigatório: `X-Cron-Secret: <secret>`
 - Query params:
   - `dry_run=true|false` (default `true` — só conta, **não** altera)
-  - `batch_size` (default `500`, entre 50 e 2000)
+  - `batch_size` (default `500`, entre 50 e 2000) — **limite máximo por requisição** (não é só tamanho de commit interno)
   - `sub_base` (opcional — limita a uma sub_base)
   - `data=YYYY-MM-DD` (opcional — data de referência da janela; default = hoje)
 
-Resposta útil para validar antes de aplicar:
+Cada chamada seleciona e atualiza **no máximo** `batch_size` registros, com **um único commit**.  
+Se a resposta tiver `tem_mais=true`, repetir a chamada até `tem_mais=false`.
 
-- `inicio_vivo`, `ref_date`
-- `candidatos`, `elegiveis`, `atualizados`
-- `por_sub_base`, `sample_ids`
+Resposta:
+
+- `inicio_vivo`, `ref_date`, `batch_size`
+- `candidatos`, `elegiveis`, `atualizados`, `restantes`, `tem_mais`
+- `por_sub_base`, `sample_ids`, `tempo_execucao_ms`
+
+Nota de performance: a atualização usa `UPDATE` via SQLAlchemy Core (não atribuição ORM), para **não** disparar o listener `saida_after_update` que recalcula coleta a cada alteração de `Saida`.
 
 ### Rollout recomendado no Render
 
@@ -179,13 +184,13 @@ curl -sf -X POST \
   "https://track-saidas-api.onrender.com/api/internal/encerrar-pendentes-quinzena?dry_run=true"
 ```
 
-3. Conferir `elegiveis` / `por_sub_base` / `sample_ids` nos logs ou na resposta.
-4. Só então aplicar:
+3. Conferir `elegiveis` / `por_sub_base` / `sample_ids` / `tem_mais` nos logs ou na resposta.
+4. Aplicar em lotes (ex.: 50–500 por chamada), repetindo enquanto `tem_mais` for true:
 
 ```bash
 curl -sf -X POST \
   -H "X-Cron-Secret: $CRON_CLEANUP_SECRET" \
-  "https://track-saidas-api.onrender.com/api/internal/encerrar-pendentes-quinzena?dry_run=false&batch_size=500"
+  "https://track-saidas-api.onrender.com/api/internal/encerrar-pendentes-quinzena?dry_run=false&batch_size=50&sub_base=DG%20EXPRESS"
 ```
 
 ### Agendamento recomendado
@@ -193,7 +198,7 @@ curl -sf -X POST \
 Diário de madrugada (UTC), por exemplo perto de 04:00 BRT:
 
 - Schedule: `0 7 * * *`
-- Command (produção, após validar dry-run):
+- Command (produção, após validar dry-run) — uma chamada por execução do cron; se houver muitos elegíveis, use batch menor e/ou várias execuções no dia:
 
 ```bash
 curl -sf -X POST \

@@ -346,7 +346,12 @@ def internal_encerrar_pendentes_quinzena(request: Request):
     """
     Encerra pendentes (SAIU/EM_ROTA) com data operacional anterior à janela de 2 quinzenas.
     Protegido por X-Cron-Secret (CRON_ENCERRAMENTO_SECRET ou CRON_CLEANUP/REFRESH).
-    Query: dry_run=true|false, batch_size=500, sub_base=opcional, data=YYYY-MM-DD (ref).
+
+    Query: dry_run=true|false, batch_size=500 (limite máximo **por requisição**),
+    sub_base=opcional, data=YYYY-MM-DD (ref).
+
+    Cada chamada atualiza no máximo ``batch_size`` registros (um commit).
+    Se ``tem_mais=true``, repetir a chamada até esgotar.
     """
     from encerramento_quinzena_service import run_encerrar_pendentes_quinzena
     from datetime import date as date_cls
@@ -392,11 +397,15 @@ def internal_encerrar_pendentes_quinzena(request: Request):
             "dry_run": result.dry_run,
             "ref_date": result.ref_date.isoformat(),
             "inicio_vivo": result.inicio_vivo.isoformat(),
+            "batch_size": result.batch_size,
             "candidatos": result.candidatos,
             "elegiveis": result.elegiveis,
             "atualizados": result.atualizados,
+            "restantes": result.restantes,
+            "tem_mais": result.tem_mais,
             "por_sub_base": result.por_sub_base,
             "sample_ids": result.sample_ids,
+            "tempo_execucao_ms": result.tempo_execucao_ms,
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})

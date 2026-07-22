@@ -1,11 +1,12 @@
 """Encerramento automático de pendentes fora da janela de 2 quinzenas."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from models import Saida, SaidaHistorico
@@ -14,14 +15,13 @@ from saida_operacional_utils import (
     deve_excluir_saida_operacional,
     timestamp_operacional_saida,
 )
-from saidas_routes import (
-    STATUS_EM_ROTA,
-    STATUS_ENCERRADO_SISTEMA,
-    STATUS_SAIU_PARA_ENTREGA,
-    normalizar_status_saida,
-)
 
+STATUS_SAIU_PARA_ENTREGA = "SAIU_PARA_ENTREGA"
+STATUS_EM_ROTA = "EM_ROTA"
+STATUS_ENCERRADO_SISTEMA = "ENCERRADO_SISTEMA"
 EVENTO_ENCERRADO = "encerrado_sistema"
+# Chunk só para carregar contexto operacional (não é o limite de escrita).
+_CTX_CHUNK = 250
 
 
 def periodo_janela_viva_quinzenas(ref: date) -> Tuple[date, date]:
@@ -48,12 +48,21 @@ class EncerramentoResult:
     candidatos: int
     elegiveis: int
     atualizados: int
+    restantes: int
+    tem_mais: bool
     por_sub_base: Dict[str, int]
     sample_ids: List[int]
+    tempo_execucao_ms: int
+    batch_size: int
 
 
 def _chunked(ids: Sequence[int], size: int) -> List[List[int]]:
     return [list(ids[i : i + size]) for i in range(0, len(ids), size)]
+
+
+def _status_encerravel(status: Optional[str]) -> bool:
+    s = (status or "").strip().upper().replace(" ", "_")
+    return s in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "SAIU")
 
 
 def run_encerrar_pendentes_quinzena(
@@ -64,6 +73,16 @@ def run_encerrar_pendentes_quinzena(
     batch_size: int = 500,
     sub_base: Optional[str] = None,
 ) -> EncerramentoResult:
+    """
+    Encerra no máximo ``batch_size`` elegíveis por chamada (limite por requisição).
+
+    - dry_run=True: conta elegíveis, não altera nada.
+    - dry_run=False: atualiza até ``batch_size`` registros e faz **um** commit.
+    - Usa UPDATE via Core (não ORM) para não disparar ``saida_after_update``
+      (que recalcula coleta a cada alteração de Saida).
+    """
+    started = time.perf_counter()
+    limit = max(1, int(batch_size))
     ref_date = ref or date.today()
     inicio_vivo, _fim = periodo_janela_viva_quinzenas(ref_date)
     # Prefitro SQL amplo: evita varrer todo o histórico recente da janela viva.
@@ -85,19 +104,21 @@ def run_encerrar_pendentes_quinzena(
         q = q.where(Saida.sub_base == sub_base)
 
     candidates = list(db.scalars(q).all())
+    candidatos = len(candidates)
+
+    selecionados: List[Saida] = []
+    total_elegiveis = 0
     por_sub_base: Dict[str, int] = {}
     sample_ids: List[int] = []
-    elegiveis: List[Saida] = []
 
-    for chunk in _chunked([int(s.id_saida) for s in candidates], max(50, min(batch_size, 250))):
+    for chunk in _chunked([int(s.id_saida) for s in candidates], _CTX_CHUNK):
         ctx_map = carregar_contexto_operacional(db, chunk)
         by_id = {int(s.id_saida): s for s in candidates if int(s.id_saida) in set(chunk)}
         for sid in chunk:
             s = by_id.get(sid)
             if not s:
                 continue
-            st = normalizar_status_saida(s.status)
-            if st not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
+            if not _status_encerravel(s.status):
                 continue
             ctx = ctx_map.get(sid)
             if deve_excluir_saida_operacional(ctx):
@@ -106,43 +127,63 @@ def run_encerrar_pendentes_quinzena(
             data_op = ts_op.date() if ts_op else (s.data or None)
             if data_op is None or data_op >= inicio_vivo:
                 continue
-            elegiveis.append(s)
+
+            total_elegiveis += 1
+            if len(selecionados) >= limit:
+                # Já temos o lote desta requisição; só continua contando elegíveis.
+                continue
+
+            selecionados.append(s)
+            sb = (s.sub_base or "").strip() or "_"
+            por_sub_base[sb] = por_sub_base.get(sb, 0) + 1
+            if len(sample_ids) < 20:
+                sample_ids.append(int(s.id_saida))
 
     atualizados = 0
-    for s in elegiveis:
-        sb = (s.sub_base or "").strip() or "_"
-        por_sub_base[sb] = por_sub_base.get(sb, 0) + 1
-        if len(sample_ids) < 20:
-            sample_ids.append(int(s.id_saida))
+    if not dry_run and selecionados:
+        # UPDATE Core: não dispara models.saida_after_update (recalcular_coleta).
+        ids = [int(s.id_saida) for s in selecionados]
+        status_por_id = {int(s.id_saida): s.status for s in selecionados}
+        motoboy_por_id = {int(s.id_saida): s.motoboy_id for s in selecionados}
 
-    if not dry_run:
-        for i in range(0, len(elegiveis), batch_size):
-            batch = elegiveis[i : i + batch_size]
-            for s in batch:
-                status_anterior = s.status
-                s.status = STATUS_ENCERRADO_SISTEMA
-                db.add(
-                    SaidaHistorico(
-                        id_saida=s.id_saida,
-                        evento=EVENTO_ENCERRADO,
-                        status_anterior=status_anterior,
-                        status_novo=STATUS_ENCERRADO_SISTEMA,
-                        motoboy_id_anterior=s.motoboy_id,
-                        motoboy_id_novo=s.motoboy_id,
-                        user_id=None,
-                        payload=f"inicio_vivo={inicio_vivo.isoformat()}",
-                    )
+        db.execute(
+            update(Saida)
+            .where(Saida.id_saida.in_(ids))
+            .values(status=STATUS_ENCERRADO_SISTEMA)
+        )
+        payload = f"inicio_vivo={inicio_vivo.isoformat()}"
+        for sid in ids:
+            db.add(
+                SaidaHistorico(
+                    id_saida=sid,
+                    evento=EVENTO_ENCERRADO,
+                    status_anterior=status_por_id.get(sid),
+                    status_novo=STATUS_ENCERRADO_SISTEMA,
+                    motoboy_id_anterior=motoboy_por_id.get(sid),
+                    motoboy_id_novo=motoboy_por_id.get(sid),
+                    user_id=None,
+                    payload=payload,
                 )
-                atualizados += 1
-            db.commit()
+            )
+        db.commit()
+        atualizados = len(ids)
+        # Evita objetos ORM stale com status antigo na mesma sessão.
+        db.expire_all()
+
+    restantes = max(0, total_elegiveis - atualizados)
+    tempo_ms = int((time.perf_counter() - started) * 1000)
 
     return EncerramentoResult(
         dry_run=dry_run,
         ref_date=ref_date,
         inicio_vivo=inicio_vivo,
-        candidatos=len(candidates),
-        elegiveis=len(elegiveis),
-        atualizados=atualizados if not dry_run else 0,
+        candidatos=candidatos,
+        elegiveis=total_elegiveis,
+        atualizados=atualizados,
+        restantes=restantes,
+        tem_mais=restantes > 0,
         por_sub_base=por_sub_base,
         sample_ids=sample_ids,
+        tempo_execucao_ms=tempo_ms,
+        batch_size=limit,
     )
