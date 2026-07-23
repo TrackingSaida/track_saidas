@@ -1945,7 +1945,7 @@ def get_saida_detalhe(
 
 class SaidaFotoPatchBody(BaseModel):
     foto_url: str = Field(min_length=1)
-    status: str = Field(pattern="^(entregue|ausente)$")
+    status: str = Field(pattern="^(entregue|ausente|devolucao)$")
     photo_id: Optional[str] = Field(default=None, max_length=80)
     validar_campos_obrigatorios: bool = True
     alterar_status: bool = True
@@ -1988,7 +1988,12 @@ def patch_saida_foto(
         raise HTTPException(status_code=422, detail="foto_url inválida.")
 
     evento = body.status.lower().strip()
-    status_canon = STATUS_ENTREGUE if evento == "entregue" else STATUS_AUSENTE
+    if evento == "entregue":
+        status_canon = STATUS_ENTREGUE
+    elif evento == "ausente":
+        status_canon = STATUS_AUSENTE
+    else:
+        status_canon = STATUS_CANCELADO
     tentativa_atual = int(getattr(detail_row, "tentativa", None) or 1) if detail_row else 1
     photo_id = (body.photo_id or "").strip() or None
     current_items = parse_foto_items(detail_row.foto_url if detail_row else None)
@@ -2045,7 +2050,7 @@ def patch_saida_foto(
         )
         db.add(detail_row)
 
-    if body.validar_campos_obrigatorios and body.alterar_status:
+    if body.validar_campos_obrigatorios and body.alterar_status and evento in ("entregue", "ausente"):
         contexto_validacao = "ENTREGUE" if status_canon == STATUS_ENTREGUE else "AUSENTE"
         faltantes = validate_campos_obrigatorios_conclusao(
             db,
@@ -2056,7 +2061,7 @@ def patch_saida_foto(
         )
         raise_if_campos_obrigatorios_faltando(faltantes)
 
-    if body.alterar_status:
+    if body.alterar_status and evento != "devolucao":
         status_anterior = obj.status
         obj.status = status_canon
         db.add(

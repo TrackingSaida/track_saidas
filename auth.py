@@ -382,6 +382,10 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "tipo_owner": _tipo_owner_from_owner(owner),
         "owner_valor": str(owner.valor or 0),
         "must_change_password": _must_change_password_from_user(user),
+        "devolucao_sub_base_habilitada": bool(
+            getattr(owner, "devolucao_sub_base_habilitada", False)
+        ),
+        "sub_base_nome": (owner.sub_base or sub_base or "").strip() or sub_base,
     }
 
 
@@ -407,6 +411,8 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     if u.tipo_owner not in ("base", "subbase"):
         u.tipo_owner = "subbase"
     u.pode_ler_coleta = bool(payload.get("pode_ler_coleta", False))
+    u.devolucao_sub_base_habilitada = bool(payload.get("devolucao_sub_base_habilitada", False))
+    u.sub_base_nome = (payload.get("sub_base_nome") or payload.get("sub_base") or "").strip() or None
     u.pode_ler_saida = bool(payload.get("pode_ler_saida", True))
     u.pode_digitar_codigo_manual = bool(payload.get("pode_digitar_codigo_manual", True))
 

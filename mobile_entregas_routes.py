@@ -10,7 +10,7 @@ import logging
 import math
 from datetime import datetime, date, timedelta
 from decimal import Decimal
-from typing import Optional, List, Dict, Tuple, Literal
+from typing import Optional, List, Dict, Tuple, Literal, Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Header
@@ -70,7 +70,7 @@ from saidas_routes import (
 )
 from ausencia_bloqueio_service import raise_if_bloqueado_ausencias, snapshot_bloqueio_ausencias
 from leitura_manual_auth import ensure_manual_code_entry_allowed
-from upload_storage_utils import extract_foto_keys
+from upload_storage_utils import extract_foto_keys, parse_foto_items
 from codigo_normalizer import (
     normalize_codigo,
     canonicalize_servico,
@@ -2681,6 +2681,87 @@ def marcar_ausente(
                 observacao=obs,
                 tentativa=tentativa_atual,
             ),
+        )
+    )
+    db.commit()
+    db.refresh(s)
+    return _marcacao_response(db, s, motoboy_id=user.motoboy_id)
+
+
+# ============================================================
+# POST /mobile/entrega/{id}/devolver
+# ============================================================
+class DevolverBody(BaseModel):
+    observacao: Optional[str] = None
+
+
+@router.post("/entrega/{id_saida}/devolver")
+def marcar_devolver(
+    id_saida: int,
+    body: Optional[DevolverBody] = Body(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+    x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
+):
+    """Devolve pacote à sub_base: exige foto prévia, marca CANCELADO. Só do motoboy logado."""
+    if x_client_action_id:
+        logger.info(
+            "marcar_devolver client_action_id=%s id_saida=%s user_id=%s",
+            x_client_action_id.strip()[:64],
+            id_saida,
+            user.id,
+        )
+
+    owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
+    if not owner or not bool(getattr(owner, "devolucao_sub_base_habilitada", False)):
+        raise HTTPException(
+            status_code=403,
+            detail="Devolução pelo app não está habilitada para esta base.",
+        )
+
+    s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
+    status_norm = normalizar_status_saida(s.status)
+    if _status_esta_finalizado(status_norm):
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, STATUS_AUSENTE):
+        raise HTTPException(
+            status_code=422,
+            detail="Status atual não permite devolução à base.",
+        )
+
+    detail = _get_detail_for_saida(db, id_saida)
+    foto_items = parse_foto_items(detail.foto_url if detail else None)
+    if not foto_items:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "FOTO_OBRIGATORIA",
+                "message": "Tire a foto do comprovante de devolução antes de confirmar.",
+            },
+        )
+
+    status_anterior = status_norm
+    s.status = STATUS_CANCELADO
+    itens = db.scalars(
+        select(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida == id_saida)
+    ).all()
+    for item in itens:
+        item.cancelado = True
+
+    sub_base_nome = (owner.sub_base or user.sub_base or "").strip() or "base"
+    obs = ((body.observacao if body else None) or "").strip() or None
+    payload_data: Dict[str, Any] = {"sub_base_nome": sub_base_nome}
+    if obs:
+        payload_data["observacao_ocorrencia"] = obs
+
+    db.add(
+        SaidaHistorico(
+            id_saida=id_saida,
+            evento="devolucao",
+            status_anterior=status_anterior,
+            status_novo=STATUS_CANCELADO,
+            user_id=user.id,
+            payload=json.dumps(payload_data, ensure_ascii=False),
         )
     )
     db.commit()
