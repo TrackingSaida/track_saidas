@@ -1873,6 +1873,80 @@ def historico_entrega(
 
 
 # ============================================================
+# GET /mobile/enderecos/cidades-operacao
+# ============================================================
+class CidadeOperacaoOut(BaseModel):
+    cidade: str
+    estado: str = ""
+    peso: int = 0
+
+
+class CidadesOperacaoResponse(BaseModel):
+    cidades: List[CidadeOperacaoOut]
+
+
+@router.get("/enderecos/cidades-operacao", response_model=CidadesOperacaoResponse)
+def listar_cidades_operacao(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """Top cidades da sub_base do motoboy (endereços conhecidos / histórico filtrado)."""
+    from models import EnderecoConhecido
+
+    sub_base = (user.sub_base or "").strip()
+    if not sub_base:
+        return CidadesOperacaoResponse(cidades=[])
+
+    rows = db.execute(
+        select(
+            EnderecoConhecido.cidade,
+            EnderecoConhecido.estado,
+            func.sum(EnderecoConhecido.qtd_utilizacoes).label("peso"),
+        )
+        .where(EnderecoConhecido.sub_base == sub_base)
+        .group_by(EnderecoConhecido.cidade, EnderecoConhecido.estado)
+        .order_by(func.sum(EnderecoConhecido.qtd_utilizacoes).desc())
+        .limit(5)
+    ).all()
+
+    if not rows:
+        rows = db.execute(
+            select(
+                SaidaDetail.dest_cidade,
+                SaidaDetail.dest_estado,
+                func.count().label("peso"),
+            )
+            .join(Saida, Saida.id_saida == SaidaDetail.id_saida)
+            .where(
+                Saida.sub_base == sub_base,
+                SaidaDetail.dest_cidade.isnot(None),
+            )
+            .group_by(SaidaDetail.dest_cidade, SaidaDetail.dest_estado)
+            .order_by(func.count().desc())
+            .limit(5)
+        ).all()
+
+    cidades: List[CidadeOperacaoOut] = []
+    seen = set()
+    for cidade, estado, peso in rows:
+        nome = (cidade or "").strip()
+        if not nome:
+            continue
+        key = nome.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cidades.append(
+            CidadeOperacaoOut(
+                cidade=nome,
+                estado=(estado or "").strip().upper()[:2],
+                peso=int(peso or 0),
+            )
+        )
+    return CidadesOperacaoResponse(cidades=cidades)
+
+
+# ============================================================
 # POST /mobile/enderecos/sugestoes
 # ============================================================
 @router.post("/enderecos/sugestoes", response_model=EnderecoSugestoesResponse)

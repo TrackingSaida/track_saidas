@@ -47,9 +47,16 @@ def _load_sub_base_stats(db: Session, sub_base: str) -> Tuple[Dict[str, int], Di
         .limit(50)
     ).all()
     if not city_rows:
+        # Fallback multi-tenant: sempre filtrar por sub_base via saidas.
+        from models import Saida
+
         city_rows = db.execute(
             select(SaidaDetail.dest_cidade, func.count())
-            .where(SaidaDetail.dest_cidade.isnot(None))
+            .join(Saida, Saida.id_saida == SaidaDetail.id_saida)
+            .where(
+                Saida.sub_base == sub_base,
+                SaidaDetail.dest_cidade.isnot(None),
+            )
             .group_by(SaidaDetail.dest_cidade)
             .order_by(func.count().desc())
             .limit(20)
