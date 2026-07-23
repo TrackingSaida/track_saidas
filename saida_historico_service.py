@@ -112,6 +112,11 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
         h, username = row[0], row[1]
         evento_norm = (h.evento or "").strip().lower()
         extra = _campos_from_payload(getattr(h, "payload", None))
+        acao_label = rotulo_acao_evento(evento_norm)
+        if evento_norm == "devolucao":
+            data = parse_historico_payload(getattr(h, "payload", None))
+            nome = str(data.get("sub_base_nome") or "").strip()
+            acao_label = f"Devolvido à {nome}" if nome else "Devolvido à base"
         out.append(
             SaidaHistoricoItemOut(
                 id=h.id,
@@ -124,7 +129,7 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
                 usuario_nome=username,
                 motoboy_id_anterior=h.motoboy_id_anterior,
                 motoboy_id_novo=h.motoboy_id_novo,
-                acao_label=rotulo_acao_evento(evento_norm),
+                acao_label=acao_label,
                 motivo_ocorrencia=extra["motivo_ocorrencia"],
                 observacao_ocorrencia=extra["observacao_ocorrencia"],
                 tentativa=extra["tentativa"],

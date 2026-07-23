@@ -90,6 +90,8 @@ class Owner(Base):
     tipo_owner = Column(Text, nullable=False, server_default=text("'subbase'"))
     # Nome institucional para relatórios (ex.: razão social / "Emitido por")
     nome_fantasia = Column(Text, nullable=True)
+    # Permite motoboy devolver pacotes à sub_base pelo app (com foto)
+    devolucao_sub_base_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"

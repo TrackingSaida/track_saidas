@@ -82,7 +82,7 @@ def _ensure_object_key_owned(db: Session, sub_base: str, object_key: str) -> Non
 class PresignIn(BaseModel):
     filename: str = Field(min_length=1)
     id_saida: int = Field(gt=0)
-    tipo: str = Field(pattern="^(entregue|ausente)$")
+    tipo: str = Field(pattern="^(entregue|ausente|devolucao)$")
     content_type: str = Field(default="image/jpeg")
     photo_id: Optional[str] = Field(default=None, max_length=80)
 

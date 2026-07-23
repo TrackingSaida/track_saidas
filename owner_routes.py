@@ -49,6 +49,7 @@ class OwnerUpdate(BaseModel):
     teste: Optional[bool] = None
     modo_operacao: Optional[str] = None
     tipo_owner: Optional[str] = None
+    devolucao_sub_base_habilitada: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -66,6 +67,7 @@ class OwnerOut(BaseModel):
     teste: bool
     modo_operacao: Optional[str] = None
     tipo_owner: Optional[str] = None
+    devolucao_sub_base_habilitada: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -224,6 +226,9 @@ def update_owner(
 
     if body.tipo_owner is not None:
         owner.tipo_owner = _normalize_tipo_owner(body.tipo_owner)
+
+    if body.devolucao_sub_base_habilitada is not None:
+        owner.devolucao_sub_base_habilitada = bool(body.devolucao_sub_base_habilitada)
 
     db.commit()
     db.refresh(owner)
