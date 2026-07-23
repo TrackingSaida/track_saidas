@@ -298,11 +298,11 @@ def filtrar_ordenar_agregar_listagem(
 
     def _sort_key(r: SaidaListRow):
         ctx = ctx_map.get(r.id_saida)
-        op_ts = None
-        if ctx and ctx.operacional_ts:
-            op_ts = ctx.operacional_ts
-        elif ctx and ctx.ultimo_evento_ts:
+        # Prioriza horário da última ação (coluna da UI), não o ts de atribuição.
+        if ctx and ctx.ultimo_evento_ts:
             op_ts = ctx.ultimo_evento_ts
+        elif ctx and ctx.operacional_ts:
+            op_ts = ctx.operacional_ts
         else:
             op_ts = r.timestamp
         return (op_ts or r.timestamp, int(r.id_saida))
@@ -1014,7 +1014,7 @@ def listar_saidas_paginado(
     page AS (
       SELECT f.*
       FROM filtradas f
-      ORDER BY f.operacional_ts DESC, f.id_saida DESC
+      ORDER BY COALESCE(f.ult_ts, f.operacional_ts, f.timestamp) DESC, f.id_saida DESC
       {limit_sql}
       {offset_sql}
     )
@@ -1044,7 +1044,7 @@ def listar_saidas_paginado(
       p.atr_user_id
     FROM totals t
     LEFT JOIN page p ON TRUE
-    ORDER BY p.operacional_ts DESC NULLS LAST, p.id_saida DESC NULLS LAST
+    ORDER BY COALESCE(p.ult_ts, p.operacional_ts, p.timestamp) DESC NULLS LAST, p.id_saida DESC NULLS LAST
     """
 
     stmt = text(sql).bindparams(
