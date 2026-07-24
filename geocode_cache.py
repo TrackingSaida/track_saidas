@@ -57,8 +57,10 @@ def _is_table_available(db: Session) -> bool:
     return _table_available
 
 
-def get_cached(db: Optional[Session], query: str) -> Optional[Tuple[float, float, Optional[str]]]:
-    """Retorna (lat, lon, provider) ou None."""
+def get_cached(
+    db: Optional[Session], query: str
+) -> Optional[Tuple[float, float, Optional[str], Optional[float]]]:
+    """Retorna (lat, lon, provider, confidence) ou None."""
     norm = _normalize_query(query)
     if not norm:
         return None
@@ -83,14 +85,15 @@ def get_cached(db: Optional[Session], query: str) -> Optional[Tuple[float, float
                 row.updated_at = datetime.now(timezone.utc)
                 db.commit()
                 logger.info("geocode_attempt cache_hit=true query=%s", norm[:80])
-                return float(row.latitude), float(row.longitude), row.provider
+                conf = float(row.confidence) if row.confidence is not None else None
+                return float(row.latitude), float(row.longitude), row.provider, conf
         except Exception as e:
             logger.warning("geocode_cache get_cached falhou: %s", e)
 
     entry = _memory_cache.get(key)
     if entry and entry.expires_at > time.time():
         logger.info("geocode_attempt cache_hit=true memory=true query=%s", norm[:80])
-        return entry.latitude, entry.longitude, entry.provider
+        return entry.latitude, entry.longitude, entry.provider, entry.confidence
     if entry:
         _memory_cache.pop(key, None)
     return None

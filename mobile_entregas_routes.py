@@ -2033,11 +2033,13 @@ def _should_replace_client_coords(
     server_precision: str,
 ) -> bool:
     """Só substitui coords do cliente por resultado strict validado (cidade/estado/CEP conferidos)."""
-    if origem == "google_places" or client_precision == "rooftop":
+    # Nunca rebaixa rooftop (mapa / google_places / qualquer origem).
+    if _precision_rank(client_precision) >= _precision_rank("rooftop"):
         return False
-    if origem == "mapa" and client_precision == "rooftop":
+    # Pin manual: não move o marcador; upgrade de metadado fica em _try_upgrade_from_strict.
+    if origem == "mapa":
         return False
-    # Servidor claramente melhor (ex.: Google rooftop vs Nominatim approx)
+    # Servidor claramente melhor (ex.: Google rooftop vs Nominatim/street do Places)
     if _precision_rank(server_precision) > _precision_rank(client_precision):
         return True
     if dist_m <= REVALIDATE_COORDS_DISTANCE_M:
