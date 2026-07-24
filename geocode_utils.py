@@ -392,7 +392,8 @@ def geocode_address_any(
     Configuração via ambiente:
     - GEOCODER_PROVIDER: \"geoapify\" | \"locationiq\" | \"geocode_maps_co\" (default: \"geoapify\")
     - GEOCODER_API_KEY: chave do provedor externo (obrigatória para geoapify/locationiq/maps_co)
-    - GOOGLE_GEOCODING_ENABLED + GOOGLE_GEOCODING_API_KEY: prioriza Google Geocoding
+    - GOOGLE_GEOCODING_ENABLED + chave (ordem): GOOGLE_GEOCODING_API_KEY → GEOCODER_API_KEY → GOOGLE_PLACES_API_KEY
+      (Places ≠ Geocoding; a chave Places só serve se tiver Geocoding API liberada no GCP)
     """
     addr = (address or "").strip()
     if not addr:
@@ -401,11 +402,18 @@ def geocode_address_any(
     cached = get_cached(db, addr)
     if cached:
         lat_c, lon_c, provider_c = cached[0], cached[1], cached[2] if len(cached) > 2 else None
-        # Cache antigo podia gravar google com precisão perdida; provider google + número → rooftop.
-        if (provider_c or "").lower() == "google" and (expected_numero or "").strip():
-            precision = "rooftop"
-        elif (provider_c or "").lower() == "google":
-            precision = "street"
+        confidence_c = cached[3] if len(cached) > 3 else None
+        # Cache antigo não guarda location_type; não inflar rooftop cegamente
+        # (GEOMETRIC_CENTER / APPROXIMATE já gravados como "google").
+        provider_l = (provider_c or "").lower()
+        if provider_l == "google":
+            if confidence_c is not None and float(confidence_c) >= 90:
+                precision = "rooftop"
+            elif confidence_c is not None and float(confidence_c) >= 70:
+                precision = "street"
+            else:
+                # Legado sem confidence: conservador (street), nunca rooftop cego.
+                precision = "street"
         else:
             precision = _external_provider_precision(expected_numero)
         return lat_c, lon_c, precision
@@ -418,7 +426,17 @@ def geocode_address_any(
     google_key = (
         os.getenv("GOOGLE_GEOCODING_API_KEY", "").strip()
         or os.getenv("GEOCODER_API_KEY", "").strip()
+        or (
+            os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
+            if google_enabled
+            else ""
+        )
     )
+    if google_enabled and not google_key:
+        logger.warning(
+            "GOOGLE_GEOCODING_ENABLED=true mas nenhuma chave útil "
+            "(GOOGLE_GEOCODING_API_KEY / GEOCODER_API_KEY / GOOGLE_PLACES_API_KEY)"
+        )
     if google_enabled and google_key:
         google_coords = _geocode_with_google(
             addr,
@@ -428,7 +446,9 @@ def geocode_address_any(
             estado=estado,
         )
         if google_coords:
-            set_cached(db, addr, google_coords[0], google_coords[1], "google")
+            g_lat, g_lon, g_prec = google_coords
+            g_conf = 95.0 if g_prec == "rooftop" else (80.0 if g_prec == "street" else 50.0)
+            set_cached(db, addr, g_lat, g_lon, "google", confidence=g_conf)
             logger.info("geocode_attempt query=%s provider=google success=true", addr[:80])
             return google_coords
 
