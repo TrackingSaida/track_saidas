@@ -543,12 +543,55 @@ def _enrich_datas_detalhe(db: Session, s: Saida, item: dict) -> None:
     item["data_hora_operacional"] = ts_op
 
 
+def _apply_campos_obrigatorios_to_item(
+    item: dict,
+    s: Saida,
+    *,
+    db: Optional[Session] = None,
+    campos_cache: Optional[Dict[tuple, List[str]]] = None,
+) -> None:
+    """Preenche campos_obrigatorios_* no item a partir da config da sub_base/serviço."""
+    sub_base = (getattr(s, "sub_base", None) or "").strip()
+    if not sub_base:
+        return
+    if campos_cache is not None:
+        campos_entregue = resolve_campos_obrigatorios_from_cache(
+            cache=campos_cache,
+            servico=s.servico,
+            contexto="ENTREGUE",
+        )
+        campos_ausente = resolve_campos_obrigatorios_from_cache(
+            cache=campos_cache,
+            servico=s.servico,
+            contexto="AUSENTE",
+        )
+    elif db is not None:
+        campos_entregue = resolve_campos_obrigatorios_ativos(
+            db,
+            sub_base=sub_base,
+            servico=s.servico,
+            contexto="ENTREGUE",
+        )
+        campos_ausente = resolve_campos_obrigatorios_ativos(
+            db,
+            sub_base=sub_base,
+            servico=s.servico,
+            contexto="AUSENTE",
+        )
+    else:
+        return
+    item["campos_obrigatorios"] = sorted(set((campos_entregue or []) + (campos_ausente or [])))
+    item["campos_obrigatorios_entregue"] = campos_entregue or []
+    item["campos_obrigatorios_ausente"] = campos_ausente or []
+
+
 def _saida_to_item(
     s: Saida,
     detail: Optional[SaidaDetail],
     *,
     data_hora_ocorrencia: Optional[datetime] = None,
     db: Optional[Session] = None,
+    campos_cache: Optional[Dict[tuple, List[str]]] = None,
 ) -> dict:
     endereco = None
     if detail and (detail.dest_rua or detail.dest_numero):
@@ -563,7 +606,7 @@ def _saida_to_item(
         snap = snapshot_bloqueio_ausencias(db, s.id_saida)
         ausencias_total = int(snap["ausencias_total"])
         bloqueado_ausencias = bool(snap["bloqueado_ausencias"])
-    return {
+    item = {
         "id_saida": s.id_saida,
         "codigo": s.codigo,
         "status": s.status or "",
@@ -605,6 +648,8 @@ def _saida_to_item(
         "campos_obrigatorios_entregue": [],
         "campos_obrigatorios_ausente": [],
     }
+    _apply_campos_obrigatorios_to_item(item, s, db=db, campos_cache=campos_cache)
+    return item
 
 
 def _parse_data_yyyy_mm_dd(raw: Optional[str]) -> Optional[date]:
@@ -809,9 +854,14 @@ def _scan_needs_qr_update(saida: Saida, qr_payload_raw: Optional[str], servico: 
     return not (saida.qr_payload_raw or "").strip()
 
 
-def _scan_item_leve(saida: Saida, detail: Optional[SaidaDetail] = None) -> dict:
+def _scan_item_leve(
+    saida: Saida,
+    detail: Optional[SaidaDetail] = None,
+    *,
+    db: Optional[Session] = None,
+) -> dict:
     """Resposta de scan sem queries extras de detail quando não há endereço."""
-    return _saida_to_item(saida, detail)
+    return _saida_to_item(saida, detail, db=db)
 
 
 def _payload_nova_saida_mesmo_entregador(
@@ -927,20 +977,8 @@ def listar_entregas(
             details_map.get(sid),
             data_hora_ocorrencia=ocorrencia_map.get(sid),
             db=db,
+            campos_cache=campos_cache,
         )
-        campos_entregue = resolve_campos_obrigatorios_from_cache(
-            cache=campos_cache,
-            servico=s.servico,
-            contexto="ENTREGUE",
-        )
-        campos_ausente = resolve_campos_obrigatorios_from_cache(
-            cache=campos_cache,
-            servico=s.servico,
-            contexto="AUSENTE",
-        )
-        item["campos_obrigatorios"] = sorted(set((campos_entregue or []) + (campos_ausente or [])))
-        item["campos_obrigatorios_entregue"] = campos_entregue or []
-        item["campos_obrigatorios_ausente"] = campos_ausente or []
         out.append(item)
     return out
 
@@ -1838,21 +1876,6 @@ def detalhe_entrega(
     detail = _get_detail_for_saida(db, s.id_saida)
     ocorrencia_map = _carregar_data_hora_ocorrencia_map(db, [id_saida])
     item = _saida_to_item(s, detail, data_hora_ocorrencia=ocorrencia_map.get(id_saida), db=db)
-    campos_entregue = resolve_campos_obrigatorios_ativos(
-        db,
-        sub_base=s.sub_base,
-        servico=s.servico,
-        contexto="ENTREGUE",
-    )
-    campos_ausente = resolve_campos_obrigatorios_ativos(
-        db,
-        sub_base=s.sub_base,
-        servico=s.servico,
-        contexto="AUSENTE",
-    )
-    item["campos_obrigatorios"] = sorted(set((campos_entregue or []) + (campos_ausente or [])))
-    item["campos_obrigatorios_entregue"] = campos_entregue or []
-    item["campos_obrigatorios_ausente"] = campos_ausente or []
     _enrich_datas_detalhe(db, s, item)
     return item
 
@@ -2360,7 +2383,7 @@ def atualizar_endereco(
         except Exception:
             pass
 
-    return _saida_to_item(s, detail)
+    return _saida_to_item(s, detail, db=db)
 
 
 def _validar_saida_para_finalizacao_lote(
@@ -3055,7 +3078,7 @@ def scan_codigo(
             db.commit()
             db.refresh(nova)
             # INSERT novo: detail ainda não existe — evita SELECT inútil
-            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova)}
+            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova, db=db)}
         except Exception as e:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Erro ao registrar leitura: {e}")
@@ -3170,7 +3193,7 @@ def scan_codigo(
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
-                    "entrega": _scan_item_leve(saida),
+                    "entrega": _scan_item_leve(saida, db=db),
                 }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
             if _scan_needs_qr_update(saida, qr_payload_raw, servico):
@@ -3181,7 +3204,7 @@ def scan_codigo(
                 "ok": True,
                 "conflito": False,
                 "ja_existia": True,
-                "entrega": _scan_item_leve(saida),
+                "entrega": _scan_item_leve(saida, db=db),
             }
         if saida.motoboy_id == motoboy_id:
             data_operacional = _ctx_data_operacional_saida(db, saida)
@@ -3219,7 +3242,7 @@ def scan_codigo(
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
-                    "entrega": _scan_item_leve(saida),
+                    "entrega": _scan_item_leve(saida, db=db),
                 }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
             if _scan_needs_qr_update(saida, qr_payload_raw, servico):
@@ -3230,7 +3253,7 @@ def scan_codigo(
                 "ok": True,
                 "conflito": False,
                 "ja_existia": True,
-                "entrega": _scan_item_leve(saida),
+                "entrega": _scan_item_leve(saida, db=db),
             }
         if saida.motoboy_id is not None:
             id_saida_lock = saida.id_saida
@@ -3273,7 +3296,7 @@ def scan_codigo(
                         "ok": True,
                         "conflito": False,
                         "ja_existia": True,
-                        "entrega": _scan_item_leve(saida),
+                        "entrega": _scan_item_leve(saida, db=db),
                     }
                 if _scan_needs_qr_update(saida, qr_payload_raw, servico):
                     saida.qr_payload_raw = qr_payload_raw.strip()
@@ -3283,7 +3306,7 @@ def scan_codigo(
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
-                    "entrega": _scan_item_leve(saida),
+                    "entrega": _scan_item_leve(saida, db=db),
                 }
             # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
@@ -3379,7 +3402,7 @@ def scan_codigo(
         "ok": True,
         "conflito": False,
         "ja_existia": not houve_atribuicao_ou_progresso,
-        "entrega": _saida_to_item(saida, detail),
+        "entrega": _saida_to_item(saida, detail, db=db),
     }
 
 
@@ -3420,7 +3443,7 @@ def confirmar_reativacao_encerrado_mobile(
             "conflito": False,
             "ja_existia": True,
             "reativado_de_encerrado": False,
-            "entrega": _saida_to_item(saida, detail),
+            "entrega": _saida_to_item(saida, detail, db=db),
         }
 
     saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
@@ -3431,7 +3454,7 @@ def confirmar_reativacao_encerrado_mobile(
             "conflito": False,
             "ja_existia": True,
             "reativado_de_encerrado": False,
-            "entrega": _saida_to_item(saida, detail),
+            "entrega": _saida_to_item(saida, detail, db=db),
         }
 
     motoboy_id_anterior = saida.motoboy_id
@@ -3483,7 +3506,7 @@ def confirmar_reativacao_encerrado_mobile(
         "conflito": False,
         "ja_existia": False,
         "reativado_de_encerrado": True,
-        "entrega": _saida_to_item(saida, detail),
+        "entrega": _saida_to_item(saida, detail, db=db),
     }
 
 
@@ -3563,7 +3586,7 @@ def confirmar_nova_saida_mesmo_entregador_mobile(
             endpoint="/mobile/entrega/{id_saida}/confirmar-nova-saida-mesmo-entregador",
         )
         detail = _get_detail_for_saida(db, saida.id_saida)
-        return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail)}
+        return {"ok": True, "conflito": False, "ja_existia": True, "entrega": _saida_to_item(saida, detail, db=db)}
 
     payload_hist = _payload_nova_saida_mesmo_entregador(
         data_operacional_anterior=data_operacional_anterior,
@@ -3605,7 +3628,7 @@ def confirmar_nova_saida_mesmo_entregador_mobile(
         endpoint="/mobile/entrega/{id_saida}/confirmar-nova-saida-mesmo-entregador",
     )
     detail = _get_detail_for_saida(db, saida.id_saida)
-    return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _saida_to_item(saida, detail)}
+    return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _saida_to_item(saida, detail, db=db)}
 
 
 # ============================================================
