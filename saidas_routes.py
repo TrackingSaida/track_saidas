@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select, func, or_, exists, text
@@ -22,6 +22,7 @@ from db import get_db
 from db_utils import run_db_query_with_retry
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from entrega_audit_log import audit_entrega, norm_client_action_id
 from saida_operacional_utils import (
     carregar_contexto_operacional,
     EVENTOS_ATRIBUICAO_VALIDOS,
@@ -1970,8 +1971,10 @@ def patch_saida_foto(
     body: SaidaFotoPatchBody,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
     """Append tipado de foto por evento/tentativa; idempotente por photo_id/key."""
+    client_action_id = norm_client_action_id(x_client_action_id)
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
@@ -2001,14 +2004,17 @@ def patch_saida_foto(
     existing = find_foto_item(current_items, key=key, photo_id=photo_id)
     if existing:
         foto_urls = extract_foto_keys(serialize_foto_items(current_items))
-        logger.info(
-            "PATCH foto idempotente: id_saida=%s key=%s photo_id=%s evento=%s tentativa=%s user_id=%s",
-            id_saida,
-            key,
-            photo_id,
-            evento,
-            tentativa_atual,
-            getattr(current_user, "id", None),
+        audit_entrega(
+            "patch_foto_result",
+            result="idempotent",
+            id_saida=id_saida,
+            user_id=getattr(current_user, "id", None),
+            client_action_id=client_action_id,
+            photo_id=photo_id,
+            object_key=key,
+            evento=evento,
+            tentativa=tentativa_atual,
+            alterar_status=bool(body.alterar_status),
         )
         return {
             "ok": True,
@@ -2018,6 +2024,16 @@ def patch_saida_foto(
         }
 
     if count_fotos_for_evento_tentativa(current_items, evento, tentativa_atual) >= MAX_FOTOS_POR_EVENTO_TENTATIVA:
+        audit_entrega(
+            "patch_foto_result",
+            result="reject",
+            code="MAX_FOTOS_EVENTO",
+            id_saida=id_saida,
+            user_id=getattr(current_user, "id", None),
+            client_action_id=client_action_id,
+            evento=evento,
+            tentativa=tentativa_atual,
+        )
         raise HTTPException(
             status_code=422,
             detail={
@@ -2059,7 +2075,19 @@ def patch_saida_foto(
             detail=detail_row,
             overrides={"foto_url": payload},
         )
-        raise_if_campos_obrigatorios_faltando(faltantes)
+        try:
+            raise_if_campos_obrigatorios_faltando(faltantes)
+        except HTTPException:
+            audit_entrega(
+                "patch_foto_result",
+                result="reject",
+                code="CAMPOS_OBRIGATORIOS_FALTANDO",
+                id_saida=id_saida,
+                user_id=getattr(current_user, "id", None),
+                client_action_id=client_action_id,
+                faltantes=faltantes,
+            )
+            raise
 
     if body.alterar_status and evento != "devolucao":
         status_anterior = obj.status
@@ -2075,15 +2103,19 @@ def patch_saida_foto(
         )
     db.commit()
     foto_urls = extract_foto_keys(payload)
-    logger.info(
-        "PATCH foto: id_saida=%s object_key=%s photo_id=%s status=%s tentativa=%s foto_urls_count=%s user_id=%s",
-        id_saida,
-        key,
-        photo_id,
-        body.status,
-        tentativa_atual,
-        len(foto_urls),
-        getattr(current_user, "id", None),
+    audit_entrega(
+        "patch_foto_result",
+        result="ok",
+        id_saida=id_saida,
+        user_id=getattr(current_user, "id", None),
+        client_action_id=client_action_id,
+        photo_id=photo_id,
+        object_key=key,
+        evento=evento,
+        tentativa=tentativa_atual,
+        foto_urls_count=len(foto_urls),
+        alterar_status=bool(body.alterar_status),
+        status_saida=normalizar_status_saida(obj.status),
     )
     return {"ok": True, "idempotent": False, "foto_urls": foto_urls, "fotos": current_items}
 
