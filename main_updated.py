@@ -143,6 +143,8 @@ from upload_routes import router as upload_router
 from acompanhamento_routes import router as acompanhamento_router
 from cep_routes import router as cep_router
 from config_campos_obrigatorios_routes import router as config_campos_obrigatorios_router
+from entradas_routes import router as entradas_router
+from conferencia_saida_routes import router as conferencia_saida_router
 
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
@@ -159,6 +161,8 @@ app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
 app.include_router(pedidos_router,      prefix=API_PREFIX)
 app.include_router(acompanhamento_router, prefix=API_PREFIX)
+app.include_router(entradas_router, prefix=API_PREFIX)
+app.include_router(conferencia_saida_router, prefix=API_PREFIX)
 app.include_router(mobile_entregas_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)

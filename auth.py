@@ -172,6 +172,8 @@ class UserResponse(BaseModel):
     modo_operacao: Optional[str] = None
     tipo_owner: Optional[str] = None
     must_change_password: Optional[bool] = None
+    entrada_obrigatoria_habilitada: bool = False
+    conferencia_saida_habilitada: bool = False
 
 
 # ======================================================
@@ -356,6 +358,12 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
         # valor SEMPRE como string (Decimal-safe)
         "owner_valor": str(owner.valor or 0),
         "must_change_password": _must_change_password_from_user(user),
+        "entrada_obrigatoria_habilitada": bool(
+            getattr(owner, "entrada_obrigatoria_habilitada", False)
+        ),
+        "conferencia_saida_habilitada": bool(
+            getattr(owner, "conferencia_saida_habilitada", False)
+        ),
     }
 
 
@@ -385,6 +393,12 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "devolucao_sub_base_habilitada": bool(
             getattr(owner, "devolucao_sub_base_habilitada", False)
         ),
+        "entrada_obrigatoria_habilitada": bool(
+            getattr(owner, "entrada_obrigatoria_habilitada", False)
+        ),
+        "conferencia_saida_habilitada": bool(
+            getattr(owner, "conferencia_saida_habilitada", False)
+        ),
         "sub_base_nome": (owner.sub_base or sub_base or "").strip() or sub_base,
     }
 
@@ -412,6 +426,8 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
         u.tipo_owner = "subbase"
     u.pode_ler_coleta = bool(payload.get("pode_ler_coleta", False))
     u.devolucao_sub_base_habilitada = bool(payload.get("devolucao_sub_base_habilitada", False))
+    u.entrada_obrigatoria_habilitada = bool(payload.get("entrada_obrigatoria_habilitada", False))
+    u.conferencia_saida_habilitada = bool(payload.get("conferencia_saida_habilitada", False))
     u.sub_base_nome = (payload.get("sub_base_nome") or payload.get("sub_base") or "").strip() or None
     u.pode_ler_saida = bool(payload.get("pode_ler_saida", True))
     u.pode_digitar_codigo_manual = bool(payload.get("pode_digitar_codigo_manual", True))
@@ -799,6 +815,12 @@ async def read_users_me(
         modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
         tipo_owner=getattr(current_user, "tipo_owner", None) or "subbase",
         must_change_password=bool(getattr(db_user, "must_change_password", False)),
+        entrada_obrigatoria_habilitada=bool(
+            getattr(current_user, "entrada_obrigatoria_habilitada", False)
+        ),
+        conferencia_saida_habilitada=bool(
+            getattr(current_user, "conferencia_saida_habilitada", False)
+        ),
     )
 
 

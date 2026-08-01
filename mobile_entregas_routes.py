@@ -61,6 +61,7 @@ from saidas_routes import (
     STATUS_AUSENTE,
     STATUS_CANCELADO,
     STATUS_ENCERRADO_SISTEMA,
+    STATUS_NA_BASE,
     _check_delete_window_or_409,
     _should_store_qr_payload_raw,
     normalizar_status_saida,
@@ -1321,8 +1322,23 @@ def iniciar_rota(
                 user_id=user.id,
             )
         )
+    atualizados = len(rows)
+    if atualizados > 0:
+        from conferencia_saida_service import (
+            owner_conferencia_habilitada,
+            upsert_conferencia_apos_iniciar_rota,
+        )
+
+        if owner_conferencia_habilitada(db, sub_base, user):
+            upsert_conferencia_apos_iniciar_rota(
+                db,
+                sub_base=sub_base,
+                motoboy_id=int(motoboy_id),
+                data_ref=_hoje_operacional(),
+                qtd=atualizados,
+            )
     db.commit()
-    return {"atualizados": len(rows)}
+    return {"atualizados": atualizados}
 
 
 def _parse_route_updated_at_header(value: Optional[str]) -> Optional[datetime]:
@@ -3193,8 +3209,23 @@ def scan_codigo(
         )
     )
 
+    entrada_obrigatoria = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
+    if not entrada_obrigatoria:
+        owner_flag = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        entrada_obrigatoria = bool(
+            owner_flag and getattr(owner_flag, "entrada_obrigatoria_habilitada", False)
+        )
+
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
     if not saida:
+        if entrada_obrigatoria:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "ENTRADA_OBRIGATORIA",
+                    "message": "Este pacote ainda não teve entrada na base.",
+                },
+            )
         motoboy = db.get(Motoboy, motoboy_id) if motoboy_id else None
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
@@ -3458,13 +3489,27 @@ def scan_codigo(
             # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
 
-    # Coletado ou AUSENTE ou outro: atribuir ao motoboy logado
+    # Coletado / NA_BASE / AUSENTE ou outro: atribuir ao motoboy logado
     saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
     status_norm = normalizar_status_saida(saida.status)
     if status_norm in (STATUS_ENTREGUE, STATUS_CANCELADO):
         return JSONResponse(
             status_code=422,
             content=_status_finalizado_detail(saida, status_norm),
+        )
+    if entrada_obrigatoria and status_norm not in (
+        STATUS_NA_BASE,
+        STATUS_SAIU_PARA_ENTREGA,
+        STATUS_EM_ROTA,
+        "saiu",
+        STATUS_AUSENTE,
+    ):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "ENTRADA_OBRIGATORIA",
+                "message": "Este pacote ainda não teve entrada na base.",
+            },
         )
     if (
         status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu")

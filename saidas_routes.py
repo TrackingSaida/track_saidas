@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from db_utils import run_db_query_with_retry
 from auth import get_current_user
-from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from models import User, Saida, Coleta, Entregador, Owner, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
 from entrega_audit_log import audit_entrega, norm_client_action_id
 from saida_operacional_utils import (
     carregar_contexto_operacional,
@@ -233,6 +233,7 @@ STATUS_ENTREGUE = "ENTREGUE"
 STATUS_AUSENTE = "AUSENTE"
 STATUS_CANCELADO = "CANCELADO"
 STATUS_ENCERRADO_SISTEMA = "ENCERRADO_SISTEMA"
+STATUS_NA_BASE = "NA_BASE"
 
 
 def normalizar_status_saida(raw: Optional[str]) -> str:
@@ -252,6 +253,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return "aguardando_coleta"
     if lower in ("não coletado", "nao coletado", "não coletada", "nao coletada"):
         return "não coletado"
+    if lower in ("na_base", "na base"):
+        return STATUS_NA_BASE
     # Novos status motoboy (aceitar em maiúsculas ou lowercase)
     if lower in ("saiu_para_entrega", "saiu para entrega"):
         return STATUS_SAIU_PARA_ENTREGA
@@ -737,10 +740,17 @@ def ler_saida(
     username = current_user.username
     role = getattr(current_user, "role", None)
     ignorar_coleta = bool(current_user.ignorar_coleta)
+    entrada_obrigatoria = bool(getattr(current_user, "entrada_obrigatoria_habilitada", False))
     owner_valor = Decimal(getattr(current_user, "owner_valor", 0))
 
     if not sub_base or not username:
         raise HTTPException(401, "Usuário inválido.")
+
+    if not entrada_obrigatoria:
+        owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        entrada_obrigatoria = bool(
+            owner_row and getattr(owner_row, "entrada_obrigatoria_habilitada", False)
+        )
 
     origem_leitura = ensure_manual_code_entry_allowed(
         db,
@@ -798,6 +808,14 @@ def ler_saida(
     )
 
     if existente is None:
+        if entrada_obrigatoria:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "ENTRADA_OBRIGATORIA",
+                    "message": "Este pacote ainda não teve entrada na base.",
+                },
+            )
         # Não existe: ignorar_coleta ou registrar_nao_coletado → INSERT; senão 422 (erro de negócio, sem retry)
         if not ignorar_coleta and not payload.registrar_nao_coletado:
             # JSONResponse direto para preservar código de erro sem passar pelo handler global.
@@ -891,6 +909,14 @@ def ler_saida(
             raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "coletado":
+        if entrada_obrigatoria:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "ENTRADA_OBRIGATORIA",
+                    "message": "Este pacote ainda não teve entrada na base.",
+                },
+            )
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
         status_anterior = existente.status
         existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
@@ -914,6 +940,39 @@ def ler_saida(
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
+
+    if status_norm == STATUS_NA_BASE:
+        status_anterior = existente.status
+        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.entregador_id = entregador_id
+        existente.entregador = entregador_nome
+        if motoboy_id is not None:
+            existente.motoboy_id = motoboy_id
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="lido",
+                status_anterior=status_anterior,
+                status_novo=existente.status,
+                user_id=getattr(current_user, "id", None),
+            )
+        )
+        try:
+            db.commit()
+            db.refresh(existente)
+            return SaidaOut.model_validate(existente)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar saída.")
+
+    if entrada_obrigatoria and not _status_ja_em_rota_ou_saida(status_norm):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "ENTRADA_OBRIGATORIA",
+                "message": "Este pacote ainda não teve entrada na base.",
+            },
+        )
 
     if _status_ja_em_rota_ou_saida(status_norm):
         # mesmo entregador/motoboy → 200 idempotente (sem 409)

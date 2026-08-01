@@ -282,7 +282,7 @@ def acompanhamento_dia(
     totais_ausente = 0
 
     nomes_motoboy = _carregar_nomes_motoboy_ids(db, [int(mid) for mid in by_motoboy.keys()])
-    for mid, list_saidas in sorted(by_motoboy.items()):
+    for mid, list_saidas in by_motoboy.items():
         pedidos = len(list_saidas)
         entregues = 0
         em_rota = 0
@@ -325,6 +325,8 @@ def acompanhamento_dia(
         totais_entregues += entregues
         totais_em_rota += em_rota
         totais_ausente += ausente_ou_ocorrencias
+
+    items.sort(key=lambda it: (it.motoboy_nome or "").casefold())
 
     sla_total = round(100.0 * totais_entregues / totais_pedidos, 1) if totais_pedidos > 0 else None
 
