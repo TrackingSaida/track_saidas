@@ -340,6 +340,7 @@ class RotasPriorityBody(BaseModel):
 class RotasOtimizarBody(BaseModel):
     delivery_ids: List[int] = Field(..., min_length=1, max_length=100)
     start: Optional[RoutePointBody] = None
+    end: Optional[RoutePointBody] = None
     priority: Optional[RotasPriorityBody] = None
 
 
@@ -1508,6 +1509,9 @@ def rotas_otimizar(
     start: Optional[StartPoint] = None
     if body.start is not None:
         start = (float(body.start.latitude), float(body.start.longitude))
+    end: Optional[StartPoint] = None
+    if body.end is not None:
+        end = (float(body.end.latitude), float(body.end.longitude))
 
     if not com_coord:
         ordem_result = list(sem_coordenadas)
@@ -1558,7 +1562,9 @@ def rotas_otimizar(
         else:
             raise HTTPException(status_code=422, detail="Prioridade inválida.")
 
-    result = otimizar_ordem_entregas(com_coord, start=start, stop_penalties=stop_penalties)
+    result = otimizar_ordem_entregas(
+        com_coord, start=start, end=end, stop_penalties=stop_penalties
+    )
     ordem_otimizada = list(result.get("ordem") or [])
     ordem_expandida = expand_stop_order(ordem_otimizada, stops)
     ordem_final = ordem_expandida + sem_coordenadas
