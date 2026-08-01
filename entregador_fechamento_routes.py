@@ -225,6 +225,10 @@ def calcular_valor_base_preview(
     if (entregador_id is None) == (motoboy_id is None):
         raise HTTPException(400, "Informe exatamente um de entregador_id ou motoboy_id.")
 
+    from conferencia_saida_service import conferencia_por_dia_periodo, owner_conferencia_habilitada
+
+    conferencia_habilitada = owner_conferencia_habilitada(db, sub_base, current_user)
+
     if motoboy_id is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, motoboy_id)
         valor_base = _calcular_valor_base_motoboy_periodo(
@@ -232,6 +236,17 @@ def calcular_valor_base_preview(
         )
         executor_nome = _get_motoboy_username(db, motoboy)
         g = _contar_g_por_servico_motoboy(db, sub_base, motoboy_id, periodo_inicio, periodo_fim)
+        conferencia_por_dia = (
+            conferencia_por_dia_periodo(
+                db,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                periodo_inicio=periodo_inicio,
+                periodo_fim=periodo_fim,
+            )
+            if conferencia_habilitada
+            else []
+        )
         return {
             "valor_base": valor_base,
             "entregador_id": None,
@@ -241,6 +256,8 @@ def calcular_valor_base_preview(
             "periodo_fim": periodo_fim.isoformat(),
             "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
             "g_total": g["total"],
+            "conferencia_habilitada": conferencia_habilitada,
+            "conferencia_por_dia": conferencia_por_dia,
         }
 
     ent = db.get(Entregador, entregador_id)
@@ -261,6 +278,8 @@ def calcular_valor_base_preview(
         "periodo_fim": periodo_fim.isoformat(),
         "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
         "g_total": g["total"],
+        "conferencia_habilitada": conferencia_habilitada,
+        "conferencia_por_dia": [],
     }
 
 

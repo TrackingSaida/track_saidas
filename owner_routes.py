@@ -50,6 +50,8 @@ class OwnerUpdate(BaseModel):
     modo_operacao: Optional[str] = None
     tipo_owner: Optional[str] = None
     devolucao_sub_base_habilitada: Optional[bool] = None
+    entrada_obrigatoria_habilitada: Optional[bool] = None
+    conferencia_saida_habilitada: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -68,6 +70,8 @@ class OwnerOut(BaseModel):
     modo_operacao: Optional[str] = None
     tipo_owner: Optional[str] = None
     devolucao_sub_base_habilitada: bool = False
+    entrada_obrigatoria_habilitada: bool = False
+    conferencia_saida_habilitada: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -229,6 +233,12 @@ def update_owner(
 
     if body.devolucao_sub_base_habilitada is not None:
         owner.devolucao_sub_base_habilitada = bool(body.devolucao_sub_base_habilitada)
+
+    if body.entrada_obrigatoria_habilitada is not None:
+        owner.entrada_obrigatoria_habilitada = bool(body.entrada_obrigatoria_habilitada)
+
+    if body.conferencia_saida_habilitada is not None:
+        owner.conferencia_saida_habilitada = bool(body.conferencia_saida_habilitada)
 
     db.commit()
     db.refresh(owner)

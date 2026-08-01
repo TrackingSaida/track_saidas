@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy, RotasMotoboy
+from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy, Owner, RotasMotoboy
 from saidas_routes import (
     normalizar_status_saida,
     STATUS_SAIU_PARA_ENTREGA,
@@ -113,6 +113,10 @@ class AcompanhamentoTotais(BaseModel):
     em_rota: int
     ausente_ou_ocorrencias: int
     sla: Optional[float] = None
+    entrada_habilitada: bool = False
+    entradas: Optional[int] = None
+    saidas: Optional[int] = None
+    pct_saida_sobre_entrada: Optional[float] = None
 
 
 class AcompanhamentoDiaResponse(BaseModel):
@@ -282,7 +286,7 @@ def acompanhamento_dia(
     totais_ausente = 0
 
     nomes_motoboy = _carregar_nomes_motoboy_ids(db, [int(mid) for mid in by_motoboy.keys()])
-    for mid, list_saidas in sorted(by_motoboy.items()):
+    for mid, list_saidas in by_motoboy.items():
         pedidos = len(list_saidas)
         entregues = 0
         em_rota = 0
@@ -326,7 +330,45 @@ def acompanhamento_dia(
         totais_em_rota += em_rota
         totais_ausente += ausente_ou_ocorrencias
 
+    items.sort(key=lambda it: (it.motoboy_nome or "").casefold())
+
     sla_total = round(100.0 * totais_entregues / totais_pedidos, 1) if totais_pedidos > 0 else None
+
+    entrada_habilitada = bool(getattr(current_user, "entrada_obrigatoria_habilitada", False))
+    if not entrada_habilitada:
+        owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        entrada_habilitada = bool(
+            owner_row and getattr(owner_row, "entrada_obrigatoria_habilitada", False)
+        )
+
+    entradas_count: Optional[int] = None
+    saidas_count: Optional[int] = None
+    pct_saida: Optional[float] = None
+    if entrada_habilitada:
+        entradas_count = int(
+            db.scalar(
+                select(func.count(func.distinct(SaidaHistorico.id_saida)))
+                .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
+                .where(Saida.sub_base == sub_base)
+                .where(SaidaHistorico.evento == "entrada_base")
+                .where(func.date(SaidaHistorico.timestamp) >= inicio)
+                .where(func.date(SaidaHistorico.timestamp) <= fim)
+            )
+            or 0
+        )
+        saidas_count = int(
+            db.scalar(
+                select(func.count())
+                .select_from(Saida)
+                .where(Saida.sub_base == sub_base)
+                .where(Saida.data >= inicio)
+                .where(Saida.data <= fim)
+                .where(Saida.motoboy_id.isnot(None))
+            )
+            or 0
+        )
+        if entradas_count > 0:
+            pct_saida = round(100.0 * saidas_count / entradas_count, 1)
 
     return AcompanhamentoDiaResponse(
         items=items,
@@ -336,6 +378,10 @@ def acompanhamento_dia(
             em_rota=totais_em_rota,
             ausente_ou_ocorrencias=totais_ausente,
             sla=sla_total,
+            entrada_habilitada=entrada_habilitada,
+            entradas=entradas_count,
+            saidas=saidas_count,
+            pct_saida_sobre_entrada=pct_saida,
         ),
         data_inicio=inicio.isoformat(),
         data_fim=fim.isoformat(),

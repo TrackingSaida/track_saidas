@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select, func, or_, exists, text
@@ -21,7 +21,8 @@ from sqlalchemy.orm import Session
 from db import get_db
 from db_utils import run_db_query_with_retry
 from auth import get_current_user
-from models import User, Saida, Coleta, Entregador, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from models import User, Saida, Coleta, Entregador, Owner, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from entrega_audit_log import audit_entrega, norm_client_action_id
 from saida_operacional_utils import (
     carregar_contexto_operacional,
     EVENTOS_ATRIBUICAO_VALIDOS,
@@ -232,6 +233,7 @@ STATUS_ENTREGUE = "ENTREGUE"
 STATUS_AUSENTE = "AUSENTE"
 STATUS_CANCELADO = "CANCELADO"
 STATUS_ENCERRADO_SISTEMA = "ENCERRADO_SISTEMA"
+STATUS_NA_BASE = "NA_BASE"
 
 
 def normalizar_status_saida(raw: Optional[str]) -> str:
@@ -251,6 +253,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return "aguardando_coleta"
     if lower in ("não coletado", "nao coletado", "não coletada", "nao coletada"):
         return "não coletado"
+    if lower in ("na_base", "na base"):
+        return STATUS_NA_BASE
     # Novos status motoboy (aceitar em maiúsculas ou lowercase)
     if lower in ("saiu_para_entrega", "saiu para entrega"):
         return STATUS_SAIU_PARA_ENTREGA
@@ -736,10 +740,17 @@ def ler_saida(
     username = current_user.username
     role = getattr(current_user, "role", None)
     ignorar_coleta = bool(current_user.ignorar_coleta)
+    entrada_obrigatoria = bool(getattr(current_user, "entrada_obrigatoria_habilitada", False))
     owner_valor = Decimal(getattr(current_user, "owner_valor", 0))
 
     if not sub_base or not username:
         raise HTTPException(401, "Usuário inválido.")
+
+    if not entrada_obrigatoria:
+        owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        entrada_obrigatoria = bool(
+            owner_row and getattr(owner_row, "entrada_obrigatoria_habilitada", False)
+        )
 
     origem_leitura = ensure_manual_code_entry_allowed(
         db,
@@ -797,6 +808,14 @@ def ler_saida(
     )
 
     if existente is None:
+        if entrada_obrigatoria:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "ENTRADA_OBRIGATORIA",
+                    "message": "Este pacote ainda não teve entrada na base.",
+                },
+            )
         # Não existe: ignorar_coleta ou registrar_nao_coletado → INSERT; senão 422 (erro de negócio, sem retry)
         if not ignorar_coleta and not payload.registrar_nao_coletado:
             # JSONResponse direto para preservar código de erro sem passar pelo handler global.
@@ -890,6 +909,14 @@ def ler_saida(
             raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "coletado":
+        if entrada_obrigatoria:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "ENTRADA_OBRIGATORIA",
+                    "message": "Este pacote ainda não teve entrada na base.",
+                },
+            )
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
         status_anterior = existente.status
         existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
@@ -913,6 +940,39 @@ def ler_saida(
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
+
+    if status_norm == STATUS_NA_BASE:
+        status_anterior = existente.status
+        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.entregador_id = entregador_id
+        existente.entregador = entregador_nome
+        if motoboy_id is not None:
+            existente.motoboy_id = motoboy_id
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="lido",
+                status_anterior=status_anterior,
+                status_novo=existente.status,
+                user_id=getattr(current_user, "id", None),
+            )
+        )
+        try:
+            db.commit()
+            db.refresh(existente)
+            return SaidaOut.model_validate(existente)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar saída.")
+
+    if entrada_obrigatoria and not _status_ja_em_rota_ou_saida(status_norm):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "ENTRADA_OBRIGATORIA",
+                "message": "Este pacote ainda não teve entrada na base.",
+            },
+        )
 
     if _status_ja_em_rota_ou_saida(status_norm):
         # mesmo entregador/motoboy → 200 idempotente (sem 409)
@@ -1256,6 +1316,10 @@ def _lancar_avulso_impl(
     db: Session,
     current_user: User,
 ):
+    from leitura_manual_auth import ensure_lancar_avulso_allowed
+
+    ensure_lancar_avulso_allowed(db, current_user)
+
     sub_base = current_user.sub_base
     username = current_user.username
     if not sub_base or not username:
@@ -1970,8 +2034,10 @@ def patch_saida_foto(
     body: SaidaFotoPatchBody,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
     """Append tipado de foto por evento/tentativa; idempotente por photo_id/key."""
+    client_action_id = norm_client_action_id(x_client_action_id)
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
@@ -2001,14 +2067,17 @@ def patch_saida_foto(
     existing = find_foto_item(current_items, key=key, photo_id=photo_id)
     if existing:
         foto_urls = extract_foto_keys(serialize_foto_items(current_items))
-        logger.info(
-            "PATCH foto idempotente: id_saida=%s key=%s photo_id=%s evento=%s tentativa=%s user_id=%s",
-            id_saida,
-            key,
-            photo_id,
-            evento,
-            tentativa_atual,
-            getattr(current_user, "id", None),
+        audit_entrega(
+            "patch_foto_result",
+            result="idempotent",
+            id_saida=id_saida,
+            user_id=getattr(current_user, "id", None),
+            client_action_id=client_action_id,
+            photo_id=photo_id,
+            object_key=key,
+            evento=evento,
+            tentativa=tentativa_atual,
+            alterar_status=bool(body.alterar_status),
         )
         return {
             "ok": True,
@@ -2018,6 +2087,16 @@ def patch_saida_foto(
         }
 
     if count_fotos_for_evento_tentativa(current_items, evento, tentativa_atual) >= MAX_FOTOS_POR_EVENTO_TENTATIVA:
+        audit_entrega(
+            "patch_foto_result",
+            result="reject",
+            code="MAX_FOTOS_EVENTO",
+            id_saida=id_saida,
+            user_id=getattr(current_user, "id", None),
+            client_action_id=client_action_id,
+            evento=evento,
+            tentativa=tentativa_atual,
+        )
         raise HTTPException(
             status_code=422,
             detail={
@@ -2059,7 +2138,19 @@ def patch_saida_foto(
             detail=detail_row,
             overrides={"foto_url": payload},
         )
-        raise_if_campos_obrigatorios_faltando(faltantes)
+        try:
+            raise_if_campos_obrigatorios_faltando(faltantes)
+        except HTTPException:
+            audit_entrega(
+                "patch_foto_result",
+                result="reject",
+                code="CAMPOS_OBRIGATORIOS_FALTANDO",
+                id_saida=id_saida,
+                user_id=getattr(current_user, "id", None),
+                client_action_id=client_action_id,
+                faltantes=faltantes,
+            )
+            raise
 
     if body.alterar_status and evento != "devolucao":
         status_anterior = obj.status
@@ -2075,15 +2166,19 @@ def patch_saida_foto(
         )
     db.commit()
     foto_urls = extract_foto_keys(payload)
-    logger.info(
-        "PATCH foto: id_saida=%s object_key=%s photo_id=%s status=%s tentativa=%s foto_urls_count=%s user_id=%s",
-        id_saida,
-        key,
-        photo_id,
-        body.status,
-        tentativa_atual,
-        len(foto_urls),
-        getattr(current_user, "id", None),
+    audit_entrega(
+        "patch_foto_result",
+        result="ok",
+        id_saida=id_saida,
+        user_id=getattr(current_user, "id", None),
+        client_action_id=client_action_id,
+        photo_id=photo_id,
+        object_key=key,
+        evento=evento,
+        tentativa=tentativa_atual,
+        foto_urls_count=len(foto_urls),
+        alterar_status=bool(body.alterar_status),
+        status_saida=normalizar_status_saida(obj.status),
     )
     return {"ok": True, "idempotent": False, "foto_urls": foto_urls, "fotos": current_items}
 

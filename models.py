@@ -92,6 +92,10 @@ class Owner(Base):
     nome_fantasia = Column(Text, nullable=True)
     # Permite motoboy devolver pacotes à sub_base pelo app (com foto)
     devolucao_sub_base_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
+    # Saída só após Registrar Entrada (status NA_BASE)
+    entrada_obrigatoria_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
+    # Conferência de saída após Começar Entrega
+    conferencia_saida_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -154,6 +158,7 @@ class Motoboy(Base):
     pode_ler_coleta = Column(Boolean, default=False, nullable=False)
     pode_ler_saida = Column(Boolean, default=True, nullable=False)
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
+    pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
 
     user = relationship("User", back_populates="motoboy")
     sub_bases = relationship("MotoboySubBase", back_populates="motoboy", cascade="all, delete-orphan")
@@ -651,6 +656,33 @@ class SaidaHistorico(Base):
 
     def __repr__(self) -> str:
         return f"<SaidaHistorico id={self.id} id_saida={self.id_saida} evento={self.evento!r}>"
+
+
+# ==========================
+# Tabela: conferencia_saida
+# ==========================
+class ConferenciaSaida(Base):
+    __tablename__ = "conferencia_saida"
+    __table_args__ = (
+        UniqueConstraint("sub_base", "motoboy_id", "data_ref", name="uq_conferencia_saida_sub_motoboy_dia"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="SET NULL"), nullable=True)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    data_ref = Column(Date, nullable=False)
+    status = Column(Text, nullable=False, server_default=text("'pendente'"))
+    conferido_por = Column(BigInteger, nullable=True)
+    conferido_em = Column(DateTime(timezone=False), nullable=True)
+    ultima_abertura_em = Column(DateTime(timezone=False), nullable=True)
+    qtd_no_momento = Column(Integer, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<ConferenciaSaida id={self.id} motoboy_id={self.motoboy_id} "
+            f"data_ref={self.data_ref} status={self.status!r}>"
+        )
 
 
 # ==========================

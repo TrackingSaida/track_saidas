@@ -61,6 +61,7 @@ from saidas_routes import (
     STATUS_AUSENTE,
     STATUS_CANCELADO,
     STATUS_ENCERRADO_SISTEMA,
+    STATUS_NA_BASE,
     _check_delete_window_or_409,
     _should_store_qr_payload_raw,
     normalizar_status_saida,
@@ -97,6 +98,7 @@ from pedido_campos_obrigatorios_service import (
     build_campos_cache_for_sub_base,
     resolve_campos_obrigatorios_from_cache,
 )
+from entrega_audit_log import audit_entrega, norm_client_action_id
 
 router = APIRouter(prefix="/mobile", tags=["Mobile - Entregas"])
 OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
@@ -1320,8 +1322,23 @@ def iniciar_rota(
                 user_id=user.id,
             )
         )
+    atualizados = len(rows)
+    if atualizados > 0:
+        from conferencia_saida_service import (
+            owner_conferencia_habilitada,
+            upsert_conferencia_apos_iniciar_rota,
+        )
+
+        if owner_conferencia_habilitada(db, sub_base, user):
+            upsert_conferencia_apos_iniciar_rota(
+                db,
+                sub_base=sub_base,
+                motoboy_id=int(motoboy_id),
+                data_ref=_hoje_operacional(),
+                qtd=atualizados,
+            )
     db.commit()
-    return {"atualizados": len(rows)}
+    return {"atualizados": atualizados}
 
 
 def _parse_route_updated_at_header(value: Optional[str]) -> Optional[datetime]:
@@ -2607,15 +2624,18 @@ def marcar_entregue(
 ):
     """Marca entrega como ENTREGUE. Permite SAIU_PARA_ENTREGA ou EM_ROTA (roteirização opcional).
     Se body for enviado, preenche tipo_recebedor, nome_recebedor, tipo_documento, numero_documento, observacao_entrega em saidas_detail."""
-    if x_client_action_id:
-        logger.info(
-            "marcar_entregue client_action_id=%s id_saida=%s user_id=%s",
-            x_client_action_id.strip()[:64],
-            id_saida,
-            user.id,
-        )
+    client_action_id = norm_client_action_id(x_client_action_id)
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
+    audit_entrega(
+        "marcar_entregue_attempt",
+        id_saida=id_saida,
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        client_action_id=client_action_id,
+        status_atual=status_norm,
+        has_body=bool(body),
+    )
 
     def _set_if_present(detail: SaidaDetail) -> None:
         if not body:
@@ -2652,9 +2672,38 @@ def marcar_entregue(
             _upsert_detail_com_body()
             db.commit()
             db.refresh(s)
+            audit_entrega(
+                "marcar_entregue_result",
+                result="complemento",
+                id_saida=id_saida,
+                user_id=user.id,
+                motoboy_id=user.motoboy_id,
+                client_action_id=client_action_id,
+                status_atual=status_norm,
+            )
             return _marcacao_response(db, s, complemento=True)
+        audit_entrega(
+            "marcar_entregue_result",
+            result="reject",
+            code="STATUS_FINALIZADO",
+            id_saida=id_saida,
+            user_id=user.id,
+            motoboy_id=user.motoboy_id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if status_norm == STATUS_AUSENTE:
+        audit_entrega(
+            "marcar_entregue_result",
+            result="reject",
+            code="REQUER_NOVA_TENTATIVA",
+            id_saida=id_saida,
+            user_id=user.id,
+            motoboy_id=user.motoboy_id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
         raise HTTPException(
             status_code=422,
             detail={
@@ -2663,6 +2712,16 @@ def marcar_entregue(
             },
         )
     if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+        audit_entrega(
+            "marcar_entregue_result",
+            result="reject",
+            code="STATUS_INVALIDO",
+            id_saida=id_saida,
+            user_id=user.id,
+            motoboy_id=user.motoboy_id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
         raise HTTPException(
             status_code=422,
             detail="Status atual não permite marcar como entregue.",
@@ -2688,7 +2747,21 @@ def marcar_entregue(
         detail=detail_atual,
         overrides=overrides,
     )
-    raise_if_campos_obrigatorios_faltando(faltantes)
+    try:
+        raise_if_campos_obrigatorios_faltando(faltantes)
+    except HTTPException:
+        audit_entrega(
+            "marcar_entregue_result",
+            result="reject",
+            code="CAMPOS_OBRIGATORIOS_FALTANDO",
+            id_saida=id_saida,
+            user_id=user.id,
+            motoboy_id=user.motoboy_id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+            faltantes=faltantes,
+        )
+        raise
 
     status_anterior = status_norm
     s.status = STATUS_ENTREGUE
@@ -2704,6 +2777,16 @@ def marcar_entregue(
     )
     db.commit()
     db.refresh(s)
+    audit_entrega(
+        "marcar_entregue_result",
+        result="ok",
+        id_saida=id_saida,
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        client_action_id=client_action_id,
+        status_anterior=status_anterior,
+        status_novo=STATUS_ENTREGUE,
+    )
     return _marcacao_response(db, s, motoboy_id=user.motoboy_id)
 
 
@@ -2719,18 +2802,39 @@ def marcar_ausente(
     x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
     """Marca entrega como AUSENTE com motivo. Permite SAIU_PARA_ENTREGA ou EM_ROTA."""
-    if x_client_action_id:
-        logger.info(
-            "marcar_ausente client_action_id=%s id_saida=%s user_id=%s",
-            x_client_action_id.strip()[:64],
-            id_saida,
-            user.id,
-        )
+    client_action_id = norm_client_action_id(x_client_action_id)
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
+    audit_entrega(
+        "marcar_ausente_attempt",
+        id_saida=id_saida,
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        client_action_id=client_action_id,
+        status_atual=status_norm,
+        motivo_id=body.motivo_id,
+    )
     if _status_esta_finalizado(status_norm):
+        audit_entrega(
+            "marcar_ausente_result",
+            result="reject",
+            code="STATUS_FINALIZADO",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+        audit_entrega(
+            "marcar_ausente_result",
+            result="reject",
+            code="STATUS_INVALIDO",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
         raise HTTPException(
             status_code=422,
             detail="Status atual não permite marcar como ausente.",
@@ -2749,7 +2853,19 @@ def marcar_ausente(
         detail=detail_atual,
         overrides={"observacao_ocorrencia": body.observacao} if body.observacao is not None else None,
     )
-    raise_if_campos_obrigatorios_faltando(faltantes)
+    try:
+        raise_if_campos_obrigatorios_faltando(faltantes)
+    except HTTPException:
+        audit_entrega(
+            "marcar_ausente_result",
+            result="reject",
+            code="CAMPOS_OBRIGATORIOS_FALTANDO",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+            faltantes=faltantes,
+        )
+        raise
 
     status_anterior = status_norm
     s.status = STATUS_AUSENTE
@@ -2784,6 +2900,16 @@ def marcar_ausente(
     )
     db.commit()
     db.refresh(s)
+    audit_entrega(
+        "marcar_ausente_result",
+        result="ok",
+        id_saida=id_saida,
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        client_action_id=client_action_id,
+        status_anterior=status_anterior,
+        status_novo=STATUS_AUSENTE,
+    )
     return _marcacao_response(db, s, motoboy_id=user.motoboy_id)
 
 
@@ -2803,13 +2929,14 @@ def marcar_devolver(
     x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
     """Devolve pacote à sub_base: exige foto prévia, marca CANCELADO. Só do motoboy logado."""
-    if x_client_action_id:
-        logger.info(
-            "marcar_devolver client_action_id=%s id_saida=%s user_id=%s",
-            x_client_action_id.strip()[:64],
-            id_saida,
-            user.id,
-        )
+    client_action_id = norm_client_action_id(x_client_action_id)
+    audit_entrega(
+        "marcar_devolver_attempt",
+        id_saida=id_saida,
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        client_action_id=client_action_id,
+    )
 
     owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
     if not owner or not bool(getattr(owner, "devolucao_sub_base_habilitada", False)):
@@ -2821,8 +2948,26 @@ def marcar_devolver(
     s = _get_saida_for_motoboy(db, id_saida, user.motoboy_id, user.sub_base)
     status_norm = normalizar_status_saida(s.status)
     if _status_esta_finalizado(status_norm):
+        audit_entrega(
+            "marcar_devolver_result",
+            result="reject",
+            code="STATUS_FINALIZADO",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, STATUS_AUSENTE):
+        audit_entrega(
+            "marcar_devolver_result",
+            result="reject",
+            code="STATUS_INVALIDO",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
         raise HTTPException(
             status_code=422,
             detail="Status atual não permite devolução à base.",
@@ -2831,6 +2976,14 @@ def marcar_devolver(
     detail = _get_detail_for_saida(db, id_saida)
     foto_items = parse_foto_items(detail.foto_url if detail else None)
     if not foto_items:
+        audit_entrega(
+            "marcar_devolver_result",
+            result="reject",
+            code="FOTO_OBRIGATORIA",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+        )
         raise HTTPException(
             status_code=422,
             detail={
@@ -2865,6 +3018,16 @@ def marcar_devolver(
     )
     db.commit()
     db.refresh(s)
+    audit_entrega(
+        "marcar_devolver_result",
+        result="ok",
+        id_saida=id_saida,
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        client_action_id=client_action_id,
+        status_anterior=status_anterior,
+        status_novo=STATUS_CANCELADO,
+    )
     return _marcacao_response(db, s, motoboy_id=user.motoboy_id)
 
 
@@ -3046,8 +3209,23 @@ def scan_codigo(
         )
     )
 
+    entrada_obrigatoria = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
+    if not entrada_obrigatoria:
+        owner_flag = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        entrada_obrigatoria = bool(
+            owner_flag and getattr(owner_flag, "entrada_obrigatoria_habilitada", False)
+        )
+
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
     if not saida:
+        if entrada_obrigatoria:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "ENTRADA_OBRIGATORIA",
+                    "message": "Este pacote ainda não teve entrada na base.",
+                },
+            )
         motoboy = db.get(Motoboy, motoboy_id) if motoboy_id else None
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
@@ -3311,13 +3489,27 @@ def scan_codigo(
             # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
 
-    # Coletado ou AUSENTE ou outro: atribuir ao motoboy logado
+    # Coletado / NA_BASE / AUSENTE ou outro: atribuir ao motoboy logado
     saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
     status_norm = normalizar_status_saida(saida.status)
     if status_norm in (STATUS_ENTREGUE, STATUS_CANCELADO):
         return JSONResponse(
             status_code=422,
             content=_status_finalizado_detail(saida, status_norm),
+        )
+    if entrada_obrigatoria and status_norm not in (
+        STATUS_NA_BASE,
+        STATUS_SAIU_PARA_ENTREGA,
+        STATUS_EM_ROTA,
+        "saiu",
+        STATUS_AUSENTE,
+    ):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "ENTRADA_OBRIGATORIA",
+                "message": "Este pacote ainda não teve entrada na base.",
+            },
         )
     if (
         status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu")
@@ -3377,10 +3569,13 @@ def scan_codigo(
                 )
             )
     _garantir_cobranca_owner_saida(db, saida, owner_valor)
+    # Primeira atribuição (sem titular anterior): mesma ação da 1ª saída sem entrada.
+    # Só marca "assumir" quando havia outro/mesmo titular (reatribuição real).
+    evento_hist = "scan" if motoboy_id_anterior is None else "assumir"
     db.add(
         SaidaHistorico(
             id_saida=saida.id_saida,
-            evento="assumir",
+            evento=evento_hist,
             status_anterior=status_norm,
             status_novo=status_scan,
             motoboy_id_anterior=motoboy_id_anterior,
