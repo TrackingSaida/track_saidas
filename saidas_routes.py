@@ -59,6 +59,37 @@ from upload_storage_utils import (
 )
 
 
+def _enqueue_atribuicao_push_externa(
+    db: Session,
+    *,
+    current_user: User,
+    sub_base: Optional[str],
+    motoboy_id: Optional[int],
+    codigo: Optional[str] = None,
+) -> None:
+    """Digest de push quando staff atribui pacote (não o próprio motoboy)."""
+    if not motoboy_id or not sub_base:
+        return
+    try:
+        role = int(getattr(current_user, "role", 0) or 0)
+    except (TypeError, ValueError):
+        role = 0
+    if role == 4:
+        return
+    try:
+        from push_notification_service import enqueue_pacotes_atribuidos
+
+        enqueue_pacotes_atribuidos(
+            db,
+            motoboy_id=int(motoboy_id),
+            sub_base=sub_base,
+            codigo=(codigo or "").strip() or None,
+        )
+        db.commit()
+    except Exception:
+        logger.exception("enqueue_atribuicao_push_failed motoboy_id=%s", motoboy_id)
+
+
 # ============================================================
 # ROTAS DE SAÍDAS
 # ============================================================
@@ -860,6 +891,13 @@ def ler_saida(
             )
             db.commit()
             db.refresh(row)
+            _enqueue_atribuicao_push_externa(
+                db,
+                current_user=current_user,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                codigo=codigo,
+            )
             return JSONResponse(
                 status_code=201,
                 content=SaidaOut.model_validate(row).model_dump(mode="json"),
@@ -903,6 +941,13 @@ def ler_saida(
         try:
             db.commit()
             db.refresh(existente)
+            _enqueue_atribuicao_push_externa(
+                db,
+                current_user=current_user,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                codigo=existente.codigo,
+            )
             return SaidaOut.model_validate(existente)
         except Exception:
             db.rollback()
@@ -936,6 +981,13 @@ def ler_saida(
         try:
             db.commit()
             db.refresh(existente)
+            _enqueue_atribuicao_push_externa(
+                db,
+                current_user=current_user,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                codigo=existente.codigo,
+            )
             return SaidaOut.model_validate(existente)
         except Exception:
             db.rollback()
@@ -960,6 +1012,13 @@ def ler_saida(
         try:
             db.commit()
             db.refresh(existente)
+            _enqueue_atribuicao_push_externa(
+                db,
+                current_user=current_user,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                codigo=existente.codigo,
+            )
             return SaidaOut.model_validate(existente)
         except Exception:
             db.rollback()
@@ -1421,6 +1480,24 @@ def _lancar_avulso_impl(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erro ao lançar avulso: {e}")
+
+    if motoboy_id and codigos:
+        _enqueue_atribuicao_push_externa(
+            db,
+            current_user=current_user,
+            sub_base=sub_base,
+            motoboy_id=motoboy_id,
+            codigo=codigos[0] if len(codigos) == 1 else None,
+        )
+        # Conta restante no digest (já +1 acima; adiciona N-1)
+        for _ in range(max(0, len(codigos) - 1)):
+            _enqueue_atribuicao_push_externa(
+                db,
+                current_user=current_user,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                codigo=None,
+            )
 
     qtd = len(codigos)
     msg = "1 avulso lançado com sucesso." if qtd == 1 else f"{qtd} avulsos lançados com sucesso."
@@ -2451,6 +2528,15 @@ def atualizar_saida(
     except Exception:
         db.rollback()
         raise HTTPException(500, "Erro ao atualizar saída.")
+
+    if payload_changed.get("motoboy") and obj.motoboy_id:
+        _enqueue_atribuicao_push_externa(
+            db,
+            current_user=current_user,
+            sub_base=sub_base,
+            motoboy_id=obj.motoboy_id,
+            codigo=obj.codigo,
+        )
 
     invalidate_listar_cache(sub_base)
     return SaidaOut.model_validate(obj)

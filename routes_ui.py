@@ -53,6 +53,12 @@ MENU_DEFS = [
                 "group": "registros"
             },
             {
+                "label": "Avisos da Base",
+                "href": "tracking-avisos.html",
+                "roles": [0, 1],
+                "group": "registros"
+            },
+            {
                 "label": "Gerar Etiqueta",
                 "href": "tracking-etiquetas.html",
                 "roles": [0, 1, 2, 3],

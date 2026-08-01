@@ -472,6 +472,8 @@ class EntregadorFechamento(Base):
     status = Column(Text, nullable=False, server_default=text("'fechado'::text"))
 
     criado_em = Column(DateTime(timezone=False), server_default=func.now())
+    pdf_object_key = Column(Text, nullable=True)
+    pdf_gerado_em = Column(DateTime(timezone=False), nullable=True)
 
     def __repr__(self) -> str:
         return (
@@ -921,3 +923,104 @@ class AddressTelemetry(Base):
     query_hash = Column(Text, nullable=True)
     event_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ==========================
+# Push notifications
+# ==========================
+class DevicePushToken(Base):
+    __tablename__ = "device_push_tokens"
+    __table_args__ = (UniqueConstraint("expo_push_token", name="uq_device_push_tokens_token"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=True)
+    role = Column(Integer, nullable=False)
+    sub_base = Column(Text, nullable=False)
+    expo_push_token = Column(Text, nullable=False)
+    platform = Column(Text, nullable=True)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    criado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    atualizado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+
+class NotifPrefs(Base):
+    __tablename__ = "notif_prefs"
+    __table_args__ = (UniqueConstraint("user_id", "sub_base", name="uq_notif_prefs_user_sub"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=True)
+    sub_base = Column(Text, nullable=False)
+    fechamento = Column(Boolean, nullable=False, server_default=text("true"))
+    pacotes_atribuidos = Column(Boolean, nullable=False, server_default=text("true"))
+    atraso_d1 = Column(Boolean, nullable=False, server_default=text("true"))
+    avisos_base = Column(Boolean, nullable=False, server_default=text("true"))
+    reconferir_saida = Column(Boolean, nullable=False, server_default=text("true"))
+    criado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    atualizado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+
+class PushDigest(Base):
+    __tablename__ = "push_digest"
+    __table_args__ = (
+        UniqueConstraint("motoboy_id", "sub_base", "tipo", name="uq_push_digest_motoboy_sub_tipo"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    tipo = Column(Text, nullable=False)
+    count = Column(Integer, nullable=False, server_default=text("0"))
+    last_codigo = Column(Text, nullable=True)
+    flush_after = Column(DateTime(timezone=False), nullable=False)
+    criado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    atualizado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+
+class PushEnvioLog(Base):
+    __tablename__ = "push_envio_log"
+    __table_args__ = (
+        UniqueConstraint(
+            "destinatario_tipo",
+            "destinatario_id",
+            "sub_base",
+            "tipo",
+            "chave_dedupe",
+            name="uq_push_envio_log_dedupe",
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    destinatario_tipo = Column(Text, nullable=False)
+    destinatario_id = Column(BigInteger, nullable=False)
+    sub_base = Column(Text, nullable=False)
+    tipo = Column(Text, nullable=False)
+    chave_dedupe = Column(Text, nullable=False)
+    enviado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+
+class AvisoBase(Base):
+    __tablename__ = "avisos_base"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    criado_por = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    titulo = Column(Text, nullable=False)
+    mensagem = Column(Text, nullable=False)
+    prioridade = Column(Text, nullable=False, server_default=text("'normal'"))
+    criado_em = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+    destinatarios = relationship("AvisoDestinatario", back_populates="aviso", cascade="all, delete-orphan")
+
+
+class AvisoDestinatario(Base):
+    __tablename__ = "aviso_destinatarios"
+    __table_args__ = (UniqueConstraint("aviso_id", "motoboy_id", name="uq_aviso_destinatario"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    aviso_id = Column(BigInteger, ForeignKey("avisos_base.id", ondelete="CASCADE"), nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    lido_em = Column(DateTime(timezone=False), nullable=True)
+
+    aviso = relationship("AvisoBase", back_populates="destinatarios")

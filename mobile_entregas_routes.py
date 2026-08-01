@@ -1330,13 +1330,35 @@ def iniciar_rota(
         )
 
         if owner_conferencia_habilitada(db, sub_base, user):
-            upsert_conferencia_apos_iniciar_rota(
+            _row, virou_reconferir = upsert_conferencia_apos_iniciar_rota(
                 db,
                 sub_base=sub_base,
                 motoboy_id=int(motoboy_id),
                 data_ref=_hoje_operacional(),
                 qtd=atualizados,
             )
+            if virou_reconferir:
+                try:
+                    from conferencia_saida_service import carregar_nomes_motoboy
+                    from push_notification_service import send_to_staff_sub_base
+
+                    nomes = carregar_nomes_motoboy(db, [int(motoboy_id)])
+                    nome = nomes.get(int(motoboy_id)) or f"Motoboy {motoboy_id}"
+                    data_ref = _hoje_operacional()
+                    send_to_staff_sub_base(
+                        db,
+                        sub_base=sub_base,
+                        tipo="reconferir_saida",
+                        title="Reconferência necessária",
+                        body=f"Reconferir do {nome}",
+                        data={
+                            "motoboy_id": int(motoboy_id),
+                            "data_ref": data_ref.isoformat(),
+                            "sub_base": sub_base,
+                        },
+                    )
+                except Exception:
+                    logger.exception("push_reconferir_failed motoboy_id=%s", motoboy_id)
     db.commit()
     return {"atualizados": atualizados}
 
@@ -2589,6 +2611,26 @@ def finalizar_lote(
 
             db.commit()
             db.refresh(s)
+            if status_novo == STATUS_AUSENTE:
+                try:
+                    from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
+                    from push_notification_service import send_to_motoboy
+
+                    bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
+                    if bloqueado and total >= 3:
+                        send_to_motoboy(
+                            db,
+                            motoboy_id=int(user.motoboy_id),
+                            sub_base=user.sub_base,
+                            tipo="bloqueio_ausencia",
+                            title="Pacote bloqueado",
+                            body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
+                            data={"id_saida": id_saida},
+                            chave_dedupe=str(id_saida),
+                        )
+                        db.commit()
+                except Exception:
+                    logger.exception("push_bloqueio_ausencia_lote_failed id_saida=%s", id_saida)
             finalizados.append(FinalizarLoteItemOut(id_saida=id_saida, status=status_novo))
         except Exception as exc:
             db.rollback()
@@ -2900,6 +2942,25 @@ def marcar_ausente(
     )
     db.commit()
     db.refresh(s)
+    try:
+        from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
+        from push_notification_service import send_to_motoboy
+
+        bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
+        if bloqueado and total >= 3:
+            send_to_motoboy(
+                db,
+                motoboy_id=int(user.motoboy_id),
+                sub_base=user.sub_base,
+                tipo="bloqueio_ausencia",
+                title="Pacote bloqueado",
+                body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
+                data={"id_saida": id_saida},
+                chave_dedupe=str(id_saida),
+            )
+            db.commit()
+    except Exception:
+        logger.exception("push_bloqueio_ausencia_failed id_saida=%s", id_saida)
     audit_entrega(
         "marcar_ausente_result",
         result="ok",

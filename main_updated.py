@@ -145,6 +145,9 @@ from cep_routes import router as cep_router
 from config_campos_obrigatorios_routes import router as config_campos_obrigatorios_router
 from entradas_routes import router as entradas_router
 from conferencia_saida_routes import router as conferencia_saida_router
+from mobile_push_routes import router as mobile_push_router
+from avisos_routes import router as avisos_router, mobile_router as avisos_mobile_router
+from mobile_fechamentos_routes import router as mobile_fechamentos_router
 
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
@@ -164,6 +167,10 @@ app.include_router(acompanhamento_router, prefix=API_PREFIX)
 app.include_router(entradas_router, prefix=API_PREFIX)
 app.include_router(conferencia_saida_router, prefix=API_PREFIX)
 app.include_router(mobile_entregas_router, prefix=API_PREFIX)
+app.include_router(mobile_push_router, prefix=API_PREFIX)
+app.include_router(avisos_router, prefix=API_PREFIX)
+app.include_router(avisos_mobile_router, prefix=API_PREFIX)
+app.include_router(mobile_fechamentos_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
@@ -411,6 +418,44 @@ def internal_encerrar_pendentes_quinzena(request: Request):
             "sample_ids": result.sample_ids,
             "tempo_execucao_ms": result.tempo_execucao_ms,
         }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
+
+@app.post(f"{API_PREFIX}/internal/flush-push-digests", tags=["Internal"])
+def internal_flush_push_digests(request: Request):
+    """Flush de digests de push (pacotes atribuídos). X-Cron-Secret."""
+    secret = os.getenv("CRON_PUSH_SECRET") or os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_PUSH_SECRET não configurado"})
+    if request.headers.get("X-Cron-Secret") != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    from push_notification_service import flush_push_digests
+
+    db = SessionLocal()
+    try:
+        return {"status": "ok", **flush_push_digests(db)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
+
+@app.post(f"{API_PREFIX}/internal/notificar-atraso-d1", tags=["Internal"])
+def internal_notificar_atraso_d1(request: Request):
+    """Push diário de atraso D+1. X-Cron-Secret."""
+    secret = os.getenv("CRON_PUSH_SECRET") or os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_PUSH_SECRET não configurado"})
+    if request.headers.get("X-Cron-Secret") != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    from atraso_push_service import notificar_atraso_d1
+
+    db = SessionLocal()
+    try:
+        return {"status": "ok", **notificar_atraso_d1(db)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
     finally:

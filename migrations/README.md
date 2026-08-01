@@ -136,3 +136,22 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_leitura_dedup_critico
     ON logs_leitura (sub_base, username, tipo, resultado, codigo, id_saida, motoboy_id, created_at DESC);
 ```
 
+## create_push_notifications.sql
+
+**Obrigatório** após deploy das notificações push mobile (tokens, preferências, digest, avisos da base, PDF de fechamento).
+
+Cria:
+
+- `device_push_tokens`
+- `notif_prefs`
+- `push_digest`
+- `push_envio_log`
+- `avisos_base` / `aviso_destinatarios`
+- colunas `pdf_object_key` / `pdf_gerado_em` em `entregador_fechamentos`
+
+```bash
+psql "$DATABASE_URL" -f migrations/create_push_notifications.sql
+```
+
+Configuração dos Cron Jobs no Render: ver seção **Notificações push (mobile)** em [`README.md`](../README.md).
+
