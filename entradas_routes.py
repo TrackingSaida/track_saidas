@@ -1,7 +1,7 @@
 """Registrar Entrada na base (sem seller/cobrança de coleta)."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
@@ -14,7 +14,12 @@ from codigo_normalizer import canonicalize_servico, is_qr_like_scan_payload, nor
 from db import get_db
 from leitura_manual_auth import ensure_manual_code_entry_allowed
 from models import Owner, Saida, SaidaHistorico, User
-from saidas_routes import STATUS_NA_BASE, normalizar_status_saida
+from saidas_routes import (
+    STATUS_NA_BASE,
+    _gerar_codigo_avulso,
+    _normalizar_label_avulso,
+    normalizar_status_saida,
+)
 
 router = APIRouter(prefix="/entradas", tags=["Entradas"])
 
@@ -25,6 +30,18 @@ class EntradaLerIn(BaseModel):
     codigo: str = Field(min_length=1)
     origem: Optional[str] = None
     qr_payload_raw: Optional[str] = None
+
+
+class EntradaLancarAvulsoIn(BaseModel):
+    identificacao: Optional[str] = Field(default=None, max_length=32)
+    quantidade: int = Field(default=1, ge=1, le=50)
+
+
+class EntradaLancarAvulsoOut(BaseModel):
+    quantidade_criada: int
+    codigos: List[str]
+    saidas: List[dict]
+    mensagem: str
 
 
 def _owner_entrada_habilitada(db: Session, sub_base: str, user: User) -> bool:
@@ -172,4 +189,90 @@ def ler_entrada(
             "id_saida": existente.id_saida,
             "status": existente.status,
         },
+    )
+
+
+@router.post("/lancar-avulso", response_model=EntradaLancarAvulsoOut)
+def lancar_avulso_entrada(
+    payload: EntradaLancarAvulsoIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cria pacotes avulso já em NA_BASE (sem seller, sem motoboy, sem cobrança)."""
+    role = int(getattr(current_user, "role", 0) or 0)
+    if role not in (0, 1, 2, 3):
+        raise HTTPException(status_code=403, detail="Acesso restrito a admin/operador.")
+
+    sub_base = (current_user.sub_base or "").strip()
+    if not sub_base:
+        raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    if not _owner_entrada_habilitada(db, sub_base, current_user):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "ENTRADA_DESABILITADA",
+                "message": "Registrar entrada não está habilitado para esta base.",
+            },
+        )
+
+    quantidade = int(payload.quantidade or 0)
+    if quantidade < 1:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "QUANTIDADE_INVALIDA", "message": "Quantidade mínima é 1."},
+        )
+
+    label_norm = _normalizar_label_avulso(payload.identificacao)
+    servico = canonicalize_servico("Avulso")
+    codigos: List[str] = []
+    saidas_criadas: List[dict] = []
+    user_id = getattr(current_user, "id", None)
+
+    try:
+        for _ in range(quantidade):
+            codigo = _gerar_codigo_avulso(db, label_norm)
+            row = Saida(
+                sub_base=sub_base,
+                username=current_user.username,
+                codigo=codigo,
+                servico=servico,
+                status=STATUS_NA_BASE,
+                base=(payload.identificacao or "").strip() or None,
+            )
+            db.add(row)
+            db.flush()
+            db.add(
+                SaidaHistorico(
+                    id_saida=row.id_saida,
+                    evento="entrada_base",
+                    status_novo=STATUS_NA_BASE,
+                    user_id=user_id,
+                )
+            )
+            codigos.append(codigo)
+            saidas_criadas.append(
+                {
+                    "id_saida": int(row.id_saida),
+                    "codigo": codigo,
+                    "servico": servico,
+                    "status": STATUS_NA_BASE,
+                }
+            )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro ao lançar avulso de entrada: {e}")
+
+    qtd = len(codigos)
+    msg = (
+        "1 avulso registrado na entrada."
+        if qtd == 1
+        else f"{qtd} avulsos registrados na entrada."
+    )
+    return EntradaLancarAvulsoOut(
+        quantidade_criada=qtd,
+        codigos=codigos,
+        saidas=saidas_criadas,
+        mensagem=msg,
     )
