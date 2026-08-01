@@ -38,6 +38,9 @@ EVENTOS_UI_ULTIMA_ACAO = {
     "status_saiu_manual",
     "status_coletado_manual",
     "status_nao_coletado_manual",
+    # Precisam entrar no contexto da listagem para "Última ação" acompanhar o histórico.
+    "entrada_base",
+    "saida_conferida",
 }
 
 ROTULOS_ACAO = {
@@ -66,6 +69,8 @@ ROTULOS_ACAO = {
     "status_saiu_manual": "Atualizou status para Saiu para entrega",
     "status_coletado_manual": "Atualizou status para Coletado",
     "status_nao_coletado_manual": "Atualizou status para Não Coletado",
+    "entrada_base": "Entrada na base",
+    "saida_conferida": "Saída conferida",
 }
 
 
