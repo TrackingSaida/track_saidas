@@ -94,6 +94,15 @@ def somar_servicos_saidas(rows: List[Saida]) -> Tuple[int, int, int]:
     return shopee, ml, avulso
 
 
+def servico_label_amigavel(servico: Optional[str]) -> str:
+    b = _servico_bucket(servico)
+    if b == "shopee":
+        return "Shopee"
+    if b == "ml":
+        return "ML"
+    return "Avulso"
+
+
 def listar_saidas_motoboy_dia(
     db: Session,
     *,
@@ -111,6 +120,99 @@ def listar_saidas_motoboy_dia(
             )
         ).all()
     )
+
+
+def _ids_ja_conferidos(db: Session, saida_ids: List[int]) -> set[int]:
+    if not saida_ids:
+        return set()
+    rows = db.scalars(
+        select(SaidaHistorico.id_saida)
+        .where(
+            SaidaHistorico.id_saida.in_(saida_ids),
+            SaidaHistorico.evento == "saida_conferida",
+        )
+        .distinct()
+    ).all()
+    return {int(x) for x in rows if x is not None}
+
+
+def listar_saidas_novas_apos_conferencia(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_id: int,
+    data_ref: date,
+) -> List[Saida]:
+    """Pacotes do motoboy/dia que ainda não receberam evento saida_conferida.
+
+    Após uma conferência, todos os pacotes do dia ganham o evento; os que
+    entram depois (novo Começar Entrega) ficam sem ele até a reconferência.
+    """
+    saidas = listar_saidas_motoboy_dia(
+        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
+    )
+    if not saidas:
+        return []
+    ja = _ids_ja_conferidos(db, [int(s.id_saida) for s in saidas])
+    novos = [s for s in saidas if int(s.id_saida) not in ja]
+    novos.sort(key=lambda s: ((s.codigo or "").upper(), int(s.id_saida)))
+    return novos
+
+
+def contar_novos_por_motoboy_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    chaves: List[Tuple[int, date]],
+) -> Dict[Tuple[int, date], int]:
+    """Conta pacotes novos (sem saida_conferida) por (motoboy_id, data_ref)."""
+    if not chaves:
+        return {}
+    chave_set = {(int(m), d) for m, d in chaves}
+    motoboy_ids = {m for m, _ in chave_set}
+    datas = {d for _, d in chave_set}
+    saidas = list(
+        db.scalars(
+            select(Saida).where(
+                Saida.sub_base == sub_base,
+                Saida.motoboy_id.in_(motoboy_ids),
+                Saida.data.in_(datas),
+                Saida.codigo.isnot(None),
+            )
+        ).all()
+    )
+    saidas = [
+        s
+        for s in saidas
+        if s.motoboy_id is not None and (int(s.motoboy_id), s.data) in chave_set
+    ]
+    ja = _ids_ja_conferidos(db, [int(s.id_saida) for s in saidas])
+    out: Dict[Tuple[int, date], int] = {k: 0 for k in chave_set}
+    for s in saidas:
+        if int(s.id_saida) in ja:
+            continue
+        key = (int(s.motoboy_id), s.data)
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def resumo_novos_pacotes(saidas_novas: List[Saida]) -> dict:
+    shopee, ml, avulso = somar_servicos_saidas(saidas_novas)
+    pacotes = [
+        {
+            "codigo": (s.codigo or "").strip(),
+            "servico": servico_label_amigavel(s.servico),
+        }
+        for s in saidas_novas
+        if (s.codigo or "").strip()
+    ]
+    return {
+        "novos_qtd": len(pacotes),
+        "novos_shopee": shopee,
+        "novos_mercado": ml,
+        "novos_avulso": avulso,
+        "novos_pacotes": pacotes,
+    }
 
 
 def carregar_nomes_motoboy(db: Session, motoboy_ids: List[int]) -> Dict[int, str]:
