@@ -3569,10 +3569,13 @@ def scan_codigo(
                 )
             )
     _garantir_cobranca_owner_saida(db, saida, owner_valor)
+    # Primeira atribuição (sem titular anterior): mesma ação da 1ª saída sem entrada.
+    # Só marca "assumir" quando havia outro/mesmo titular (reatribuição real).
+    evento_hist = "scan" if motoboy_id_anterior is None else "assumir"
     db.add(
         SaidaHistorico(
             id_saida=saida.id_saida,
-            evento="assumir",
+            evento=evento_hist,
             status_anterior=status_norm,
             status_novo=status_scan,
             motoboy_id_anterior=motoboy_id_anterior,

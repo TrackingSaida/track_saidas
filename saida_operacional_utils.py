@@ -17,6 +17,8 @@ from saida_operacional_pure import (
     ROTULOS_ACAO,
     SaidaOperacionalContext,
     deve_excluir_saida_operacional,
+    eh_reatribuicao_real,
+    normalizar_evento_atribuicao,
     resolver_chave_acao,
     rotulo_acao_evento,
     timestamp_operacional_saida,
@@ -35,6 +37,8 @@ __all__ = [
     "SaidaOperacionalContext",
     "resolver_chave_acao",
     "rotulo_acao_evento",
+    "eh_reatribuicao_real",
+    "normalizar_evento_atribuicao",
     "carregar_contexto_operacional",
     "deve_excluir_saida_operacional",
     "timestamp_operacional_saida",
@@ -105,7 +109,8 @@ def carregar_contexto_operacional(
             estado["teve_reatribuicao"] = False
             continue
 
-        if evento in EVENTOS_REATRIBUICAO:
+        motoboy_ant = getattr(h, "motoboy_id_anterior", None)
+        if eh_reatribuicao_real(evento, motoboy_ant):
             estado["teve_reatribuicao"] = True
         if evento in EVENTOS_ATRIBUICAO_VALIDOS:
             estado["op"] = h
@@ -158,12 +163,22 @@ def carregar_contexto_operacional(
         op_user_id = getattr(op, "user_id", None) if op is not None else None
         op_user_id = int(op_user_id) if op_user_id is not None else None
         houve_reatribuicao = bool(estado.get("teve_reatribuicao", False))
+        ultimo_motoboy_ant = (
+            getattr(ultimo, "motoboy_id_anterior", None) if ultimo is not None else None
+        )
+        ultimo_evento_ui = normalizar_evento_atribuicao(
+            ultimo_evento, motoboy_id_anterior=ultimo_motoboy_ant
+        )
 
         out[sid] = SaidaOperacionalContext(
             id_saida=sid,
-            ultimo_evento=ultimo_evento,
+            ultimo_evento=ultimo_evento_ui or ultimo_evento,
             ultimo_evento_ts=getattr(ultimo, "timestamp", None) if ultimo is not None else None,
-            acao_label=rotulo_acao_evento(ultimo_evento, houve_reatribuicao=houve_reatribuicao),
+            acao_label=rotulo_acao_evento(
+                ultimo_evento,
+                houve_reatribuicao=houve_reatribuicao,
+                motoboy_id_anterior=ultimo_motoboy_ant,
+            ),
             executado_por=executado_por,
             ultimo_ator_username=user_map.get(op_user_id) if op_user_id is not None else None,
             ultimo_ator_user_id=op_user_id,

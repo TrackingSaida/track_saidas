@@ -95,10 +95,46 @@ def _normalizar_evento(evento: Optional[str]) -> str:
     return (evento or "").strip().lower().replace(" ", "_")
 
 
-def resolver_chave_acao(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
+def eh_reatribuicao_real(
+    evento: Optional[str],
+    motoboy_id_anterior: Optional[int] = None,
+) -> bool:
+    """
+    Reatribuição real exige evento de reatribuição E titular anterior.
+    Primeira atribuição (ex.: saída após entrada NA_BASE) não é reatribuição.
+    """
+    key = _normalizar_evento(evento)
+    if key not in EVENTOS_REATRIBUICAO:
+        return False
+    return motoboy_id_anterior is not None
+
+
+def normalizar_evento_atribuicao(
+    evento: Optional[str],
+    motoboy_id_anterior: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Converte 'assumir/reatribuicao' sem titular anterior em 'scan'
+    (mesma última ação da 1ª saída sem entrada obrigatória).
+    """
     if not evento:
         return None
     key = _normalizar_evento(evento)
+    if key in EVENTOS_REATRIBUICAO and motoboy_id_anterior is None:
+        return "scan"
+    return key
+
+
+def resolver_chave_acao(
+    evento: Optional[str],
+    houve_reatribuicao: bool = False,
+    motoboy_id_anterior: Optional[int] = None,
+) -> Optional[str]:
+    if not evento:
+        return None
+    key = normalizar_evento_atribuicao(evento, motoboy_id_anterior=motoboy_id_anterior)
+    if not key:
+        return None
     if key in EVENTOS_REATRIBUICAO:
         return "reatribuido"
     if key == "em_rota" and houve_reatribuicao:
@@ -106,8 +142,16 @@ def resolver_chave_acao(evento: Optional[str], houve_reatribuicao: bool = False)
     return key
 
 
-def rotulo_acao_evento(evento: Optional[str], houve_reatribuicao: bool = False) -> Optional[str]:
-    key = resolver_chave_acao(evento, houve_reatribuicao=houve_reatribuicao)
+def rotulo_acao_evento(
+    evento: Optional[str],
+    houve_reatribuicao: bool = False,
+    motoboy_id_anterior: Optional[int] = None,
+) -> Optional[str]:
+    key = resolver_chave_acao(
+        evento,
+        houve_reatribuicao=houve_reatribuicao,
+        motoboy_id_anterior=motoboy_id_anterior,
+    )
     if not key:
         return None
     return ROTULOS_ACAO.get(key, (evento or "").replace("_", " ").strip().capitalize())
