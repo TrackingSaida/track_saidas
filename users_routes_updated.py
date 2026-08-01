@@ -42,6 +42,7 @@ class MotoboyOut(BaseModel):
     pode_ler_coleta: bool = False
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = True
+    pode_lancar_avulso: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -73,6 +74,7 @@ class UserCreate(BaseModel):
     pode_ler_coleta: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
+    pode_lancar_avulso: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -123,8 +125,21 @@ class AdminUserUpdate(BaseModel):
     pode_ler_coleta: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
+    pode_lancar_avulso: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MotoboyPermissoesLoteIn(BaseModel):
+    """Aplica permissão a todos os motoboys da sub_base do admin."""
+    pode_lancar_avulso: Optional[bool] = None
+    pode_digitar_codigo_manual: Optional[bool] = None
+
+
+class MotoboyPermissoesLoteOut(BaseModel):
+    atualizados: int
+    pode_lancar_avulso: Optional[bool] = None
+    pode_digitar_codigo_manual: Optional[bool] = None
 
 
 class UserUpdatePayload(BaseModel):
@@ -516,6 +531,9 @@ def create_user(
             pode_digitar_codigo_manual = (
                 body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else True
             )
+            pode_lancar_avulso = (
+                body.pode_lancar_avulso if body.pode_lancar_avulso is not None else True
+            )
             if owner.ignorar_coleta:
                 pode_ler_coleta = False
 
@@ -537,6 +555,7 @@ def create_user(
                 pode_ler_coleta=pode_ler_coleta,
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=pode_digitar_codigo_manual,
+                pode_lancar_avulso=pode_lancar_avulso,
             )
             db.add(motoboy)
             db.flush()
@@ -622,6 +641,48 @@ def list_motoboys(
             nome = f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or ""
             out.append(MotoboyItem(id_motoboy=u.motoboy.id_motoboy, nome=nome or f"Motoboy {u.motoboy.id_motoboy}"))
     return out
+
+
+@router.post("/motoboys/permissoes-lote", response_model=MotoboyPermissoesLoteOut)
+def motoboys_permissoes_lote(
+    body: MotoboyPermissoesLoteIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Aplica permissões a todos os motoboys da sub_base do admin."""
+    if getattr(current_user, "role", None) not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+    if body.pode_lancar_avulso is None and body.pode_digitar_codigo_manual is None:
+        raise HTTPException(422, "Informe ao menos uma permissão para atualizar.")
+
+    sub_base = (current_user.sub_base or "").strip()
+    if not sub_base:
+        raise HTTPException(403, "Sub_base não definida.")
+
+    motoboys = list(
+        db.scalars(
+            select(Motoboy).where(Motoboy.sub_base == sub_base)
+        ).all()
+    )
+    atualizados = 0
+    for m in motoboys:
+        changed = False
+        if body.pode_lancar_avulso is not None:
+            m.pode_lancar_avulso = bool(body.pode_lancar_avulso)
+            changed = True
+        if body.pode_digitar_codigo_manual is not None:
+            m.pode_digitar_codigo_manual = bool(body.pode_digitar_codigo_manual)
+            changed = True
+        if changed:
+            atualizados += 1
+
+    db.commit()
+    return MotoboyPermissoesLoteOut(
+        atualizados=atualizados,
+        pode_lancar_avulso=body.pode_lancar_avulso,
+        pode_digitar_codigo_manual=body.pode_digitar_codigo_manual,
+    )
 
 
 # ============================================================
@@ -761,7 +822,7 @@ def admin_update_user(
     # Campos Motoboy (role=4)
     motoboy_fields = {
         "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
-        "pode_ler_coleta", "pode_ler_saida", "pode_digitar_codigo_manual",
+        "pode_ler_coleta", "pode_ler_saida", "pode_digitar_codigo_manual", "pode_lancar_avulso",
     }
     sub_base = current_user.sub_base or ""
     if user.role == 4:
@@ -787,6 +848,11 @@ def admin_update_user(
                 if updates.get("pode_digitar_codigo_manual") is not None
                 else True
             )
+            pode_lancar_avulso = (
+                updates.get("pode_lancar_avulso", True)
+                if updates.get("pode_lancar_avulso") is not None
+                else True
+            )
             if owner and owner.ignorar_coleta:
                 pode_ler_coleta = False
             motoboy = Motoboy(
@@ -807,6 +873,7 @@ def admin_update_user(
                 pode_ler_coleta=pode_ler_coleta,
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=bool(pode_digitar_codigo_manual),
+                pode_lancar_avulso=bool(pode_lancar_avulso),
             )
             db.add(motoboy)
             db.flush()

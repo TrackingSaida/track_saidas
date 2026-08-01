@@ -1,12 +1,14 @@
 """Registrar Entrada na base (sem seller/cobrança de coleta)."""
 from __future__ import annotations
 
+from datetime import date, datetime, time, timedelta
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -24,6 +26,7 @@ from saidas_routes import (
 router = APIRouter(prefix="/entradas", tags=["Entradas"])
 
 MSG_ENTRADA_OBRIGATORIA = "Este pacote ainda não teve entrada na base."
+OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
 
 
 class EntradaLerIn(BaseModel):
@@ -44,6 +47,14 @@ class EntradaLancarAvulsoOut(BaseModel):
     mensagem: str
 
 
+class EntradaResumoDiaOut(BaseModel):
+    data_ref: date
+    total: int
+    sum_shopee: int
+    sum_mercado: int
+    sum_avulso: int
+
+
 def _owner_entrada_habilitada(db: Session, sub_base: str, user: User) -> bool:
     if bool(getattr(user, "entrada_obrigatoria_habilitada", False)):
         return True
@@ -51,26 +62,13 @@ def _owner_entrada_habilitada(db: Session, sub_base: str, user: User) -> bool:
     return bool(owner and getattr(owner, "entrada_obrigatoria_habilitada", False))
 
 
-def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
-    if not qr_raw or not str(qr_raw).strip():
-        return False
-    return (servico or "").strip().lower() in ("ml", "mercado_livre", "mercado livre")
-
-
-@router.post("/ler")
-def ler_entrada(
-    payload: EntradaLerIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+def _require_staff_entrada(db: Session, current_user: User) -> str:
     role = int(getattr(current_user, "role", 0) or 0)
     if role not in (0, 1, 2, 3):
         raise HTTPException(status_code=403, detail="Acesso restrito a admin/operador.")
-
     sub_base = (current_user.sub_base or "").strip()
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
-
     if not _owner_entrada_habilitada(db, sub_base, current_user):
         raise HTTPException(
             status_code=403,
@@ -79,6 +77,81 @@ def ler_entrada(
                 "message": "Registrar entrada não está habilitado para esta base.",
             },
         )
+    return sub_base
+
+
+def _servico_bucket(servico: Optional[str]) -> str:
+    s = (servico or "").strip().lower()
+    if "shopee" in s:
+        return "shopee"
+    if s in ("ml",) or "mercado" in s or "livre" in s:
+        return "ml"
+    return "avulso"
+
+
+def _bounds_dia_operacional(data_ref: date) -> tuple[datetime, datetime]:
+    start = datetime.combine(data_ref, time.min, tzinfo=OPERACAO_TZ)
+    end = start + timedelta(days=1)
+    # Historico tipicamente naive; compara em horário de Brasília (naive).
+    return start.replace(tzinfo=None), end.replace(tzinfo=None)
+
+
+def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
+    if not qr_raw or not str(qr_raw).strip():
+        return False
+    return (servico or "").strip().lower() in ("ml", "mercado_livre", "mercado livre")
+
+
+@router.get("/resumo-dia", response_model=EntradaResumoDiaOut)
+def resumo_entradas_dia(
+    data_ref: Optional[date] = Query(None, description="Dia operacional (YYYY-MM-DD). Default: hoje."),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Totais de entrada na base no dia (todos os operadores da sub_base)."""
+    sub_base = _require_staff_entrada(db, current_user)
+    dia = data_ref or datetime.now(OPERACAO_TZ).date()
+    start, end = _bounds_dia_operacional(dia)
+
+    rows = db.execute(
+        select(Saida.servico, func.count(func.distinct(SaidaHistorico.id_saida)))
+        .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
+        .where(
+            Saida.sub_base == sub_base,
+            SaidaHistorico.evento == "entrada_base",
+            SaidaHistorico.timestamp >= start,
+            SaidaHistorico.timestamp < end,
+        )
+        .group_by(Saida.servico)
+    ).all()
+
+    shopee = ml = avulso = 0
+    for servico, qtd in rows:
+        n = int(qtd or 0)
+        bucket = _servico_bucket(servico)
+        if bucket == "shopee":
+            shopee += n
+        elif bucket == "ml":
+            ml += n
+        else:
+            avulso += n
+
+    return EntradaResumoDiaOut(
+        data_ref=dia,
+        total=shopee + ml + avulso,
+        sum_shopee=shopee,
+        sum_mercado=ml,
+        sum_avulso=avulso,
+    )
+
+
+@router.post("/ler")
+def ler_entrada(
+    payload: EntradaLerIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _require_staff_entrada(db, current_user)
 
     origem = ensure_manual_code_entry_allowed(
         db, current_user, origem=getattr(payload, "origem", None) or "camera"
@@ -199,22 +272,7 @@ def lancar_avulso_entrada(
     current_user: User = Depends(get_current_user),
 ):
     """Cria pacotes avulso já em NA_BASE (sem seller, sem motoboy, sem cobrança)."""
-    role = int(getattr(current_user, "role", 0) or 0)
-    if role not in (0, 1, 2, 3):
-        raise HTTPException(status_code=403, detail="Acesso restrito a admin/operador.")
-
-    sub_base = (current_user.sub_base or "").strip()
-    if not sub_base:
-        raise HTTPException(status_code=403, detail="Sub-base não definida.")
-
-    if not _owner_entrada_habilitada(db, sub_base, current_user):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "ENTRADA_DESABILITADA",
-                "message": "Registrar entrada não está habilitado para esta base.",
-            },
-        )
+    sub_base = _require_staff_entrada(db, current_user)
 
     quantidade = int(payload.quantidade or 0)
     if quantidade < 1:

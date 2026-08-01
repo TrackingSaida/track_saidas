@@ -1316,6 +1316,10 @@ def _lancar_avulso_impl(
     db: Session,
     current_user: User,
 ):
+    from leitura_manual_auth import ensure_lancar_avulso_allowed
+
+    ensure_lancar_avulso_allowed(db, current_user)
+
     sub_base = current_user.sub_base
     username = current_user.username
     if not sub_base or not username:

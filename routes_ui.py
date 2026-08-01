@@ -34,6 +34,13 @@ MENU_DEFS = [
                 "group": "leituras"
             },
             {
+                "label": "Registrar Entrada",
+                "href": "tracking-entrada-leitura.html",
+                "roles": [0, 1, 2, 3],
+                "group": "leituras",
+                "entrada_only": True,
+            },
+            {
                 "label": "Registros Gerais",
                 "href": "tracking-registros.html",
                 "roles": [0, 1, 2, 3],
@@ -114,7 +121,13 @@ def _menu_label_for_owner(item_label: str, tipo_owner: str) -> str:
     return item_label
 
 
-def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = "codigo", tipo_owner: str = "subbase"):
+def menu_for_role(
+    role: int,
+    ignorar_coleta: bool = False,
+    modo_operacao: str = "codigo",
+    tipo_owner: str = "subbase",
+    entrada_obrigatoria: bool = False,
+):
     visible_sections = []
     tipo_owner = (tipo_owner or "subbase").strip().lower()
     if tipo_owner not in ("base", "subbase"):
@@ -126,6 +139,7 @@ def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = 
             # Filtra os itens permitidos (role + ignorar_coleta + modo_operacao + base_only)
             # coleta_only: ocultar quando ignorar_coleta, EXCETO se coleta_manual_ok e modo=coleta_manual
             # visao360_only: sempre ocultar quando ignorar_coleta
+            # entrada_only: mostrar só quando owner habilitou entrada obrigatória
             # base_only: mostrar só quando tipo_owner == "base"; base_only_roles: aplicar só a esses roles (ex.: [1] = só admin exige base)
             allowed_items = []
             for item in section["items"]:
@@ -135,6 +149,8 @@ def menu_for_role(role: int, ignorar_coleta: bool = False, modo_operacao: str = 
                     roles_that_require_base = item.get("base_only_roles")
                     if roles_that_require_base is None or role in roles_that_require_base:
                         continue
+                if item.get("entrada_only") and not entrada_obrigatoria:
+                    continue
                 if ignorar_coleta and item.get("visao360_only"):
                     continue
                 if ignorar_coleta and item.get("coleta_only"):
@@ -172,7 +188,14 @@ def get_menu(user: User = Depends(get_current_user)):
     ignorar_coleta = bool(getattr(user, "ignorar_coleta", False))
     modo_operacao = getattr(user, "modo_operacao", None) or "codigo"
     tipo_owner = getattr(user, "tipo_owner", None) or "subbase"
-    menu = menu_for_role(role, ignorar_coleta, modo_operacao, tipo_owner)
+    entrada_obrigatoria = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
+    menu = menu_for_role(
+        role,
+        ignorar_coleta,
+        modo_operacao,
+        tipo_owner,
+        entrada_obrigatoria=entrada_obrigatoria,
+    )
 
     return {
         "role": role,

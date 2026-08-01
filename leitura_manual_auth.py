@@ -51,3 +51,33 @@ def ensure_manual_code_entry_allowed(
             },
         )
     return origem_norm
+
+
+def ensure_lancar_avulso_allowed(db: Session, user: User) -> None:
+    """
+    Staff (roles 0-3) sempre pode. Motoboy (role 4) só com flag no banco.
+    Revalida no DB para permitir revogação sem esperar expirar JWT.
+    """
+    role = int(getattr(user, "role", 0) or 0)
+    if role != 4:
+        return
+
+    motoboy_id = getattr(user, "motoboy_id", None)
+    if not motoboy_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "LANCAR_AVULSO_FORBIDDEN",
+                "message": "Lançar avulso não é permitido para este perfil.",
+            },
+        )
+
+    motoboy = db.get(Motoboy, int(motoboy_id))
+    if not motoboy or not bool(getattr(motoboy, "pode_lancar_avulso", True)):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "LANCAR_AVULSO_FORBIDDEN",
+                "message": "Lançar avulso não é permitido para este entregador.",
+            },
+        )
