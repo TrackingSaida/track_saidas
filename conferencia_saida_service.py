@@ -122,6 +122,9 @@ def listar_saidas_motoboy_dia(
     )
 
 
+EVENTOS_CONFERENCIA_PACOTE = ("saida_conferida", "saida_reconferida")
+
+
 def _ids_ja_conferidos(db: Session, saida_ids: List[int]) -> set[int]:
     if not saida_ids:
         return set()
@@ -129,7 +132,7 @@ def _ids_ja_conferidos(db: Session, saida_ids: List[int]) -> set[int]:
         select(SaidaHistorico.id_saida)
         .where(
             SaidaHistorico.id_saida.in_(saida_ids),
-            SaidaHistorico.evento == "saida_conferida",
+            SaidaHistorico.evento.in_(EVENTOS_CONFERENCIA_PACOTE),
         )
         .distinct()
     ).all()
@@ -143,10 +146,10 @@ def listar_saidas_novas_apos_conferencia(
     motoboy_id: int,
     data_ref: date,
 ) -> List[Saida]:
-    """Pacotes do motoboy/dia que ainda não receberam evento saida_conferida.
+    """Pacotes do motoboy/dia sem evento saida_conferida/saida_reconferida.
 
-    Após uma conferência, todos os pacotes do dia ganham o evento; os que
-    entram depois (novo Começar Entrega) ficam sem ele até a reconferência.
+    Após conferir/reconferir, os pacotes do dia ganham o evento; os que
+    entram depois (novo Começar Entrega) ficam sem ele até a próxima ação.
     """
     saidas = listar_saidas_motoboy_dia(
         db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
@@ -165,7 +168,7 @@ def contar_novos_por_motoboy_dia(
     sub_base: str,
     chaves: List[Tuple[int, date]],
 ) -> Dict[Tuple[int, date], int]:
-    """Conta pacotes novos (sem saida_conferida) por (motoboy_id, data_ref)."""
+    """Conta pacotes novos (sem conferência/reconferência) por (motoboy_id, data_ref)."""
     if not chaves:
         return {}
     chave_set = {(int(m), d) for m, d in chaves}
@@ -286,6 +289,10 @@ def conferir_saida(
     saidas = listar_saidas_motoboy_dia(
         db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
     )
+    # Reconferência usa evento distinto para histórico / última ação.
+    evento_hist = (
+        "saida_reconferida" if row.status == STATUS_RECONFERIR else "saida_conferida"
+    )
     now = datetime.utcnow()
     row.status = STATUS_CONFERIDA
     row.conferido_por = user_id
@@ -296,7 +303,7 @@ def conferir_saida(
         db.add(
             SaidaHistorico(
                 id_saida=s.id_saida,
-                evento="saida_conferida",
+                evento=evento_hist,
                 status_anterior=s.status,
                 status_novo=s.status,
                 user_id=user_id,

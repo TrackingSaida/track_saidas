@@ -41,6 +41,7 @@ EVENTOS_UI_ULTIMA_ACAO = {
     # Precisam entrar no contexto da listagem para "Última ação" acompanhar o histórico.
     "entrada_base",
     "saida_conferida",
+    "saida_reconferida",
 }
 
 ROTULOS_ACAO = {
@@ -71,6 +72,7 @@ ROTULOS_ACAO = {
     "status_nao_coletado_manual": "Atualizou status para Não Coletado",
     "entrada_base": "Entrada na base",
     "saida_conferida": "Saída conferida",
+    "saida_reconferida": "Saída reconferida",
 }
 
 
