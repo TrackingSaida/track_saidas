@@ -372,6 +372,27 @@ def criar_fechamento(
     db.commit()
     db.refresh(fech)
 
+    try:
+        from fechamento_pdf_service import upload_fechamento_pdf
+        from push_notification_service import send_to_motoboy
+
+        upload_fechamento_pdf(db, fech, chave_pix=chave_pix)
+        if fech.id_motoboy:
+            periodo = f"{fech.periodo_inicio.strftime('%d/%m')} a {fech.periodo_fim.strftime('%d/%m')}"
+            send_to_motoboy(
+                db,
+                motoboy_id=int(fech.id_motoboy),
+                sub_base=fech.sub_base,
+                tipo="fechamento_pronto",
+                title="Fechamento pronto",
+                body=f"Seu fechamento de {periodo} está disponível — R$ {fech.valor_final}",
+                data={"fechamento_id": fech.id_fechamento},
+            )
+        db.commit()
+        db.refresh(fech)
+    except Exception:
+        pass
+
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
         sub_base=fech.sub_base,
@@ -501,6 +522,27 @@ def atualizar_fechamento(
 
     db.commit()
     db.refresh(fech)
+
+    try:
+        from fechamento_pdf_service import upload_fechamento_pdf
+        from push_notification_service import send_to_motoboy
+
+        upload_fechamento_pdf(db, fech, chave_pix=chave_pix)
+        if fech.id_motoboy:
+            periodo = f"{fech.periodo_inicio.strftime('%d/%m')} a {fech.periodo_fim.strftime('%d/%m')}"
+            send_to_motoboy(
+                db,
+                motoboy_id=int(fech.id_motoboy),
+                sub_base=fech.sub_base,
+                tipo="fechamento_reajustado",
+                title="Fechamento reajustado",
+                body=f"Seu fechamento de {periodo} foi atualizado — R$ {fech.valor_final}",
+                data={"fechamento_id": fech.id_fechamento},
+            )
+        db.commit()
+        db.refresh(fech)
+    except Exception:
+        pass
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,

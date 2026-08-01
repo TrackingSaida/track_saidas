@@ -39,9 +39,13 @@ def upsert_conferencia_apos_iniciar_rota(
     motoboy_id: int,
     data_ref: date,
     qtd: int,
-) -> Optional[ConferenciaSaida]:
+) -> Tuple[Optional[ConferenciaSaida], bool]:
+    """
+    Cria/atualiza conferência do dia.
+    Retorna (row, virou_reconferir) — virou_reconferir só True na transição conferida→reconferir.
+    """
     if qtd <= 0:
-        return None
+        return None, False
     row = db.scalar(
         select(ConferenciaSaida).where(
             ConferenciaSaida.sub_base == sub_base,
@@ -61,15 +65,17 @@ def upsert_conferencia_apos_iniciar_rota(
             qtd_no_momento=qtd,
         )
         db.add(row)
-        return row
+        return row, False
 
     row.qtd_no_momento = qtd
     row.ultima_abertura_em = now
+    virou_reconferir = False
     if row.status == STATUS_CONFERIDA:
         row.status = STATUS_RECONFERIR
         row.conferido_por = None
         row.conferido_em = None
-    return row
+        virou_reconferir = True
+    return row, virou_reconferir
 
 
 def _servico_bucket(servico: Optional[str]) -> str:

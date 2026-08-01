@@ -214,6 +214,90 @@ Filtro opcional por tenant na primeira limpeza grande:
 ".../encerrar-pendentes-quinzena?dry_run=true&sub_base=NOME_DA_SUB_BASE"
 ```
 
+## Notificações push (mobile) — Cron Jobs no Render
+
+Push remoto para motoboy e staff (Expo Push API). Depende de tokens registrados pelo app (`POST /api/mobile/push/register`) e das tabelas criadas pela migração de notificações.
+
+### Escopo dos jobs internos
+
+| Job | Endpoint | Função |
+|-----|----------|--------|
+| Flush de digest | `POST /api/internal/flush-push-digests` | Agrega atribuições web (~60s) e envia push “novos pacotes” |
+| Atraso D+1 | `POST /api/internal/notificar-atraso-d1` | 1 push/dia por motoboy com pendências de dias anteriores |
+
+Outros pushes (fechamento, aviso da base, bloqueio por ausência, reconferência) disparam **na hora** no request da API — não precisam de cron.
+
+### Pré-requisitos
+
+1. Aplicar migração `migrations/create_push_notifications.sql` no Postgres (tokens, prefs, digest, log, avisos, colunas PDF do fechamento).
+2. Deploy da API com os endpoints `/api/mobile/push/*`, `/api/avisos`, `/api/mobile/avisos/*`, `/api/mobile/fechamentos/*` e os dois internos acima.
+3. No **Web Service** da API (Environment), configurar ao menos um secret:
+   - `CRON_PUSH_SECRET` (recomendado, dedicado aos jobs de push)
+   - ou reutilizar `CRON_REFRESH_SECRET` (fallback já suportado pelos endpoints)
+4. App mobile com `expo-notifications` (build nativo) e permissão de notificação no device.
+5. **PDF de fechamento no B2:** object keys usam prefixo `fechamento/{sub_base}/...`. Se a Application Key do B2 estiver restrita só a `saida/`, amplie o prefixo (ou remova a restrição) para permitir `fechamento/` também — senão o PDF continua gerável sob demanda no download autenticado, mas o upload pode falhar.
+
+### Endpoints internos
+
+**Flush digest**
+
+- `POST /api/internal/flush-push-digests`
+- Header: `X-Cron-Secret: <CRON_PUSH_SECRET ou CRON_REFRESH_SECRET>`
+- Resposta típica: `{ "status": "ok", "digests": N, "messages": M }`
+
+**Atraso D+1**
+
+- `POST /api/internal/notificar-atraso-d1`
+- Header: `X-Cron-Secret: <CRON_PUSH_SECRET ou CRON_REFRESH_SECRET>`
+- Resposta típica: `{ "status": "ok", "motoboys": N, "messages": M, "data": "YYYY-MM-DD" }`
+- Dedupe: no máximo 1 envio por motoboy/sub_base/dia (tabela `push_envio_log`)
+
+### Onde configurar no Render
+
+1. Dashboard → [Render](https://dashboard.render.com) → Web Service da API (ex.: `track-saidas-api`).
+2. **Environment** → adicionar `CRON_PUSH_SECRET` (valor forte, igual ao usado nos Cron Jobs).
+3. Criar **dois Cron Jobs** (New → Cron Job) apontando para a URL da API, com a mesma env do secret (ou herdar do serviço, conforme o plano).
+
+### Agendamento recomendado
+
+**1) Flush de digest (pacotes atribuídos)** — a cada 1 minuto:
+
+- Schedule: `* * * * *`
+- Command:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_PUSH_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/flush-push-digests"
+```
+
+Se o plano do Render não permitir cron a cada 1 min, use o menor intervalo disponível (ex.: 5 min); o digest só atrasa o envio agregado.
+
+**2) Atraso D+1** — 1x/dia perto das 08:00 BRT (UTC-3 → 11:00 UTC):
+
+- Schedule: `0 11 * * *`
+- Command:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_PUSH_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/notificar-atraso-d1"
+```
+
+Dica: se `CRON_PUSH_SECRET` não estiver no Cron Job, use `$CRON_REFRESH_SECRET` no header (mesmo fallback do código).
+
+### Smoke test manual
+
+```bash
+export SECRET="$CRON_PUSH_SECRET"   # ou CRON_REFRESH_SECRET
+export BASE_URL="https://track-saidas-api.onrender.com"
+
+curl -sf -X POST -H "X-Cron-Secret: $SECRET" "$BASE_URL/api/internal/flush-push-digests"
+curl -sf -X POST -H "X-Cron-Secret: $SECRET" "$BASE_URL/api/internal/notificar-atraso-d1"
+```
+
+Esperado: HTTP 200 e JSON com `status=ok`. HTTP 401 = secret errado; 500 com “não configurado” = variável ausente no ambiente do processo que atendeu o request.
+
 ## Benchmark de performance (Registros)
 
 Antes de ativar a limpeza e após alguns ciclos, rodar os mesmos testes em `GET /api/saidas/listar`:
