@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -19,6 +20,7 @@ from db import get_db
 from auth import get_current_user
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
+from fechamento_pdf_service import build_fechamento_code, get_fechamento_pdf_bytes
 
 from entregador_routes import (
     _resolve_user_base,
@@ -561,4 +563,34 @@ def atualizar_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+    )
+
+
+# =========================================================
+# GET — PDF oficial do fechamento (mesmo arquivo do mobile)
+# =========================================================
+
+@router.get("/fechamentos/{id_fechamento}/pdf")
+def baixar_pdf_fechamento_admin(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    sub_base = _resolve_user_base(db, current_user)
+    fech = db.get(EntregadorFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+
+    chave_pix: Optional[str] = None
+    if getattr(fech, "id_motoboy", None) is not None:
+        chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
+
+    pdf = get_fechamento_pdf_bytes(db, fech, chave_pix=chave_pix)
+    codigo = build_fechamento_code(fech)
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{codigo}.pdf"',
+        },
     )

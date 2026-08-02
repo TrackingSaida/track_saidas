@@ -25,8 +25,8 @@ PREF_ATRASO = "atraso_d1"
 PREF_AVISOS = "avisos_base"
 PREF_RECONFERIR = "reconferir_saida"
 
-# Tipos que ignoram opt-out
-ALWAYS_SEND_TYPES = frozenset({"bloqueio_ausencia", "aviso_urgente"})
+# Tipos que ignoram opt-out (avisos da base sempre chegam; controle é de quem a operação envia)
+ALWAYS_SEND_TYPES = frozenset({"bloqueio_ausencia", "aviso_urgente", "aviso_base"})
 
 
 def _now() -> datetime:
