@@ -4,6 +4,7 @@ Prefixo: /mobile/push
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -16,6 +17,8 @@ from auth import get_current_user
 from db import get_db
 from models import DevicePushToken, Motoboy, NotifPrefs, User
 from push_notification_service import get_or_create_prefs
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/mobile/push", tags=["Mobile Push"])
 
@@ -123,6 +126,14 @@ def register_push(
         motoboy_id=motoboy_id,
     )
     db.commit()
+    logger.info(
+        "push_register_ok user_id=%s motoboy_id=%s role=%s sub_base=%s platform=%s",
+        current_user.id,
+        motoboy_id,
+        role,
+        sub_base,
+        (payload.platform or "").strip() or None,
+    )
     return {"ok": True, "motoboy_id": motoboy_id}
 
 
