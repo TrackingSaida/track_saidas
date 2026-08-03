@@ -11,7 +11,7 @@ import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import DevicePushToken, NotifPrefs, PushDigest, PushEnvioLog
+from models import DevicePushToken, Motoboy, NotifPrefs, PushDigest, PushEnvioLog
 
 logger = logging.getLogger(__name__)
 
@@ -211,13 +211,42 @@ def send_to_motoboy(
     ):
         return 0
 
-    tokens = db.scalars(
-        select(DevicePushToken).where(
-            DevicePushToken.motoboy_id == motoboy_id,
-            DevicePushToken.sub_base == sub_base,
-            DevicePushToken.ativo.is_(True),
-        )
-    ).all()
+    tokens = list(
+        db.scalars(
+            select(DevicePushToken).where(
+                DevicePushToken.motoboy_id == motoboy_id,
+                DevicePushToken.sub_base == sub_base,
+                DevicePushToken.ativo.is_(True),
+            )
+        ).all()
+    )
+    # Fallback: token registrado sem motoboy_id (JWT incompleto) — busca pelo user_id do motoboy
+    if not tokens:
+        motoboy = db.get(Motoboy, motoboy_id)
+        user_id = int(motoboy.user_id) if motoboy and motoboy.user_id else None
+        if user_id:
+            tokens = list(
+                db.scalars(
+                    select(DevicePushToken).where(
+                        DevicePushToken.user_id == user_id,
+                        DevicePushToken.sub_base == sub_base,
+                        DevicePushToken.ativo.is_(True),
+                    )
+                ).all()
+            )
+            # Corrige vínculo para próximos envios
+            for t in tokens:
+                if t.motoboy_id is None:
+                    t.motoboy_id = motoboy_id
+            if tokens:
+                db.flush()
+                logger.info(
+                    "push_token_recuperado_via_user_id tipo=%s motoboy_id=%s user_id=%s qtd=%s",
+                    tipo,
+                    motoboy_id,
+                    user_id,
+                    len(tokens),
+                )
     if not tokens:
         logger.info(
             "push_sem_token_ativo tipo=%s motoboy_id=%s sub_base=%s",

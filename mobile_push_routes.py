@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from db import get_db
-from models import DevicePushToken, NotifPrefs, User
+from models import DevicePushToken, Motoboy, NotifPrefs, User
 from push_notification_service import get_or_create_prefs
 
 router = APIRouter(prefix="/mobile/push", tags=["Mobile Push"])
@@ -28,10 +28,26 @@ def _require_sub_base(user: User) -> str:
 
 
 def _role_int(user: User) -> int:
+    raw = getattr(user, "role", None)
+    if raw is None or raw == "":
+        return 2
     try:
-        return int(getattr(user, "role", 2) or 2)
+        return int(raw)
     except (TypeError, ValueError):
         return 2
+
+
+def _resolve_motoboy_id(db: Session, user: User, role: int) -> Optional[int]:
+    if role != 4:
+        return None
+    mid = getattr(user, "motoboy_id", None)
+    if mid is not None:
+        try:
+            return int(mid)
+        except (TypeError, ValueError):
+            pass
+    row = db.scalar(select(Motoboy).where(Motoboy.user_id == user.id))
+    return int(row.id_motoboy) if row else None
 
 
 class RegisterPushIn(BaseModel):
@@ -73,7 +89,7 @@ def register_push(
             raise HTTPException(400, "Token de push inválido.")
 
     role = _role_int(current_user)
-    motoboy_id = getattr(current_user, "motoboy_id", None) if role == 4 else None
+    motoboy_id = _resolve_motoboy_id(db, current_user, role)
     now = datetime.utcnow()
 
     existing = db.scalar(
@@ -107,7 +123,7 @@ def register_push(
         motoboy_id=motoboy_id,
     )
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "motoboy_id": motoboy_id}
 
 
 @router.post("/unregister")

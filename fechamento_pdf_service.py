@@ -539,12 +539,20 @@ def upload_fechamento_pdf(
     *,
     chave_pix: Optional[str] = None,
 ) -> Optional[str]:
-    """Gera PDF, sobe ao B2 e atualiza colunas do fechamento. Retorna object_key ou None."""
+    """Gera PDF, sobe ao B2 e atualiza colunas do fechamento. Retorna object_key ou None.
+
+    Usa prefixo `saida/fechamento/...` porque a application key do B2 em produção
+    costuma estar restrita ao prefixo `saida/` (fotos). Prefixo `fechamento/` gera AccessDenied.
+    """
     pdf_bytes = gerar_pdf_bytes(fech, chave_pix=chave_pix, db=db)
     codigo = build_fechamento_code(fech)
-    object_key = f"fechamento/{fech.sub_base}/{fech.id_fechamento}/fechamento_{codigo}.pdf"
+    # Preferir saida/ (entitlement tipico do B2); manter legado fechamento/ como fallback de leitura
+    object_key = (
+        f"saida/fechamento/{fech.sub_base}/{fech.id_fechamento}/fechamento_{codigo}.pdf"
+    )
 
     client = get_s3_client_optional()
+    uploaded = False
     if client and b2_configured():
         try:
             client.put_object(
@@ -553,15 +561,30 @@ def upload_fechamento_pdf(
                 Body=pdf_bytes,
                 ContentType="application/pdf",
             )
-        except Exception:
-            logger.exception("fechamento_pdf_upload_failed id=%s", fech.id_fechamento)
+            uploaded = True
+        except Exception as e:
+            err_name = type(e).__name__
+            logger.exception(
+                "fechamento_pdf_upload_failed id=%s bucket=%s key=%s err=%s — "
+                "verifique B2_BUCKET_NAME e permissao write no prefixo saida/",
+                fech.id_fechamento,
+                B2_BUCKET_NAME,
+                object_key,
+                err_name,
+            )
     else:
         logger.warning("b2_not_configured_fechamento_pdf id=%s", fech.id_fechamento)
 
-    fech.pdf_object_key = object_key
+    # Só grava key se o upload realmente funcionou (download regenera sob demanda)
+    if uploaded:
+        fech.pdf_object_key = object_key
+        fech.pdf_gerado_em = datetime.utcnow()
+        db.flush()
+        return object_key
+
     fech.pdf_gerado_em = datetime.utcnow()
     db.flush()
-    return object_key
+    return None
 
 
 def get_fechamento_pdf_bytes(
