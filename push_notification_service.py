@@ -9,15 +9,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import requests
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from models import DevicePushToken, NotifPrefs, PushDigest, PushEnvioLog
+from models import DevicePushToken, Motoboy, NotifPrefs, PushDigest, PushEnvioLog
 
 logger = logging.getLogger(__name__)
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
-CHANNEL_DEFAULT = "default"
-CHANNEL_URGENT = "urgent"
+# IDs novos forçam recriação do canal no Android (importância/som atualizados)
+CHANNEL_DEFAULT = "avisos_geral"
+CHANNEL_URGENT = "avisos_urgente"
 
 PREF_FECHAMENTO = "fechamento"
 PREF_PACOTES = "pacotes_atribuidos"
@@ -25,8 +27,16 @@ PREF_ATRASO = "atraso_d1"
 PREF_AVISOS = "avisos_base"
 PREF_RECONFERIR = "reconferir_saida"
 
-# Tipos que ignoram opt-out
-ALWAYS_SEND_TYPES = frozenset({"bloqueio_ausencia", "aviso_urgente"})
+# Tipos operacionais que ignoram opt-out do motoboy (prefs não são mais editáveis no app)
+ALWAYS_SEND_TYPES = frozenset(
+    {
+        "bloqueio_ausencia",
+        "aviso_urgente",
+        "aviso_base",
+        "fechamento_pronto",
+        "fechamento_reajustado",
+    }
+)
 
 
 def _now() -> datetime:
@@ -125,6 +135,13 @@ def _build_message(
     data: Dict[str, Any],
     tipo: str,
 ) -> Dict[str, Any]:
+    is_high = tipo in (
+        "aviso_urgente",
+        "aviso_base",
+        "fechamento_pronto",
+        "fechamento_reajustado",
+        "bloqueio_ausencia",
+    )
     channel = CHANNEL_URGENT if tipo == "aviso_urgente" else CHANNEL_DEFAULT
     return {
         "to": token,
@@ -132,7 +149,8 @@ def _build_message(
         "body": body,
         "sound": "default",
         "channelId": channel,
-        "priority": "high" if tipo == "aviso_urgente" else "default",
+        # Prioridade alta ajuda o Android a tocar som de forma confiável
+        "priority": "high" if is_high else "default",
         "data": {**data, "type": tipo},
     }
 
@@ -194,14 +212,49 @@ def send_to_motoboy(
     ):
         return 0
 
-    tokens = db.scalars(
-        select(DevicePushToken).where(
-            DevicePushToken.motoboy_id == motoboy_id,
-            DevicePushToken.sub_base == sub_base,
-            DevicePushToken.ativo.is_(True),
-        )
-    ).all()
+    tokens = list(
+        db.scalars(
+            select(DevicePushToken).where(
+                DevicePushToken.motoboy_id == motoboy_id,
+                DevicePushToken.sub_base == sub_base,
+                DevicePushToken.ativo.is_(True),
+            )
+        ).all()
+    )
+    # Fallback: token registrado sem motoboy_id (JWT incompleto) — busca pelo user_id do motoboy
     if not tokens:
+        motoboy = db.get(Motoboy, motoboy_id)
+        user_id = int(motoboy.user_id) if motoboy and motoboy.user_id else None
+        if user_id:
+            tokens = list(
+                db.scalars(
+                    select(DevicePushToken).where(
+                        DevicePushToken.user_id == user_id,
+                        DevicePushToken.sub_base == sub_base,
+                        DevicePushToken.ativo.is_(True),
+                    )
+                ).all()
+            )
+            # Corrige vínculo para próximos envios
+            for t in tokens:
+                if t.motoboy_id is None:
+                    t.motoboy_id = motoboy_id
+            if tokens:
+                db.flush()
+                logger.info(
+                    "push_token_recuperado_via_user_id tipo=%s motoboy_id=%s user_id=%s qtd=%s",
+                    tipo,
+                    motoboy_id,
+                    user_id,
+                    len(tokens),
+                )
+    if not tokens:
+        logger.info(
+            "push_sem_token_ativo tipo=%s motoboy_id=%s sub_base=%s",
+            tipo,
+            motoboy_id,
+            sub_base,
+        )
         return 0
 
     # Prefs: usa a do primeiro user_id com token (geralmente o mesmo)
@@ -219,6 +272,12 @@ def send_to_motoboy(
             )
         )
     if not pref_allows(prefs, tipo):
+        logger.info(
+            "push_bloqueado_por_pref tipo=%s motoboy_id=%s sub_base=%s",
+            tipo,
+            motoboy_id,
+            sub_base,
+        )
         return 0
 
     messages = [
@@ -289,31 +348,33 @@ def enqueue_pacotes_atribuidos(
     codigo: Optional[str] = None,
     delay_seconds: int = 60,
 ) -> None:
+    """Acumula atribuições no digest (upsert atômico — seguro em lote/paralelo)."""
     now = _now()
-    row = db.scalar(
-        select(PushDigest).where(
-            PushDigest.motoboy_id == motoboy_id,
-            PushDigest.sub_base == sub_base,
-            PushDigest.tipo == "pacotes_atribuidos",
+    flush_after = now + timedelta(seconds=delay_seconds)
+    # ON CONFLICT evita UniqueViolation quando N PATCH em lote batem no mesmo digest.
+    stmt = (
+        pg_insert(PushDigest)
+        .values(
+            motoboy_id=motoboy_id,
+            sub_base=sub_base,
+            tipo="pacotes_atribuidos",
+            count=1,
+            last_codigo=codigo,
+            flush_after=flush_after,
+            criado_em=now,
+            atualizado_em=now,
+        )
+        .on_conflict_do_update(
+            constraint="uq_push_digest_motoboy_sub_tipo",
+            set_={
+                "count": PushDigest.__table__.c.count + 1,
+                "last_codigo": codigo if codigo else PushDigest.__table__.c.last_codigo,
+                "flush_after": flush_after,
+                "atualizado_em": now,
+            },
         )
     )
-    if row:
-        row.count = int(row.count or 0) + 1
-        if codigo:
-            row.last_codigo = codigo
-        row.flush_after = now + timedelta(seconds=delay_seconds)
-        row.atualizado_em = now
-    else:
-        db.add(
-            PushDigest(
-                motoboy_id=motoboy_id,
-                sub_base=sub_base,
-                tipo="pacotes_atribuidos",
-                count=1,
-                last_codigo=codigo,
-                flush_after=now + timedelta(seconds=delay_seconds),
-            )
-        )
+    db.execute(stmt)
 
 
 def flush_push_digests(db: Session) -> Dict[str, int]:

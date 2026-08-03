@@ -6,11 +6,13 @@ GET /entregadores/fechamentos/{id_fechamento} — obter um (para modal)
 """
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -19,6 +21,7 @@ from db import get_db
 from auth import get_current_user
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
+from fechamento_pdf_service import build_fechamento_code, get_fechamento_pdf_bytes
 
 from entregador_routes import (
     _resolve_user_base,
@@ -29,6 +32,8 @@ from entregador_routes import (
     _normalizar_servico,
     STATUS_VALOR_BASE_VALIDOS,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["Fechamentos"])
 
@@ -372,14 +377,26 @@ def criar_fechamento(
     db.commit()
     db.refresh(fech)
 
+    fech_id = int(fech.id_fechamento)
     try:
         from fechamento_pdf_service import upload_fechamento_pdf
-        from push_notification_service import send_to_motoboy
 
         upload_fechamento_pdf(db, fech, chave_pix=chave_pix)
-        if fech.id_motoboy:
+        db.commit()
+    except Exception:
+        logger.exception("fechamento_pdf_pos_criar_failed id=%s", fech_id)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    fech = db.get(EntregadorFechamento, fech_id) or fech
+    if getattr(fech, "id_motoboy", None):
+        try:
+            from push_notification_service import send_to_motoboy
+
             periodo = f"{fech.periodo_inicio.strftime('%d/%m')} a {fech.periodo_fim.strftime('%d/%m')}"
-            send_to_motoboy(
+            n = send_to_motoboy(
                 db,
                 motoboy_id=int(fech.id_motoboy),
                 sub_base=fech.sub_base,
@@ -388,10 +405,32 @@ def criar_fechamento(
                 body=f"Seu fechamento de {periodo} está disponível — R$ {fech.valor_final}",
                 data={"fechamento_id": fech.id_fechamento},
             )
-        db.commit()
-        db.refresh(fech)
-    except Exception:
-        pass
+            db.commit()
+            if n <= 0:
+                logger.warning(
+                    "fechamento_push_sem_token id=%s motoboy_id=%s sub_base=%s",
+                    fech.id_fechamento,
+                    fech.id_motoboy,
+                    fech.sub_base,
+                )
+            else:
+                logger.info(
+                    "fechamento_push_ok id=%s motoboy_id=%s msgs=%s",
+                    fech.id_fechamento,
+                    fech.id_motoboy,
+                    n,
+                )
+        except Exception:
+            logger.exception(
+                "fechamento_push_failed id=%s motoboy_id=%s",
+                fech_id,
+                getattr(fech, "id_motoboy", None),
+            )
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        fech = db.get(EntregadorFechamento, fech_id) or fech
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
@@ -523,14 +562,26 @@ def atualizar_fechamento(
     db.commit()
     db.refresh(fech)
 
+    fech_id = int(fech.id_fechamento)
     try:
         from fechamento_pdf_service import upload_fechamento_pdf
-        from push_notification_service import send_to_motoboy
 
         upload_fechamento_pdf(db, fech, chave_pix=chave_pix)
-        if fech.id_motoboy:
+        db.commit()
+    except Exception:
+        logger.exception("fechamento_pdf_pos_reajuste_failed id=%s", fech_id)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    fech = db.get(EntregadorFechamento, fech_id) or fech
+    if getattr(fech, "id_motoboy", None):
+        try:
+            from push_notification_service import send_to_motoboy
+
             periodo = f"{fech.periodo_inicio.strftime('%d/%m')} a {fech.periodo_fim.strftime('%d/%m')}"
-            send_to_motoboy(
+            n = send_to_motoboy(
                 db,
                 motoboy_id=int(fech.id_motoboy),
                 sub_base=fech.sub_base,
@@ -539,10 +590,32 @@ def atualizar_fechamento(
                 body=f"Seu fechamento de {periodo} foi atualizado — R$ {fech.valor_final}",
                 data={"fechamento_id": fech.id_fechamento},
             )
-        db.commit()
-        db.refresh(fech)
-    except Exception:
-        pass
+            db.commit()
+            if n <= 0:
+                logger.warning(
+                    "fechamento_reajuste_push_sem_token id=%s motoboy_id=%s sub_base=%s",
+                    fech.id_fechamento,
+                    fech.id_motoboy,
+                    fech.sub_base,
+                )
+            else:
+                logger.info(
+                    "fechamento_reajuste_push_ok id=%s motoboy_id=%s msgs=%s",
+                    fech.id_fechamento,
+                    fech.id_motoboy,
+                    n,
+                )
+        except Exception:
+            logger.exception(
+                "fechamento_reajuste_push_failed id=%s motoboy_id=%s",
+                fech_id,
+                getattr(fech, "id_motoboy", None),
+            )
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        fech = db.get(EntregadorFechamento, fech_id) or fech
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
@@ -561,4 +634,34 @@ def atualizar_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+    )
+
+
+# =========================================================
+# GET — PDF oficial do fechamento (mesmo arquivo do mobile)
+# =========================================================
+
+@router.get("/fechamentos/{id_fechamento}/pdf")
+def baixar_pdf_fechamento_admin(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    sub_base = _resolve_user_base(db, current_user)
+    fech = db.get(EntregadorFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+
+    chave_pix: Optional[str] = None
+    if getattr(fech, "id_motoboy", None) is not None:
+        chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
+
+    pdf = get_fechamento_pdf_bytes(db, fech, chave_pix=chave_pix)
+    codigo = build_fechamento_code(fech)
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{codigo}.pdf"',
+        },
     )
