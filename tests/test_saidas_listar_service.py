@@ -13,13 +13,15 @@ from saidas_listar_service import (
 )
 
 
-def _hist(id_, id_saida, evento, ts, user_id=None):
+def _hist(id_, id_saida, evento, ts, user_id=None, motoboy_id_anterior=None, motoboy_id_novo=None):
     return SimpleNamespace(
         id=id_,
         id_saida=id_saida,
         evento=evento,
         timestamp=ts,
         user_id=user_id,
+        motoboy_id_anterior=motoboy_id_anterior,
+        motoboy_id_novo=motoboy_id_novo,
     )
 
 
@@ -210,3 +212,35 @@ def test_matriz_filtro_acao_leu_pedido():
     )
     assert totals["total"] == 1
     assert page[0].id_saida == 12
+
+
+def test_matriz_reatribuicao_com_titular_anterior_mostra_reatribuiu():
+    """Reatribuição real (com motoboy anterior) deve aparecer como 'Reatribuiu pedido'."""
+    ts = datetime(2026, 7, 5, 12, 0, 0)
+    historicos = [
+        _hist(1, 20, "scan", datetime(2026, 7, 5, 10, 0, 0), user_id=1),
+        _hist(
+            2,
+            20,
+            "reatribuido",
+            ts,
+            user_id=2,
+            motoboy_id_anterior=10,
+            motoboy_id_novo=100,
+        ),
+    ]
+    ctx = build_operacional_ctx_from_historico_rows([20], historicos, {1: "op", 2: "Max"})
+    assert ctx[20].acao_label == "Reatribuiu pedido"
+    assert ctx[20].ultimo_evento == "reatribuido"
+    assert ctx[20].executado_por == "Max"
+
+
+def test_matriz_reatribuicao_sem_titular_anterior_equivale_scan():
+    """Primeira atribuição marcada como reatribuido sem titular anterior → Escaneou."""
+    ts = datetime(2026, 7, 5, 12, 0, 0)
+    historicos = [
+        _hist(1, 21, "reatribuido", ts, user_id=2, motoboy_id_anterior=None, motoboy_id_novo=100),
+    ]
+    ctx = build_operacional_ctx_from_historico_rows([21], historicos, {2: "Max"})
+    assert ctx[21].acao_label == "Escaneou pedido"
+    assert ctx[21].ultimo_evento == "scan"

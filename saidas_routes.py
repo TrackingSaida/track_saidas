@@ -88,6 +88,10 @@ def _enqueue_atribuicao_push_externa(
         db.commit()
     except Exception:
         logger.exception("enqueue_atribuicao_push_failed motoboy_id=%s", motoboy_id)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 # ============================================================

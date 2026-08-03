@@ -376,6 +376,8 @@ def _load_historico_tuples(db, ids: Sequence[int]) -> List[Any]:
                     SaidaHistorico.evento,
                     SaidaHistorico.timestamp,
                     SaidaHistorico.user_id,
+                    SaidaHistorico.motoboy_id_anterior,
+                    SaidaHistorico.motoboy_id_novo,
                 )
                 .where(
                     SaidaHistorico.id_saida.in_(ids_lote),

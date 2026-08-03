@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import requests
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from models import DevicePushToken, Motoboy, NotifPrefs, PushDigest, PushEnvioLog
@@ -347,31 +348,33 @@ def enqueue_pacotes_atribuidos(
     codigo: Optional[str] = None,
     delay_seconds: int = 60,
 ) -> None:
+    """Acumula atribuições no digest (upsert atômico — seguro em lote/paralelo)."""
     now = _now()
-    row = db.scalar(
-        select(PushDigest).where(
-            PushDigest.motoboy_id == motoboy_id,
-            PushDigest.sub_base == sub_base,
-            PushDigest.tipo == "pacotes_atribuidos",
+    flush_after = now + timedelta(seconds=delay_seconds)
+    # ON CONFLICT evita UniqueViolation quando N PATCH em lote batem no mesmo digest.
+    stmt = (
+        pg_insert(PushDigest)
+        .values(
+            motoboy_id=motoboy_id,
+            sub_base=sub_base,
+            tipo="pacotes_atribuidos",
+            count=1,
+            last_codigo=codigo,
+            flush_after=flush_after,
+            criado_em=now,
+            atualizado_em=now,
+        )
+        .on_conflict_do_update(
+            constraint="uq_push_digest_motoboy_sub_tipo",
+            set_={
+                "count": PushDigest.__table__.c.count + 1,
+                "last_codigo": codigo if codigo else PushDigest.__table__.c.last_codigo,
+                "flush_after": flush_after,
+                "atualizado_em": now,
+            },
         )
     )
-    if row:
-        row.count = int(row.count or 0) + 1
-        if codigo:
-            row.last_codigo = codigo
-        row.flush_after = now + timedelta(seconds=delay_seconds)
-        row.atualizado_em = now
-    else:
-        db.add(
-            PushDigest(
-                motoboy_id=motoboy_id,
-                sub_base=sub_base,
-                tipo="pacotes_atribuidos",
-                count=1,
-                last_codigo=codigo,
-                flush_after=now + timedelta(seconds=delay_seconds),
-            )
-        )
+    db.execute(stmt)
 
 
 def flush_push_digests(db: Session) -> Dict[str, int]:
