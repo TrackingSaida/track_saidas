@@ -219,6 +219,12 @@ def send_to_motoboy(
         )
     ).all()
     if not tokens:
+        logger.info(
+            "push_sem_token_ativo tipo=%s motoboy_id=%s sub_base=%s",
+            tipo,
+            motoboy_id,
+            sub_base,
+        )
         return 0
 
     # Prefs: usa a do primeiro user_id com token (geralmente o mesmo)
@@ -236,6 +242,12 @@ def send_to_motoboy(
             )
         )
     if not pref_allows(prefs, tipo):
+        logger.info(
+            "push_bloqueado_por_pref tipo=%s motoboy_id=%s sub_base=%s",
+            tipo,
+            motoboy_id,
+            sub_base,
+        )
         return 0
 
     messages = [
