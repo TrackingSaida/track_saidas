@@ -414,9 +414,14 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.username = payload.get("username")
     u.email = payload.get("email")
     u.contato = payload.get("contato")
-    u.role = payload.get("role")
+    try:
+        role_int = int(payload.get("role")) if payload.get("role") is not None and payload.get("role") != "" else None
+    except (TypeError, ValueError):
+        role_int = None
+    u.role = role_int if role_int is not None else payload.get("role")
     u.sub_base = payload.get("sub_base")
-    u.motoboy_id = payload.get("motoboy_id") if payload.get("role") == 4 else None
+    # role pode vir como "4" no JWT — não perder motoboy_id no register de push
+    u.motoboy_id = payload.get("motoboy_id") if role_int == 4 else None
 
     # flags/policies vindas do token
     u.ignorar_coleta = payload.get("ignorar_coleta", False)

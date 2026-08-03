@@ -155,9 +155,11 @@ def _build_message(
     }
 
 
-def _send_expo(messages: List[Dict[str, Any]]) -> None:
+def _send_expo(messages: List[Dict[str, Any]]) -> List[str]:
+    """Envia mensagens à Expo Push API. Retorna tokens inválidos (DeviceNotRegistered)."""
+    invalid: List[str] = []
     if not messages:
-        return
+        return invalid
     try:
         # Expo aceita até 100 por request
         for i in range(0, len(messages), 100):
@@ -171,11 +173,21 @@ def _send_expo(messages: List[Dict[str, Any]]) -> None:
             for idx, ticket in enumerate(tickets):
                 if isinstance(ticket, dict) and ticket.get("status") == "error":
                     details = ticket.get("details") or {}
-                    if details.get("error") == "DeviceNotRegistered":
-                        bad_token = chunk[idx].get("to")
-                        logger.info("expo_token_invalid token=%s", bad_token)
+                    err = details.get("error")
+                    bad_token = chunk[idx].get("to")
+                    logger.warning(
+                        "expo_push_ticket_error error=%s message=%s token=%s",
+                        err,
+                        ticket.get("message"),
+                        bad_token,
+                    )
+                    if err == "DeviceNotRegistered" and bad_token:
+                        invalid.append(str(bad_token))
+                elif isinstance(ticket, dict) and ticket.get("status") == "ok":
+                    logger.info("expo_push_ticket_ok id=%s", ticket.get("id"))
     except Exception:
         logger.exception("expo_push_send_failed count=%s", len(messages))
+    return invalid
 
 
 def _deactivate_invalid_tokens(db: Session, tokens: Sequence[str]) -> None:
@@ -221,39 +233,86 @@ def send_to_motoboy(
             )
         ).all()
     )
-    # Fallback: token registrado sem motoboy_id (JWT incompleto) — busca pelo user_id do motoboy
-    if not tokens:
-        motoboy = db.get(Motoboy, motoboy_id)
-        user_id = int(motoboy.user_id) if motoboy and motoboy.user_id else None
-        if user_id:
-            tokens = list(
-                db.scalars(
-                    select(DevicePushToken).where(
-                        DevicePushToken.user_id == user_id,
-                        DevicePushToken.sub_base == sub_base,
-                        DevicePushToken.ativo.is_(True),
-                    )
-                ).all()
-            )
-            # Corrige vínculo para próximos envios
-            for t in tokens:
-                if t.motoboy_id is None:
-                    t.motoboy_id = motoboy_id
-            if tokens:
-                db.flush()
-                logger.info(
-                    "push_token_recuperado_via_user_id tipo=%s motoboy_id=%s user_id=%s qtd=%s",
-                    tipo,
-                    motoboy_id,
-                    user_id,
-                    len(tokens),
+    motoboy = db.get(Motoboy, motoboy_id)
+    user_id = int(motoboy.user_id) if motoboy and motoboy.user_id else None
+
+    # Fallback 1: token com user_id na mesma sub_base (JWT sem motoboy_id no register)
+    if not tokens and user_id:
+        tokens = list(
+            db.scalars(
+                select(DevicePushToken).where(
+                    DevicePushToken.user_id == user_id,
+                    DevicePushToken.sub_base == sub_base,
+                    DevicePushToken.ativo.is_(True),
                 )
+            ).all()
+        )
+        if tokens:
+            logger.info(
+                "push_token_recuperado_via_user_id tipo=%s motoboy_id=%s user_id=%s qtd=%s",
+                tipo,
+                motoboy_id,
+                user_id,
+                len(tokens),
+            )
+
+    # Fallback 2: mesmo motoboy em outra sub_base (login/troca de base)
+    if not tokens:
+        tokens = list(
+            db.scalars(
+                select(DevicePushToken).where(
+                    DevicePushToken.motoboy_id == motoboy_id,
+                    DevicePushToken.ativo.is_(True),
+                )
+            ).all()
+        )
+        if tokens:
+            logger.info(
+                "push_token_recuperado_outra_sub_base tipo=%s motoboy_id=%s sub_base=%s qtd=%s",
+                tipo,
+                motoboy_id,
+                sub_base,
+                len(tokens),
+            )
+
+    # Fallback 3: user_id em qualquer sub_base
+    if not tokens and user_id:
+        tokens = list(
+            db.scalars(
+                select(DevicePushToken).where(
+                    DevicePushToken.user_id == user_id,
+                    DevicePushToken.ativo.is_(True),
+                )
+            ).all()
+        )
+        if tokens:
+            logger.info(
+                "push_token_recuperado_user_qualquer_sub tipo=%s motoboy_id=%s user_id=%s qtd=%s",
+                tipo,
+                motoboy_id,
+                user_id,
+                len(tokens),
+            )
+
+    # Repara vínculo para próximos envios (mesmo tenant operacional)
+    repaired = False
+    for t in tokens:
+        if t.motoboy_id is None or int(t.motoboy_id) != int(motoboy_id):
+            t.motoboy_id = motoboy_id
+            repaired = True
+        if (t.sub_base or "") != sub_base:
+            t.sub_base = sub_base
+            repaired = True
+    if repaired:
+        db.flush()
+
     if not tokens:
         logger.info(
-            "push_sem_token_ativo tipo=%s motoboy_id=%s sub_base=%s",
+            "push_sem_token_ativo tipo=%s motoboy_id=%s sub_base=%s user_id=%s",
             tipo,
             motoboy_id,
             sub_base,
+            user_id,
         )
         return 0
 
@@ -285,7 +344,10 @@ def send_to_motoboy(
         for t in tokens
         if t.expo_push_token
     ]
-    _send_expo(messages)
+    invalid = _send_expo(messages)
+    if invalid:
+        _deactivate_invalid_tokens(db, invalid)
+        db.flush()
 
     if chave_dedupe:
         mark_sent(
@@ -336,7 +398,10 @@ def send_to_staff_sub_base(
         messages.append(
             _build_message(t.expo_push_token, title=title, body=body, data=data, tipo=tipo)
         )
-    _send_expo(messages)
+    invalid = _send_expo(messages)
+    if invalid:
+        _deactivate_invalid_tokens(db, invalid)
+        db.flush()
     return len(messages)
 
 
