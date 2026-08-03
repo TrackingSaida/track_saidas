@@ -22,8 +22,12 @@ RATE_LIMIT_PER_HOUR = 20
 
 
 def _role(user: User) -> int:
+    """Role 0 é admin global — não usar `or` (0 é falsy em Python)."""
+    raw = getattr(user, "role", None)
+    if raw is None or raw == "":
+        return 2
     try:
-        return int(getattr(user, "role", 2) or 2)
+        return int(raw)
     except (TypeError, ValueError):
         return 2
 
