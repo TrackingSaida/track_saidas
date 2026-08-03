@@ -16,8 +16,9 @@ from models import DevicePushToken, NotifPrefs, PushDigest, PushEnvioLog
 logger = logging.getLogger(__name__)
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
-CHANNEL_DEFAULT = "default"
-CHANNEL_URGENT = "urgent"
+# IDs novos forçam recriação do canal no Android (importância/som atualizados)
+CHANNEL_DEFAULT = "avisos_geral"
+CHANNEL_URGENT = "avisos_urgente"
 
 PREF_FECHAMENTO = "fechamento"
 PREF_PACOTES = "pacotes_atribuidos"
@@ -25,8 +26,16 @@ PREF_ATRASO = "atraso_d1"
 PREF_AVISOS = "avisos_base"
 PREF_RECONFERIR = "reconferir_saida"
 
-# Tipos que ignoram opt-out (avisos da base sempre chegam; controle é de quem a operação envia)
-ALWAYS_SEND_TYPES = frozenset({"bloqueio_ausencia", "aviso_urgente", "aviso_base"})
+# Tipos operacionais que ignoram opt-out do motoboy (prefs não são mais editáveis no app)
+ALWAYS_SEND_TYPES = frozenset(
+    {
+        "bloqueio_ausencia",
+        "aviso_urgente",
+        "aviso_base",
+        "fechamento_pronto",
+        "fechamento_reajustado",
+    }
+)
 
 
 def _now() -> datetime:
@@ -125,6 +134,13 @@ def _build_message(
     data: Dict[str, Any],
     tipo: str,
 ) -> Dict[str, Any]:
+    is_high = tipo in (
+        "aviso_urgente",
+        "aviso_base",
+        "fechamento_pronto",
+        "fechamento_reajustado",
+        "bloqueio_ausencia",
+    )
     channel = CHANNEL_URGENT if tipo == "aviso_urgente" else CHANNEL_DEFAULT
     return {
         "to": token,
@@ -132,7 +148,8 @@ def _build_message(
         "body": body,
         "sound": "default",
         "channelId": channel,
-        "priority": "high" if tipo == "aviso_urgente" else "default",
+        # Prioridade alta ajuda o Android a tocar som de forma confiável
+        "priority": "high" if is_high else "default",
         "data": {**data, "type": tipo},
     }
 

@@ -19,6 +19,12 @@ from push_notification_service import send_to_motoboy
 router = APIRouter(tags=["Avisos"])
 
 RATE_LIMIT_PER_HOUR = 20
+# Comunicado fica disponível no app do motoboy apenas por este período
+AVISO_TTL_HOURS = 12
+
+
+def _aviso_ttl_cutoff() -> datetime:
+    return datetime.utcnow() - timedelta(hours=AVISO_TTL_HOURS)
 
 
 def _role(user: User) -> int:
@@ -239,6 +245,7 @@ def listar_avisos_motoboy(
         .where(
             AvisoBase.sub_base == sub_base,
             AvisoDestinatario.motoboy_id == motoboy_id,
+            AvisoBase.criado_em >= _aviso_ttl_cutoff(),
         )
         .order_by(AvisoBase.criado_em.desc())
         .limit(100)
@@ -272,6 +279,7 @@ def listar_urgentes_pendentes(
             AvisoDestinatario.motoboy_id == motoboy_id,
             AvisoBase.prioridade == "urgente",
             AvisoDestinatario.lido_em.is_(None),
+            AvisoBase.criado_em >= _aviso_ttl_cutoff(),
         )
         .order_by(AvisoBase.criado_em.asc())
     ).all()
@@ -309,6 +317,8 @@ def obter_aviso_motoboy(
     if not row:
         raise HTTPException(404, "Aviso não encontrado.")
     a, d = row
+    if a.criado_em and a.criado_em < _aviso_ttl_cutoff():
+        raise HTTPException(410, "Este aviso expirou (disponível por 12 horas).")
     return AvisoMotoboyOut(
         id=a.id,
         titulo=a.titulo,
