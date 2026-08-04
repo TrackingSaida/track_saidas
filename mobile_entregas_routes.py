@@ -1271,13 +1271,66 @@ def resumo_entregas(
 # ============================================================
 # POST /mobile/iniciar-rota
 # ============================================================
+_STATUS_INICIAR_ROTA = (STATUS_SAIU_PARA_ENTREGA, "saiu", STATUS_EM_ROTA)
+
+
+def _upsert_conferencia_motoboy_iniciar(
+    db: Session,
+    *,
+    user: User,
+    sub_base: str,
+    motoboy_id: int,
+    qtd: int,
+) -> None:
+    """Cria/atualiza conferência de saída após o motoboy iniciar entrega/rota."""
+    if qtd <= 0:
+        return
+    from conferencia_saida_service import (
+        owner_conferencia_habilitada,
+        upsert_conferencia_apos_iniciar_rota,
+    )
+
+    if not owner_conferencia_habilitada(db, sub_base, user):
+        return
+    _row, virou_reconferir = upsert_conferencia_apos_iniciar_rota(
+        db,
+        sub_base=sub_base,
+        motoboy_id=int(motoboy_id),
+        data_ref=_hoje_operacional(),
+        qtd=qtd,
+    )
+    if not virou_reconferir:
+        return
+    try:
+        from conferencia_saida_service import carregar_nomes_motoboy
+        from push_notification_service import send_to_staff_sub_base
+
+        nomes = carregar_nomes_motoboy(db, [int(motoboy_id)])
+        nome = nomes.get(int(motoboy_id)) or f"Motoboy {motoboy_id}"
+        data_ref = _hoje_operacional()
+        send_to_staff_sub_base(
+            db,
+            sub_base=sub_base,
+            tipo="reconferir_saida",
+            title="Reconferência necessária",
+            body=f"Reconferir do {nome}",
+            data={
+                "motoboy_id": int(motoboy_id),
+                "data_ref": data_ref.isoformat(),
+                "sub_base": sub_base,
+            },
+        )
+    except Exception:
+        logger.exception("push_reconferir_failed motoboy_id=%s", motoboy_id)
+
+
 @router.post("/iniciar-rota")
 def iniciar_rota(
     body: Optional[IniciarRotaBody] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Atualiza SAIU_PARA_ENTREGA para EM_ROTA. Se body.delivery_ids for enviado, só esses id_saida; senão, todas do motoboy."""
+    """Atualiza SAIU_PARA_ENTREGA/saiu para EM_ROTA. Se body.delivery_ids for enviado, só esses id_saida; senão, todas do motoboy."""
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
@@ -1285,15 +1338,16 @@ def iniciar_rota(
 
     if body and body.delivery_ids:
         ids = body.delivery_ids
+        # Inclui legado "saiu" e já EM_ROTA (reentrada / Preparar rota) para não zerar a conferência.
         result = db.execute(
             select(Saida).where(
                 Saida.id_saida.in_(ids),
                 Saida.sub_base == sub_base,
                 Saida.motoboy_id == motoboy_id,
-                Saida.status == STATUS_SAIU_PARA_ENTREGA,
+                Saida.status.in_(_STATUS_INICIAR_ROTA),
             )
         )
-        rows = result.scalars().all()
+        all_rows = list(result.scalars().all())
     else:
         # Sem IDs: só o dia operacional atual (evita atualizar milhares de históricos).
         # Prefiltro SQL reduz candidatos antes do contexto operacional.
@@ -1303,63 +1357,42 @@ def iniciar_rota(
             select(Saida).where(
                 Saida.sub_base == sub_base,
                 Saida.motoboy_id == motoboy_id,
-                Saida.status == STATUS_SAIU_PARA_ENTREGA,
+                Saida.status.in_(_STATUS_INICIAR_ROTA),
                 or_(
                     Saida.data >= cutoff,
                     func.date(Saida.timestamp) >= cutoff,
                 ),
             )
         )
-        rows = _filtrar_por_data_operacional(db, list(result.scalars().all()), hoje)
-    for s in rows:
+        all_rows = _filtrar_por_data_operacional(db, list(result.scalars().all()), hoje)
+
+    rows_to_update = [
+        s
+        for s in all_rows
+        if normalizar_status_saida(s.status) in ("saiu", STATUS_SAIU_PARA_ENTREGA)
+    ]
+    for s in rows_to_update:
+        status_antes = normalizar_status_saida(s.status) or (s.status or STATUS_SAIU_PARA_ENTREGA)
         s.status = STATUS_EM_ROTA
-    for s in rows:
         db.add(
             SaidaHistorico(
                 id_saida=s.id_saida,
                 evento="em_rota",
-                status_anterior=STATUS_SAIU_PARA_ENTREGA,
+                status_anterior=status_antes,
                 status_novo=STATUS_EM_ROTA,
                 user_id=user.id,
             )
         )
-    atualizados = len(rows)
-    if atualizados > 0:
-        from conferencia_saida_service import (
-            owner_conferencia_habilitada,
-            upsert_conferencia_apos_iniciar_rota,
-        )
-
-        if owner_conferencia_habilitada(db, sub_base, user):
-            _row, virou_reconferir = upsert_conferencia_apos_iniciar_rota(
-                db,
-                sub_base=sub_base,
-                motoboy_id=int(motoboy_id),
-                data_ref=_hoje_operacional(),
-                qtd=atualizados,
-            )
-            if virou_reconferir:
-                try:
-                    from conferencia_saida_service import carregar_nomes_motoboy
-                    from push_notification_service import send_to_staff_sub_base
-
-                    nomes = carregar_nomes_motoboy(db, [int(motoboy_id)])
-                    nome = nomes.get(int(motoboy_id)) or f"Motoboy {motoboy_id}"
-                    data_ref = _hoje_operacional()
-                    send_to_staff_sub_base(
-                        db,
-                        sub_base=sub_base,
-                        tipo="reconferir_saida",
-                        title="Reconferência necessária",
-                        body=f"Reconferir do {nome}",
-                        data={
-                            "motoboy_id": int(motoboy_id),
-                            "data_ref": data_ref.isoformat(),
-                            "sub_base": sub_base,
-                        },
-                    )
-                except Exception:
-                    logger.exception("push_reconferir_failed motoboy_id=%s", motoboy_id)
+    atualizados = len(rows_to_update)
+    # Conferência usa o total da sessão (inclui pacotes já EM_ROTA).
+    qtd_conferencia = len(all_rows)
+    _upsert_conferencia_motoboy_iniciar(
+        db,
+        user=user,
+        sub_base=sub_base,
+        motoboy_id=int(motoboy_id),
+        qtd=qtd_conferencia,
+    )
     db.commit()
     return {"atualizados": atualizados}
 
@@ -1607,7 +1640,7 @@ def rotas_iniciar(
             Saida.id_saida.in_(ids),
             Saida.sub_base == sub_base,
             Saida.motoboy_id == motoboy_id,
-            Saida.status.in_([STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA]),
+            Saida.status.in_(_STATUS_INICIAR_ROTA),
         )
     )
     rows = result.scalars().all()
@@ -1619,16 +1652,25 @@ def rotas_iniciar(
     for s in rows:
         status_antes = s.status
         s.status = STATUS_EM_ROTA
-        if status_antes == STATUS_SAIU_PARA_ENTREGA:
+        if status_antes == STATUS_SAIU_PARA_ENTREGA or normalizar_status_saida(status_antes) == "saiu":
             db.add(
                 SaidaHistorico(
                     id_saida=s.id_saida,
                     evento="em_rota",
-                    status_anterior=STATUS_SAIU_PARA_ENTREGA,
+                    status_anterior=status_antes,
                     status_novo=STATUS_EM_ROTA,
                     user_id=user.id,
                 )
             )
+
+    # Garante conferência também no fluxo Preparar rota → gerar/iniciar rota.
+    _upsert_conferencia_motoboy_iniciar(
+        db,
+        user=user,
+        sub_base=sub_base,
+        motoboy_id=int(motoboy_id),
+        qtd=len(rows),
+    )
 
     hoje = _hoje_operacional()
     now = datetime.utcnow()
