@@ -253,6 +253,8 @@ class EnderecoBody(BaseModel):
     coord_precision: Optional[str] = None  # rooftop | street | approx
     geocode_source: Optional[str] = None
     geocode_score: Optional[float] = None
+    bairro_informado: Optional[str] = None
+    address_events: Optional[List[str]] = None
 
 
 class EnderecoSugestoesHints(BaseModel):
@@ -2411,6 +2413,39 @@ def atualizar_endereco(
                 endereco_formatado,
                 {"id_saida": id_saida, "origem": origem},
             )
+            bairro_inf = (body.bairro_informado or "").strip()
+            bairro_final = body.bairro.strip()
+            if bairro_inf and bairro_final:
+                from address_ranker import compare_bairro
+
+                if compare_bairro(bairro_inf, bairro_final) == "conflict":
+                    log_address_event(
+                        db,
+                        "bairro_mismatch",
+                        user.sub_base,
+                        user.motoboy_id,
+                        endereco_formatado,
+                        {
+                            "id_saida": id_saida,
+                            "bairro_informado": bairro_inf,
+                            "bairro_salvo": bairro_final,
+                        },
+                    )
+            for ev in body.address_events or []:
+                ev_name = (ev or "").strip()
+                if ev_name in (
+                    "bairro_mismatch",
+                    "auto_apply_overridden",
+                    "suggestion_changed_by_user",
+                ):
+                    log_address_event(
+                        db,
+                        ev_name,
+                        user.sub_base,
+                        user.motoboy_id,
+                        endereco_formatado,
+                        {"id_saida": id_saida, "origem": origem},
+                    )
         except Exception as e:
             log.warning("known_address upsert failed: %s", e)
     else:

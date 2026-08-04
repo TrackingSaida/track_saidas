@@ -4,14 +4,17 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
-from address_normalizer import normalize_address_key, normalize_numero_part, normalize_street_part
+from address_fuzzy import similarity
+from address_normalizer import normalize_numero_part, normalize_street_part
 from address_providers.base import RawAddressHit
 from address_normalizer import normalize_cep
 
 MIN_SUGGESTION_SCORE = int(os.getenv("MIN_SUGGESTION_SCORE", "20"))
 MAX_SCORE_REFERENCE = 250.0
+
+BairroMatchLevel = Literal["equal", "partial", "conflict", "unknown"]
 
 
 @dataclass
@@ -20,6 +23,7 @@ class RankContext:
     query_numero: str = ""
     query_cep: str = ""
     query_rua_norm: str = ""
+    query_bairro: str = ""
     gps_lat: Optional[float] = None
     gps_lon: Optional[float] = None
     sub_base_city_weights: Optional[Dict[str, int]] = None
@@ -75,6 +79,32 @@ def _numero_score(query_num: str, hit_num: str) -> int:
     return 0
 
 
+def compare_bairro(query_bairro: str, hit_bairro: str) -> BairroMatchLevel:
+    qa = normalize_street_part(query_bairro)
+    hb = normalize_street_part(hit_bairro)
+    if not qa or not hb:
+        return "unknown"
+    if qa == hb:
+        return "equal"
+    if qa in hb or hb in qa:
+        return "partial"
+    sim = similarity(qa, hb)
+    if sim >= 0.72:
+        return "partial"
+    return "conflict"
+
+
+def _bairro_score(query_bairro: str, hit_bairro: str) -> int:
+    level = compare_bairro(query_bairro, hit_bairro)
+    if level == "equal":
+        return 35
+    if level == "partial":
+        return 15
+    if level == "conflict":
+        return -60
+    return 0
+
+
 def _recurrence_bonus(weights: Optional[Dict[str, int]], key: str, cap: int = 20) -> int:
     if not weights or not key:
         return 0
@@ -107,16 +137,30 @@ def score_hit(hit: RawAddressHit, ctx: RankContext) -> tuple[int, float, float]:
         elif ctx.query_rua_norm in hit_rua_norm or hit_rua_norm in ctx.query_rua_norm:
             score += 5
 
+    bairro_level = compare_bairro(ctx.query_bairro, hit.bairro)
+    score += _bairro_score(ctx.query_bairro, hit.bairro)
+
     if ctx.known_qtd > 0:
         score += min(30, 10 + int(math.log1p(ctx.known_qtd) * 8))
 
     if hit.source == "google_places":
-        score += 10
+        # Preferir providers com bairro coerente; provisional sem bairro perde bônus.
+        if (hit.bairro or "").strip():
+            score += 10
+        else:
+            score += 2
+
+    sub_bairro_bonus = _recurrence_bonus(ctx.sub_base_bairro_weights, hit.bairro, 20)
+    mot_bairro_bonus = _recurrence_bonus(ctx.motoboy_bairro_weights, hit.bairro, 15)
+    # Reduz peso do bairro frequente da sub_base quando conflita com o informado.
+    if bairro_level == "conflict":
+        sub_bairro_bonus = min(sub_bairro_bonus, 4)
+        mot_bairro_bonus = min(mot_bairro_bonus, 3)
 
     score += _recurrence_bonus(ctx.sub_base_city_weights, hit.cidade, 20)
-    score += _recurrence_bonus(ctx.sub_base_bairro_weights, hit.bairro, 20)
+    score += sub_bairro_bonus
     score += _recurrence_bonus(ctx.motoboy_city_weights, hit.cidade, 25)
-    score += _recurrence_bonus(ctx.motoboy_bairro_weights, hit.bairro, 15)
+    score += mot_bairro_bonus
 
     if not hit.cidade or not hit.estado or len(hit.estado) < 2:
         score -= 30
@@ -144,11 +188,13 @@ def build_rank_context(
     query_cep = normalize_cep(hints.get("cep") or "")
     rua_hint = hints.get("rua") or query
     rua_norm = normalize_street_part(rua_hint)
+    query_bairro = normalize_street_part(hints.get("bairro") or "")
     return RankContext(
         query=query,
         query_numero=query_num,
         query_cep=query_cep,
         query_rua_norm=rua_norm,
+        query_bairro=query_bairro,
         gps_lat=gps_lat,
         gps_lon=gps_lon,
         **kwargs,

@@ -53,13 +53,23 @@ def _extract_numero_from_query(query: str) -> str:
 
 
 def _dedupe_hits(scored: List[dict]) -> List[dict]:
+    from address_ranker import compare_bairro
+
     seen: Dict[str, dict] = {}
+    extras: List[dict] = []
     for item in scored:
         key = normalize_address_key(item.get("rua"), item.get("numero"), item.get("cep"))
         prev = seen.get(key)
-        if prev is None or item.get("score", 0) > prev.get("score", 0):
+        if prev is None:
             seen[key] = item
-    return list(seen.values())
+            continue
+        # Mesma rua/número/CEP com bairros conflitantes: manter ambos.
+        if compare_bairro(prev.get("bairro") or "", item.get("bairro") or "") == "conflict":
+            extras.append(item)
+            continue
+        if item.get("score", 0) > prev.get("score", 0):
+            seen[key] = item
+    return list(seen.values()) + extras
 
 
 def _google_prediction_to_dict(prediction, score: int, search_query: str) -> dict:
@@ -133,11 +143,15 @@ def _make_rank_ctx(
     mot_bairros: dict,
     known_qtd: int,
 ) -> RankContext:
+    from address_normalizer import normalize_street_part
+
+    query_bairro = ctx_base.query_bairro or normalize_street_part(hints.get("bairro") or "")
     return RankContext(
         query=ctx_base.query,
         query_numero=ctx_base.query_numero or _extract_numero_from_query(search_query),
         query_cep=ctx_base.query_cep or normalize_cep(hints.get("cep")),
         query_rua_norm=ctx_base.query_rua_norm,
+        query_bairro=query_bairro,
         gps_lat=latitude,
         gps_lon=longitude,
         sub_base_city_weights=sub_cities,
@@ -384,11 +398,17 @@ class SmartAddressSearch:
 
         skip_providers = False
         if SKIP_PROVIDERS_IF_KNOWN and known_results:
+            from address_ranker import compare_bairro
+
             for hit, qtd in known_results:
                 ctx = _make_rank_ctx(
                     ctx_base, hints, search_query, latitude, longitude,
                     sub_cities, sub_bairros, mot_cities, mot_bairros, qtd,
                 )
+                # Não short-circuitar known address se bairro informado ≠ known.bairro.
+                if ctx.query_bairro and hit.bairro:
+                    if compare_bairro(ctx.query_bairro, hit.bairro) == "conflict":
+                        continue
                 score, _, _ = score_hit(hit, ctx)
                 if score >= KNOWN_FAST_SCORE:
                     skip_providers = True
@@ -439,6 +459,25 @@ class SmartAddressSearch:
         suggestions = scored[:limit]
         used_google = False
         pre_google_best_by_source = best_score_by_source(scored)
+
+        if ctx_base.query_bairro and suggestions:
+            from address_ranker import compare_bairro
+
+            top = suggestions[0]
+            if compare_bairro(ctx_base.query_bairro, top.get("bairro") or "") == "conflict":
+                log_address_event(
+                    db,
+                    "bairro_mismatch",
+                    sub_base,
+                    motoboy_id,
+                    search_query,
+                    {
+                        "query_bairro": ctx_base.query_bairro,
+                        "hit_bairro": top.get("bairro"),
+                        "hit_source": top.get("source"),
+                        "hit_score": top.get("score"),
+                    },
+                )
 
         invoke_google, google_reason, cost_guard_hit = should_auto_invoke_google_places(
             suggestions,
