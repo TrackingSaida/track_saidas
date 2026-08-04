@@ -81,8 +81,9 @@ def _ensure_object_key_owned(db: Session, sub_base: str, object_key: str) -> Non
 
 class PresignIn(BaseModel):
     filename: str = Field(min_length=1)
-    id_saida: int = Field(gt=0)
-    tipo: str = Field(pattern="^(entregue|ausente|devolucao)$")
+    # id_saida opcional só para tipo=lancar_avulso (foto antes de criar a saída).
+    id_saida: Optional[int] = Field(default=None, gt=0)
+    tipo: str = Field(pattern="^(entregue|ausente|devolucao|lancar_avulso)$")
     content_type: str = Field(default="image/jpeg")
     photo_id: Optional[str] = Field(default=None, max_length=80)
 
@@ -522,15 +523,24 @@ def upload_presign(
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
-    saida = _ensure_saida_owned(db, sub_base, body.id_saida)
-    _ensure_motoboy_owns_saida(current_user, saida)
+
+    tipo = (body.tipo or "").strip().lower()
+    if body.id_saida is None:
+        if tipo != "lancar_avulso":
+            raise HTTPException(status_code=422, detail="id_saida é obrigatório para este tipo.")
+    else:
+        saida = _ensure_saida_owned(db, sub_base, body.id_saida)
+        _ensure_motoboy_owns_saida(current_user, saida)
 
     ext = "jpg"
     if body.filename and "." in body.filename:
         ext = body.filename.rsplit(".", 1)[-1].lower()
         if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
             ext = "jpg"
-    object_key = f"saida/{body.id_saida}/{body.tipo}/{uuid.uuid4().hex}.{ext}"
+    if body.id_saida is None:
+        object_key = f"saida/pending/{tipo}/{uuid.uuid4().hex}.{ext}"
+    else:
+        object_key = f"saida/{body.id_saida}/{tipo}/{uuid.uuid4().hex}.{ext}"
 
     client = _get_s3_client()
     params = {"Bucket": B2_BUCKET_NAME, "Key": object_key}

@@ -22,6 +22,7 @@ from conferencia_saida_service import (
     owner_conferencia_habilitada,
     resumo_novos_pacotes,
     somar_servicos_saidas,
+    upsert_conferencia_dia,
 )
 from db import get_db
 from models import ConferenciaSaida, User
@@ -74,6 +75,25 @@ class ConferenciaDetalheOut(BaseModel):
 
 class ConferirBody(BaseModel):
     data_ref: date = Field(...)
+
+
+class ConfirmarLeituraBody(BaseModel):
+    motoboy_id: int = Field(..., ge=1)
+    data_ref: date = Field(...)
+    qtd: Optional[int] = Field(None, ge=0)
+
+
+class ConfirmarLeituraOut(BaseModel):
+    motoboy_id: int
+    motoboy_nome: str
+    data_ref: date
+    status: str
+    qtd_no_momento: int
+    sum_shopee: int
+    sum_mercado: int
+    sum_avulso: int
+    total: int
+    virou_reconferir: bool = False
 
 
 def _require_staff(user: User) -> None:
@@ -136,6 +156,99 @@ def _detalhe_out(
         novos_mercado=int(novos_payload["novos_mercado"]),
         novos_avulso=int(novos_payload["novos_avulso"]),
         novos_pacotes=[PacoteNovoOut(**p) for p in novos_payload["novos_pacotes"]],
+    )
+
+
+@router.post("/confirmar-leitura", response_model=ConfirmarLeituraOut)
+def confirmar_leitura(
+    body: ConfirmarLeituraBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Staff confirma a leitura do dia operacional do motoboy.
+    Cria/atualiza conferencia_saida (Pendente ou Reconferir) sem exigir iniciar rota.
+    """
+    _require_staff(current_user)
+    sub_base = (current_user.sub_base or "").strip()
+    if not sub_base:
+        raise HTTPException(403, "Sub-base não definida.")
+    _require_flag(db, current_user, sub_base)
+
+    saidas = listar_saidas_motoboy_dia(
+        db,
+        sub_base=sub_base,
+        motoboy_id=int(body.motoboy_id),
+        data_ref=body.data_ref,
+    )
+    qtd = len(saidas)
+    if body.qtd is not None and int(body.qtd) > qtd:
+        # Client pode informar qtd da sessão; nunca ultrapassa o operacional do dia.
+        qtd = max(qtd, 0)
+    if qtd <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "SEM_LEITURAS",
+                "message": "Não há leituras operacionais deste motoboy para a data informada.",
+            },
+        )
+
+    try:
+        row, virou_reconferir = upsert_conferencia_dia(
+            db,
+            sub_base=sub_base,
+            motoboy_id=int(body.motoboy_id),
+            data_ref=body.data_ref,
+            qtd=qtd,
+        )
+        if row is None:
+            raise HTTPException(422, "Não foi possível criar a conferência.")
+        db.commit()
+        db.refresh(row)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Erro ao confirmar leitura: {e}")
+
+    if virou_reconferir:
+        try:
+            from push_notification_service import send_to_staff_sub_base
+
+            nomes = carregar_nomes_motoboy(db, [int(body.motoboy_id)])
+            nome = nomes.get(int(body.motoboy_id)) or f"Motoboy {body.motoboy_id}"
+            send_to_staff_sub_base(
+                db,
+                sub_base=sub_base,
+                tipo="reconferir_saida",
+                title="Reconferência necessária",
+                body=f"Reconferir do {nome}",
+                data={
+                    "motoboy_id": int(body.motoboy_id),
+                    "data_ref": body.data_ref.isoformat(),
+                    "sub_base": sub_base,
+                },
+            )
+        except Exception:
+            pass
+
+    shopee, ml, avulso = somar_servicos_saidas(saidas)
+    nome = carregar_nomes_motoboy(db, [int(body.motoboy_id)]).get(
+        int(body.motoboy_id), f"Motoboy {body.motoboy_id}"
+    )
+    return ConfirmarLeituraOut(
+        motoboy_id=int(body.motoboy_id),
+        motoboy_nome=nome,
+        data_ref=body.data_ref,
+        status=row.status,
+        qtd_no_momento=int(row.qtd_no_momento or qtd),
+        sum_shopee=shopee,
+        sum_mercado=ml,
+        sum_avulso=avulso,
+        total=shopee + ml + avulso,
+        virou_reconferir=bool(virou_reconferir),
     )
 
 
