@@ -512,6 +512,11 @@ async def login_for_access_token(
     user_credentials: UserLogin,
     db: Session = Depends(get_db),
 ):
+    """
+    Login staff (admin/operador) para API/mobile.
+    Com remember=true (app mobile / “lembrar”), emite access longo como o cookie web.
+    Sem remember, mantém TTL curto (ACCESS_TOKEN_EXPIRE_MINUTES).
+    """
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(401, "Login ou senha incorretos")
@@ -521,12 +526,21 @@ async def login_for_access_token(
 
     owner = _owner_for_sub_base(db, user.sub_base)
 
-    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expires = (
+        timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
+        if user_credentials.remember
+        else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     token = create_access_token(_claims(user, owner), expires)
 
     must_change = _must_change_password_from_user(user)
 
-    return {"access_token": token, "token_type": "bearer", "must_change_password": must_change}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "must_change_password": must_change,
+        "expires_in": int(expires.total_seconds()),
+    }
 
 
 @router.post("/login")
