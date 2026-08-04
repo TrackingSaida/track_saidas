@@ -190,9 +190,11 @@ class LancarAvulsoIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
-    # Foto do lançamento (presign pending ou pós-create); obrigatória se avulso_exige_foto.
+    # Foto(s) do lançamento (presign pending); obrigatória(s) se avulso_exige_foto.
     foto_object_key: Optional[str] = Field(default=None, max_length=500)
     photo_id: Optional[str] = Field(default=None, max_length=80)
+    foto_object_keys: Optional[List[str]] = None
+    photo_ids: Optional[List[str]] = None
 
 
 class LancarAvulsoOut(BaseModel):
@@ -1424,8 +1426,27 @@ def _lancar_avulso_impl(
     avulso_exige_foto = bool(
         motoboy_row is not None and getattr(motoboy_row, "avulso_exige_foto", False)
     )
-    foto_key = (payload.foto_object_key or "").strip() or None
-    if avulso_exige_foto and not foto_key:
+    from upload_storage_utils import MAX_FOTOS_POR_EVENTO_TENTATIVA
+
+    foto_keys: List[str] = []
+    for k in list(payload.foto_object_keys or []):
+        kk = (k or "").strip()
+        if kk and kk not in foto_keys:
+            foto_keys.append(kk)
+    single_key = (payload.foto_object_key or "").strip() or None
+    if single_key and single_key not in foto_keys:
+        foto_keys.insert(0, single_key)
+    foto_keys = foto_keys[:MAX_FOTOS_POR_EVENTO_TENTATIVA]
+
+    photo_ids_list: List[Optional[str]] = []
+    raw_ids = list(payload.photo_ids or [])
+    if payload.photo_id and not raw_ids:
+        raw_ids = [payload.photo_id]
+    for i, _k in enumerate(foto_keys):
+        pid = (raw_ids[i] if i < len(raw_ids) else None) or None
+        photo_ids_list.append((str(pid).strip() or None) if pid is not None else None)
+
+    if avulso_exige_foto and not foto_keys:
         raise HTTPException(
             status_code=422,
             detail={
@@ -1486,17 +1507,18 @@ def _lancar_avulso_impl(
                     valor=owner_valor,
                 )
             )
-            if foto_key:
+            if foto_keys:
                 from upload_storage_utils import build_foto_item, serialize_foto_items
 
                 foto_payload = serialize_foto_items(
                     [
                         build_foto_item(
-                            key=foto_key,
+                            key=key,
                             evento="lancar_avulso",
                             tentativa=1,
-                            photo_id=(payload.photo_id or "").strip() or None,
+                            photo_id=photo_ids_list[i] if i < len(photo_ids_list) else None,
                         )
+                        for i, key in enumerate(foto_keys)
                     ]
                 )
                 db.add(
