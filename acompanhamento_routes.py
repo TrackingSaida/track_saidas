@@ -22,7 +22,10 @@ from saidas_routes import (
     STATUS_ENTREGUE,
     STATUS_AUSENTE,
 )
-from saida_operacional_utils import carregar_contexto_operacional
+from saida_operacional_utils import (
+    carregar_contexto_operacional,
+    filtrar_saidas_por_periodo_operacional,
+)
 
 router = APIRouter(prefix="/acompanhamento", tags=["Acompanhamento"])
 
@@ -426,7 +429,7 @@ def acompanhamento_saidas_dia(
     data_fim: Optional[date] = Query(None, description="Fim do período (YYYY-MM-DD)"),
     modo: str = Query(
         "pendentes",
-        description="pendentes = só abertos (web); saidas = todas as leituras do período por Saida.data",
+        description="pendentes = só abertos (web); saidas = todas as leituras do período por data operacional",
     ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -434,7 +437,8 @@ def acompanhamento_saidas_dia(
     """
     Quantidades por serviço do motoboy.
     - modo=pendentes: pendentes operacionais no período (compatível com a web).
-    - modo=saidas: todas as saídas/leituras com Saida.data no período (histórico).
+    - modo=saidas: todas as saídas/leituras com data operacional no período
+      (reatribuição/nova saída no dia D conta em D, não na Saida.data antiga).
     """
     sub_base = getattr(current_user, "sub_base", None)
     if not sub_base or not str(sub_base).strip():
@@ -446,17 +450,16 @@ def acompanhamento_saidas_dia(
         raise HTTPException(status_code=400, detail="modo deve ser 'pendentes' ou 'saidas'.")
 
     if modo_norm == "saidas":
-        rows_periodo = list(
+        rows_all = list(
             db.scalars(
                 select(Saida).where(
                     Saida.sub_base == sub_base,
                     Saida.motoboy_id == motoboy_id,
                     Saida.codigo.isnot(None),
-                    Saida.data >= inicio,
-                    Saida.data <= fim,
                 )
             ).all()
         )
+        rows_periodo, _ = filtrar_saidas_por_periodo_operacional(db, rows_all, inicio, fim)
     else:
         rows_pendentes_all = db.scalars(
             select(Saida).where(

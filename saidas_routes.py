@@ -190,6 +190,9 @@ class LancarAvulsoIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
+    # Foto do lançamento (presign pending ou pós-create); obrigatória se avulso_exige_foto.
+    foto_object_key: Optional[str] = Field(default=None, max_length=500)
+    photo_id: Optional[str] = Field(default=None, max_length=80)
 
 
 class LancarAvulsoOut(BaseModel):
@@ -197,6 +200,7 @@ class LancarAvulsoOut(BaseModel):
     codigos: List[str]
     saidas: List[dict]
     mensagem: str
+    avulso_exige_foto: bool = False
 
 
 class SaidaDetailOut(BaseModel):
@@ -1395,10 +1399,11 @@ def _lancar_avulso_impl(
     entregador_id: Optional[int] = None
     entregador_nome = ""
 
+    motoboy_row = None
     if payload.motoboy_id is not None:
-        motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
-        motoboy_id = motoboy.id_motoboy
-        entregador_nome = _get_motoboy_nome(db, motoboy)
+        motoboy_row = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        motoboy_id = motoboy_row.id_motoboy
+        entregador_nome = _get_motoboy_nome(db, motoboy_row)
     elif payload.entregador_id is not None or (payload.entregador and payload.entregador.strip()):
         entregador_id, entregador_nome = _resolve_entregador(
             db,
@@ -1407,13 +1412,26 @@ def _lancar_avulso_impl(
             entregador_nome=payload.entregador,
         )
     elif role == 4 and getattr(current_user, "motoboy_id", None):
-        motoboy = _resolve_motoboy_for_subbase(db, sub_base, int(current_user.motoboy_id))
-        motoboy_id = motoboy.id_motoboy
-        entregador_nome = _get_motoboy_nome(db, motoboy)
+        motoboy_row = _resolve_motoboy_for_subbase(db, sub_base, int(current_user.motoboy_id))
+        motoboy_id = motoboy_row.id_motoboy
+        entregador_nome = _get_motoboy_nome(db, motoboy_row)
     else:
         raise HTTPException(
             status_code=422,
             detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe motoboy_id ou entregador_id/entregador."},
+        )
+
+    avulso_exige_foto = bool(
+        motoboy_row is not None and getattr(motoboy_row, "avulso_exige_foto", False)
+    )
+    foto_key = (payload.foto_object_key or "").strip() or None
+    if avulso_exige_foto and not foto_key:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "FOTO_OBRIGATORIA",
+                "message": "Este entregador exige foto ao lançar avulso.",
+            },
         )
 
     quantidade = int(payload.quantidade or 0)
@@ -1468,6 +1486,28 @@ def _lancar_avulso_impl(
                     valor=owner_valor,
                 )
             )
+            if foto_key:
+                from upload_storage_utils import build_foto_item, serialize_foto_items
+
+                foto_payload = serialize_foto_items(
+                    [
+                        build_foto_item(
+                            key=foto_key,
+                            evento="lancar_avulso",
+                            tentativa=1,
+                            photo_id=(payload.photo_id or "").strip() or None,
+                        )
+                    ]
+                )
+                db.add(
+                    SaidaDetail(
+                        id_saida=row.id_saida,
+                        id_entregador=motoboy_id or entregador_id or 0,
+                        status=status_inicial,
+                        tentativa=1,
+                        foto_url=foto_payload,
+                    )
+                )
             codigos.append(codigo)
             saidas_criadas.append(
                 {
@@ -1505,7 +1545,13 @@ def _lancar_avulso_impl(
 
     qtd = len(codigos)
     msg = "1 avulso lançado com sucesso." if qtd == 1 else f"{qtd} avulsos lançados com sucesso."
-    return {"quantidade_criada": qtd, "codigos": codigos, "saidas": saidas_criadas, "mensagem": msg}
+    return {
+        "quantidade_criada": qtd,
+        "codigos": codigos,
+        "saidas": saidas_criadas,
+        "mensagem": msg,
+        "avulso_exige_foto": avulso_exige_foto,
+    }
 
 
 @router.post("/pedidos/lancar-avulso", response_model=LancarAvulsoOut)
@@ -2090,7 +2136,7 @@ def get_saida_detalhe(
 
 class SaidaFotoPatchBody(BaseModel):
     foto_url: str = Field(min_length=1)
-    status: str = Field(pattern="^(entregue|ausente|devolucao)$")
+    status: str = Field(pattern="^(entregue|ausente|devolucao|lancar_avulso)$")
     photo_id: Optional[str] = Field(default=None, max_length=80)
     validar_campos_obrigatorios: bool = True
     alterar_status: bool = True
@@ -2125,7 +2171,9 @@ def patch_saida_foto(
     obj = _get_owned_saida(db, sub_base, id_saida)
     _ensure_motoboy_owns_saida(current_user, obj)
     status_norm = normalizar_status_saida(obj.status)
-    if _status_esta_finalizado(status_norm) and body.alterar_status:
+    evento = (body.status or "").lower().strip()
+    alterar_status = bool(body.alterar_status) and evento != "lancar_avulso"
+    if _status_esta_finalizado(status_norm) and alterar_status:
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_norm))
     detail_row = db.scalar(
         select(SaidaDetail).where(SaidaDetail.id_saida == id_saida).order_by(SaidaDetail.id_detail.desc()).limit(1)
@@ -2134,11 +2182,16 @@ def patch_saida_foto(
     if not key:
         raise HTTPException(status_code=422, detail="foto_url inválida.")
 
-    evento = body.status.lower().strip()
+    validar_campos = bool(body.validar_campos_obrigatorios) and evento != "lancar_avulso"
     if evento == "entregue":
         status_canon = STATUS_ENTREGUE
     elif evento == "ausente":
         status_canon = STATUS_AUSENTE
+    elif evento == "lancar_avulso":
+        # Foto do lançamento não altera status da saída.
+        status_canon = normalizar_status_saida(obj.status) or STATUS_SAIU_PARA_ENTREGA
+        alterar_status = False
+        validar_campos = False
     else:
         status_canon = STATUS_CANCELADO
     tentativa_atual = int(getattr(detail_row, "tentativa", None) or 1) if detail_row else 1
@@ -2158,7 +2211,7 @@ def patch_saida_foto(
             object_key=key,
             evento=evento,
             tentativa=tentativa_atual,
-            alterar_status=bool(body.alterar_status),
+            alterar_status=alterar_status,
         )
         return {
             "ok": True,
@@ -2198,19 +2251,19 @@ def patch_saida_foto(
 
     if detail_row:
         detail_row.foto_url = payload
-        if body.alterar_status:
+        if alterar_status:
             detail_row.status = status_canon
     else:
         detail_row = SaidaDetail(
             id_saida=id_saida,
             id_entregador=getattr(obj, "motoboy_id", None) or 0,
-            status=status_canon if body.alterar_status else (obj.status or status_canon),
+            status=status_canon if alterar_status else (obj.status or status_canon),
             tentativa=tentativa_atual,
             foto_url=payload,
         )
         db.add(detail_row)
 
-    if body.validar_campos_obrigatorios and body.alterar_status and evento in ("entregue", "ausente"):
+    if validar_campos and alterar_status and evento in ("entregue", "ausente"):
         contexto_validacao = "ENTREGUE" if status_canon == STATUS_ENTREGUE else "AUSENTE"
         faltantes = validate_campos_obrigatorios_conclusao(
             db,
@@ -2233,7 +2286,7 @@ def patch_saida_foto(
             )
             raise
 
-    if body.alterar_status and evento != "devolucao":
+    if alterar_status and evento not in ("devolucao", "lancar_avulso"):
         status_anterior = obj.status
         obj.status = status_canon
         db.add(
@@ -2258,7 +2311,7 @@ def patch_saida_foto(
         evento=evento,
         tentativa=tentativa_atual,
         foto_urls_count=len(foto_urls),
-        alterar_status=bool(body.alterar_status),
+        alterar_status=alterar_status,
         status_saida=normalizar_status_saida(obj.status),
     )
     return {"ok": True, "idempotent": False, "foto_urls": foto_urls, "fotos": current_items}

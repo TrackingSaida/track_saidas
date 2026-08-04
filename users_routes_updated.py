@@ -43,6 +43,7 @@ class MotoboyOut(BaseModel):
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = True
     pode_lancar_avulso: bool = True
+    avulso_exige_foto: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -75,6 +76,7 @@ class UserCreate(BaseModel):
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
+    avulso_exige_foto: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -126,6 +128,7 @@ class AdminUserUpdate(BaseModel):
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
+    avulso_exige_foto: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -134,12 +137,14 @@ class MotoboyPermissoesLoteIn(BaseModel):
     """Aplica permissão a todos os motoboys da sub_base do admin."""
     pode_lancar_avulso: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
+    avulso_exige_foto: Optional[bool] = None
 
 
 class MotoboyPermissoesLoteOut(BaseModel):
     atualizados: int
     pode_lancar_avulso: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
+    avulso_exige_foto: Optional[bool] = None
 
 
 class UserUpdatePayload(BaseModel):
@@ -534,6 +539,9 @@ def create_user(
             pode_lancar_avulso = (
                 body.pode_lancar_avulso if body.pode_lancar_avulso is not None else True
             )
+            avulso_exige_foto = bool(body.avulso_exige_foto) if body.avulso_exige_foto is not None else False
+            if not pode_lancar_avulso:
+                avulso_exige_foto = False
             if owner.ignorar_coleta:
                 pode_ler_coleta = False
 
@@ -556,6 +564,7 @@ def create_user(
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=pode_digitar_codigo_manual,
                 pode_lancar_avulso=pode_lancar_avulso,
+                avulso_exige_foto=avulso_exige_foto,
             )
             db.add(motoboy)
             db.flush()
@@ -615,6 +624,8 @@ def read_current_user(
 class MotoboyItem(BaseModel):
     id_motoboy: int
     nome: str
+    pode_lancar_avulso: bool = True
+    avulso_exige_foto: bool = False
 
 
 @router.get("/motoboys", response_model=list[MotoboyItem])
@@ -639,7 +650,14 @@ def list_motoboys(
     for u in users:
         if u.motoboy and u.motoboy.id_motoboy:
             nome = f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or ""
-            out.append(MotoboyItem(id_motoboy=u.motoboy.id_motoboy, nome=nome or f"Motoboy {u.motoboy.id_motoboy}"))
+            out.append(
+                MotoboyItem(
+                    id_motoboy=u.motoboy.id_motoboy,
+                    nome=nome or f"Motoboy {u.motoboy.id_motoboy}",
+                    pode_lancar_avulso=bool(getattr(u.motoboy, "pode_lancar_avulso", True)),
+                    avulso_exige_foto=bool(getattr(u.motoboy, "avulso_exige_foto", False)),
+                )
+            )
     return out
 
 
@@ -653,7 +671,11 @@ def motoboys_permissoes_lote(
     if getattr(current_user, "role", None) not in (0, 1):
         raise HTTPException(403, "Acesso negado.")
 
-    if body.pode_lancar_avulso is None and body.pode_digitar_codigo_manual is None:
+    if (
+        body.pode_lancar_avulso is None
+        and body.pode_digitar_codigo_manual is None
+        and body.avulso_exige_foto is None
+    ):
         raise HTTPException(422, "Informe ao menos uma permissão para atualizar.")
 
     sub_base = (current_user.sub_base or "").strip()
@@ -670,9 +692,14 @@ def motoboys_permissoes_lote(
         changed = False
         if body.pode_lancar_avulso is not None:
             m.pode_lancar_avulso = bool(body.pode_lancar_avulso)
+            if not m.pode_lancar_avulso:
+                m.avulso_exige_foto = False
             changed = True
         if body.pode_digitar_codigo_manual is not None:
             m.pode_digitar_codigo_manual = bool(body.pode_digitar_codigo_manual)
+            changed = True
+        if body.avulso_exige_foto is not None:
+            m.avulso_exige_foto = bool(body.avulso_exige_foto) and bool(m.pode_lancar_avulso)
             changed = True
         if changed:
             atualizados += 1
@@ -682,6 +709,7 @@ def motoboys_permissoes_lote(
         atualizados=atualizados,
         pode_lancar_avulso=body.pode_lancar_avulso,
         pode_digitar_codigo_manual=body.pode_digitar_codigo_manual,
+        avulso_exige_foto=body.avulso_exige_foto,
     )
 
 
@@ -823,6 +851,7 @@ def admin_update_user(
     motoboy_fields = {
         "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
         "pode_ler_coleta", "pode_ler_saida", "pode_digitar_codigo_manual", "pode_lancar_avulso",
+        "avulso_exige_foto",
     }
     sub_base = current_user.sub_base or ""
     if user.role == 4:
@@ -835,6 +864,8 @@ def admin_update_user(
                     if field == "pode_ler_coleta" and owner and owner.ignorar_coleta:
                         val = False
                     setattr(user.motoboy, field, val)
+            if not bool(getattr(user.motoboy, "pode_lancar_avulso", True)):
+                user.motoboy.avulso_exige_foto = False
         else:
             # Criar Motoboy ao mudar role para 4
             obrigatorios = ["documento", "rua", "numero", "bairro", "cidade", "cep"]
@@ -853,6 +884,7 @@ def admin_update_user(
                 if updates.get("pode_lancar_avulso") is not None
                 else True
             )
+            avulso_exige_foto = bool(updates.get("avulso_exige_foto", False)) and bool(pode_lancar_avulso)
             if owner and owner.ignorar_coleta:
                 pode_ler_coleta = False
             motoboy = Motoboy(
@@ -874,6 +906,7 @@ def admin_update_user(
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=bool(pode_digitar_codigo_manual),
                 pode_lancar_avulso=bool(pode_lancar_avulso),
+                avulso_exige_foto=avulso_exige_foto,
             )
             db.add(motoboy)
             db.flush()

@@ -8,6 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models import ConferenciaSaida, Motoboy, Owner, Saida, SaidaHistorico, User
+from saida_operacional_utils import (
+    carregar_contexto_operacional,
+    deve_excluir_saida_operacional,
+    filtrar_saidas_por_periodo_operacional,
+    timestamp_operacional_saida,
+)
 
 STATUS_PENDENTE = "pendente"
 STATUS_RECONFERIR = "reconferir"
@@ -32,7 +38,7 @@ def _owner_id_for_sub_base(db: Session, sub_base: str) -> Optional[int]:
     return int(owner.id_owner) if owner else None
 
 
-def upsert_conferencia_apos_iniciar_rota(
+def upsert_conferencia_dia(
     db: Session,
     *,
     sub_base: str,
@@ -41,7 +47,7 @@ def upsert_conferencia_apos_iniciar_rota(
     qtd: int,
 ) -> Tuple[Optional[ConferenciaSaida], bool]:
     """
-    Cria/atualiza conferência do dia.
+    Cria/atualiza conferência do dia (staff Confirmar Leitura ou motoboy ao iniciar rota).
     Retorna (row, virou_reconferir) — virou_reconferir só True na transição conferida→reconferir.
     """
     if qtd <= 0:
@@ -76,6 +82,24 @@ def upsert_conferencia_apos_iniciar_rota(
         row.conferido_em = None
         virou_reconferir = True
     return row, virou_reconferir
+
+
+def upsert_conferencia_apos_iniciar_rota(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_id: int,
+    data_ref: date,
+    qtd: int,
+) -> Tuple[Optional[ConferenciaSaida], bool]:
+    """Alias histórico — mesma regra de upsert_conferencia_dia."""
+    return upsert_conferencia_dia(
+        db,
+        sub_base=sub_base,
+        motoboy_id=motoboy_id,
+        data_ref=data_ref,
+        qtd=qtd,
+    )
 
 
 def _servico_bucket(servico: Optional[str]) -> str:
@@ -116,16 +140,18 @@ def listar_saidas_motoboy_dia(
     motoboy_id: int,
     data_ref: date,
 ) -> List[Saida]:
-    return list(
+    """Pacotes do motoboy com data operacional == data_ref (reatribuição conta no dia D)."""
+    rows_all = list(
         db.scalars(
             select(Saida).where(
                 Saida.sub_base == sub_base,
                 Saida.motoboy_id == motoboy_id,
                 Saida.codigo.isnot(None),
-                Saida.data == data_ref,
             )
         ).all()
     )
+    filtradas, _ = filtrar_saidas_por_periodo_operacional(db, rows_all, data_ref, data_ref)
+    return list(filtradas)
 
 
 EVENTOS_CONFERENCIA_PACOTE = ("saida_conferida", "saida_reconferida")
@@ -174,33 +200,46 @@ def contar_novos_por_motoboy_dia(
     sub_base: str,
     chaves: List[Tuple[int, date]],
 ) -> Dict[Tuple[int, date], int]:
-    """Conta pacotes novos (sem conferência/reconferência) por (motoboy_id, data_ref)."""
+    """Conta pacotes novos (sem conferência/reconferência) por (motoboy_id, data_ref operacional)."""
     if not chaves:
         return {}
     chave_set = {(int(m), d) for m, d in chaves}
     motoboy_ids = {m for m, _ in chave_set}
-    datas = {d for _, d in chave_set}
     saidas = list(
         db.scalars(
             select(Saida).where(
                 Saida.sub_base == sub_base,
                 Saida.motoboy_id.in_(motoboy_ids),
-                Saida.data.in_(datas),
                 Saida.codigo.isnot(None),
             )
         ).all()
     )
-    saidas = [
-        s
-        for s in saidas
-        if s.motoboy_id is not None and (int(s.motoboy_id), s.data) in chave_set
-    ]
-    ja = _ids_ja_conferidos(db, [int(s.id_saida) for s in saidas])
-    out: Dict[Tuple[int, date], int] = {k: 0 for k in chave_set}
+    if not saidas:
+        return {k: 0 for k in chave_set}
+    ctx_map = carregar_contexto_operacional(db, [int(s.id_saida) for s in saidas])
+    relevantes: List[Saida] = []
     for s in saidas:
+        if s.motoboy_id is None:
+            continue
+        ctx = ctx_map.get(int(s.id_saida))
+        if deve_excluir_saida_operacional(ctx):
+            continue
+        ts = timestamp_operacional_saida(ctx, getattr(s, "timestamp", None))
+        if ts is None:
+            continue
+        key = (int(s.motoboy_id), ts.date())
+        if key in chave_set:
+            relevantes.append(s)
+    ja = _ids_ja_conferidos(db, [int(s.id_saida) for s in relevantes])
+    out: Dict[Tuple[int, date], int] = {k: 0 for k in chave_set}
+    for s in relevantes:
         if int(s.id_saida) in ja:
             continue
-        key = (int(s.motoboy_id), s.data)
+        ctx = ctx_map.get(int(s.id_saida))
+        ts = timestamp_operacional_saida(ctx, getattr(s, "timestamp", None))
+        if ts is None:
+            continue
+        key = (int(s.motoboy_id), ts.date())
         out[key] = out.get(key, 0) + 1
     return out
 

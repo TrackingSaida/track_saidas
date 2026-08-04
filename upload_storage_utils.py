@@ -19,7 +19,7 @@ B2_SECRET_ACCESS_KEY = os.getenv("B2_SECRET_ACCESS_KEY", "")
 B2_ENDPOINT_URL = os.getenv("B2_ENDPOINT_URL", "https://s3.us-east-005.backblazeb2.com")
 
 MAX_FOTOS_POR_EVENTO_TENTATIVA = 3
-EVENTOS_FOTO = frozenset({"entregue", "ausente", "legacy"})
+EVENTOS_FOTO = frozenset({"entregue", "ausente", "legacy", "lancar_avulso", "devolucao"})
 
 _B2_REGION = "us-east-005"
 if "backblazeb2.com" in B2_ENDPOINT_URL:

@@ -159,6 +159,7 @@ class Motoboy(Base):
     pode_ler_saida = Column(Boolean, default=True, nullable=False)
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
     pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
+    avulso_exige_foto = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="motoboy")
     sub_bases = relationship("MotoboySubBase", back_populates="motoboy", cascade="all, delete-orphan")

@@ -385,6 +385,7 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "pode_ler_saida": bool(motoboy.pode_ler_saida),
         "pode_digitar_codigo_manual": bool(getattr(motoboy, "pode_digitar_codigo_manual", True)),
         "pode_lancar_avulso": bool(getattr(motoboy, "pode_lancar_avulso", True)),
+        "avulso_exige_foto": bool(getattr(motoboy, "avulso_exige_foto", False)),
         "ignorar_coleta": bool(owner.ignorar_coleta),
         "owner_ativo": bool(owner.ativo),
         "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
@@ -438,6 +439,7 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.pode_ler_saida = bool(payload.get("pode_ler_saida", True))
     u.pode_digitar_codigo_manual = bool(payload.get("pode_digitar_codigo_manual", True))
     u.pode_lancar_avulso = bool(payload.get("pode_lancar_avulso", True))
+    u.avulso_exige_foto = bool(payload.get("avulso_exige_foto", False))
 
     # flags de senha vindas do token (podem ser sobrescritas por leitura direta em /auth/me)
     u.must_change_password = payload.get("must_change_password", None)
