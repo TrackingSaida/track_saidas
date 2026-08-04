@@ -69,11 +69,71 @@ def _ensure_motoboy_owns_saida(current_user: User, saida: Saida) -> None:
         raise HTTPException(status_code=404, detail="Saída não encontrada.")
 
 
-def _ensure_object_key_owned(db: Session, sub_base: str, object_key: str) -> None:
-    id_saida = parse_id_saida_from_object_key(object_key)
-    if id_saida is None:
+def _is_pending_object_key(object_key: str) -> bool:
+    """Keys de foto tirada antes de existir a saída (ex.: lançar avulso)."""
+    return (object_key or "").startswith("saida/pending/")
+
+
+def _ensure_pending_object_key_owned(
+    db: Session,
+    sub_base: str,
+    object_key: str,
+    *,
+    id_saida_hint: Optional[int] = None,
+) -> None:
+    """
+    Fotos de avulso sobem como saida/pending/... e depois são referenciadas em saidas_detail.
+    Sem id_saida no path, valida pelo vínculo na sub_base (e id_saida opcional do cliente).
+    """
+    key = (object_key or "").strip()
+    if not _is_pending_object_key(key):
         raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
-    _ensure_saida_owned(db, sub_base, id_saida)
+
+    if id_saida_hint is not None:
+        _ensure_saida_owned(db, sub_base, id_saida_hint)
+        rows = db.execute(
+            select(SaidaDetail.foto_url).where(SaidaDetail.id_saida == int(id_saida_hint))
+        ).scalars().all()
+        for foto_url in rows:
+            if key in extract_foto_keys(foto_url):
+                return
+        raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
+
+    # Escape LIKE wildcards no object_key (uuid hex, mas defensivo).
+    like_pat = (
+        key.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    found = db.execute(
+        select(Saida.id_saida)
+        .join(SaidaDetail, SaidaDetail.id_saida == Saida.id_saida)
+        .where(Saida.sub_base == sub_base)
+        .where(SaidaDetail.foto_url.is_not(None))
+        .where(SaidaDetail.foto_url.like(f"%{like_pat}%", escape="\\"))
+        .limit(1)
+    ).first()
+    if not found:
+        raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
+
+
+def _ensure_object_key_owned(
+    db: Session,
+    sub_base: str,
+    object_key: str,
+    *,
+    id_saida_hint: Optional[int] = None,
+) -> None:
+    id_saida = parse_id_saida_from_object_key(object_key)
+    if id_saida is not None:
+        _ensure_saida_owned(db, sub_base, id_saida)
+        return
+    if _is_pending_object_key(object_key):
+        _ensure_pending_object_key_owned(
+            db, sub_base, object_key, id_saida_hint=id_saida_hint
+        )
+        return
+    raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
 
 
 # ---------- Schemas ----------
@@ -91,6 +151,8 @@ class PresignIn(BaseModel):
 class PresignGetIn(BaseModel):
     foto_url: Optional[str] = None
     foto_urls: Optional[List[str]] = None
+    # Contexto opcional para keys saida/pending/... (foto de avulso antes do id_saida).
+    id_saida: Optional[int] = Field(default=None, gt=0)
 
 
 class WatermarkFotoOut(BaseModel):
@@ -602,8 +664,9 @@ def upload_presign_get(
     if not keys:
         raise HTTPException(status_code=422, detail="Informe foto_url ou foto_urls.")
 
+    id_saida_hint = int(body.id_saida) if body.id_saida else None
     for key in keys:
-        _ensure_object_key_owned(db, sub_base, key)
+        _ensure_object_key_owned(db, sub_base, key, id_saida_hint=id_saida_hint)
 
     client = _get_s3_client()
     expires_in = 60
