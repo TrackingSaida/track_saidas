@@ -153,5 +153,58 @@ class TestGooglePlacesRanking(unittest.TestCase):
         self.assertGreater(score_g, score_o)
 
 
+class TestBairroRanking(unittest.TestCase):
+    def test_query_bairro_equal_beats_conflict(self):
+        from address_ranker import compare_bairro
+
+        ctx = build_rank_context(
+            "Rua Marco Antonio 21 Parque Jandaia",
+            hints={"bairro": "Parque Jandaia", "numero": "21"},
+            gps_lat=-23.45,
+            gps_lon=-46.92,
+        )
+        self.assertEqual(ctx.query_bairro, "parque jandaia")
+        match = _hit(
+            rua="Rua Marco Antonio dos Santos",
+            numero="21",
+            bairro="Parque Jandaia",
+            cidade="Santana de Parnaiba",
+            cep="06515010",
+            latitude=-23.45,
+            longitude=-46.92,
+        )
+        conflict = _hit(
+            rua="Rua Marco Antonio dos Santos",
+            numero="21",
+            bairro="Parque Santana Gleba 2",
+            cidade="Santana de Parnaiba",
+            cep="06515005",
+            latitude=-23.451,
+            longitude=-46.921,
+            source="nominatim",
+        )
+        # Frequente da sub_base no bairro errado não deve vencer.
+        ctx.sub_base_bairro_weights = {"parque santana gleba 2": 50}
+        score_match, _, _ = score_hit(match, ctx)
+        score_conflict, _, _ = score_hit(conflict, ctx)
+        self.assertEqual(compare_bairro(ctx.query_bairro, conflict.bairro), "conflict")
+        self.assertGreater(score_match, score_conflict)
+
+    def test_known_fast_skips_on_bairro_conflict(self):
+        from address_ranker import compare_bairro
+
+        ctx = build_rank_context(
+            "Rua X 10",
+            hints={"bairro": "Parque Jandaia"},
+            gps_lat=-23.45,
+            gps_lon=-46.92,
+        )
+        known = _hit(bairro="Parque Santana Gleba 2")
+        self.assertEqual(compare_bairro(ctx.query_bairro, known.bairro), "conflict")
+        score, _, _ = score_hit(known, ctx)
+        # Penalidade forte de conflito; não deve passar do limiar típico de known-fast.
+        self.assertLess(score, 40)
+
+
 if __name__ == "__main__":
     unittest.main()
