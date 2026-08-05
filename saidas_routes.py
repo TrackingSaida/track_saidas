@@ -269,6 +269,9 @@ def _normalizar_nome(s: str) -> str:
 
 # Status canônicos do fluxo motoboy (armazenados em maiúsculas)
 STATUS_SAIU_PARA_ENTREGA = "SAIU_PARA_ENTREGA"
+_PENDING_AVULSO_KEY_RE = re.compile(
+    r"^saida/pending/lancar_avulso/[a-fA-F0-9]{16,64}\.(jpg|jpeg|png|gif|webp)$"
+)
 STATUS_EM_ROTA = "EM_ROTA"
 STATUS_ENTREGUE = "ENTREGUE"
 STATUS_AUSENTE = "AUSENTE"
@@ -1437,6 +1440,17 @@ def _lancar_avulso_impl(
     if single_key and single_key not in foto_keys:
         foto_keys.insert(0, single_key)
     foto_keys = foto_keys[:MAX_FOTOS_POR_EVENTO_TENTATIVA]
+
+    # Keys de foto avulsa devem vir do presign pending (evita apontar para arquivo inexistente/alheio).
+    for kk in foto_keys:
+        if not _PENDING_AVULSO_KEY_RE.match(kk):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "FOTO_KEY_INVALIDA",
+                    "message": "Foto inválida para lançamento avulso. Tire a foto novamente.",
+                },
+            )
 
     photo_ids_list: List[Optional[str]] = []
     raw_ids = list(payload.photo_ids or [])
