@@ -149,14 +149,23 @@ def _status_amigavel(status: Optional[str]) -> str:
     return mapping.get(norm, (status or "—").strip() or "—")
 
 
-def _format_dt_br(value: Optional[datetime]) -> str:
+def _format_dt_br(value: Optional[datetime], *, assume_utc: bool = False) -> str:
+    """Formata data/hora no fuso operacional (America/Sao_Paulo).
+
+    Timestamps de `saida_historico` vêm de NOW() do Postgres em TIMESTAMP WITHOUT
+    TIME ZONE e são horário de parede da operação — iguais aos exibidos na timeline.
+    Já `data_hora_entrega` legada é gravada com datetime.utcnow(); nesse fallback
+    use assume_utc=True.
+    """
     if not value:
         return ""
     try:
         dt = value
         if dt.tzinfo is None:
-            # Timestamps operacionais são gravados como UTC naive na maioria dos fluxos.
-            dt = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(OPERACAO_TZ)
+            if assume_utc:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(OPERACAO_TZ)
+            else:
+                dt = dt.replace(tzinfo=OPERACAO_TZ)
         else:
             dt = dt.astimezone(OPERACAO_TZ)
         return dt.strftime("%d/%m/%Y às %H:%M")
@@ -173,17 +182,29 @@ def _load_detail_for_saida(db: Session, id_saida: int) -> Optional[SaidaDetail]:
     ).scalar_one_or_none()
 
 
-def _ultima_data_ocorrencia(db: Session, saida: Saida) -> Optional[datetime]:
-    if saida.data_hora_entrega:
-        return saida.data_hora_entrega
+def _ultima_data_ocorrencia(db: Session, saida: Saida) -> tuple[Optional[datetime], bool]:
+    """Retorna (datetime, assume_utc) da última ocorrência relevante.
+
+    Prefere o timestamp do histórico (mesma fonte da timeline). Fallback legado
+    para data_hora_entrega (UTC naive).
+    """
     status_norm = (saida.status or "").strip().upper().replace(" ", "_")
-    eventos = ("entregue", "entregue_lote") if status_norm == "ENTREGUE" else ("ausente", "ausente_lote", "entregue", "ausente")
-    return db.execute(
+    eventos = (
+        ("entregue", "entregue_lote")
+        if status_norm == "ENTREGUE"
+        else ("ausente", "ausente_lote", "entregue", "ausente")
+    )
+    hist_ts = db.execute(
         select(func.max(SaidaHistorico.timestamp)).where(
             SaidaHistorico.id_saida == saida.id_saida,
             SaidaHistorico.evento.in_(eventos),
         )
     ).scalar_one_or_none()
+    if hist_ts is not None:
+        return hist_ts, False
+    if saida.data_hora_entrega:
+        return saida.data_hora_entrega, True
+    return None, False
 
 
 def _primeiro_nome(nome_completo: Optional[str]) -> str:
@@ -215,7 +236,8 @@ def _build_comprovante_resumo(
     detail: Optional[SaidaDetail],
 ) -> Dict[str, Any]:
     status_label = _status_amigavel(saida.status)
-    data_hora = _format_dt_br(_ultima_data_ocorrencia(db, saida))
+    ocorrencia_dt, assume_utc = _ultima_data_ocorrencia(db, saida)
+    data_hora = _format_dt_br(ocorrencia_dt, assume_utc=assume_utc)
     nome_recebedor = (getattr(detail, "nome_recebedor", None) or "").strip() if detail else ""
     motivo = (getattr(detail, "motivo_ocorrencia", None) or "").strip() if detail else ""
     observacao = ""
