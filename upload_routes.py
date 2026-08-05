@@ -554,7 +554,14 @@ def upload_presign(
             ExpiresIn=300,
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Erro ao gerar presigned URL: {e}")
+        logger.exception("upload_presign_failed tipo=%s id_saida=%s", body.tipo, body.id_saida)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "STORAGE_TEMPORARY_ERROR",
+                "message": "Falha temporária ao preparar o envio da foto. Tente novamente.",
+            },
+        ) from e
 
     logger.info(
         "upload presign: id_saida=%s tipo=%s photo_id=%s object_key=%s user_id=%s",
