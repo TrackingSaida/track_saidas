@@ -25,7 +25,7 @@ router = APIRouter(prefix="/contabilidade", tags=["Contabilidade"])
 
 # Incluir "saiu_para_entrega" pois o app mobile grava SAIU_PARA_ENTREGA
 STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega", "em_rota", "entregue", "ausente", "pendente"]
-STATUS_FECHAMENTO_CONTABIL = ("GERADO", "REAJUSTADO", "FECHADO")  # FECHADO = legado
+STATUS_FECHAMENTO_CONTABIL = ("GERADO", "REAJUSTADO", "FECHADO", "PAGO")  # FECHADO = legado
 
 
 def _saida_conta_para_indicador(saida: Saida, modo_entregas: str) -> bool:

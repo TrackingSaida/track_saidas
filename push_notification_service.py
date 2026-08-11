@@ -35,6 +35,7 @@ ALWAYS_SEND_TYPES = frozenset(
         "aviso_base",
         "fechamento_pronto",
         "fechamento_reajustado",
+        "fechamento_pago",
     }
 )
 
@@ -78,6 +79,7 @@ def pref_allows(prefs: Optional[NotifPrefs], tipo: str) -> bool:
     mapping = {
         "fechamento_pronto": prefs.fechamento,
         "fechamento_reajustado": prefs.fechamento,
+        "fechamento_pago": prefs.fechamento,
         "pacotes_atribuidos": prefs.pacotes_atribuidos,
         "atraso_d1": prefs.atraso_d1,
         "aviso_base": prefs.avisos_base,
@@ -140,6 +142,7 @@ def _build_message(
         "aviso_base",
         "fechamento_pronto",
         "fechamento_reajustado",
+        "fechamento_pago",
         "bloqueio_ausencia",
     )
     channel = CHANNEL_URGENT if tipo == "aviso_urgente" else CHANNEL_DEFAULT

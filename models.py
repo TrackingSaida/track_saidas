@@ -475,6 +475,8 @@ class EntregadorFechamento(Base):
     criado_em = Column(DateTime(timezone=False), server_default=func.now())
     pdf_object_key = Column(Text, nullable=True)
     pdf_gerado_em = Column(DateTime(timezone=False), nullable=True)
+    pago_em = Column(DateTime(timezone=False), nullable=True)
+    pago_por = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return (

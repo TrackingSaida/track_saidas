@@ -73,6 +73,7 @@ MENU_DEFS = [
         "items": [
             {"label": "Fechamento Bases", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
             {"label": "Fechamento de Motoboys", "href": "tracking-entregadores-resumo.html", "roles": [0, 1]},
+            {"label": "A Pagar", "href": "tracking-entregadores-a-pagar.html", "roles": [0, 1]},
             {"label": "Contabilidade", "href": "tracking-contabilidade.html", "roles": [0, 1]},
         ]
     },

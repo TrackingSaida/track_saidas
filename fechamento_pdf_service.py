@@ -32,6 +32,7 @@ STATUS_LABELS = {
     "PENDENTE": "PENDENTE",
     "GERADO": "GERADO",
     "REAJUSTADO": "REAJUSTADO",
+    "PAGO": "PAGO",
     "FECHADO": "GERADO",
 }
 
