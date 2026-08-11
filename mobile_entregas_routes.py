@@ -863,8 +863,13 @@ def _scan_item_leve(
     *,
     db: Optional[Session] = None,
 ) -> dict:
-    """Resposta de scan sem queries extras de detail quando não há endereço."""
-    return _saida_to_item(saida, detail, db=db)
+    """Resposta de scan sem queries extras de campos obrigatórios / bloqueio.
+
+    O app usa id_saida/codigo/servico/status no bip; campos obrigatórios e
+    endereço completo são rehidratados em loadDeliveries / getEntrega.
+    """
+    _ = db  # API compatível; hot path não consulta DB aqui.
+    return _saida_to_item(saida, detail, db=None, campos_cache={})
 
 
 def _payload_nova_saida_mesmo_entregador(
@@ -3278,10 +3283,20 @@ def scan_codigo(
 
     entrada_obrigatoria = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
     if not entrada_obrigatoria:
-        owner_flag = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-        entrada_obrigatoria = bool(
-            owner_flag and getattr(owner_flag, "entrada_obrigatoria_habilitada", False)
-        )
+        # Claim JWT ausente/false: resolve 1x e cacheia no user do request.
+        cache_key = "_entrada_obrigatoria_resolved"
+        cached = getattr(user, cache_key, None)
+        if isinstance(cached, bool):
+            entrada_obrigatoria = cached
+        else:
+            owner_flag = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+            entrada_obrigatoria = bool(
+                owner_flag and getattr(owner_flag, "entrada_obrigatoria_habilitada", False)
+            )
+            try:
+                setattr(user, cache_key, entrada_obrigatoria)
+            except Exception:
+                pass
 
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
     if not saida:
@@ -3321,9 +3336,8 @@ def scan_codigo(
                 )
             )
             db.commit()
-            db.refresh(nova)
-            # INSERT novo: detail ainda não existe — evita SELECT inútil
-            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova, db=db)}
+            # flush já preencheu id_saida; evita refresh + SELECTs de campos.
+            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova)}
         except Exception as e:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Erro ao registrar leitura: {e}")
@@ -3438,7 +3452,7 @@ def scan_codigo(
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
-                    "entrega": _scan_item_leve(saida, db=db),
+                    "entrega": _scan_item_leve(saida),
                 }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
             if _scan_needs_qr_update(saida, qr_payload_raw, servico):
@@ -3449,7 +3463,7 @@ def scan_codigo(
                 "ok": True,
                 "conflito": False,
                 "ja_existia": True,
-                "entrega": _scan_item_leve(saida, db=db),
+                "entrega": _scan_item_leve(saida),
             }
         if saida.motoboy_id == motoboy_id:
             data_operacional = _ctx_data_operacional_saida(db, saida)
@@ -3487,7 +3501,7 @@ def scan_codigo(
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
-                    "entrega": _scan_item_leve(saida, db=db),
+                    "entrega": _scan_item_leve(saida),
                 }
             saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
             if _scan_needs_qr_update(saida, qr_payload_raw, servico):
@@ -3498,7 +3512,7 @@ def scan_codigo(
                 "ok": True,
                 "conflito": False,
                 "ja_existia": True,
-                "entrega": _scan_item_leve(saida, db=db),
+                "entrega": _scan_item_leve(saida),
             }
         if saida.motoboy_id is not None:
             id_saida_lock = saida.id_saida
@@ -3541,7 +3555,7 @@ def scan_codigo(
                         "ok": True,
                         "conflito": False,
                         "ja_existia": True,
-                        "entrega": _scan_item_leve(saida, db=db),
+                        "entrega": _scan_item_leve(saida),
                     }
                 if _scan_needs_qr_update(saida, qr_payload_raw, servico):
                     saida.qr_payload_raw = qr_payload_raw.strip()
@@ -3551,7 +3565,7 @@ def scan_codigo(
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
-                    "entrega": _scan_item_leve(saida, db=db),
+                    "entrega": _scan_item_leve(saida),
                 }
             # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
@@ -3614,6 +3628,7 @@ def scan_codigo(
             saida.qr_payload_raw = qr_payload_raw.strip()
     motoboy_id_anterior = saida.motoboy_id
     status_anterior = status_norm
+    detail_resp: Optional[SaidaDetail] = None
     if motoboy_id is not None:
         motoboy = db.get(Motoboy, motoboy_id)
         if motoboy:
@@ -3623,18 +3638,17 @@ def scan_codigo(
     saida.status = status_scan
     if status_norm == STATUS_AUSENTE:
         raise_if_bloqueado_ausencias(db, saida.id_saida)
-        detail = _get_detail_for_saida(db, saida.id_saida)
-        if detail:
-            detail.tentativa = (detail.tentativa or 1) + 1
+        detail_resp = _get_detail_for_saida(db, saida.id_saida)
+        if detail_resp:
+            detail_resp.tentativa = (detail_resp.tentativa or 1) + 1
         else:
-            db.add(
-                SaidaDetail(
-                    id_saida=saida.id_saida,
-                    id_entregador=motoboy_id,
-                    status=status_scan,
-                    tentativa=2,
-                )
+            detail_resp = SaidaDetail(
+                id_saida=saida.id_saida,
+                id_entregador=motoboy_id,
+                status=status_scan,
+                tentativa=2,
             )
+            db.add(detail_resp)
     _garantir_cobranca_owner_saida(db, saida, owner_valor)
     # Primeira atribuição (sem titular anterior): mesma ação da 1ª saída sem entrada.
     # Só marca "assumir" quando havia outro/mesmo titular (reatribuição real).
@@ -3651,8 +3665,8 @@ def scan_codigo(
         )
     )
     db.commit()
-    db.refresh(saida)
-    detail = _get_detail_for_saida(db, saida.id_saida)
+    # Sem refresh/detail extra: dados já estão no objeto; campos obrigatórios
+    # voltam no loadDeliveries ao sair do scanner.
     houve_atribuicao_ou_progresso = bool(
         motoboy_id is not None
         and (
@@ -3664,7 +3678,7 @@ def scan_codigo(
         "ok": True,
         "conflito": False,
         "ja_existia": not houve_atribuicao_ou_progresso,
-        "entrega": _saida_to_item(saida, detail, db=db),
+        "entrega": _scan_item_leve(saida, detail_resp),
     }
 
 

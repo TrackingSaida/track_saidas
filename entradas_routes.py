@@ -200,7 +200,6 @@ def ler_entrada(
                 )
             )
             db.commit()
-            db.refresh(row)
             return {
                 "ok": True,
                 "ja_existia": False,
@@ -240,7 +239,6 @@ def ler_entrada(
         )
         try:
             db.commit()
-            db.refresh(existente)
             return {
                 "ok": True,
                 "ja_existia": True,
