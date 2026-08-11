@@ -158,8 +158,10 @@ app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
 app.include_router(base_fechamento_router, prefix=f"{API_PREFIX}/coletas")
 app.include_router(users_router,        prefix=API_PREFIX)
-app.include_router(entregadores_router, prefix=API_PREFIX)
+# Fechamentos ANTES de entregadores: evita que GET /entregadores/{id_entregador}
+# capture /entregadores/fechamentos (id="fechamentos" → HTTP 422).
 app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")
+app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
 app.include_router(pedidos_router,      prefix=API_PREFIX)
