@@ -4,6 +4,7 @@ Prefixo: /mobile/fechamentos
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional
@@ -21,6 +22,15 @@ from models import EntregadorFechamento, Motoboy, User
 from entregador_fechamento_routes import _get_motoboy_chave_pix
 
 router = APIRouter(prefix="/mobile/fechamentos", tags=["Mobile Fechamentos"])
+
+# Desligado por padrão: app mobile antigo ainda mostra "Baixar PDF", mas a API bloqueia.
+# Para reativar: FECHAMENTO_PDF_MOBILE_ENABLED=true
+def _pdf_mobile_enabled() -> bool:
+    return os.getenv("FECHAMENTO_PDF_MOBILE_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _require_motoboy(user: User) -> tuple[int, str]:
@@ -114,6 +124,8 @@ def baixar_pdf_fechamento(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if not _pdf_mobile_enabled():
+        raise HTTPException(403, "Download de PDF temporariamente indisponível.")
     motoboy_id, sub_base = _require_motoboy(current_user)
     fech = db.get(EntregadorFechamento, id_fechamento)
     if (
