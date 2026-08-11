@@ -121,9 +121,10 @@ class EntregadorResumoItem(BaseModel):
     valor_cancelados: Decimal = Decimal("0.00")
     valor_total: Decimal = Decimal("0.00")
     g_total: int = 0
-    fechamento_status: Optional[str] = None  # PENDENTE | GERADO | REAJUSTADO
+    fechamento_status: Optional[str] = None  # PENDENTE | GERADO | REAJUSTADO | PAGO
     id_fechamento: Optional[int] = None  # quando existe fechamento
-    pode_reajustar: Optional[bool] = None  # True quando GERADO e valor_base atual != valor_base fechado
+    pode_reajustar: Optional[bool] = None  # True quando GERADO/REAJUSTADO e valor_base diverge
+    alerta_pos_pago: Optional[bool] = None  # True quando PAGO e valor_base diverge (só alerta)
     valor_base_atual: Optional[Decimal] = None  # valor_base recalculado no período
     valor_base_fechado: Optional[Decimal] = None  # valor_base gravado no fechamento
     periodo_inicio: Optional[str] = None  # YYYY-MM-DD, quando existe fechamento
@@ -1162,11 +1163,12 @@ def resumo_entregadores(
         fech_status, id_fech, fech = _get_fechamento(eid, mid, item["data"])
 
         pode_reajustar = None
+        alerta_pos_pago = None
         valor_base_atual = None
         valor_base_fechado = None
         periodo_inicio_str = None
         periodo_fim_str = None
-        if fech_status == "GERADO" and fech is not None and id_fech is not None:
+        if fech_status in ("GERADO", "REAJUSTADO", "PAGO") and fech is not None and id_fech is not None:
             if mid is not None:
                 key_vb = ("m", mid, fech.periodo_inicio, fech.periodo_fim)
                 if key_vb not in cache_valor_base and hasattr(EntregadorFechamento, "id_motoboy"):
@@ -1182,8 +1184,11 @@ def resumo_entregadores(
                     )
                 valor_base_atual = cache_valor_base[key_vb]
             valor_base_fechado = fech.valor_base
-            if valor_base_atual is not None:
-                pode_reajustar = valor_base_atual != valor_base_fechado
+            if valor_base_atual is not None and valor_base_atual != valor_base_fechado:
+                if fech_status in ("GERADO", "REAJUSTADO"):
+                    pode_reajustar = True
+                elif fech_status == "PAGO":
+                    alerta_pos_pago = True
             periodo_inicio_str = fech.periodo_inicio.isoformat() if hasattr(fech.periodo_inicio, "isoformat") else str(fech.periodo_inicio)
             periodo_fim_str = fech.periodo_fim.isoformat() if hasattr(fech.periodo_fim, "isoformat") else str(fech.periodo_fim)
         if fech is not None and id_fech is not None and periodo_inicio_str is None:
@@ -1221,6 +1226,7 @@ def resumo_entregadores(
                 fechamento_status=fech_status,
                 id_fechamento=id_fech,
                 pode_reajustar=pode_reajustar,
+                alerta_pos_pago=alerta_pos_pago,
                 valor_base_atual=valor_base_atual,
                 valor_base_fechado=valor_base_fechado,
                 periodo_inicio=periodo_inicio_str,

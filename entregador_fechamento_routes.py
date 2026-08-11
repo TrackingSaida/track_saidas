@@ -1,15 +1,18 @@
 """
 Rotas de Fechamento de Entregador
+GET  /entregadores/fechamentos — listar (visão A Pagar)
+POST /entregadores/fechamentos/marcar-pago — marcar como pago (lote)
 POST /entregadores/fechamentos — criar
-PATCH /entregadores/fechamentos/{id_fechamento} — editar/reabrir
+PATCH /entregadores/fechamentos/{id_fechamento} — editar/reajustar
 GET /entregadores/fechamentos/{id_fechamento} — obter um (para modal)
+GET /entregadores/fechamentos/calcular — preview valor base
 """
 from __future__ import annotations
 
 import logging
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
@@ -40,6 +43,9 @@ router = APIRouter(prefix="", tags=["Fechamentos"])
 # Status aceitos
 STATUS_GERADO = "GERADO"
 STATUS_REAJUSTADO = "REAJUSTADO"
+STATUS_PAGO = "PAGO"
+STATUS_ELEGIVEIS_PAGAMENTO = (STATUS_GERADO, STATUS_REAJUSTADO)
+STATUS_PERMITE_REAJUSTE = (STATUS_GERADO, STATUS_REAJUSTADO)
 
 # Status válidos para saidas no cálculo (fonte única compartilhada)
 STATUS_SAIDAS_VALIDOS = STATUS_VALOR_BASE_VALIDOS
@@ -136,6 +142,84 @@ def _get_motoboy_chave_pix(db: Session, motoboy_id: int) -> Optional[str]:
     return (getattr(motoboy, "chave_pix", None) or "").strip() or None
 
 
+def _status_norm(fech: EntregadorFechamento) -> str:
+    st = (fech.status or "").strip().upper()
+    if st == "FECHADO":
+        return STATUS_GERADO
+    return st
+
+
+def _recalcular_valor_base_fechamento(
+    db: Session,
+    sub_base: str,
+    fech: EntregadorFechamento,
+) -> Decimal:
+    if getattr(fech, "id_motoboy", None) is not None:
+        return _calcular_valor_base_motoboy_periodo(
+            db, sub_base, fech.id_motoboy,
+            fech.periodo_inicio, fech.periodo_fim,
+        )
+    return _calcular_valor_base_periodo(
+        db, sub_base, fech.id_entregador,
+        fech.periodo_inicio, fech.periodo_fim,
+    )
+
+
+def _fmt_brl_push(v) -> str:
+    try:
+        n = Decimal(str(v or 0))
+    except Exception:
+        n = Decimal("0")
+    s = f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
+
+
+def _enviar_push_fechamento_pago(db: Session, fech: EntregadorFechamento) -> None:
+    if not getattr(fech, "id_motoboy", None):
+        return
+    try:
+        from push_notification_service import send_to_motoboy
+
+        periodo = f"{fech.periodo_inicio.strftime('%d/%m')} a {fech.periodo_fim.strftime('%d/%m')}"
+        n = send_to_motoboy(
+            db,
+            motoboy_id=int(fech.id_motoboy),
+            sub_base=fech.sub_base,
+            tipo="fechamento_pago",
+            title="Pagamento realizado",
+            body=(
+                f"Pagamento de {_fmt_brl_push(fech.valor_final)} "
+                f"referente a {periodo} foi confirmado."
+            ),
+            data={"fechamento_id": fech.id_fechamento},
+        )
+        db.commit()
+        if n <= 0:
+            logger.warning(
+                "fechamento_pago_push_sem_token id=%s motoboy_id=%s sub_base=%s",
+                fech.id_fechamento,
+                fech.id_motoboy,
+                fech.sub_base,
+            )
+        else:
+            logger.info(
+                "fechamento_pago_push_ok id=%s motoboy_id=%s msgs=%s",
+                fech.id_fechamento,
+                fech.id_motoboy,
+                n,
+            )
+    except Exception:
+        logger.exception(
+            "fechamento_pago_push_failed id=%s motoboy_id=%s",
+            fech.id_fechamento,
+            getattr(fech, "id_motoboy", None),
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 def _buscar_fechamento_por_data(
     db: Session,
     sub_base: str,
@@ -199,9 +283,114 @@ class FechamentoOut(BaseModel):
     valor_final: Decimal
     status: str
     criado_em: Optional[datetime] = None
+    pago_em: Optional[datetime] = None
+    pago_por: Optional[str] = None
     divergencia_valor_base: Optional[bool] = None  # True = valor_base recalculado diferente do gravado
     valor_base_recalculado: Optional[Decimal] = None  # quando há divergência
+    precisa_reajuste: Optional[bool] = None
+    alerta_pos_pago: Optional[bool] = None
+    tem_pdf: Optional[bool] = None
+    codigo: Optional[str] = None
 
+
+class FechamentoListaTotais(BaseModel):
+    total_a_pagar: Decimal = Decimal("0.00")
+    total_pago: Decimal = Decimal("0.00")
+    qtd_precisa_reajuste: int = 0
+    qtd_a_pagar: int = 0
+    qtd_pago: int = 0
+
+
+class FechamentoListaResponse(BaseModel):
+    items: List[FechamentoOut]
+    totais: FechamentoListaTotais
+
+
+class MarcarPagoRequest(BaseModel):
+    periodo_inicio: date
+    periodo_fim: date
+    todos_elegiveis: bool = False
+    ids_fechamento: Optional[List[int]] = None
+    confirmar_com_divergencia: bool = False
+
+    @model_validator(mode="after")
+    def check_alvo(self):
+        if self.periodo_inicio > self.periodo_fim:
+            raise ValueError("periodo_inicio deve ser anterior a periodo_fim.")
+        if self.todos_elegiveis:
+            return self
+        if not self.ids_fechamento:
+            raise ValueError("Informe ids_fechamento ou todos_elegiveis=true.")
+        return self
+
+
+class MarcarPagoDivergenteItem(BaseModel):
+    id_fechamento: int
+    username_entregador: Optional[str] = None
+    valor_final: Decimal
+    valor_base: Decimal
+    valor_base_recalculado: Decimal
+
+
+class MarcarPagoResponse(BaseModel):
+    marcados: int
+    ids_fechamento: List[int]
+
+
+def _fechamento_to_out(
+    db: Session,
+    sub_base: str,
+    fech: EntregadorFechamento,
+    *,
+    valor_base_recalc: Optional[Decimal] = None,
+    incluir_divergencia: bool = True,
+) -> FechamentoOut:
+    st = _status_norm(fech)
+    chave_pix: Optional[str] = None
+    if getattr(fech, "id_motoboy", None) is not None:
+        chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
+
+    divergencia = None
+    valor_recalc = None
+    precisa_reajuste = None
+    alerta_pos_pago = None
+    if incluir_divergencia:
+        if valor_base_recalc is None:
+            valor_base_recalc = _recalcular_valor_base_fechamento(db, sub_base, fech)
+        divergencia = valor_base_recalc != fech.valor_base
+        if divergencia:
+            valor_recalc = valor_base_recalc
+            if st in STATUS_PERMITE_REAJUSTE:
+                precisa_reajuste = True
+            elif st == STATUS_PAGO:
+                alerta_pos_pago = True
+
+    return FechamentoOut(
+        id_fechamento=fech.id_fechamento,
+        sub_base=fech.sub_base,
+        id_entregador=fech.id_entregador,
+        id_motoboy=getattr(fech, "id_motoboy", None),
+        username_entregador=fech.username_entregador,
+        chave_pix=chave_pix,
+        periodo_inicio=fech.periodo_inicio,
+        periodo_fim=fech.periodo_fim,
+        valor_base=fech.valor_base,
+        valor_adicao=fech.valor_adicao,
+        motivo_adicao=fech.motivo_adicao,
+        valor_subtracao=fech.valor_subtracao,
+        motivo_subtracao=fech.motivo_subtracao,
+        valor_final=fech.valor_final,
+        status=st if st else (fech.status or ""),
+        criado_em=fech.criado_em,
+        pago_em=getattr(fech, "pago_em", None),
+        pago_por=getattr(fech, "pago_por", None),
+        divergencia_valor_base=True if divergencia else None,
+        valor_base_recalculado=valor_recalc,
+        precisa_reajuste=precisa_reajuste,
+        alerta_pos_pago=alerta_pos_pago,
+        tem_pdf=bool(getattr(fech, "pdf_object_key", None)),
+        codigo=build_fechamento_code(fech),
+    )
 
 # =========================================================
 # GET — Calcular valor_base (preview para modal)
@@ -286,6 +475,169 @@ def calcular_valor_base_preview(
         "conferencia_habilitada": conferencia_habilitada,
         "conferencia_por_dia": [],
     }
+
+
+# =========================================================
+# GET — Listar fechamentos (visão A Pagar)
+# =========================================================
+
+@router.get("/fechamentos", response_model=FechamentoListaResponse)
+def listar_fechamentos_admin(
+    periodo_inicio: date = Query(...),
+    periodo_fim: date = Query(...),
+    status: Optional[str] = Query(None, description="GERADO|REAJUSTADO|PAGO"),
+    apenas_com_divergencia: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Lista fechamentos consolidados do período (não é o resumo diário)."""
+    sub_base = _resolve_user_base(db, current_user)
+    if periodo_inicio > periodo_fim:
+        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+
+    stmt = select(EntregadorFechamento).where(
+        EntregadorFechamento.sub_base == sub_base,
+        EntregadorFechamento.periodo_inicio == periodo_inicio,
+        EntregadorFechamento.periodo_fim == periodo_fim,
+    )
+    rows = list(db.scalars(stmt).all())
+
+    status_filtro = (status or "").strip().upper() or None
+    items: List[FechamentoOut] = []
+    total_a_pagar = Decimal("0.00")
+    total_pago = Decimal("0.00")
+    qtd_precisa_reajuste = 0
+    qtd_a_pagar = 0
+    qtd_pago = 0
+
+    for fech in rows:
+        out = _fechamento_to_out(db, sub_base, fech)
+        st = (out.status or "").upper()
+
+        if st in STATUS_ELEGIVEIS_PAGAMENTO:
+            total_a_pagar += Decimal(str(out.valor_final or 0))
+            qtd_a_pagar += 1
+        elif st == STATUS_PAGO:
+            total_pago += Decimal(str(out.valor_final or 0))
+            qtd_pago += 1
+        if out.precisa_reajuste:
+            qtd_precisa_reajuste += 1
+
+        if status_filtro and st != status_filtro:
+            if not (status_filtro == STATUS_GERADO and (fech.status or "").upper() == "FECHADO"):
+                continue
+        if apenas_com_divergencia and not out.divergencia_valor_base:
+            continue
+        items.append(out)
+
+    items.sort(
+        key=lambda x: (
+            (x.username_entregador or "").casefold(),
+            x.id_fechamento,
+        )
+    )
+
+    return FechamentoListaResponse(
+        items=items,
+        totais=FechamentoListaTotais(
+            total_a_pagar=total_a_pagar.quantize(Decimal("0.01")),
+            total_pago=total_pago.quantize(Decimal("0.01")),
+            qtd_precisa_reajuste=qtd_precisa_reajuste,
+            qtd_a_pagar=qtd_a_pagar,
+            qtd_pago=qtd_pago,
+        ),
+    )
+
+
+# =========================================================
+# POST — Marcar fechamentos como pagos
+# =========================================================
+
+@router.post("/fechamentos/marcar-pago", response_model=MarcarPagoResponse)
+def marcar_fechamentos_pagos(
+    payload: MarcarPagoRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    sub_base = _resolve_user_base(db, current_user)
+    pago_por = (getattr(current_user, "username", None) or "").strip() or str(
+        getattr(current_user, "id", "") or ""
+    )
+
+    stmt = select(EntregadorFechamento).where(
+        EntregadorFechamento.sub_base == sub_base,
+        EntregadorFechamento.periodo_inicio == payload.periodo_inicio,
+        EntregadorFechamento.periodo_fim == payload.periodo_fim,
+    )
+    rows = list(db.scalars(stmt).all())
+
+    if payload.todos_elegiveis:
+        alvos = [f for f in rows if _status_norm(f) in STATUS_ELEGIVEIS_PAGAMENTO]
+    else:
+        ids = set(int(i) for i in (payload.ids_fechamento or []))
+        alvos = []
+        by_id = {int(f.id_fechamento): f for f in rows}
+        for fid in ids:
+            fech = by_id.get(fid)
+            if not fech:
+                raise HTTPException(
+                    404,
+                    f"Fechamento {fid} não encontrado no período/sub_base.",
+                )
+            if _status_norm(fech) not in STATUS_ELEGIVEIS_PAGAMENTO:
+                raise HTTPException(
+                    400,
+                    f"Fechamento {fid} não está elegível para pagamento "
+                    f"(status atual: {_status_norm(fech)}).",
+                )
+            alvos.append(fech)
+
+    if not alvos:
+        raise HTTPException(400, "Nenhum fechamento elegível para marcar como pago.")
+
+    divergentes: List[MarcarPagoDivergenteItem] = []
+    recalc_cache: dict = {}
+    for fech in alvos:
+        valor_recalc = _recalcular_valor_base_fechamento(db, sub_base, fech)
+        recalc_cache[int(fech.id_fechamento)] = valor_recalc
+        if valor_recalc != fech.valor_base:
+            divergentes.append(
+                MarcarPagoDivergenteItem(
+                    id_fechamento=int(fech.id_fechamento),
+                    username_entregador=fech.username_entregador,
+                    valor_final=fech.valor_final,
+                    valor_base=fech.valor_base,
+                    valor_base_recalculado=valor_recalc,
+                )
+            )
+
+    if divergentes and not payload.confirmar_com_divergencia:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "Há fechamentos com divergência de valor base. "
+                    "Confirme explicitamente para marcar como pago mesmo assim."
+                ),
+                "divergentes": [d.model_dump(mode="json") for d in divergentes],
+            },
+        )
+
+    agora = datetime.utcnow()
+    ids_marcados: List[int] = []
+    for fech in alvos:
+        fech.status = STATUS_PAGO
+        fech.pago_em = agora
+        fech.pago_por = pago_por
+        ids_marcados.append(int(fech.id_fechamento))
+
+    db.commit()
+
+    for fech in alvos:
+        db.refresh(fech)
+        _enviar_push_fechamento_pago(db, fech)
+
+    return MarcarPagoResponse(marcados=len(ids_marcados), ids_fechamento=ids_marcados)
 
 
 # =========================================================
@@ -468,40 +820,7 @@ def obter_fechamento(
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
 
-    chave_pix: Optional[str] = None
-    if getattr(fech, "id_motoboy", None) is not None:
-        chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
-        valor_base_recalc = _calcular_valor_base_motoboy_periodo(
-            db, sub_base, fech.id_motoboy,
-            fech.periodo_inicio, fech.periodo_fim,
-        )
-    else:
-        valor_base_recalc = _calcular_valor_base_periodo(
-            db, sub_base, fech.id_entregador,
-            fech.periodo_inicio, fech.periodo_fim,
-        )
-    divergencia = valor_base_recalc != fech.valor_base
-
-    return FechamentoOut(
-        id_fechamento=fech.id_fechamento,
-        sub_base=fech.sub_base,
-        id_entregador=fech.id_entregador,
-        id_motoboy=getattr(fech, "id_motoboy", None),
-        username_entregador=fech.username_entregador,
-        chave_pix=chave_pix,
-        periodo_inicio=fech.periodo_inicio,
-        periodo_fim=fech.periodo_fim,
-        valor_base=fech.valor_base,
-        valor_adicao=fech.valor_adicao,
-        motivo_adicao=fech.motivo_adicao,
-        valor_subtracao=fech.valor_subtracao,
-        motivo_subtracao=fech.motivo_subtracao,
-        valor_final=fech.valor_final,
-        status=fech.status,
-        criado_em=fech.criado_em,
-        divergencia_valor_base=divergencia if divergencia else None,
-        valor_base_recalculado=valor_base_recalc if divergencia else None,
-    )
+    return _fechamento_to_out(db, sub_base, fech)
 
 
 # =========================================================
@@ -520,10 +839,17 @@ def atualizar_fechamento(
     fech = db.get(EntregadorFechamento, id_fechamento)
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
-    if (fech.status or "").upper() != STATUS_GERADO:
+
+    st = _status_norm(fech)
+    if st == STATUS_PAGO:
         raise HTTPException(
             400,
-            "Apenas fechamentos com status GERADO podem ser reajustados.",
+            "Fechamentos com status PAGO não podem ser reajustados.",
+        )
+    if st not in STATUS_PERMITE_REAJUSTE:
+        raise HTTPException(
+            400,
+            "Apenas fechamentos com status GERADO ou REAJUSTADO podem ser reajustados.",
         )
 
     chave_pix: Optional[str] = None
@@ -617,25 +943,7 @@ def atualizar_fechamento(
                 pass
         fech = db.get(EntregadorFechamento, fech_id) or fech
 
-    return FechamentoOut(
-        id_fechamento=fech.id_fechamento,
-        sub_base=fech.sub_base,
-        id_entregador=fech.id_entregador,
-        id_motoboy=getattr(fech, "id_motoboy", None),
-        username_entregador=fech.username_entregador,
-        chave_pix=chave_pix,
-        periodo_inicio=fech.periodo_inicio,
-        periodo_fim=fech.periodo_fim,
-        valor_base=fech.valor_base,
-        valor_adicao=fech.valor_adicao,
-        motivo_adicao=fech.motivo_adicao,
-        valor_subtracao=fech.valor_subtracao,
-        motivo_subtracao=fech.motivo_subtracao,
-        valor_final=fech.valor_final,
-        status=fech.status,
-        criado_em=fech.criado_em,
-    )
-
+    return _fechamento_to_out(db, sub_base, fech, incluir_divergencia=False)
 
 # =========================================================
 # GET — PDF oficial do fechamento (mesmo arquivo do mobile)
