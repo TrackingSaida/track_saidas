@@ -35,35 +35,8 @@ MEDIA_ENTREGAS_POR_ROTA_DEFAULT = 140
 
 
 def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> Dict[int, str]:
-    ids = sorted({int(mid) for mid in motoboy_ids if mid is not None})
-    if not ids:
-        return {}
-    rows_motoboy = db.execute(
-        select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(ids))
-    ).all()
-    motoboy_user_map: Dict[int, Optional[int]] = {
-        int(mid): (int(uid) if uid is not None else None)
-        for mid, uid in rows_motoboy
-    }
-    user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
-    user_map: Dict[int, tuple] = {}
-    if user_ids:
-        rows_user = db.execute(
-            select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
-        ).all()
-        user_map = {
-            int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
-            for uid, nome, sobrenome, username in rows_user
-        }
-    out: Dict[int, str] = {}
-    for mid in ids:
-        uid = motoboy_user_map.get(mid)
-        if uid is None:
-            out[mid] = f"Motoboy {mid}"
-            continue
-        nome, sobrenome, username = user_map.get(uid, ("", "", ""))
-        out[mid] = (f"{nome} {sobrenome}".strip() or username or f"Motoboy {mid}")
-    return out
+    from motoboy_nome_utils import carregar_nomes_motoboy_ids
+    return carregar_nomes_motoboy_ids(db, motoboy_ids)
 
 
 def _sub_base(user: User) -> str:
