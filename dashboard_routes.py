@@ -990,9 +990,15 @@ class DashboardEntradaMarketplaceOut(BaseModel):
     pct: float
 
 
+class DashboardEntradaNaBaseDiaOut(BaseModel):
+    date: str  # YYYY-MM-DD (data operacional do pacote)
+    qty: int
+
+
 class DashboardEntradaOut(BaseModel):
     total_entradas: int
     ainda_na_base: int
+    ainda_na_base_detalhe: List[DashboardEntradaNaBaseDiaOut] = []
     total_saidas: int
     taxa_saida_pct: float
     gap_entrada_saida: int
@@ -1188,22 +1194,29 @@ def get_dashboard_saidas(
                     evolucao_map[dia_key]["entradas"] += 1
 
         total_entradas = ent_shopee + ent_ml + ent_avulso
-        ainda_na_base = int(
-            db.scalar(
-                select(func.count())
-                .select_from(Saida)
-                .where(
-                    Saida.sub_base == sub_base,
-                    Saida.codigo.isnot(None),
-                    or_(
-                        Saida.status == STATUS_NA_BASE,
-                        func.lower(Saida.status) == "na_base",
-                        func.lower(Saida.status) == "na base",
-                    ),
-                )
+        rows_na_base = db.scalars(
+            select(Saida).where(
+                Saida.sub_base == sub_base,
+                Saida.codigo.isnot(None),
+                or_(
+                    Saida.status == STATUS_NA_BASE,
+                    func.lower(Saida.status) == "na_base",
+                    func.lower(Saida.status) == "na base",
+                ),
             )
-            or 0
-        )
+        ).all()
+        ainda_na_base = len(rows_na_base)
+        # Detalhe por data operacional (Saida.data) — alinhado à tela de registros
+        na_base_por_dia: Dict[str, int] = {}
+        for s in rows_na_base:
+            dia = s.data.isoformat() if s.data else (s.timestamp.date().isoformat() if s.timestamp else None)
+            if not dia:
+                continue
+            na_base_por_dia[dia] = na_base_por_dia.get(dia, 0) + 1
+        ainda_na_base_detalhe = [
+            DashboardEntradaNaBaseDiaOut(date=d, qty=q)
+            for d, q in sorted(na_base_por_dia.items(), key=lambda x: x[0], reverse=True)
+        ]
         taxa_saida_pct = round((total_saidas / total_entradas) * 100, 1) if total_entradas > 0 else 0.0
         gap_entrada_saida = total_entradas - total_saidas
         pct_e_shopee = round(ent_shopee / total_entradas * 100, 1) if total_entradas > 0 else 0.0
@@ -1212,6 +1225,7 @@ def get_dashboard_saidas(
         entrada_out = DashboardEntradaOut(
             total_entradas=total_entradas,
             ainda_na_base=ainda_na_base,
+            ainda_na_base_detalhe=ainda_na_base_detalhe,
             total_saidas=total_saidas,
             taxa_saida_pct=taxa_saida_pct,
             gap_entrada_saida=gap_entrada_saida,
