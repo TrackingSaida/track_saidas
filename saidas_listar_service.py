@@ -947,8 +947,21 @@ def listar_saidas_paginado(
     if acao_eventos:
         acao_sql = " AND coalesce(ops.ult_evento, '') IN :acao_eventos "
 
-    de_sql = " AND (:de IS NULL OR (ops.operacional_ts)::date >= :de) "
-    ate_sql = " AND (:ate IS NULL OR (ops.operacional_ts)::date <= :ate) "
+    # Evita bind de data NULL (pode zerar resultado em alguns drivers/planos).
+    de_sql = ""
+    ate_sql = ""
+    if de is not None:
+        de_sql = " AND (ops.operacional_ts)::date >= :de "
+    else:
+        params.pop("de", None)
+    if ate is not None:
+        ate_sql = " AND (ops.operacional_ts)::date <= :ate "
+    else:
+        params.pop("ate", None)
+    if de is None:
+        params.pop("dt_inicio", None)
+    if ate is None:
+        params.pop("dt_fim_exclusivo", None)
 
     limit_sql = " LIMIT :limit " if limit is not None else ""
     offset_sql = " OFFSET :offset "
