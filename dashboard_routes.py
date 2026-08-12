@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -17,12 +18,25 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from base import _resolve_user_sub_base
-from models import BasePreco, Coleta, Entregador, Motoboy, Owner, OwnerCobrancaItem, Saida, User
+from models import (
+    BasePreco,
+    Coleta,
+    Entregador,
+    Motoboy,
+    Owner,
+    OwnerCobrancaItem,
+    Saida,
+    SaidaHistorico,
+    User,
+)
 
 from contabilidade_routes import _get_motoboy_nome as _contab_motoboy_nome, _resolve_actor_saida
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
+STATUS_NA_BASE = "NA_BASE"
 
 # Status considerados válidos (saiu/em rota/entregue/ausente — alinhado ao app mobile)
 # Incluir "saiu_para_entrega" pois o app mobile grava SAIU_PARA_ENTREGA
@@ -73,6 +87,20 @@ def _saida_conta_para_indicador(saida: Saida, modo_entregas: str) -> bool:
         return st == "entregue"
     # modo "saiu"/"operacional" (default): status operacionais válidos
     return st in STATUS_SAIDAS_VALIDOS
+
+
+def _owner_entrada_habilitada(db: Session, sub_base: str, user: User) -> bool:
+    if bool(getattr(user, "entrada_obrigatoria_habilitada", False)):
+        return True
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    return bool(owner and getattr(owner, "entrada_obrigatoria_habilitada", False))
+
+
+def _bounds_periodo_operacional(data_inicio: date, data_fim: date) -> tuple[datetime, datetime]:
+    """Intervalo [start, end) em horário de Brasília (naive), alinhado ao resumo de entradas."""
+    start = datetime.combine(data_inicio, time.min, tzinfo=OPERACAO_TZ).replace(tzinfo=None)
+    end = datetime.combine(data_fim + timedelta(days=1), time.min, tzinfo=OPERACAO_TZ).replace(tzinfo=None)
+    return start, end
 
 
 # --- Schemas de resposta ---
@@ -936,6 +964,7 @@ class DashboardSaidasEvolucaoOut(BaseModel):
     mercado_livre: int
     avulso: int
     valor_total: Decimal
+    entradas: int = 0
 
 
 class DashboardSaidasRankingEntregadorOut(BaseModel):
@@ -955,12 +984,29 @@ class DashboardSaidasRankingBaseOut(BaseModel):
     pct: float
 
 
+class DashboardEntradaMarketplaceOut(BaseModel):
+    nome: str  # Shopee | Mercado Livre | Avulso
+    qty: int
+    pct: float
+
+
+class DashboardEntradaOut(BaseModel):
+    total_entradas: int
+    ainda_na_base: int
+    total_saidas: int
+    taxa_saida_pct: float
+    gap_entrada_saida: int
+    por_marketplace: List[DashboardEntradaMarketplaceOut]
+
+
 class DashboardSaidasResponse(BaseModel):
     cards: DashboardSaidasCardsOut
     por_marketplace: List[DashboardSaidasPorMarketplaceOut]
     evolucao_diaria: List[DashboardSaidasEvolucaoOut]
     ranking_entregadores: List[DashboardSaidasRankingEntregadorOut]
     ranking_bases: List[DashboardSaidasRankingBaseOut]
+    entrada_habilitada: bool = False
+    entrada: Optional[DashboardEntradaOut] = None
 
 
 @router.get("/saidas", response_model=DashboardSaidasResponse)
@@ -1060,7 +1106,14 @@ def get_dashboard_saidas(
     for d in range((data_fim - data_inicio).days + 1):
         dt = data_inicio + timedelta(days=d)
         key = dt.isoformat()
-        evolucao_map[key] = {"date": key, "shopee": 0, "mercado_livre": 0, "avulso": 0, "valor_total": Decimal("0")}
+        evolucao_map[key] = {
+            "date": key,
+            "shopee": 0,
+            "mercado_livre": 0,
+            "avulso": 0,
+            "valor_total": Decimal("0"),
+            "entradas": 0,
+        }
     for s in rows_validas:
         eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is None and mid is None:
@@ -1091,6 +1144,84 @@ def get_dashboard_saidas(
             else:
                 evolucao_map[date_key]["avulso"] += 1
             evolucao_map[date_key]["valor_total"] += v
+
+    # Bloco de entrada (somente se owner registra entrada)
+    entrada_habilitada = _owner_entrada_habilitada(db, sub_base, current_user)
+    entrada_out: Optional[DashboardEntradaOut] = None
+    if entrada_habilitada:
+        start_hist, end_hist = _bounds_periodo_operacional(data_inicio, data_fim)
+        rows_entrada = db.execute(
+            select(
+                Saida.servico,
+                SaidaHistorico.timestamp,
+                SaidaHistorico.id_saida,
+            )
+            .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
+            .where(
+                Saida.sub_base == sub_base,
+                SaidaHistorico.evento == "entrada_base",
+                SaidaHistorico.timestamp >= start_hist,
+                SaidaHistorico.timestamp < end_hist,
+            )
+        ).all()
+
+        # 1ª entrada do pacote no período (evita duplicar se houver reprocessamento)
+        primeira_entrada: Dict[int, tuple] = {}
+        for servico, ts, id_saida in rows_entrada:
+            sid = int(id_saida)
+            if sid not in primeira_entrada or (ts and ts < primeira_entrada[sid][1]):
+                primeira_entrada[sid] = (servico, ts)
+
+        ent_shopee = ent_ml = ent_avulso = 0
+        for servico, ts in primeira_entrada.values():
+            bucket = _classify_servico(servico)
+            if bucket == "shopee":
+                ent_shopee += 1
+            elif bucket == "mercado_livre":
+                ent_ml += 1
+            else:
+                ent_avulso += 1
+            if ts is not None:
+                # timestamp naive em horário de Brasília (mesmo padrão de entradas_routes)
+                dia_key = ts.date().isoformat() if hasattr(ts, "date") else None
+                if dia_key and dia_key in evolucao_map:
+                    evolucao_map[dia_key]["entradas"] += 1
+
+        total_entradas = ent_shopee + ent_ml + ent_avulso
+        ainda_na_base = int(
+            db.scalar(
+                select(func.count())
+                .select_from(Saida)
+                .where(
+                    Saida.sub_base == sub_base,
+                    Saida.codigo.isnot(None),
+                    or_(
+                        Saida.status == STATUS_NA_BASE,
+                        func.lower(Saida.status) == "na_base",
+                        func.lower(Saida.status) == "na base",
+                    ),
+                )
+            )
+            or 0
+        )
+        taxa_saida_pct = round((total_saidas / total_entradas) * 100, 1) if total_entradas > 0 else 0.0
+        gap_entrada_saida = total_entradas - total_saidas
+        pct_e_shopee = round(ent_shopee / total_entradas * 100, 1) if total_entradas > 0 else 0.0
+        pct_e_ml = round(ent_ml / total_entradas * 100, 1) if total_entradas > 0 else 0.0
+        pct_e_avulso = round(ent_avulso / total_entradas * 100, 1) if total_entradas > 0 else 0.0
+        entrada_out = DashboardEntradaOut(
+            total_entradas=total_entradas,
+            ainda_na_base=ainda_na_base,
+            total_saidas=total_saidas,
+            taxa_saida_pct=taxa_saida_pct,
+            gap_entrada_saida=gap_entrada_saida,
+            por_marketplace=[
+                DashboardEntradaMarketplaceOut(nome="Shopee", qty=ent_shopee, pct=pct_e_shopee),
+                DashboardEntradaMarketplaceOut(nome="Mercado Livre", qty=ent_ml, pct=pct_e_ml),
+                DashboardEntradaMarketplaceOut(nome="Avulso", qty=ent_avulso, pct=pct_e_avulso),
+            ],
+        )
+
     evolucao_diaria = [
         DashboardSaidasEvolucaoOut(
             date=v["date"],
@@ -1098,6 +1229,7 @@ def get_dashboard_saidas(
             mercado_livre=v["mercado_livre"],
             avulso=v["avulso"],
             valor_total=v["valor_total"].quantize(Decimal("0.01")),
+            entradas=int(v.get("entradas") or 0),
         )
         for v in sorted(evolucao_map.values(), key=lambda x: x["date"])
     ]
@@ -1190,6 +1322,8 @@ def get_dashboard_saidas(
         evolucao_diaria=evolucao_diaria,
         ranking_entregadores=ranking_entregadores,
         ranking_bases=ranking_bases,
+        entrada_habilitada=entrada_habilitada,
+        entrada=entrada_out,
     )
 
 
