@@ -645,9 +645,17 @@ def _status_group_aliases(token: str) -> List[str]:
         "coletado": ["coletado"],
         "nao coletado": ["nao coletado", "não coletado"],
         "cancelado": ["cancelado", "cancelados"],
+        "na base": ["na base", "na_base"],
     }
-    normalized = groups.get(key, [key])
-    return sorted({v for v in normalized if v})
+    normalized = list(groups.get(key, [key]))
+    out: set[str] = set()
+    for v in normalized:
+        v_norm = " ".join(_norm_text(v).replace("_", " ").replace("-", " ").split())
+        if not v_norm:
+            continue
+        out.add(v_norm)
+        out.add(v_norm.replace(" ", "_"))
+    return sorted(out)
 
 
 def _acao_equivalente(evento_norm: str) -> str:
@@ -1703,8 +1711,8 @@ def _servico_tokens_from_param(servico: Optional[List[str]]) -> List[str]:
 def _saida_passa_filtro_status(row: Saida, status_aliases: List[str]) -> bool:
     if not status_aliases:
         return True
-    status_norm = _norm_text(row.status or "")
-    return any(_norm_text(alias) == status_norm for alias in status_aliases)
+    status_norm = _norm_text(row.status or "").replace("_", " ")
+    return any(_norm_text(alias).replace("_", " ") == status_norm for alias in status_aliases)
 
 
 def _saida_passa_filtro_servico(row: Saida, servico_tokens: List[str]) -> bool:

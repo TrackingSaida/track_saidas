@@ -108,10 +108,17 @@ def _status_group_aliases(token: str) -> List[str]:
             "encerrado_pelo_sistema",
         ],
         "na base": ["na base", "na_base"],
-        "na_base": ["na base", "na_base"],
     }
-    normalized = groups.get(key, [key])
-    return sorted({v for v in normalized if v})
+    normalized = list(groups.get(key, [key]))
+    # Sempre incluir variantes com espaço e underscore (DB usa NA_BASE → na_base).
+    out: set[str] = set()
+    for v in normalized:
+        v_norm = " ".join(_norm_text(v).replace("_", " ").replace("-", " ").split())
+        if not v_norm:
+            continue
+        out.add(v_norm)
+        out.add(v_norm.replace(" ", "_"))
+    return sorted(out)
 
 
 def _servico_text_expr(expr):
@@ -546,7 +553,9 @@ def _build_candidate_stmt(
     )
     if status_aliases:
         conds_status = [
-            func.unaccent(func.lower(Saida.status)) == func.unaccent(alias) for alias in status_aliases
+            func.replace(func.unaccent(func.lower(Saida.status)), "_", " ")
+            == func.replace(func.unaccent(alias), "_", " ")
+            for alias in status_aliases
         ]
         stmt = stmt.where(or_(*conds_status))
 
@@ -853,9 +862,12 @@ def listar_saidas_paginado(
         for i, alias in enumerate(status_aliases):
             key = f"status_alias_{i}"
             params[key] = alias
-            placeholders.append(f"unaccent(lower(:{key}))")
+            placeholders.append(
+                f"replace(unaccent(lower(:{key})), '_', ' ')"
+            )
         where_extra.append(
-            f"unaccent(lower(coalesce(s.status, ''))) IN ({', '.join(placeholders)})"
+            "replace(unaccent(lower(coalesce(s.status, ''))), '_', ' ') "
+            f"IN ({', '.join(placeholders)})"
         )
 
     servico_tokens = [
