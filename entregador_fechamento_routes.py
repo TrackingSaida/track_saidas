@@ -278,6 +278,7 @@ class FechamentoOut(BaseModel):
     id_entregador: Optional[int] = None
     id_motoboy: Optional[int] = None
     username_entregador: Optional[str] = None
+    nome_exibicao: Optional[str] = None
     chave_pix: Optional[str] = None
     periodo_inicio: date
     periodo_fim: date
@@ -333,6 +334,7 @@ class MarcarPagoRequest(BaseModel):
 class MarcarPagoDivergenteItem(BaseModel):
     id_fechamento: int
     username_entregador: Optional[str] = None
+    nome_exibicao: Optional[str] = None
     valor_final: Decimal
     valor_base: Decimal
     valor_base_recalculado: Decimal
@@ -343,6 +345,32 @@ class MarcarPagoResponse(BaseModel):
     ids_fechamento: List[int]
 
 
+def _resolver_nome_exibicao_fechamento(
+    db: Session,
+    fech: EntregadorFechamento,
+    *,
+    nomes_motoboy_map: Optional[dict] = None,
+) -> str:
+    """Nome amigável (nome+sobrenome normalizados) para a tela A Pagar."""
+    from motoboy_nome_utils import get_motoboy_display_name
+    from name_normalizer import normalize_display_name
+
+    mid = getattr(fech, "id_motoboy", None)
+    if mid is not None:
+        if nomes_motoboy_map is not None and int(mid) in nomes_motoboy_map:
+            return nomes_motoboy_map[int(mid)]
+        return get_motoboy_display_name(db, int(mid))
+
+    if fech.id_entregador is not None:
+        ent = db.get(Entregador, int(fech.id_entregador))
+        if ent and (ent.nome or "").strip():
+            return normalize_display_name(ent.nome)
+
+    return normalize_display_name(fech.username_entregador or "") or (
+        (fech.username_entregador or "").strip() or "—"
+    )
+
+
 def _fechamento_to_out(
     db: Session,
     sub_base: str,
@@ -350,6 +378,7 @@ def _fechamento_to_out(
     *,
     valor_base_recalc: Optional[Decimal] = None,
     incluir_divergencia: bool = True,
+    nomes_motoboy_map: Optional[dict] = None,
 ) -> FechamentoOut:
     st = _status_norm(fech)
     chave_pix: Optional[str] = None
@@ -371,12 +400,17 @@ def _fechamento_to_out(
             elif st == STATUS_PAGO:
                 alerta_pos_pago = True
 
+    nome_exibicao = _resolver_nome_exibicao_fechamento(
+        db, fech, nomes_motoboy_map=nomes_motoboy_map
+    )
+
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
         sub_base=fech.sub_base,
         id_entregador=fech.id_entregador,
         id_motoboy=getattr(fech, "id_motoboy", None),
         username_entregador=fech.username_entregador,
+        nome_exibicao=nome_exibicao,
         chave_pix=chave_pix,
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
@@ -508,6 +542,14 @@ def listar_fechamentos_admin(
     )
     rows = list(db.scalars(stmt).all())
 
+    from motoboy_nome_utils import carregar_nomes_motoboy_ids
+    motoboy_ids = [
+        int(f.id_motoboy)
+        for f in rows
+        if getattr(f, "id_motoboy", None) is not None
+    ]
+    nomes_motoboy_map = carregar_nomes_motoboy_ids(db, motoboy_ids)
+
     status_filtro = (status or "").strip().upper() or None
     items: List[FechamentoOut] = []
     total_a_pagar = Decimal("0.00")
@@ -517,7 +559,9 @@ def listar_fechamentos_admin(
     qtd_pago = 0
 
     for fech in rows:
-        out = _fechamento_to_out(db, sub_base, fech)
+        out = _fechamento_to_out(
+            db, sub_base, fech, nomes_motoboy_map=nomes_motoboy_map
+        )
         st = (out.status or "").upper()
 
         if st in STATUS_ELEGIVEIS_PAGAMENTO:
@@ -538,7 +582,7 @@ def listar_fechamentos_admin(
 
     items.sort(
         key=lambda x: (
-            (x.username_entregador or "").casefold(),
+            (x.nome_exibicao or x.username_entregador or "").casefold(),
             x.id_fechamento,
         )
     )
@@ -611,6 +655,7 @@ def marcar_fechamentos_pagos(
                 MarcarPagoDivergenteItem(
                     id_fechamento=int(fech.id_fechamento),
                     username_entregador=fech.username_entregador,
+                    nome_exibicao=_resolver_nome_exibicao_fechamento(db, fech),
                     valor_final=fech.valor_final,
                     valor_base=fech.valor_base,
                     valor_base_recalculado=valor_recalc,
