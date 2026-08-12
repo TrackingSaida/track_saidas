@@ -469,6 +469,8 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
     user = get_user_by_identifier(db, identifier)
     if not user:
         return None
+    if not bool(getattr(user, "status", True)):
+        return None
     if not verify_password(password, user.password_hash):
         return None
     return user
@@ -805,13 +807,18 @@ async def motoboy_logout(body: MotoboyLogoutBody, db: Session = Depends(get_db))
 
 def _nome_exibicao(user: User) -> tuple[Optional[str], Optional[str]]:
     """Retorna (nome, sobrenome) para exibição. Quando ambos vazios, deriva do username."""
+    from name_normalizer import normalize_person_name
+
     nome_val = (getattr(user, "nome", None) or "").strip()
     sobrenome_val = (getattr(user, "sobrenome", None) or "").strip()
     if not nome_val and not sobrenome_val and (user.username or "").strip():
         # Fallback: formata username como nome (ex: joao.silva -> Joao Silva)
         partes = (user.username or "").replace(".", " ").replace("_", " ").split()
-        nome_val = " ".join(p.capitalize() for p in partes) if partes else ""
-    return (nome_val or None, sobrenome_val or None)
+        nome_val = " ".join(partes) if partes else ""
+    return (
+        normalize_person_name(nome_val),
+        normalize_person_name(sobrenome_val),
+    )
 
 
 @router.get("/me", response_model=UserResponse)

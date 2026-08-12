@@ -264,21 +264,8 @@ def resumo_novos_pacotes(saidas_novas: List[Saida]) -> dict:
 
 
 def carregar_nomes_motoboy(db: Session, motoboy_ids: List[int]) -> Dict[int, str]:
-    if not motoboy_ids:
-        return {}
-    # Motoboy.user_id → User.username; fallback nome do relacionamento
-    from models import User as UserModel
-
-    rows = db.execute(
-        select(Motoboy.id_motoboy, UserModel.username, UserModel.nome, UserModel.sobrenome).outerjoin(
-            UserModel, UserModel.id == Motoboy.user_id
-        ).where(Motoboy.id_motoboy.in_(motoboy_ids))
-    ).all()
-    out: Dict[int, str] = {}
-    for mid, username, nome, sobrenome in rows:
-        full = " ".join(p for p in [(nome or "").strip(), (sobrenome or "").strip()] if p).strip()
-        out[int(mid)] = full or (username or "").strip() or f"Motoboy {mid}"
-    return out
+    from motoboy_nome_utils import carregar_nomes_motoboy_ids
+    return carregar_nomes_motoboy_ids(db, motoboy_ids)
 
 
 def label_fechamento(status: str) -> str:

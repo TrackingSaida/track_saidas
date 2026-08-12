@@ -4,13 +4,14 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field, AliasChoices
-from sqlalchemy import func, or_, select
+from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from db import get_db
 from name_normalizer import normalize_person_name
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
+from entregador_legado_sync import filtrar_entregadores_operacionais
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
@@ -104,6 +105,14 @@ class EntregadorOut(BaseModel):
     username_entregador: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("nome", mode="after")
+    @classmethod
+    def _normalize_nome(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        from name_normalizer import normalize_display_name
+        return normalize_display_name(v) or None
 
 
 class EntregadorResumoItem(BaseModel):
@@ -502,7 +511,7 @@ def create_entregador(
 
 @router.get("/", response_model=List[EntregadorOut])
 def list_entregadores(
-    status: Optional[str] = Query("todos", description="Filtrar por status: ativo, inativo ou todos"),
+    status: Optional[str] = Query("ativo", description="Filtrar por status: ativo, inativo ou todos"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
@@ -516,7 +525,12 @@ def list_entregadores(
         stmt = stmt.where(Entregador.ativo.is_(False))
     stmt = stmt.order_by(Entregador.nome)
 
-    return db.scalars(stmt).all()
+    rows = list(db.scalars(stmt).all())
+    # Em listagens operacionais (ativo), omite espelho de usuário excluído/inativo.
+    if status == "ativo":
+        rows = filtrar_entregadores_operacionais(db, rows)
+    rows.sort(key=lambda e: (e.nome or "").casefold())
+    return rows
 
 
 @router.get("/executores", response_model=List[ExecutorItem])
@@ -536,28 +550,43 @@ def list_executores(
     elif status == "inativo":
         stmt_ent = stmt_ent.where(Entregador.ativo.is_(False))
     stmt_ent = stmt_ent.order_by(Entregador.nome)
-    for ent in db.scalars(stmt_ent).all():
+    entregadores = list(db.scalars(stmt_ent).all())
+    if status == "ativo":
+        entregadores = filtrar_entregadores_operacionais(db, entregadores)
+    for ent in entregadores:
+        from name_normalizer import normalize_display_name
         out.append(ExecutorItem(
             id_entregador=ent.id_entregador,
             id_motoboy=None,
-            nome=(ent.nome or f"Entregador {ent.id_entregador}").strip(),
+            nome=normalize_display_name(
+                (ent.nome or f"Entregador {ent.id_entregador}").strip(),
+                fallback=f"Entregador {ent.id_entregador}",
+            ),
             tipo="entregador",
             executor_tipo="e",
             executor_id=ent.id_entregador,
             executor_key=f"e_{ent.id_entregador}",
         ))
 
-    # Motoboys vinculados à sub_base
+    # Motoboys vinculados à sub_base (somente User ativo)
     stmt_mb = (
         select(Motoboy)
+        .join(User, User.id == Motoboy.user_id)
         .join(MotoboySubBase, MotoboySubBase.motoboy_id == Motoboy.id_motoboy)
         .where(
             MotoboySubBase.sub_base == sub_base_user,
             MotoboySubBase.ativo.is_(True),
+            Motoboy.ativo.is_(True),
+            User.status.is_(True),
+            User.role == 4,
         )
         .order_by(Motoboy.id_motoboy)
     )
-    motoboys = db.scalars(stmt_mb).all()
+    if status == "inativo":
+        # Para inativos, não misturar motoboys ativos no dropdown operacional.
+        motoboys = []
+    else:
+        motoboys = db.scalars(stmt_mb).all()
     nomes_motoboy = _carregar_nomes_motoboy_ids(db, [m.id_motoboy for m in motoboys])
     for motoboy in motoboys:
         nome = nomes_motoboy.get(int(motoboy.id_motoboy), f"Motoboy {motoboy.id_motoboy}")
@@ -571,6 +600,7 @@ def list_executores(
             executor_key=f"m_{motoboy.id_motoboy}",
         ))
 
+    out.sort(key=lambda x: (x.nome or "").casefold())
     return out
 
 
@@ -583,49 +613,16 @@ def _normalizar_servico(servico: Optional[str]) -> str:
     return "avulso"
 
 
-def _get_motoboy_nome(db: Session, motoboy_id: int) -> str:
-    """Nome do motoboy (User) para exibição no resumo."""
-    motoboy = db.get(Motoboy, motoboy_id)
-    if not motoboy or not motoboy.user_id:
-        return f"Motoboy {motoboy_id}"
-    u = db.get(User, motoboy.user_id)
-    if not u:
-        return f"Motoboy {motoboy_id}"
-    nome = (f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or "").strip()
-    return nome or f"Motoboy {motoboy_id}"
-
-
 def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> Dict[int, str]:
     """Resolve nomes de motoboy em lote para evitar N+1."""
-    ids = sorted({int(mid) for mid in motoboy_ids if mid is not None})
-    if not ids:
-        return {}
-    rows_motoboy = db.execute(
-        select(Motoboy.id_motoboy, Motoboy.user_id).where(Motoboy.id_motoboy.in_(ids))
-    ).all()
-    motoboy_user_map: Dict[int, Optional[int]] = {
-        int(mid): (int(uid) if uid is not None else None)
-        for mid, uid in rows_motoboy
-    }
-    user_ids = sorted({uid for uid in motoboy_user_map.values() if uid is not None})
-    user_map: Dict[int, tuple] = {}
-    if user_ids:
-        rows_user = db.execute(
-            select(User.id, User.nome, User.sobrenome, User.username).where(User.id.in_(user_ids))
-        ).all()
-        user_map = {
-            int(uid): ((nome or ""), (sobrenome or ""), (username or ""))
-            for uid, nome, sobrenome, username in rows_user
-        }
-    out: Dict[int, str] = {}
-    for mid in ids:
-        uid = motoboy_user_map.get(mid)
-        if uid is None:
-            out[mid] = f"Motoboy {mid}"
-            continue
-        nome, sobrenome, username = user_map.get(uid, ("", "", ""))
-        out[mid] = (f"{nome} {sobrenome}".strip() or username or f"Motoboy {mid}")
-    return out
+    from motoboy_nome_utils import carregar_nomes_motoboy_ids
+    return carregar_nomes_motoboy_ids(db, motoboy_ids)
+
+
+def _get_motoboy_nome(db: Session, motoboy_id: int) -> str:
+    """Nome do motoboy (User) para exibição no resumo."""
+    from motoboy_nome_utils import get_motoboy_display_name
+    return get_motoboy_display_name(db, motoboy_id)
 
 
 def _carregar_motoboys_ativos_da_subbase(db: Session, sub_base_user: str) -> List[Motoboy]:
@@ -636,9 +633,13 @@ def _carregar_motoboys_ativos_da_subbase(db: Session, sub_base_user: str) -> Lis
         .where(
             User.role == 4,
             User.status.is_(True),
+            Motoboy.ativo.is_(True),
             or_(
                 Motoboy.sub_base == sub_base_user,
-                MotoboySubBase.sub_base == sub_base_user,
+                and_(
+                    MotoboySubBase.sub_base == sub_base_user,
+                    MotoboySubBase.ativo.is_(True),
+                ),
             ),
         )
         .order_by(Motoboy.id_motoboy.asc())
@@ -673,7 +674,8 @@ def _preco_item_from_motoboy(
     if entregador_id is not None:
         ent = db.get(Entregador, int(entregador_id))
         if ent and ent.sub_base == sub_base_user:
-            entregador_nome = (ent.nome or "").strip() or None
+            from name_normalizer import normalize_display_name
+            entregador_nome = normalize_display_name((ent.nome or "").strip()) or None
 
     return PrecoIndividualItem(
         entregador_id=int(entregador_id or 0),
@@ -1737,9 +1739,14 @@ def delete_entregador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """Remove o entregador, sem deletar o user"""
+    """Remove o entregador e a exceção de preço, sem deletar o user"""
     sub_base_user = _resolve_user_base(db, current_user)
     obj = _get_owned_entregador(db, sub_base_user, id_entregador)
+    ep = db.scalars(
+        select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
+    ).first()
+    if ep:
+        db.delete(ep)
     db.delete(obj)
     db.commit()
     return

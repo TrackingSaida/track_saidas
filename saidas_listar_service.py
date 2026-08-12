@@ -457,7 +457,10 @@ def _load_motoboy_nome_map(db, motoboy_ids: Sequence[int]) -> Dict[int, str]:
             out[mid] = f"Motoboy {mid}"
             continue
         nome, sobrenome, username_val = user_map.get(uid, ("", "", ""))
-        out[mid] = f"{nome} {sobrenome}".strip() or username_val or f"Motoboy {mid}"
+        from motoboy_nome_utils import format_motoboy_nome_parts
+        out[mid] = format_motoboy_nome_parts(
+            nome, sobrenome, username_val, motoboy_id=mid
+        )
     return out
 
 
@@ -1144,6 +1147,8 @@ def listar_saidas_paginado(
             nome_exec = page_motoboy_map.get(int(row.motoboy_id)) or row.entregador
         else:
             nome_exec = row.entregador
+        from name_normalizer import normalize_display_name
+        nome_exec = normalize_display_name(nome_exec) if nome_exec else nome_exec
         items.append(montar_item(row, ctx, nome_exec))
 
     result = {

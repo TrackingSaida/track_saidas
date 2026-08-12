@@ -16,6 +16,10 @@ from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from db import get_db
 from name_normalizer import normalize_person_name
 from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD, revoke_motoboy_refresh_tokens_for_user
+from entregador_legado_sync import (
+    limpar_legado_entregador_ao_excluir_usuario,
+    sincronizar_legado_entregador_com_status_usuario,
+)
 from models import User, Owner, Motoboy, MotoboySubBase
 from base import _resolve_user_sub_base
 
@@ -648,8 +652,11 @@ def list_motoboys(
     ).all()
     out = []
     for u in users:
-        if u.motoboy and u.motoboy.id_motoboy:
-            nome = f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or ""
+        if u.motoboy and u.motoboy.id_motoboy and bool(getattr(u.motoboy, "ativo", True)):
+            from motoboy_nome_utils import format_motoboy_nome_parts
+            nome = format_motoboy_nome_parts(
+                u.nome, u.sobrenome, u.username, motoboy_id=u.motoboy.id_motoboy
+            )
             out.append(
                 MotoboyItem(
                     id_motoboy=u.motoboy.id_motoboy,
@@ -658,6 +665,7 @@ def list_motoboys(
                     avulso_exige_foto=bool(getattr(u.motoboy, "avulso_exige_foto", False)),
                 )
             )
+    out.sort(key=lambda x: (x.nome or "").casefold())
     return out
 
 
@@ -847,6 +855,22 @@ def admin_update_user(
         if field in user_fields:
             setattr(user, field, value)
 
+    # Sincroniza Motoboy/Entregador legado quando status muda
+    if "status" in updates:
+        sincronizar_legado_entregador_com_status_usuario(
+            db,
+            user,
+            ativo=bool(user.status),
+            remover_excecao_preco=not bool(user.status),
+        )
+        if not bool(user.status):
+            try:
+                revoke_motoboy_refresh_tokens_for_user(db, int(user.id), commit=False)
+            except Exception:
+                logger.exception(
+                    "Falha ao revogar refresh tokens ao inativar user_id=%s", user.id
+                )
+
     # Campos Motoboy (role=4)
     motoboy_fields = {
         "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
@@ -970,12 +994,30 @@ def delete_user(
     if current_user.role not in (0, 1):
         raise HTTPException(403, "Acesso negado.")
 
-    user = db.get(User, user_id)
+    user = db.scalars(
+        select(User).options(joinedload(User.motoboy)).where(User.id == user_id)
+    ).first()
     if not user:
         raise HTTPException(404, "Usuário não encontrado")
 
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
+
+    # Limpa espelho legado (entregador + exceção de preço) antes do hard delete.
+    try:
+        limpar_legado_entregador_ao_excluir_usuario(db, user)
+    except Exception:
+        logger.exception(
+            "Falha ao limpar entregador legado ao excluir user_id=%s", user_id
+        )
+        raise HTTPException(500, "Falha ao limpar dados vinculados do usuário.")
+
+    try:
+        revoke_motoboy_refresh_tokens_for_user(db, int(user.id), commit=False)
+    except Exception:
+        logger.exception(
+            "Falha ao revogar refresh tokens ao excluir user_id=%s", user_id
+        )
 
     db.delete(user)
     db.commit()

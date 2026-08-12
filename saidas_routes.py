@@ -497,13 +497,8 @@ def _resolve_entregador(
 
 def _get_motoboy_nome(db: Session, motoboy: Motoboy) -> str:
     """Retorna nome do motoboy (User) para exibição."""
-    if not motoboy or not motoboy.user_id:
-        return "Motoboy"
-    u = db.get(User, motoboy.user_id)
-    if not u:
-        return "Motoboy"
-    nome = f"{u.nome or ''} {u.sobrenome or ''}".strip() or u.username or ""
-    return nome or f"Motoboy {motoboy.id_motoboy}"
+    from motoboy_nome_utils import get_motoboy_display_name
+    return get_motoboy_display_name(db, motoboy=motoboy)
 
 
 def _resolve_motoboy_for_subbase(db: Session, sub_base: str, motoboy_id: int) -> Motoboy:

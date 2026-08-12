@@ -126,12 +126,18 @@ def _resolve_motoboy_subbase(db: Session, sub_base: str, motoboy_id: int) -> Mot
 
 def _get_motoboy_username(db: Session, motoboy: Motoboy) -> str:
     """Username ou nome do User do motoboy para username_entregador."""
+    from motoboy_nome_utils import format_motoboy_nome_parts
+
     if not motoboy or not motoboy.user_id:
         return f"Motoboy {motoboy.id_motoboy}"
     u = db.get(User, motoboy.user_id)
     if not u:
         return f"Motoboy {motoboy.id_motoboy}"
-    return (u.username or f"{u.nome or ''} {u.sobrenome or ''}".strip() or f"Motoboy {motoboy.id_motoboy}").strip()
+    if (u.username or "").strip():
+        return u.username.strip()
+    return format_motoboy_nome_parts(
+        u.nome, u.sobrenome, None, motoboy_id=motoboy.id_motoboy
+    )
 
 
 def _get_motoboy_chave_pix(db: Session, motoboy_id: int) -> Optional[str]:
