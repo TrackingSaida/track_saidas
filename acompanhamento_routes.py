@@ -81,6 +81,10 @@ class AcompanhamentoItem(BaseModel):
     distancia_tempo: Optional[str] = None
     ultima_entrega: Optional[str] = None
     sla: Optional[float] = None
+    # Volumes por serviço (saídas do período) — opcionais p/ clientes antigos
+    sum_shopee: int = 0
+    sum_mercado: int = 0
+    sum_avulso: int = 0
 
 
 class AcompanhamentoTotais(BaseModel):
@@ -283,6 +287,7 @@ def acompanhamento_dia(
                     ultima_entrega_dt = ts_entrega
 
         sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
+        sum_shopee, sum_mercado, sum_avulso = _somar_servicos(list_saidas)
 
         motoboy_nome = nomes_motoboy.get(int(mid), f"Motoboy {mid}")
 
@@ -299,6 +304,9 @@ def acompanhamento_dia(
                 distancia_tempo=None,
                 ultima_entrega=ultima_entrega_dt.isoformat() if ultima_entrega_dt else None,
                 sla=sla,
+                sum_shopee=sum_shopee,
+                sum_mercado=sum_mercado,
+                sum_avulso=sum_avulso,
             )
         )
         totais_pedidos += pedidos
