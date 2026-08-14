@@ -520,7 +520,7 @@ def _build_comprovante_share_image_bytes(
             y += draw.textbbox((0, 0), wrapped, font=value_font)[3] + 2
         y += 10
 
-    footer = "TrackingSaída — comprovante operacional"
+    footer = "ROTEVO — comprovante operacional"
     draw.text((pad_x, header_h - pad_y - 4), footer, font=footer_font, fill=(148, 163, 184))
 
     y = header_h

@@ -277,7 +277,7 @@ def _gerar_pdf_simples(fech: EntregadorFechamento, chave_pix: Optional[str] = No
         y -= gap
 
     codigo = build_fechamento_code(fech)
-    line("TrackingSaídas — Fechamento", 16, 8 * mm, bold=True)
+    line("ROTEVO — Fechamento", 16, 8 * mm, bold=True)
     line(f"Código: {codigo}", 12, 6 * mm, bold=True)
     line(f"Status: {_normalize_status(fech.status)}")
     line(f"Executor: {fech.username_entregador or '—'}")
@@ -304,7 +304,7 @@ def _gerar_pdf_simples(fech: EntregadorFechamento, chave_pix: Optional[str] = No
 
     c.setFont("Helvetica", 8)
     c.setFillColorRGB(0.4, 0.4, 0.4)
-    c.drawString(left, 12 * mm, "Documento gerado automaticamente pelo TrackingSaídas.")
+    c.drawString(left, 12 * mm, "Documento gerado automaticamente pelo ROTEVO.")
     c.showPage()
     c.save()
     return buf.getvalue()
@@ -527,7 +527,7 @@ def _gerar_pdf_rico(
         page_w / 2,
         2.5 * mm,
         f"Data de geração: {datetime.now().strftime('%d/%m/%Y %H:%M')} · "
-        f"{datetime.now().year} © TrackingSaídas.",
+        f"{datetime.now().year} © ROTEVO.",
     )
     c.showPage()
     c.save()
