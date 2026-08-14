@@ -16,6 +16,8 @@ from db import get_db
 from auth import get_current_user
 from models import Coleta, Entregador, BasePreco, User, Saida, Owner, BaseFechamento
 from models import OwnerCobrancaItem, SaidaHistorico
+from leitura_manual_auth import ensure_lancar_avulso_allowed
+from saidas_routes import _gerar_codigo_avulso, _normalizar_label_avulso
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -38,6 +40,12 @@ class ColetaLoteIn(BaseModel):
     base: str = Field(min_length=1)
     itens: List[ItemLote] = Field(min_length=1)
     entregador_id: Optional[int] = None
+
+
+class ColetaLancarAvulsoIn(BaseModel):
+    base: str = Field(min_length=1)
+    identificacao: Optional[str] = Field(default=None, max_length=32)
+    quantidade: int = Field(default=1, ge=1, le=50)
 
 
 class ResumoLote(BaseModel):
@@ -100,6 +108,21 @@ class LoteResponse(BaseModel):
     coleta: ColetaOut
     resumo: ResumoLote
     saidas_criadas: List[SaidaCriadaLote] = Field(default_factory=list)
+
+
+class ColetaAvulsoSaidaOut(BaseModel):
+    id_saida: int
+    codigo: str
+    servico: str
+    status: str
+
+
+class ColetaLancarAvulsoOut(BaseModel):
+    quantidade_criada: int
+    codigos: List[str]
+    saidas: List[ColetaAvulsoSaidaOut]
+    coleta: ColetaOut
+    mensagem: str
 
 
 # ============================================================
@@ -416,6 +439,68 @@ def registrar_coleta_em_lote(
             total=_fmt_money(coleta.valor_total),
         ),
         saidas_criadas=saidas_criadas,
+    )
+
+
+@router.post("/lancar-avulso", response_model=ColetaLancarAvulsoOut, status_code=201)
+def lancar_avulso_coleta(
+    payload: ColetaLancarAvulsoIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cria pacotes avulsos já coletados e vinculados à mesma coleta."""
+    sub_base = _sub_base_from_token_or_422(current_user)
+    role_raw = getattr(current_user, "role", None)
+    try:
+        role = int(role_raw) if role_raw is not None else -1
+    except (TypeError, ValueError):
+        role = -1
+    if role not in (0, 1, 2, 3):
+        raise HTTPException(status_code=403, detail="Acesso restrito à operação.")
+    if bool(getattr(current_user, "ignorar_coleta", False)):
+        raise HTTPException(status_code=403, detail="Fluxo de coletas desativado para este owner.")
+
+    ensure_lancar_avulso_allowed(db, current_user)
+    base = payload.base.strip()
+    if not base:
+        raise HTTPException(status_code=422, detail="Informe a base para registrar a coleta.")
+
+    label_norm = _normalizar_label_avulso(payload.identificacao)
+    codigos = [
+        _gerar_codigo_avulso(db, label_norm)
+        for _ in range(int(payload.quantidade))
+    ]
+    lote = registrar_coleta_em_lote(
+        ColetaLoteIn(
+            base=base,
+            itens=[ItemLote(codigo=codigo, servico="Avulso") for codigo in codigos],
+        ),
+        db=db,
+        current_user=current_user,
+    )
+
+    ids_por_codigo = {item.codigo: item.id_saida for item in lote.saidas_criadas}
+    saidas = [
+        ColetaAvulsoSaidaOut(
+            id_saida=ids_por_codigo[codigo],
+            codigo=codigo,
+            servico="Avulso",
+            status="coletado",
+        )
+        for codigo in codigos
+    ]
+    quantidade = len(saidas)
+    mensagem = (
+        "1 avulso registrado na coleta."
+        if quantidade == 1
+        else f"{quantidade} avulsos registrados na coleta."
+    )
+    return ColetaLancarAvulsoOut(
+        quantidade_criada=quantidade,
+        codigos=codigos,
+        saidas=saidas,
+        coleta=lote.coleta,
+        mensagem=mensagem,
     )
 
 
