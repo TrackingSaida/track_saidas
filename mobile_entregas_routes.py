@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Optional, List, Dict, Tuple, Literal, Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, exists, or_
@@ -38,7 +38,6 @@ from active_route_sync import (
 from geocode_utils import (
     geocode_address_strict,
     haversine_m,
-    otimizar_ordem_entregas,
     RoutePoint,
     StartPoint,
 )
@@ -352,6 +351,13 @@ class RotasOtimizarOut(BaseModel):
     sem_coordenadas: List[int]
     distancia_total_m: Optional[int] = None
     duracao_total_s: Optional[int] = None
+    optimization_mode: Optional[str] = None
+    geometry_provider: Optional[str] = None
+    geometry_status: Optional[str] = None
+    route_revision: Optional[int] = None
+    polyline_encoded: Optional[str] = None
+    polyline_coords: Optional[List[dict]] = None
+    rota_id: Optional[str] = None
 
 
 class RotasIniciarBody(BaseModel):
@@ -377,6 +383,14 @@ class RotasAtivaOut(BaseModel):
     sequencia_preservada: bool = True
     started_at: Optional[str] = None
     updated_at: Optional[str] = None
+    optimization_mode: Optional[str] = None
+    geometry_provider: Optional[str] = None
+    geometry_status: Optional[str] = None
+    route_revision: Optional[int] = None
+    polyline_encoded: Optional[str] = None
+    polyline_coords: Optional[List[dict]] = None
+    distancia_total_m: Optional[int] = None
+    duracao_total_s: Optional[int] = None
 
 
 class RotasOrdemBody(BaseModel):
@@ -386,6 +400,21 @@ class RotasOrdemBody(BaseModel):
 class RotasOrdemOut(BaseModel):
     ordem: List[int]
     parada_atual: int
+    route_revision: Optional[int] = None
+    geometry_status: Optional[str] = None
+
+
+class RotasGeometryRefreshOut(BaseModel):
+    ok: bool
+    route_revision: int
+    geometry_status: str
+    geometry_provider: Optional[str] = None
+    polyline_encoded: Optional[str] = None
+    polyline_coords: Optional[List[dict]] = None
+    distancia_total_m: Optional[int] = None
+    duracao_total_s: Optional[int] = None
+    discarded: bool = False
+    message: Optional[str] = None
 
 
 class RotasResumoOut(BaseModel):
@@ -1458,18 +1487,53 @@ def _upsert_rota_preparando(
     sub_base: str,
     ref_date: date,
     ordem: List[int],
-) -> None:
+    optimization_mode: Optional[str] = None,
+    optimization_input_hash: Optional[str] = None,
+    distancia_total_m: Optional[int] = None,
+    duracao_total_s: Optional[int] = None,
+    polyline_encoded: Optional[str] = None,
+    geometry_provider: Optional[str] = None,
+) -> RotasMotoboy:
+    from datetime import timezone as _tz
+
+    from routing.hashes import order_hash
+
     existing = _find_open_rota(db, motoboy_id=motoboy_id, sub_base=sub_base, ref_date=ref_date)
     now = datetime.utcnow()
     if existing and existing.status == "ativa":
-        return
+        return existing
+
+    geom_status = "missing"
+    geom_hash = None
+    if polyline_encoded and geometry_provider:
+        geom_status = "valid"
+        geom_hash = order_hash(ordem)
+
     if existing and existing.status == "preparando":
+        rev = int(getattr(existing, "route_revision", 0) or 0) + 1
         existing.ordem_json = json.dumps(ordem)
         existing.parada_atual = 0
         existing.updated_at = now
         existing.sub_base = sub_base
+        existing.route_revision = rev
+        existing.optimization_mode = optimization_mode
+        existing.optimization_input_hash = optimization_input_hash
+        existing.optimized_at = datetime.now(_tz.utc)
+        existing.distancia_total_m = distancia_total_m
+        existing.duracao_total_s = duracao_total_s
+        if polyline_encoded and geometry_provider:
+            existing.polyline_encoded = polyline_encoded
+            existing.geometry_provider = geometry_provider
+            existing.geometry_status = geom_status
+            existing.geometry_order_hash = geom_hash
+        else:
+            existing.geometry_status = "stale" if existing.polyline_encoded else "missing"
+            if not polyline_encoded:
+                existing.geometry_order_hash = None
         db.commit()
-        return
+        db.refresh(existing)
+        return existing
+
     rota = RotasMotoboy(
         motoboy_id=motoboy_id,
         sub_base=sub_base,
@@ -1478,9 +1542,21 @@ def _upsert_rota_preparando(
         ordem_json=json.dumps(ordem),
         parada_atual=0,
         updated_at=now,
+        route_revision=1,
+        optimization_mode=optimization_mode,
+        optimization_input_hash=optimization_input_hash,
+        optimized_at=datetime.now(_tz.utc),
+        distancia_total_m=distancia_total_m,
+        duracao_total_s=duracao_total_s,
+        polyline_encoded=polyline_encoded,
+        geometry_provider=geometry_provider,
+        geometry_status=geom_status if polyline_encoded else "missing",
+        geometry_order_hash=geom_hash,
     )
     db.add(rota)
     db.commit()
+    db.refresh(rota)
+    return rota
 
 
 # ============================================================
@@ -1489,14 +1565,50 @@ def _upsert_rota_preparando(
 @router.post("/rotas/otimizar", response_model=RotasOtimizarOut)
 def rotas_otimizar(
     body: RotasOtimizarBody,
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_motoboy),
 ):
-    """Otimiza ordem das entregas (OSRM Trip com fallback nearest neighbor)."""
+    """Otimiza ordem das entregas (OSRM ou Google conforme feature flags)."""
+    from routing.config import get_geometry_provider, get_google_cost_objective, get_optimization_provider
+    from routing.geometry_cas import geometry_payload_for_api
+    from routing.hashes import optimization_input_hash
+    from routing.idempotency import (
+        begin_idempotent_request,
+        complete_idempotent_request,
+        fail_idempotent_request,
+    )
+    from routing.polyline_codec import polyline_to_coords_dicts
+    from routing.service import optimize_route_order
+    from routing.types import RoutingError
+
     motoboy_id = user.motoboy_id
     sub_base = user.sub_base
     if not sub_base:
         raise HTTPException(status_code=403, detail="Sub-base não definida.")
+
+    idem_key = (request.headers.get("Idempotency-Key") or "").strip() or None
+    idem_row = None
+
+    if idem_key:
+        action, cached, idem_row = begin_idempotent_request(
+            db,
+            sub_base=sub_base,
+            motoboy_id=int(motoboy_id),
+            idempotency_key=idem_key,
+        )
+        if action == "replay" and cached:
+            try:
+                return RotasOtimizarOut(**cached)
+            except Exception:
+                # payload antigo / campos extras — filtra
+                allowed = set(getattr(RotasOtimizarOut, "model_fields", getattr(RotasOtimizarOut, "__fields__", {})).keys())
+                return RotasOtimizarOut(**{k: v for k, v in cached.items() if k in allowed})
+        if action == "in_progress":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "OPTIMIZATION_IN_PROGRESS", "message": "Otimização já em andamento."},
+            )
 
     delivery_ids = list(dict.fromkeys(int(i) for i in body.delivery_ids))
     if len(delivery_ids) > 100:
@@ -1512,11 +1624,15 @@ def rotas_otimizar(
     ).all()
     found_ids = {int(s.id_saida) for s in rows}
     if len(found_ids) != len(delivery_ids):
+        if idem_row is not None:
+            fail_idempotent_request(db, idem_row, error={"code": "INVALID_DELIVERIES"})
         raise HTTPException(
             status_code=422,
             detail="Um ou mais pedidos são inválidos ou não pertencem ao motoboy.",
         )
     if not rows:
+        if idem_row is not None:
+            fail_idempotent_request(db, idem_row, error={"code": "EMPTY"})
         raise HTTPException(status_code=400, detail="Nenhuma entrega válida para otimização.")
 
     from route_stops import build_route_stops, expand_stop_order
@@ -1528,11 +1644,13 @@ def rotas_otimizar(
     sem_coordenadas: List[int] = []
     stops_with_coords = 0
     stops_without_coords = 0
+    stop_repr_ids: List[int] = []
 
     for stop in stops:
         if stop.has_coords:
             stops_with_coords += 1
             com_coord.append((stop.representative_id, stop.lat, stop.lon))
+            stop_repr_ids.append(stop.representative_id)
         else:
             stops_without_coords += 1
             sem_coordenadas.extend(stop.delivery_ids)
@@ -1553,22 +1671,55 @@ def rotas_otimizar(
     if body.end is not None:
         end = (float(body.end.latitude), float(body.end.longitude))
 
+    opt_provider = get_optimization_provider()
+    geom_provider_flag = get_geometry_provider()
+    priority_payload = None
+    if body.priority is not None:
+        priority_payload = {
+            "type": body.priority.type,
+            "value": body.priority.value,
+            "id_saida": body.priority.id_saida,
+        }
+    input_hash = optimization_input_hash(
+        optimization_provider=opt_provider,
+        geometry_provider=geom_provider_flag,
+        delivery_ids=delivery_ids,
+        stop_representative_ids=stop_repr_ids,
+        start=start,
+        end=end,
+        priority=priority_payload,
+        cost_objective=get_google_cost_objective(),
+    )
+
     if not com_coord:
         ordem_result = list(sem_coordenadas)
-        _upsert_rota_preparando(
+        rota = _upsert_rota_preparando(
             db,
             motoboy_id=int(motoboy_id),
             sub_base=sub_base,
             ref_date=_hoje_operacional(),
             ordem=ordem_result,
+            optimization_mode="nearest_fallback",
+            optimization_input_hash=input_hash,
         )
-        return RotasOtimizarOut(
+        out = RotasOtimizarOut(
             ordem=ordem_result,
             modo="nearest_fallback",
+            optimization_mode="nearest_fallback",
             sem_coordenadas=sem_coordenadas,
             distancia_total_m=None,
             duracao_total_s=None,
+            geometry_provider=None,
+            geometry_status=getattr(rota, "geometry_status", None) or "missing",
+            route_revision=int(getattr(rota, "route_revision", 0) or 0),
+            rota_id=str(rota.id),
         )
+        if idem_row is not None:
+            payload = out.model_dump() if hasattr(out, "model_dump") else out.dict()
+            complete_idempotent_request(
+                db, idem_row, response=payload, route_id=rota.id, route_revision=out.route_revision
+            )
+        return out
 
     stop_penalties = None
     if body.priority is not None:
@@ -1602,28 +1753,69 @@ def rotas_otimizar(
         else:
             raise HTTPException(status_code=422, detail="Prioridade inválida.")
 
-    result = otimizar_ordem_entregas(
-        com_coord, start=start, end=end, stop_penalties=stop_penalties
-    )
-    ordem_otimizada = list(result.get("ordem") or [])
+    try:
+        result = optimize_route_order(
+            com_coord, start=start, end=end, stop_penalties=stop_penalties
+        )
+    except RoutingError as err:
+        if idem_row is not None:
+            fail_idempotent_request(db, idem_row, error={"code": err.code, "message": err.message})
+        raise HTTPException(
+            status_code=err.http_status,
+            detail={"code": err.code, "message": err.message},
+        )
+
+    ordem_otimizada = list(result.ordem or [])
     ordem_expandida = expand_stop_order(ordem_otimizada, stops)
     ordem_final = ordem_expandida + sem_coordenadas
 
-    _upsert_rota_preparando(
+    poly = result.polyline_encoded
+    geom_provider = "google" if poly and result.optimization_mode == "google" else None
+    # Soft / osrm sem polyline no backend: geometry fica missing/stale; mobile legado usa OSRM Route
+    if result.optimization_mode == "osrm":
+        geom_provider = None
+
+    rota = _upsert_rota_preparando(
         db,
         motoboy_id=int(motoboy_id),
         sub_base=sub_base,
         ref_date=_hoje_operacional(),
         ordem=ordem_final,
+        optimization_mode=result.optimization_mode,
+        optimization_input_hash=input_hash,
+        distancia_total_m=result.distancia_total_m,
+        duracao_total_s=result.duracao_total_s,
+        polyline_encoded=poly,
+        geometry_provider=geom_provider,
     )
 
-    return RotasOtimizarOut(
+    # Se priority_soft + geometry google: geometria via refresh (endpoint dedicado / pós-POC)
+    geom = geometry_payload_for_api(rota)
+    out = RotasOtimizarOut(
         ordem=ordem_final,
-        modo=str(result.get("modo") or "nearest_fallback"),
+        modo=result.optimization_mode,
+        optimization_mode=result.optimization_mode,
         sem_coordenadas=sem_coordenadas,
-        distancia_total_m=result.get("distancia_total_m"),
-        duracao_total_s=result.get("duracao_total_s"),
+        distancia_total_m=result.distancia_total_m,
+        duracao_total_s=result.duracao_total_s,
+        geometry_provider=geom.get("geometry_provider"),
+        geometry_status=geom.get("geometry_status"),
+        route_revision=int(getattr(rota, "route_revision", 0) or 0),
+        polyline_encoded=geom.get("polyline_encoded"),
+        polyline_coords=geom.get("polyline_coords")
+        or (polyline_to_coords_dicts(poly) if poly and geom.get("geometry_status") == "valid" else None),
+        rota_id=str(rota.id),
     )
+    if idem_row is not None:
+        payload = out.model_dump() if hasattr(out, "model_dump") else out.dict()
+        complete_idempotent_request(
+            db,
+            idem_row,
+            response=payload,
+            route_id=rota.id,
+            route_revision=out.route_revision,
+        )
+    return out
 
 
 # ============================================================
@@ -1837,9 +2029,140 @@ def rotas_atualizar_ordem(
 
     rota.ordem_json = json.dumps(nova_ordem)
     rota.updated_at = datetime.utcnow()
+    rev = int(getattr(rota, "route_revision", 0) or 0) + 1
+    rota.route_revision = rev
+    rota.geometry_status = "stale"
+    # Polyline antiga deixa de ser servida (geometry_payload_for_api exige hash match + valid)
     db.commit()
     db.refresh(rota)
-    return RotasOrdemOut(ordem=nova_ordem, parada_atual=parada_atual)
+    return RotasOrdemOut(
+        ordem=nova_ordem,
+        parada_atual=parada_atual,
+        route_revision=rev,
+        geometry_status=getattr(rota, "geometry_status", None),
+    )
+
+
+# ============================================================
+# POST /mobile/rotas/{id}/geometry/refresh
+# ============================================================
+@router.post("/rotas/{rota_id}/geometry/refresh", response_model=RotasGeometryRefreshOut)
+def rotas_geometry_refresh(
+    rota_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    """
+    Regenera polyline para a ordem atual (refreshDetailsRoutes quando geometry=google).
+    Usa CAS de revision/hash — resposta atrasada é descartada.
+    """
+    from routing.config import get_geometry_provider
+    from routing.geometry_cas import (
+        capture_geometry_cas_token,
+        parse_ordem_json,
+        try_persist_geometry_cas,
+    )
+    from routing.hashes import order_hash
+    from routing.polyline_codec import polyline_to_coords_dicts
+    from routing.types import RoutingError
+
+    motoboy_id = user.motoboy_id
+    sub_base = user.sub_base
+    rota = db.get(RotasMotoboy, rota_id)
+    if not rota or rota.motoboy_id != motoboy_id:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+    if sub_base and getattr(rota, "sub_base", None) and rota.sub_base != sub_base:
+        raise HTTPException(status_code=404, detail="Rota não encontrada.")
+    if rota.status not in ("ativa", "preparando"):
+        raise HTTPException(status_code=400, detail="Rota não está aberta.")
+
+    ordem = parse_ordem_json(rota.ordem_json)
+    expected_rev, expected_hash = capture_geometry_cas_token(rota)
+
+    if get_geometry_provider() != "google":
+        # Com geometry=osrm o mobile continua desenhando via OSRM local.
+        rota.geometry_status = "missing"
+        rota.geometry_provider = "osrm"
+        db.commit()
+        return RotasGeometryRefreshOut(
+            ok=True,
+            route_revision=expected_rev,
+            geometry_status="missing",
+            geometry_provider="osrm",
+            message="Geometria delegada ao cliente OSRM (ROUTING_GEOMETRY_PROVIDER=osrm).",
+        )
+
+    details_map = _carregar_details_por_saida_ids(db, ordem)
+    from route_stops import build_route_stops
+
+    stops = build_route_stops(ordem, details_map)
+    points = []
+    for stop in stops:
+        if stop.has_coords:
+            points.append((stop.representative_id, float(stop.lat), float(stop.lon)))
+
+    if len(points) < 1:
+        rota.geometry_status = "failed"
+        db.commit()
+        return RotasGeometryRefreshOut(
+            ok=False,
+            route_revision=expected_rev,
+            geometry_status="failed",
+            message="Sem coordenadas para gerar geometria.",
+        )
+
+    try:
+        from routing.google_route_optimization import refresh_geometry_google
+
+        geom = refresh_geometry_google(points)
+    except RoutingError as err:
+        rota.geometry_status = "failed"
+        db.commit()
+        raise HTTPException(
+            status_code=err.http_status,
+            detail={"code": err.code, "message": err.message},
+        )
+
+    if not geom.ok or not geom.polyline_encoded:
+        rota.geometry_status = "failed"
+        db.commit()
+        return RotasGeometryRefreshOut(
+            ok=False,
+            route_revision=expected_rev,
+            geometry_status="failed",
+            message=geom.error_code or "Falha ao gerar geometria.",
+        )
+
+    applied = try_persist_geometry_cas(
+        db,
+        rota_id=int(rota.id),
+        expected_route_revision=expected_rev,
+        expected_geometry_order_hash=expected_hash,
+        polyline_encoded=geom.polyline_encoded,
+        geometry_provider="google",
+        distancia_total_m=geom.distancia_total_m,
+        duracao_total_s=geom.duracao_total_s,
+    )
+    if not applied:
+        return RotasGeometryRefreshOut(
+            ok=False,
+            discarded=True,
+            route_revision=expected_rev,
+            geometry_status="stale",
+            message="Resposta de geometria descartada (rota alterada concurrentemente).",
+        )
+
+    db.refresh(rota)
+    return RotasGeometryRefreshOut(
+        ok=True,
+        route_revision=int(getattr(rota, "route_revision", 0) or 0),
+        geometry_status="valid",
+        geometry_provider="google",
+        polyline_encoded=geom.polyline_encoded,
+        polyline_coords=polyline_to_coords_dicts(geom.polyline_encoded),
+        distancia_total_m=geom.distancia_total_m,
+        duracao_total_s=geom.duracao_total_s,
+    )
 
 
 # ============================================================

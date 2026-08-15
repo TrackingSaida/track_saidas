@@ -758,9 +758,49 @@ class RotasMotoboy(Base):
     iniciado_em = Column(DateTime(timezone=False), nullable=True)
     finalizado_em = Column(DateTime(timezone=False), nullable=True)
     updated_at = Column(DateTime(timezone=False), nullable=True)
+    # Routing metadata (Google Route Optimization / OSRM)
+    optimization_mode = Column(Text, nullable=True)  # google | osrm | priority_soft | nearest_fallback
+    geometry_provider = Column(Text, nullable=True)  # google | osrm
+    geometry_status = Column(Text, nullable=True)  # valid | stale | missing | failed
+    route_revision = Column(Integer, nullable=False, server_default=text("0"))
+    geometry_order_hash = Column(Text, nullable=True)
+    polyline_encoded = Column(Text, nullable=True)
+    distancia_total_m = Column(Integer, nullable=True)
+    duracao_total_s = Column(Integer, nullable=True)
+    optimization_input_hash = Column(Text, nullable=True)
+    optimized_at = Column(DateTime(timezone=True), nullable=True)
 
     def __repr__(self) -> str:
         return f"<RotasMotoboy id={self.id} motoboy_id={self.motoboy_id} status={self.status!r}>"
+
+
+# ==========================
+# Tabela: route_optimization_requests (idempotência de otimização)
+# ==========================
+class RouteOptimizationRequest(Base):
+    __tablename__ = "route_optimization_requests"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    route_id = Column(BigInteger, ForeignKey("rotas_motoboy.id", ondelete="SET NULL"), nullable=True)
+    idempotency_key = Column(Text, nullable=False)
+    request_hash = Column(Text, nullable=True)
+    route_revision = Column(Integer, nullable=True)
+    status = Column(Text, nullable=False)  # pending | completed | failed
+    response_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("sub_base", "motoboy_id", "idempotency_key", name="uq_route_opt_req_subbase_motoboy_key"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<RouteOptimizationRequest id={self.id} key={self.idempotency_key!r} "
+            f"status={self.status!r}>"
+        )
 
 
 # ==========================
