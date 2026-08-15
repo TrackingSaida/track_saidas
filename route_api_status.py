@@ -44,6 +44,14 @@ def build_rotas_ativa_out(
             "sequencia_preservada": True,
             "started_at": None,
             "updated_at": datetime.utcnow().isoformat() + "Z",
+            "optimization_mode": None,
+            "geometry_provider": None,
+            "geometry_status": "missing",
+            "route_revision": 0,
+            "polyline_encoded": None,
+            "polyline_coords": None,
+            "distancia_total_m": None,
+            "duracao_total_s": None,
         }
 
     ordem_list = ordem if ordem is not None else []
@@ -51,6 +59,10 @@ def build_rotas_ativa_out(
     updated_iso = updated.isoformat() + "Z" if updated else datetime.utcnow().isoformat() + "Z"
     started = getattr(rota, "iniciado_em", None)
     started_iso = started.isoformat() + "Z" if started else None
+
+    from routing.geometry_cas import geometry_payload_for_api
+
+    geom = geometry_payload_for_api(rota)
 
     return {
         "status": api_status,
@@ -63,4 +75,6 @@ def build_rotas_ativa_out(
         "sequencia_preservada": True,
         "started_at": started_iso,
         "updated_at": updated_iso,
+        "optimization_mode": getattr(rota, "optimization_mode", None),
+        **geom,
     }
