@@ -1,7 +1,7 @@
 # base.py
 from __future__ import annotations
 
-from typing import Optional, List
+from typing import Optional, List, Dict
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select
@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, BasePreco  # classe do models.py com __tablename__ = "base"
+from models import User, BasePreco, BaseSellerDados  # classe do models.py com __tablename__ = "base"
 
 router = APIRouter(prefix="/base", tags=["Base"])
 
@@ -35,6 +35,8 @@ class BaseOut(BaseModel):
     avulso: float
     # novo: expor status
     ativo: bool
+    # Endereço cadastrado em base_seller_dados (opcional; aditivo)
+    endereco_completo: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class BaseUpdate(BaseModel):
@@ -66,6 +68,64 @@ def _resolve_user_sub_base(db: Session, current_user: User) -> str:
         if u and getattr(u, "sub_base", None):
             return u.sub_base
     raise HTTPException(status_code=401, detail="Usuário sem 'sub_base' definida em 'users'.")
+
+
+def _format_endereco_seller(seller: BaseSellerDados) -> Optional[str]:
+    """Monta endereço corrido a partir de base_seller_dados (campos vazios são omitidos)."""
+    partes: List[str] = []
+    if seller.rua:
+        rua_num = str(seller.rua).strip()
+        if seller.numero:
+            rua_num = f"{rua_num}, {str(seller.numero).strip()}"
+        partes.append(rua_num)
+    if seller.complemento:
+        partes.append(str(seller.complemento).strip())
+    bairro_cidade: List[str] = []
+    if seller.bairro:
+        bairro_cidade.append(str(seller.bairro).strip())
+    if seller.cidade:
+        bairro_cidade.append(str(seller.cidade).strip())
+    if bairro_cidade:
+        partes.append(" - ".join(bairro_cidade))
+    uf_cep: List[str] = []
+    if seller.estado:
+        uf_cep.append(str(seller.estado).strip())
+    if seller.cep:
+        uf_cep.append(str(seller.cep).strip())
+    if uf_cep:
+        partes.append(" ".join(uf_cep))
+    texto = ", ".join([p for p in partes if p])
+    return texto or None
+
+
+def _base_to_out(obj: BasePreco, endereco_completo: Optional[str] = None) -> BaseOut:
+    return BaseOut(
+        id_base=obj.id_base,
+        base=obj.base,
+        sub_base=obj.sub_base,
+        username=obj.username,
+        shopee=float(obj.shopee or 0),
+        ml=float(obj.ml or 0),
+        avulso=float(obj.avulso or 0),
+        ativo=bool(obj.ativo),
+        endereco_completo=endereco_completo,
+    )
+
+
+def _enderecos_por_base_ids(db: Session, base_ids: List[int]) -> Dict[int, str]:
+    if not base_ids:
+        return {}
+    rows = db.scalars(
+        select(BaseSellerDados).where(BaseSellerDados.base_id.in_(base_ids))
+    ).all()
+    out: Dict[int, str] = {}
+    for seller in rows:
+        if seller.base_id is None:
+            continue
+        texto = _format_endereco_seller(seller)
+        if texto:
+            out[int(seller.base_id)] = texto
+    return out
 
 # =========================
 # POST /base
@@ -144,7 +204,11 @@ def list_bases(
 
     stmt = stmt.order_by(BasePreco.base)
     rows = db.scalars(stmt).all()
-    return rows
+    enderecos = _enderecos_por_base_ids(db, [int(r.id_base) for r in rows])
+    return [
+        _base_to_out(r, enderecos.get(int(r.id_base)))
+        for r in rows
+    ]
 
 # =========================
 # GET /base/{id_base}
@@ -159,7 +223,8 @@ def get_base(
     obj = db.get(BasePreco, id_base)
     if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(status_code=404, detail="Não encontrado")
-    return obj
+    enderecos = _enderecos_por_base_ids(db, [int(obj.id_base)])
+    return _base_to_out(obj, enderecos.get(int(obj.id_base)))
 
 # =========================
 # PATCH /base/{id_base}
@@ -210,7 +275,8 @@ def patch_base(
 
     db.commit()
     db.refresh(obj)
-    return obj
+    enderecos = _enderecos_por_base_ids(db, [int(obj.id_base)])
+    return _base_to_out(obj, enderecos.get(int(obj.id_base)))
 
 # =========================
 # DELETE /base/{id_base}
