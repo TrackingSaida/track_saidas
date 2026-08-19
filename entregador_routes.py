@@ -9,7 +9,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from db import get_db
-from name_normalizer import normalize_person_name
+from name_normalizer import normalize_display_name, normalize_person_name, person_name_sort_key
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
 from entregador_legado_sync import filtrar_entregadores_operacionais
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
@@ -542,31 +542,7 @@ def list_executores(
     """Lista executores (entregadores + motoboys) da sub_base para dropdown de Fechamento de Motoboys."""
     sub_base_user = _resolve_user_base(db, current_user)
     out: List[ExecutorItem] = []
-
-    # Entregadores
-    stmt_ent = select(Entregador).where(Entregador.sub_base == sub_base_user)
-    if status == "ativo":
-        stmt_ent = stmt_ent.where(Entregador.ativo.is_(True))
-    elif status == "inativo":
-        stmt_ent = stmt_ent.where(Entregador.ativo.is_(False))
-    stmt_ent = stmt_ent.order_by(Entregador.nome)
-    entregadores = list(db.scalars(stmt_ent).all())
-    if status == "ativo":
-        entregadores = filtrar_entregadores_operacionais(db, entregadores)
-    for ent in entregadores:
-        from name_normalizer import normalize_display_name
-        out.append(ExecutorItem(
-            id_entregador=ent.id_entregador,
-            id_motoboy=None,
-            nome=normalize_display_name(
-                (ent.nome or f"Entregador {ent.id_entregador}").strip(),
-                fallback=f"Entregador {ent.id_entregador}",
-            ),
-            tipo="entregador",
-            executor_tipo="e",
-            executor_id=ent.id_entregador,
-            executor_key=f"e_{ent.id_entregador}",
-        ))
+    nomes_motoboy_keys: set[str] = set()
 
     # Motoboys vinculados à sub_base (somente User ativo)
     stmt_mb = (
@@ -583,13 +559,13 @@ def list_executores(
         .order_by(Motoboy.id_motoboy)
     )
     if status == "inativo":
-        # Para inativos, não misturar motoboys ativos no dropdown operacional.
         motoboys = []
     else:
         motoboys = db.scalars(stmt_mb).all()
     nomes_motoboy = _carregar_nomes_motoboy_ids(db, [m.id_motoboy for m in motoboys])
     for motoboy in motoboys:
         nome = nomes_motoboy.get(int(motoboy.id_motoboy), f"Motoboy {motoboy.id_motoboy}")
+        nomes_motoboy_keys.add(person_name_sort_key(nome))
         out.append(ExecutorItem(
             id_entregador=None,
             id_motoboy=motoboy.id_motoboy,
@@ -598,6 +574,34 @@ def list_executores(
             executor_tipo="m",
             executor_id=motoboy.id_motoboy,
             executor_key=f"m_{motoboy.id_motoboy}",
+        ))
+
+    # Entregadores legado: só entram se tiverem titular operacional ativo
+    # e não duplicarem um motoboy já listado (mesmo nome).
+    stmt_ent = select(Entregador).where(Entregador.sub_base == sub_base_user)
+    if status == "ativo":
+        stmt_ent = stmt_ent.where(Entregador.ativo.is_(True))
+    elif status == "inativo":
+        stmt_ent = stmt_ent.where(Entregador.ativo.is_(False))
+    stmt_ent = stmt_ent.order_by(Entregador.nome)
+    entregadores = list(db.scalars(stmt_ent).all())
+    if status == "ativo":
+        entregadores = filtrar_entregadores_operacionais(db, entregadores)
+    for ent in entregadores:
+        nome = normalize_display_name(
+            (ent.nome or f"Entregador {ent.id_entregador}").strip(),
+            fallback=f"Entregador {ent.id_entregador}",
+        )
+        if status == "ativo" and person_name_sort_key(nome) in nomes_motoboy_keys:
+            continue
+        out.append(ExecutorItem(
+            id_entregador=ent.id_entregador,
+            id_motoboy=None,
+            nome=nome,
+            tipo="entregador",
+            executor_tipo="e",
+            executor_id=ent.id_entregador,
+            executor_key=f"e_{ent.id_entregador}",
         ))
 
     out.sort(key=lambda x: (x.nome or "").casefold())
