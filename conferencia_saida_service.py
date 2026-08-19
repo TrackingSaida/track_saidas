@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from conferencia_saida_pure import filtrar_status_conferencia, status_conta_na_conferencia
 from models import ConferenciaSaida, Motoboy, Owner, Saida, SaidaHistorico, User
 from saida_operacional_utils import (
     carregar_contexto_operacional,
@@ -140,7 +141,10 @@ def listar_saidas_motoboy_dia(
     motoboy_id: int,
     data_ref: date,
 ) -> List[Saida]:
-    """Pacotes do motoboy com data operacional == data_ref (reatribuição conta no dia D)."""
+    """Pacotes do motoboy com data operacional == data_ref (reatribuição conta no dia D).
+
+    Exclui cancelados/encerrados. Entregue permanece: ainda é saída válida do dia.
+    """
     rows_all = list(
         db.scalars(
             select(Saida).where(
@@ -151,7 +155,7 @@ def listar_saidas_motoboy_dia(
         ).all()
     )
     filtradas, _ = filtrar_saidas_por_periodo_operacional(db, rows_all, data_ref, data_ref)
-    return list(filtradas)
+    return filtrar_status_conferencia(list(filtradas))
 
 
 EVENTOS_CONFERENCIA_PACOTE = ("saida_conferida", "saida_reconferida")
@@ -194,16 +198,19 @@ def listar_saidas_novas_apos_conferencia(
     return novos
 
 
-def contar_novos_por_motoboy_dia(
+def _saidas_relevantes_por_chave(
     db: Session,
     *,
     sub_base: str,
     chaves: List[Tuple[int, date]],
-) -> Dict[Tuple[int, date], int]:
-    """Conta pacotes novos (sem conferência/reconferência) por (motoboy_id, data_ref operacional)."""
-    if not chaves:
-        return {}
+) -> Tuple[Dict[Tuple[int, date], int], List[Saida], Dict]:
+    """Carrega saídas válidas da conferência por (motoboy_id, data operacional).
+
+    Retorna (totais, lista_relevante, ctx_map).
+    """
     chave_set = {(int(m), d) for m, d in chaves}
+    if not chave_set:
+        return {}, [], {}
     motoboy_ids = {m for m, _ in chave_set}
     saidas = list(
         db.scalars(
@@ -214,8 +221,9 @@ def contar_novos_por_motoboy_dia(
             )
         ).all()
     )
+    totais: Dict[Tuple[int, date], int] = {k: 0 for k in chave_set}
     if not saidas:
-        return {k: 0 for k in chave_set}
+        return totais, [], {}
     ctx_map = carregar_contexto_operacional(db, [int(s.id_saida) for s in saidas])
     relevantes: List[Saida] = []
     for s in saidas:
@@ -224,14 +232,60 @@ def contar_novos_por_motoboy_dia(
         ctx = ctx_map.get(int(s.id_saida))
         if deve_excluir_saida_operacional(ctx):
             continue
+        if not status_conta_na_conferencia(getattr(s, "status", None)):
+            continue
         ts = timestamp_operacional_saida(ctx, getattr(s, "timestamp", None))
         if ts is None:
             continue
         key = (int(s.motoboy_id), ts.date())
-        if key in chave_set:
-            relevantes.append(s)
+        if key not in chave_set:
+            continue
+        relevantes.append(s)
+        totais[key] = totais.get(key, 0) + 1
+    return totais, relevantes, ctx_map
+
+
+def contar_saidas_por_motoboy_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    chaves: List[Tuple[int, date]],
+) -> Dict[Tuple[int, date], int]:
+    """Conta pacotes válidos (lidos no dia, sem cancelado/encerrado) por motoboy/dia."""
+    totais, _, _ = _saidas_relevantes_por_chave(db, sub_base=sub_base, chaves=chaves)
+    return totais
+
+
+def contar_novos_por_motoboy_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    chaves: List[Tuple[int, date]],
+) -> Dict[Tuple[int, date], int]:
+    """Conta pacotes novos (sem conferência/reconferência) por (motoboy_id, data_ref operacional)."""
+    _totais, novos = contar_totais_e_novos_por_motoboy_dia(
+        db, sub_base=sub_base, chaves=chaves
+    )
+    return novos
+
+
+def contar_totais_e_novos_por_motoboy_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    chaves: List[Tuple[int, date]],
+) -> Tuple[Dict[Tuple[int, date], int], Dict[Tuple[int, date], int]]:
+    """Retorna (totais válidos, pacotes novos) por (motoboy_id, data_ref)."""
+    if not chaves:
+        return {}, {}
+    chave_set = {(int(m), d) for m, d in chaves}
+    totais, relevantes, ctx_map = _saidas_relevantes_por_chave(
+        db, sub_base=sub_base, chaves=chaves
+    )
+    novos: Dict[Tuple[int, date], int] = {k: 0 for k in chave_set}
+    if not relevantes:
+        return totais, novos
     ja = _ids_ja_conferidos(db, [int(s.id_saida) for s in relevantes])
-    out: Dict[Tuple[int, date], int] = {k: 0 for k in chave_set}
     for s in relevantes:
         if int(s.id_saida) in ja:
             continue
@@ -240,8 +294,8 @@ def contar_novos_por_motoboy_dia(
         if ts is None:
             continue
         key = (int(s.motoboy_id), ts.date())
-        out[key] = out.get(key, 0) + 1
-    return out
+        novos[key] = novos.get(key, 0) + 1
+    return totais, novos
 
 
 def resumo_novos_pacotes(saidas_novas: List[Saida]) -> dict:

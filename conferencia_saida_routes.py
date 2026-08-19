@@ -16,7 +16,8 @@ from conferencia_saida_service import (
     STATUS_RECONFERIR,
     carregar_nomes_motoboy,
     conferir_saida,
-    contar_novos_por_motoboy_dia,
+    contar_saidas_por_motoboy_dia,
+    contar_totais_e_novos_por_motoboy_dia,
     listar_saidas_motoboy_dia,
     listar_saidas_novas_apos_conferencia,
     owner_conferencia_habilitada,
@@ -126,6 +127,7 @@ def _detalhe_out(
     )
     shopee, ml, avulso = somar_servicos_saidas(saidas)
     nome = carregar_nomes_motoboy(db, [motoboy_id]).get(motoboy_id, f"Motoboy {motoboy_id}")
+    total_vivo = shopee + ml + avulso
 
     novos_payload = {
         "novos_qtd": 0,
@@ -148,8 +150,8 @@ def _detalhe_out(
         sum_shopee=shopee,
         sum_mercado=ml,
         sum_avulso=avulso,
-        total=shopee + ml + avulso,
-        qtd_no_momento=row.qtd_no_momento,
+        total=total_vivo,
+        qtd_no_momento=total_vivo,
         conferido_em=row.conferido_em.isoformat() if row.conferido_em else None,
         novos_qtd=int(novos_payload["novos_qtd"]),
         novos_shopee=int(novos_payload["novos_shopee"]),
@@ -288,14 +290,18 @@ def listar_conferencias(
 
     rows = list(db.scalars(q).all())
     nomes = carregar_nomes_motoboy(db, [int(r.motoboy_id) for r in rows])
-
-    novos_map = {}
-    if status == STATUS_RECONFERIR and rows:
-        novos_map = contar_novos_por_motoboy_dia(
-            db,
-            sub_base=sub_base,
-            chaves=[(int(r.motoboy_id), r.data_ref) for r in rows],
-        )
+    chaves = [(int(r.motoboy_id), r.data_ref) for r in rows]
+    qtd_map: dict = {}
+    novos_map: dict = {}
+    if rows:
+        if status == STATUS_RECONFERIR:
+            qtd_map, novos_map = contar_totais_e_novos_por_motoboy_dia(
+                db, sub_base=sub_base, chaves=chaves
+            )
+        else:
+            qtd_map = contar_saidas_por_motoboy_dia(
+                db, sub_base=sub_base, chaves=chaves
+            )
 
     items = [
         ConferenciaItemOut(
@@ -304,7 +310,7 @@ def listar_conferencias(
             motoboy_nome=nomes.get(int(r.motoboy_id), f"Motoboy {r.motoboy_id}"),
             data_ref=r.data_ref,
             status=r.status,
-            qtd_no_momento=r.qtd_no_momento,
+            qtd_no_momento=qtd_map.get((int(r.motoboy_id), r.data_ref), 0),
             conferido_em=r.conferido_em.isoformat() if r.conferido_em else None,
             ultima_abertura_em=r.ultima_abertura_em.isoformat() if r.ultima_abertura_em else None,
             novos_qtd=(
