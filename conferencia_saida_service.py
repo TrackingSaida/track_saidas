@@ -11,6 +11,7 @@ from conferencia_saida_pure import filtrar_status_conferencia, status_conta_na_c
 from models import ConferenciaSaida, Motoboy, Owner, Saida, SaidaHistorico, User
 from saida_operacional_utils import (
     carregar_contexto_operacional,
+    carregar_saidas_candidatas_periodo,
     deve_excluir_saida_operacional,
     filtrar_saidas_por_periodo_operacional,
     timestamp_operacional_saida,
@@ -145,14 +146,12 @@ def listar_saidas_motoboy_dia(
 
     Exclui cancelados/encerrados. Entregue permanece: ainda é saída válida do dia.
     """
-    rows_all = list(
-        db.scalars(
-            select(Saida).where(
-                Saida.sub_base == sub_base,
-                Saida.motoboy_id == motoboy_id,
-                Saida.codigo.isnot(None),
-            )
-        ).all()
+    rows_all = carregar_saidas_candidatas_periodo(
+        db,
+        sub_base=sub_base,
+        motoboy_ids=[motoboy_id],
+        inicio=data_ref,
+        fim=data_ref,
     )
     filtradas, _ = filtrar_saidas_por_periodo_operacional(db, rows_all, data_ref, data_ref)
     return filtrar_status_conferencia(list(filtradas))
@@ -212,14 +211,13 @@ def _saidas_relevantes_por_chave(
     if not chave_set:
         return {}, [], {}
     motoboy_ids = {m for m, _ in chave_set}
-    saidas = list(
-        db.scalars(
-            select(Saida).where(
-                Saida.sub_base == sub_base,
-                Saida.motoboy_id.in_(motoboy_ids),
-                Saida.codigo.isnot(None),
-            )
-        ).all()
+    datas = [d for _, d in chave_set]
+    saidas = carregar_saidas_candidatas_periodo(
+        db,
+        sub_base=sub_base,
+        motoboy_ids=list(motoboy_ids),
+        inicio=min(datas),
+        fim=max(datas),
     )
     totais: Dict[Tuple[int, date], int] = {k: 0 for k in chave_set}
     if not saidas:

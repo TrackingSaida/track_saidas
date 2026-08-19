@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
+from conferencia_saida_pure import filtrar_status_conferencia
 from db import get_db
 from auth import get_current_user
 from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy, Owner, RotasMotoboy
@@ -24,6 +25,7 @@ from saidas_routes import (
 )
 from saida_operacional_utils import (
     carregar_contexto_operacional,
+    carregar_saidas_candidatas_periodo,
     filtrar_saidas_por_periodo_operacional,
 )
 
@@ -420,6 +422,7 @@ def acompanhamento_saidas_dia(
     - modo=pendentes: pendentes operacionais no período (compatível com a web).
     - modo=saidas: todas as saídas/leituras com data operacional no período
       (reatribuição/nova saída no dia D conta em D, não na Saida.data antiga).
+      Cancelado/encerrado não entram no total (mesma regra da conferência).
     """
     sub_base = getattr(current_user, "sub_base", None)
     if not sub_base or not str(sub_base).strip():
@@ -431,16 +434,15 @@ def acompanhamento_saidas_dia(
         raise HTTPException(status_code=400, detail="modo deve ser 'pendentes' ou 'saidas'.")
 
     if modo_norm == "saidas":
-        rows_all = list(
-            db.scalars(
-                select(Saida).where(
-                    Saida.sub_base == sub_base,
-                    Saida.motoboy_id == motoboy_id,
-                    Saida.codigo.isnot(None),
-                )
-            ).all()
+        rows_all = carregar_saidas_candidatas_periodo(
+            db,
+            sub_base=sub_base,
+            motoboy_ids=[motoboy_id],
+            inicio=inicio,
+            fim=fim,
         )
         rows_periodo, _ = filtrar_saidas_por_periodo_operacional(db, rows_all, inicio, fim)
+        rows_periodo = filtrar_status_conferencia(rows_periodo)
     else:
         rows_pendentes_all = db.scalars(
             select(Saida).where(
