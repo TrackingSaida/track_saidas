@@ -1,13 +1,15 @@
 """
 Rotas de Fechamento de Bases (Coletas)
 GET /coletas/fechamentos/calcular — preview
+GET /coletas/fechamentos — listar (visão A Receber)
+POST /coletas/fechamentos/marcar-recebido — baixar recebimentos
 POST /coletas/fechamentos — criar
 GET /coletas/fechamentos/{id_fechamento} — obter (para modal)
 PATCH /coletas/fechamentos/{id_fechamento} — reajustar
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +26,8 @@ from models import (
     BasePreco,
     BaseSellerDados,
     Coleta,
+    ColetaCalendarioExcecao,
+    ColetaExecucao,
     Owner,
     Saida,
     User,
@@ -35,6 +39,123 @@ router = APIRouter(prefix="/fechamentos", tags=["Fechamentos Bases"])
 
 STATUS_GERADO = "GERADO"
 STATUS_REAJUSTADO = "REAJUSTADO"
+STATUS_RECEBIDO = "RECEBIDO"
+STATUS_ELEGIVEIS_RECEBIMENTO = {STATUS_GERADO, STATUS_REAJUSTADO}
+
+
+def _exigir_admin_financeiro(current_user: User) -> None:
+    try:
+        role = int(current_user.role)
+    except (TypeError, ValueError):
+        role = -1
+    if role not in (0, 1):
+        raise HTTPException(403, "Apenas admin/root pode acessar o financeiro de bases.")
+
+
+def _resumo_calendario_fechamento(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> dict:
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    if owner and bool(owner.ignorar_coleta):
+        return {
+            "coleta_habilitada": False,
+            "agenda_confirmada": False,
+            "pronto_para_fechamento": True,
+            "dias_esperados": 0,
+            "dias_com_lancamento": 0,
+            "dias_feriado": 0,
+            "dias_justificados": 0,
+            "dias_pendentes": [],
+        }
+    base = db.scalar(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base,
+            func.upper(BasePreco.base) == base_nome.strip().upper(),
+        )
+    )
+    if not base:
+        raise HTTPException(404, "Base não encontrada nesta sub_base.")
+    if not bool(base.agenda_coleta_confirmada):
+        return {
+            "coleta_habilitada": True,
+            "agenda_confirmada": False,
+            "pronto_para_fechamento": True,
+            "dias_esperados": 0,
+            "dias_com_lancamento": 0,
+            "dias_feriado": 0,
+            "dias_justificados": 0,
+            "dias_pendentes": [],
+        }
+    excecoes = db.scalars(
+        select(ColetaCalendarioExcecao).where(
+            ColetaCalendarioExcecao.sub_base == sub_base,
+            ColetaCalendarioExcecao.data >= periodo_inicio,
+            ColetaCalendarioExcecao.data <= periodo_fim,
+            (ColetaCalendarioExcecao.base_id == base.id_base)
+            | (ColetaCalendarioExcecao.base_id.is_(None)),
+        )
+    ).all()
+    globais = {item.data: item for item in excecoes if item.base_id is None}
+    por_base = {item.data: item for item in excecoes if item.base_id == base.id_base}
+    execucoes = {
+        item.data_operacao: item
+        for item in db.scalars(
+            select(ColetaExecucao).where(
+                ColetaExecucao.sub_base == sub_base,
+                ColetaExecucao.base_id == base.id_base,
+                ColetaExecucao.data_operacao >= periodo_inicio,
+                ColetaExecucao.data_operacao <= periodo_fim,
+            )
+        ).all()
+    }
+    # Compatibilidade: coletas anteriores à migração ainda vivem apenas na
+    # tabela legada e devem satisfazer a agenda da base.
+    lancamentos_legados = {
+        item.timestamp.date()
+        for item in db.scalars(
+            select(Coleta).where(
+                Coleta.sub_base == sub_base,
+                func.upper(Coleta.base) == base_nome.strip().upper(),
+                Coleta.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()),
+                Coleta.timestamp <= datetime.combine(periodo_fim, datetime.max.time()),
+            )
+        ).all()
+    }
+    dias_configurados = set(base.dias_coleta or [])
+    esperado = com_lancamento = feriados = justificados = 0
+    pendentes: list[dict] = []
+    cursor = periodo_inicio
+    while cursor <= periodo_fim:
+        excecao = por_base.get(cursor) or globais.get(cursor)
+        programado = cursor.isoweekday() in dias_configurados
+        coleta_extra = bool(excecao and excecao.tipo == "COLETA_EXTRA")
+        if not programado and not coleta_extra:
+            cursor += timedelta(days=1)
+            continue
+        esperado += 1
+        if cursor in execucoes or cursor in lancamentos_legados:
+            com_lancamento += 1
+        elif excecao and excecao.tipo == "FERIADO":
+            feriados += 1
+        elif excecao and excecao.tipo in ("SEM_COLETA", "JUSTIFICADO"):
+            justificados += 1
+        else:
+            pendentes.append({"data": cursor.isoformat(), "status": "PENDENTE"})
+        cursor += timedelta(days=1)
+    return {
+        "coleta_habilitada": True,
+        "agenda_confirmada": True,
+        "pronto_para_fechamento": not pendentes,
+        "dias_esperados": esperado,
+        "dias_com_lancamento": com_lancamento,
+        "dias_feriado": feriados,
+        "dias_justificados": justificados,
+        "dias_pendentes": pendentes,
+    }
 
 
 def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[str, Any]]:
@@ -374,6 +495,7 @@ class CalcularOut(BaseModel):
     ajuste_g_motivo: Optional[str] = None
     seller_info: Optional[Dict[str, Any]] = None
     emitido_por: Optional[str] = None
+    calendario: dict
 
 
 class FechamentoOut(BaseModel):
@@ -391,6 +513,8 @@ class FechamentoOut(BaseModel):
     valor_final: Decimal
     status: str
     criado_em: Optional[datetime] = None
+    recebido_em: Optional[datetime] = None
+    recebido_por: Optional[str] = None
     itens: List[FechamentoItemOut]
     total_g_shopee: int = 0
     total_g_ml: int = 0
@@ -403,6 +527,42 @@ class FechamentoOut(BaseModel):
     valor_final_recalculado: Optional[Decimal] = None
     seller_info: Optional[Dict[str, Any]] = None
     emitido_por: Optional[str] = None
+
+
+class FechamentoReceberItem(BaseModel):
+    id_fechamento: int
+    base: str
+    periodo_inicio: date
+    periodo_fim: date
+    valor_final: Decimal
+    status: str
+    criado_em: Optional[datetime] = None
+    recebido_em: Optional[datetime] = None
+    recebido_por: Optional[str] = None
+
+
+class FechamentoReceberTotais(BaseModel):
+    total_a_receber: Decimal = Decimal("0.00")
+    total_recebido: Decimal = Decimal("0.00")
+    qtd_a_receber: int = 0
+    qtd_recebido: int = 0
+
+
+class FechamentoReceberLista(BaseModel):
+    items: List[FechamentoReceberItem]
+    totais: FechamentoReceberTotais
+
+
+class MarcarRecebidoRequest(BaseModel):
+    periodo_inicio: date
+    periodo_fim: date
+    todos_elegiveis: bool = False
+    ids_fechamento: Optional[List[int]] = None
+
+
+class MarcarRecebidoResponse(BaseModel):
+    marcados: int
+    ids_fechamento: List[int]
 
 
 # =========================================================
@@ -490,6 +650,9 @@ def calcular_fechamento(
         valor_final_com_ajuste_g = None
 
     seller_info = _montar_seller_info(db, sub_base, base.strip())
+    calendario = _resumo_calendario_fechamento(
+        db, sub_base, base, periodo_inicio, periodo_fim
+    )
 
     return CalcularOut(
         base=base.strip(),
@@ -509,6 +672,7 @@ def calcular_fechamento(
         ajuste_g_motivo=(ajuste_g_motivo or None),
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
+        calendario=calendario,
     )
 
 
@@ -533,6 +697,17 @@ def criar_fechamento(
         )
 
     base_norm = payload.base.strip()
+    calendario = _resumo_calendario_fechamento(
+        db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
+    )
+    if not calendario["pronto_para_fechamento"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Existem dias de coleta pendentes antes do fechamento.",
+                "calendario": calendario,
+            },
+        )
 
     # Verificar duplicidade
     existente = db.scalar(
@@ -670,6 +845,8 @@ def criar_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+        recebido_em=getattr(fech, "recebido_em", None),
+        recebido_por=getattr(fech, "recebido_por", None),
         itens=itens_out,
         total_g_shopee=total_g_shopee,
         total_g_ml=total_g_ml,
@@ -679,6 +856,129 @@ def criar_fechamento(
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
     )
+
+
+# =========================================================
+# GET/POST — A Receber (fechamentos consolidados das bases)
+# =========================================================
+
+def _status_receber(fech: BaseFechamento) -> str:
+    status_atual = (fech.status or "").strip().upper()
+    return STATUS_GERADO if status_atual == "FECHADO" else status_atual
+
+
+@router.get("", response_model=FechamentoReceberLista)
+def listar_fechamentos_a_receber(
+    periodo_inicio: date = Query(...),
+    periodo_fim: date = Query(...),
+    status: Optional[str] = Query(None, description="GERADO|REAJUSTADO|RECEBIDO"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _exigir_admin_financeiro(current_user)
+    sub_base = _sub_base_from_token_or_422(current_user)
+    if periodo_inicio > periodo_fim:
+        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+
+    rows = list(
+        db.scalars(
+            select(BaseFechamento).where(
+                BaseFechamento.sub_base == sub_base,
+                BaseFechamento.periodo_inicio == periodo_inicio,
+                BaseFechamento.periodo_fim == periodo_fim,
+            )
+        ).all()
+    )
+    status_filtro = (status or "").strip().upper() or None
+    items: List[FechamentoReceberItem] = []
+    total_a_receber = Decimal("0.00")
+    total_recebido = Decimal("0.00")
+    qtd_a_receber = qtd_recebido = 0
+
+    for fech in rows:
+        status_atual = _status_receber(fech)
+        valor = Decimal(str(fech.valor_final or 0))
+        if status_atual in STATUS_ELEGIVEIS_RECEBIMENTO:
+            total_a_receber += valor
+            qtd_a_receber += 1
+        elif status_atual == STATUS_RECEBIDO:
+            total_recebido += valor
+            qtd_recebido += 1
+        if status_filtro and status_atual != status_filtro:
+            continue
+        items.append(
+            FechamentoReceberItem(
+                id_fechamento=int(fech.id_fechamento),
+                base=fech.base,
+                periodo_inicio=fech.periodo_inicio,
+                periodo_fim=fech.periodo_fim,
+                valor_final=fech.valor_final,
+                status=status_atual,
+                criado_em=fech.criado_em,
+                recebido_em=getattr(fech, "recebido_em", None),
+                recebido_por=getattr(fech, "recebido_por", None),
+            )
+        )
+
+    items.sort(key=lambda item: ((item.base or "").casefold(), item.id_fechamento))
+    return FechamentoReceberLista(
+        items=items,
+        totais=FechamentoReceberTotais(
+            total_a_receber=total_a_receber.quantize(Decimal("0.01")),
+            total_recebido=total_recebido.quantize(Decimal("0.01")),
+            qtd_a_receber=qtd_a_receber,
+            qtd_recebido=qtd_recebido,
+        ),
+    )
+
+
+@router.post("/marcar-recebido", response_model=MarcarRecebidoResponse)
+def marcar_fechamentos_recebidos(
+    payload: MarcarRecebidoRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _exigir_admin_financeiro(current_user)
+    sub_base = _sub_base_from_token_or_422(current_user)
+    if payload.periodo_inicio > payload.periodo_fim:
+        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
+    rows = list(
+        db.scalars(
+            select(BaseFechamento).where(
+                BaseFechamento.sub_base == sub_base,
+                BaseFechamento.periodo_inicio == payload.periodo_inicio,
+                BaseFechamento.periodo_fim == payload.periodo_fim,
+            )
+        ).all()
+    )
+    if payload.todos_elegiveis:
+        alvos = [item for item in rows if _status_receber(item) in STATUS_ELEGIVEIS_RECEBIMENTO]
+    else:
+        ids = {int(item) for item in (payload.ids_fechamento or [])}
+        if not ids:
+            raise HTTPException(422, "Selecione ao menos um fechamento.")
+        por_id = {int(item.id_fechamento): item for item in rows}
+        alvos = []
+        for id_fechamento in ids:
+            fech = por_id.get(id_fechamento)
+            if not fech:
+                raise HTTPException(404, f"Fechamento {id_fechamento} não encontrado no período/sub_base.")
+            if _status_receber(fech) not in STATUS_ELEGIVEIS_RECEBIMENTO:
+                raise HTTPException(400, f"Fechamento {id_fechamento} não está elegível para recebimento.")
+            alvos.append(fech)
+    if not alvos:
+        raise HTTPException(400, "Nenhum fechamento elegível para marcar como recebido.")
+
+    agora = datetime.utcnow()
+    recebido_por = (getattr(current_user, "username", None) or "").strip() or str(current_user.id)
+    ids_marcados = []
+    for fech in alvos:
+        fech.status = STATUS_RECEBIDO
+        fech.recebido_em = agora
+        fech.recebido_por = recebido_por
+        ids_marcados.append(int(fech.id_fechamento))
+    db.commit()
+    return MarcarRecebidoResponse(marcados=len(ids_marcados), ids_fechamento=ids_marcados)
 
 
 # =========================================================
@@ -752,6 +1052,8 @@ def obter_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+        recebido_em=getattr(fech, "recebido_em", None),
+        recebido_por=getattr(fech, "recebido_por", None),
         itens=itens_out,
         total_g_shopee=total_g_shopee,
         total_g_ml=total_g_ml,
@@ -782,6 +1084,10 @@ def atualizar_fechamento(
     fech = db.get(BaseFechamento, id_fechamento)
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
+    raise HTTPException(
+        409,
+        "Fechamentos gerados são imutáveis. Resolva os lançamentos antes de gerar o fechamento.",
+    )
     if (fech.status or "").upper() != STATUS_GERADO:
         raise HTTPException(400, "Apenas fechamentos com status GERADO podem ser reajustados.")
 
@@ -877,6 +1183,8 @@ def atualizar_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+        recebido_em=getattr(fech, "recebido_em", None),
+        recebido_por=getattr(fech, "recebido_por", None),
         itens=itens_out,
         total_g_shopee=total_g_shopee,
         total_g_ml=total_g_ml,

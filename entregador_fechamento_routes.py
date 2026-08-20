@@ -22,7 +22,20 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
+from models import (
+    BasePreco,
+    ColetaExecucao,
+    ColetaExecucaoParticipante,
+    Entregador,
+    EntregadorFechamento,
+    EntregadorFechamentoColetaItem,
+    EntregadorPreco,
+    EntregadorPrecoGlobal,
+    Motoboy,
+    MotoboySubBase,
+    Saida,
+    User,
+)
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 from fechamento_pdf_service import build_fechamento_code, get_fechamento_pdf_bytes
 
@@ -45,7 +58,7 @@ STATUS_GERADO = "GERADO"
 STATUS_REAJUSTADO = "REAJUSTADO"
 STATUS_PAGO = "PAGO"
 STATUS_ELEGIVEIS_PAGAMENTO = (STATUS_GERADO, STATUS_REAJUSTADO)
-STATUS_PERMITE_REAJUSTE = (STATUS_GERADO, STATUS_REAJUSTADO)
+STATUS_PERMITE_REAJUSTE = ()
 
 # Status válidos para saidas no cálculo (fonte única compartilhada)
 STATUS_SAIDAS_VALIDOS = STATUS_VALOR_BASE_VALIDOS
@@ -161,14 +174,55 @@ def _recalcular_valor_base_fechamento(
     fech: EntregadorFechamento,
 ) -> Decimal:
     if getattr(fech, "id_motoboy", None) is not None:
-        return _calcular_valor_base_motoboy_periodo(
+        valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
         )
+        _, valor_coletas, _ = _calcular_diarias_coleta_motoboy(
+            db, sub_base, fech.id_motoboy, fech.periodo_inicio, fech.periodo_fim
+        )
+        return (valor_entregas + valor_coletas).quantize(Decimal("0.01"))
     return _calcular_valor_base_periodo(
         db, sub_base, fech.id_entregador,
         fech.periodo_inicio, fech.periodo_fim,
     )
+
+
+def _calcular_diarias_coleta_motoboy(
+    db: Session,
+    sub_base: str,
+    motoboy_id: int,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> tuple[int, Decimal, list[dict]]:
+    """Uma diária por motoboy/data, independentemente da quantidade de bases."""
+    rows = db.execute(
+        select(ColetaExecucao.data_operacao, BasePreco.base)
+        .join(
+            ColetaExecucaoParticipante,
+            ColetaExecucaoParticipante.execucao_id == ColetaExecucao.id_execucao,
+        )
+        .join(BasePreco, BasePreco.id_base == ColetaExecucao.base_id)
+        .where(
+            ColetaExecucao.sub_base == sub_base,
+            ColetaExecucaoParticipante.sub_base == sub_base,
+            ColetaExecucaoParticipante.motoboy_id == motoboy_id,
+            ColetaExecucao.data_operacao >= periodo_inicio,
+            ColetaExecucao.data_operacao <= periodo_fim,
+        )
+        .order_by(ColetaExecucao.data_operacao, BasePreco.base)
+    ).all()
+    bases_por_dia: dict[date, set[str]] = {}
+    for data_operacao, base_nome in rows:
+        bases_por_dia.setdefault(data_operacao, set()).add(base_nome)
+    valor_diaria = Decimal(
+        resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id).get("coleta_valor") or 0
+    ).quantize(Decimal("0.01"))
+    itens = [
+        {"data": dia, "bases": sorted(bases), "valor_diaria": valor_diaria}
+        for dia, bases in sorted(bases_por_dia.items())
+    ]
+    return len(itens), (valor_diaria * len(itens)).quantize(Decimal("0.01")), itens
 
 
 def _fmt_brl_push(v) -> str:
@@ -283,6 +337,9 @@ class FechamentoOut(BaseModel):
     periodo_inicio: date
     periodo_fim: date
     valor_base: Decimal
+    valor_entregas: Decimal = Decimal("0.00")
+    valor_coletas: Decimal = Decimal("0.00")
+    qtd_dias_coleta: int = 0
     valor_adicao: Decimal
     motivo_adicao: Optional[str] = None
     valor_subtracao: Decimal
@@ -415,6 +472,9 @@ def _fechamento_to_out(
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
         valor_base=fech.valor_base,
+        valor_entregas=getattr(fech, "valor_entregas", fech.valor_base),
+        valor_coletas=getattr(fech, "valor_coletas", Decimal("0.00")),
+        qtd_dias_coleta=int(getattr(fech, "qtd_dias_coleta", 0) or 0),
         valor_adicao=fech.valor_adicao,
         motivo_adicao=fech.motivo_adicao,
         valor_subtracao=fech.valor_subtracao,
@@ -465,9 +525,13 @@ def calcular_valor_base_preview(
 
     if motoboy_id is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, motoboy_id)
-        valor_base = _calcular_valor_base_motoboy_periodo(
+        valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, motoboy_id, periodo_inicio, periodo_fim
         )
+        qtd_dias_coleta, valor_coletas, dias_coleta = _calcular_diarias_coleta_motoboy(
+            db, sub_base, motoboy_id, periodo_inicio, periodo_fim
+        )
+        valor_base = (valor_entregas + valor_coletas).quantize(Decimal("0.01"))
         executor_nome = _get_motoboy_username(db, motoboy)
         g = _contar_g_por_servico_motoboy(db, sub_base, motoboy_id, periodo_inicio, periodo_fim)
         conferencia_por_dia = (
@@ -483,6 +547,10 @@ def calcular_valor_base_preview(
         )
         return {
             "valor_base": valor_base,
+            "valor_entregas": valor_entregas,
+            "valor_coletas": valor_coletas,
+            "qtd_dias_coleta": qtd_dias_coleta,
+            "dias_coleta": dias_coleta,
             "entregador_id": None,
             "motoboy_id": motoboy_id,
             "entregador_nome": executor_nome,
@@ -505,6 +573,10 @@ def calcular_valor_base_preview(
 
     return {
         "valor_base": valor_base,
+        "valor_entregas": valor_base,
+        "valor_coletas": Decimal("0.00"),
+        "qtd_dias_coleta": 0,
+        "dias_coleta": [],
         "entregador_id": entregador_id,
         "motoboy_id": None,
         "entregador_nome": ent.nome or "",
@@ -727,10 +799,15 @@ def criar_fechamento(
                 EntregadorFechamento.periodo_fim == payload.periodo_fim,
             )
         )
-        valor_base = _calcular_valor_base_motoboy_periodo(
+        valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, payload.id_motoboy,
             payload.periodo_inicio, payload.periodo_fim,
         )
+        qtd_dias_coleta, valor_coletas, dias_coleta = _calcular_diarias_coleta_motoboy(
+            db, sub_base, payload.id_motoboy,
+            payload.periodo_inicio, payload.periodo_fim,
+        )
+        valor_base = (valor_entregas + valor_coletas).quantize(Decimal("0.01"))
     else:
         ent = db.get(Entregador, payload.id_entregador)
         if not ent or ent.sub_base != sub_base:
@@ -746,16 +823,35 @@ def criar_fechamento(
                 EntregadorFechamento.periodo_fim == payload.periodo_fim,
             )
         )
-        valor_base = _calcular_valor_base_periodo(
+        valor_entregas = _calcular_valor_base_periodo(
             db, sub_base, payload.id_entregador,
             payload.periodo_inicio, payload.periodo_fim,
         )
+        valor_coletas = Decimal("0.00")
+        qtd_dias_coleta = 0
+        dias_coleta = []
+        valor_base = valor_entregas
 
     if existente:
         raise HTTPException(
             409,
             "Já existe fechamento para este executor e período."
         )
+
+    if id_motoboy_val is not None and dias_coleta:
+        dias = [item["data"] for item in dias_coleta]
+        dia_ja_pago = db.scalar(
+            select(EntregadorFechamentoColetaItem.data).where(
+                EntregadorFechamentoColetaItem.sub_base == sub_base,
+                EntregadorFechamentoColetaItem.motoboy_id == id_motoboy_val,
+                EntregadorFechamentoColetaItem.data.in_(dias),
+            )
+        )
+        if dia_ja_pago:
+            raise HTTPException(
+                409,
+                f"A diária de coleta de {dia_ja_pago.strftime('%d/%m/%Y')} já pertence a outro fechamento.",
+            )
 
     valor_ad = Decimal(str(payload.valor_adicao or 0)).quantize(Decimal("0.01"))
     valor_sub = Decimal(str(payload.valor_subtracao or 0)).quantize(Decimal("0.01"))
@@ -769,6 +865,9 @@ def criar_fechamento(
         periodo_inicio=payload.periodo_inicio,
         periodo_fim=payload.periodo_fim,
         valor_base=valor_base,
+        valor_entregas=valor_entregas,
+        valor_coletas=valor_coletas,
+        qtd_dias_coleta=qtd_dias_coleta,
         valor_adicao=valor_ad,
         motivo_adicao=(payload.motivo_adicao or "").strip() or None,
         valor_subtracao=valor_sub,
@@ -777,6 +876,19 @@ def criar_fechamento(
         status=STATUS_GERADO,
     )
     db.add(fech)
+    db.flush()
+    if id_motoboy_val is not None:
+        for item in dias_coleta:
+            db.add(
+                EntregadorFechamentoColetaItem(
+                    id_fechamento=fech.id_fechamento,
+                    sub_base=sub_base,
+                    motoboy_id=id_motoboy_val,
+                    data=item["data"],
+                    bases=item["bases"],
+                    valor_diaria=item["valor_diaria"],
+                )
+            )
     db.commit()
     db.refresh(fech)
 
@@ -845,6 +957,9 @@ def criar_fechamento(
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
         valor_base=fech.valor_base,
+        valor_entregas=fech.valor_entregas,
+        valor_coletas=fech.valor_coletas,
+        qtd_dias_coleta=fech.qtd_dias_coleta,
         valor_adicao=fech.valor_adicao,
         motivo_adicao=fech.motivo_adicao,
         valor_subtracao=fech.valor_subtracao,
@@ -890,6 +1005,11 @@ def atualizar_fechamento(
     fech = db.get(EntregadorFechamento, id_fechamento)
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
+
+    raise HTTPException(
+        409,
+        "Fechamentos gerados são imutáveis. Ajuste os lançamentos antes de gerar um novo fechamento.",
+    )
 
     st = _status_norm(fech)
     if st == STATUS_PAGO:

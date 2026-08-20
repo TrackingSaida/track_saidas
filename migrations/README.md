@@ -1,5 +1,21 @@
 # Migrações
 
+## coleta_flexivel.sql
+
+Obrigatória antes do deploy da coleta flexível. Adiciona agenda por base, calendário de
+exceções, execução/participantes de coleta, permissão canônica do motoboy, diária de
+coleta e snapshots imutáveis no fechamento.
+Também adiciona a baixa financeira `recebido_em/recebido_por` dos fechamentos de bases,
+usada pela visão **A Receber**.
+
+```bash
+psql "$DATABASE_URL" -f migrations/coleta_flexivel.sql
+```
+
+O script preserva permissões existentes copiando `pode_ler_coleta=true` para
+`pode_realizar_coleta=true`. Bases existentes começam com segunda a sábado, mas com a
+agenda não confirmada; por isso não bloqueiam fechamento até revisão do administrador.
+
 Execute no **banco do Render** (e em qualquer ambiente) após deploy que inclua a coluna correspondente no modelo.
 
 ## motoboy_refresh_tokens.sql + rotas_motoboy_continuidade.sql
@@ -154,4 +170,3 @@ psql "$DATABASE_URL" -f migrations/create_push_notifications.sql
 ```
 
 Configuração dos Cron Jobs no Render: ver seção **Notificações push (mobile)** em [`README.md`](../README.md).
-

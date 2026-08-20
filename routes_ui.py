@@ -25,7 +25,7 @@ MENU_DEFS = [
                 "roles": [0, 1, 2, 3],
                 "group": "leituras",
                 "coleta_only": True,
-                "coleta_manual_ok": False
+                "coleta_leitura_only": True,
             },
             {
                 "label": "Registrar Saídas",
@@ -71,9 +71,10 @@ MENU_DEFS = [
         "icon": "ri-money-dollar-circle-line",
         "roles": [0, 1],
         "items": [
-            {"label": "Fechamento Bases", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
-            {"label": "Fechamento de Motoboys", "href": "tracking-entregadores-resumo.html", "roles": [0, 1]},
-            {"label": "A Pagar", "href": "tracking-entregadores-a-pagar.html", "roles": [0, 1]},
+            {"label": "Fechamento de Motoboys", "href": "tracking-entregadores-resumo.html", "roles": [0, 1], "group": "saidas"},
+            {"label": "A Pagar", "href": "tracking-entregadores-a-pagar.html", "roles": [0, 1], "group": "saidas"},
+            {"label": "Fechamento Bases", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True, "group": "coletas"},
+            {"label": "A Receber", "href": "tracking-bases-a-receber.html", "roles": [0, 1], "coleta_only": True, "group": "coletas"},
             {"label": "Contabilidade", "href": "tracking-contabilidade.html", "roles": [0, 1]},
         ]
     },
@@ -84,7 +85,7 @@ MENU_DEFS = [
         "items": [
             {"label": "Admin", "href": "dashboard-admin.html", "roles": [0]},
             {"label": "Visão 360", "href": "dashboard-visao-360.html", "roles": [0, 1], "visao360_only": True},
-            {"label": "Coletas", "href": "dashboard-coletas.html", "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
+            {"label": "Coletas", "href": "dashboard-coletas.html", "roles": [0, 1], "coleta_only": True},
             {"label": "Saídas", "href": "dashboard-saidas.html", "roles": [0, 1]},
             {"label": "Financeiro", "href": "dashboard-financeiro.html", "roles": [0, 1]},
         ]
@@ -95,7 +96,7 @@ MENU_DEFS = [
         "icon": "ri-user-settings-line",
         "roles": [0, 1],
         "items": [
-            {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True, "coleta_manual_ok": True},
+            {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True},
             {"label": "Usuários",     "href": "tracking-usuarios.html",   "roles": [0, 1]},
             {"label": "Preços de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
             {"label": "Autenticação", "href": "tracking-autenticacao.html", "roles": [0, 1], "base_only": True, "base_only_roles": [1]},
@@ -144,7 +145,8 @@ def menu_for_role(
         # Se o usuário pode ver a seção inteira
         if role in section["roles"]:
             # Filtra os itens permitidos (role + ignorar_coleta + modo_operacao + base_only)
-            # coleta_only: ocultar quando ignorar_coleta, EXCETO se coleta_manual_ok e modo=coleta_manual
+            # coleta_only: ocultar sempre quando ignorar_coleta
+            # coleta_leitura_only: mostrar apenas nos modos codigo/ambos
             # visao360_only: sempre ocultar quando ignorar_coleta
             # entrada_only: mostrar só quando owner habilitou entrada obrigatória
             # base_only: mostrar só quando tipo_owner == "base"; base_only_roles: aplicar só a esses roles (ex.: [1] = só admin exige base)
@@ -161,8 +163,8 @@ def menu_for_role(
                 if ignorar_coleta and item.get("visao360_only"):
                     continue
                 if ignorar_coleta and item.get("coleta_only"):
-                    if item.get("coleta_manual_ok") and modo_operacao == "coleta_manual":
-                        allowed_items.append(item)
+                    continue
+                if item.get("coleta_leitura_only") and modo_operacao not in ("codigo", "ambos"):
                     continue
                 # Aplica label por tipo (Base -> Seller quando tipo_owner == "base")
                 label = _menu_label_for_owner(item.get("label", ""), tipo_owner)

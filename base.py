@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional, List, Dict
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,16 @@ class BaseCreate(BaseModel):
     avulso: float = Field(ge=0)
     # novo: toggle opcional; se não vier, usamos False (segue server_default)
     ativo: Optional[bool] = None
+    dias_coleta: List[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5, 6])
+    agenda_coleta_confirmada: bool = False
+
+    @field_validator("dias_coleta")
+    @classmethod
+    def validar_dias_coleta(cls, value: List[int]) -> List[int]:
+        dias = sorted(set(value))
+        if not dias or any(dia < 1 or dia > 7 for dia in dias):
+            raise ValueError("dias_coleta deve conter dias ISO entre 1 e 7")
+        return dias
     model_config = ConfigDict(from_attributes=True)
 
 class BaseOut(BaseModel):
@@ -35,6 +45,8 @@ class BaseOut(BaseModel):
     avulso: float
     # novo: expor status
     ativo: bool
+    dias_coleta: List[int]
+    agenda_coleta_confirmada: bool
     # Endereço cadastrado em base_seller_dados (opcional; aditivo)
     endereco_completo: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
@@ -46,6 +58,18 @@ class BaseUpdate(BaseModel):
     avulso: Optional[float] = Field(default=None, ge=0)
     # novo: permitir alterar status
     ativo: Optional[bool]   = None
+    dias_coleta: Optional[List[int]] = None
+    agenda_coleta_confirmada: Optional[bool] = None
+
+    @field_validator("dias_coleta")
+    @classmethod
+    def validar_dias_coleta(cls, value: Optional[List[int]]) -> Optional[List[int]]:
+        if value is None:
+            return value
+        dias = sorted(set(value))
+        if not dias or any(dia < 1 or dia > 7 for dia in dias):
+            raise ValueError("dias_coleta deve conter dias ISO entre 1 e 7")
+        return dias
     model_config = ConfigDict(from_attributes=True)
 
 # =========================
@@ -108,6 +132,8 @@ def _base_to_out(obj: BasePreco, endereco_completo: Optional[str] = None) -> Bas
         ml=float(obj.ml or 0),
         avulso=float(obj.avulso or 0),
         ativo=bool(obj.ativo),
+        dias_coleta=list(obj.dias_coleta or []),
+        agenda_coleta_confirmada=bool(obj.agenda_coleta_confirmada),
         endereco_completo=endereco_completo,
     )
 
@@ -166,6 +192,8 @@ def criar_precos_base(
         ml=payload.ml,
         avulso=payload.avulso,
         ativo=bool(payload.ativo) if payload.ativo is not None else True,
+        dias_coleta=payload.dias_coleta,
+        agenda_coleta_confirmada=bool(payload.agenda_coleta_confirmada),
     )
 
     db.add(obj)
@@ -272,6 +300,11 @@ def patch_base(
     # novo: toggle de status
     if body.ativo is not None:
         obj.ativo = bool(body.ativo)
+
+    if body.dias_coleta is not None:
+        obj.dias_coleta = body.dias_coleta
+    if body.agenda_coleta_confirmada is not None:
+        obj.agenda_coleta_confirmada = bool(body.agenda_coleta_confirmada)
 
     db.commit()
     db.refresh(obj)

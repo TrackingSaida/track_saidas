@@ -158,6 +158,7 @@ class PrecoGlobalOut(BaseModel):
     shopee_valor: Decimal
     ml_valor: Decimal
     avulso_valor: Decimal
+    coleta_valor: Decimal = Decimal("0.00")
     considerar_pacote_g_adicional: bool = False
 
 
@@ -165,6 +166,7 @@ class PrecoGlobalUpdate(BaseModel):
     shopee_valor: Optional[Decimal] = Field(None, ge=0)
     ml_valor: Optional[Decimal] = Field(None, ge=0)
     avulso_valor: Optional[Decimal] = Field(None, ge=0)
+    coleta_valor: Optional[Decimal] = Field(None, ge=0)
     considerar_pacote_g_adicional: Optional[bool] = None
 
 
@@ -176,6 +178,7 @@ class PrecoIndividualItem(BaseModel):
     shopee_valor: Optional[Decimal] = None
     ml_valor: Optional[Decimal] = None
     avulso_valor: Optional[Decimal] = None
+    coleta_valor: Optional[Decimal] = None
 
 
 class PrecoIndividuaisResponse(BaseModel):
@@ -187,6 +190,7 @@ class PrecoEntregadorUpdate(BaseModel):
     shopee_valor: Optional[Decimal] = Field(None, ge=0)
     ml_valor: Optional[Decimal] = Field(None, ge=0)
     avulso_valor: Optional[Decimal] = Field(None, ge=0)
+    coleta_valor: Optional[Decimal] = Field(None, ge=0)
 
 
 # =========================================================
@@ -259,16 +263,18 @@ def resolver_precos_entregador(
     shopee_global = global_row.shopee_valor if global_row else zero
     ml_global = global_row.ml_valor if global_row else zero
     avulso_global = global_row.avulso_valor if global_row else zero
+    coleta_global = global_row.coleta_valor if global_row else zero
 
     if preco and preco.usa_preco_global is False:
         shopee_valor = preco.shopee_valor if preco.shopee_valor is not None else shopee_global
         ml_valor = preco.ml_valor if preco.ml_valor is not None else ml_global
         avulso_valor = preco.avulso_valor if preco.avulso_valor is not None else avulso_global
-        return {"shopee_valor": shopee_valor, "ml_valor": ml_valor, "avulso_valor": avulso_valor}
+        coleta_valor = preco.coleta_valor if preco.coleta_valor is not None else coleta_global
+        return {"shopee_valor": shopee_valor, "ml_valor": ml_valor, "avulso_valor": avulso_valor, "coleta_valor": coleta_valor}
 
     if global_row:
-        return {"shopee_valor": shopee_global, "ml_valor": ml_global, "avulso_valor": avulso_global}
-    return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero}
+        return {"shopee_valor": shopee_global, "ml_valor": ml_global, "avulso_valor": avulso_global, "coleta_valor": coleta_global}
+    return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero, "coleta_valor": zero}
 
 
 def _resolver_entregador_principal_do_motoboy(
@@ -384,8 +390,9 @@ def resolver_precos_motoboy(
             "shopee_valor": global_row.shopee_valor or zero,
             "ml_valor": global_row.ml_valor or zero,
             "avulso_valor": global_row.avulso_valor or zero,
+            "coleta_valor": global_row.coleta_valor or zero,
         }
-    return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero}
+    return {"shopee_valor": zero, "ml_valor": zero, "avulso_valor": zero, "coleta_valor": zero}
 
 
 def _toggle_pacote_g_ativo(db: Session, sub_base: str) -> bool:
@@ -689,6 +696,7 @@ def _preco_item_from_motoboy(
         shopee_valor=(ep.shopee_valor if ep else None),
         ml_valor=(ep.ml_valor if ep else None),
         avulso_valor=(ep.avulso_valor if ep else None),
+        coleta_valor=(ep.coleta_valor if ep else None),
     )
 
 
@@ -1297,12 +1305,14 @@ def get_preco_global(
             shopee_valor=row.shopee_valor,
             ml_valor=row.ml_valor,
             avulso_valor=row.avulso_valor,
+            coleta_valor=row.coleta_valor,
             considerar_pacote_g_adicional=bool(getattr(row, "considerar_pacote_g_adicional", False)),
         )
     return PrecoGlobalOut(
         shopee_valor=_zero,
         ml_valor=_zero,
         avulso_valor=_zero,
+        coleta_valor=_zero,
         considerar_pacote_g_adicional=False,
     )
 
@@ -1318,11 +1328,12 @@ def patch_preco_global(
         body.shopee_valor is None
         and body.ml_valor is None
         and body.avulso_valor is None
+        and body.coleta_valor is None
         and body.considerar_pacote_g_adicional is None
     ):
         raise HTTPException(
             status_code=422,
-            detail="Envie ao menos um campo: shopee_valor, ml_valor, avulso_valor ou considerar_pacote_g_adicional.",
+            detail="Envie ao menos um campo de preço ou considerar_pacote_g_adicional.",
         )
     sub_base_user = _resolve_user_base(db, current_user)
     row = db.scalars(
@@ -1335,6 +1346,8 @@ def patch_preco_global(
             row.ml_valor = body.ml_valor
         if body.avulso_valor is not None:
             row.avulso_valor = body.avulso_valor
+        if body.coleta_valor is not None:
+            row.coleta_valor = body.coleta_valor
         if body.considerar_pacote_g_adicional is not None:
             row.considerar_pacote_g_adicional = bool(body.considerar_pacote_g_adicional)
     else:
@@ -1343,6 +1356,7 @@ def patch_preco_global(
             shopee_valor=body.shopee_valor if body.shopee_valor is not None else _zero,
             ml_valor=body.ml_valor if body.ml_valor is not None else _zero,
             avulso_valor=body.avulso_valor if body.avulso_valor is not None else _zero,
+            coleta_valor=body.coleta_valor if body.coleta_valor is not None else _zero,
             considerar_pacote_g_adicional=bool(body.considerar_pacote_g_adicional) if body.considerar_pacote_g_adicional is not None else False,
         )
         db.add(row)
@@ -1352,6 +1366,7 @@ def patch_preco_global(
         shopee_valor=row.shopee_valor,
         ml_valor=row.ml_valor,
         avulso_valor=row.avulso_valor,
+        coleta_valor=row.coleta_valor,
         considerar_pacote_g_adicional=bool(getattr(row, "considerar_pacote_g_adicional", False)),
     )
 
@@ -1629,12 +1644,15 @@ def _salvar_preco_por_entregador(
             ep.ml_valor = body.ml_valor
         if body.avulso_valor is not None:
             ep.avulso_valor = body.avulso_valor
+        if body.coleta_valor is not None:
+            ep.coleta_valor = body.coleta_valor
     else:
         ep = EntregadorPreco(
             id_entregador=id_entregador,
             shopee_valor=body.shopee_valor,
             ml_valor=body.ml_valor,
             avulso_valor=body.avulso_valor,
+            coleta_valor=body.coleta_valor,
             usa_preco_global=False,
         )
         db.add(ep)
@@ -1646,6 +1664,7 @@ def _salvar_preco_por_entregador(
         shopee_valor=ep.shopee_valor,
         ml_valor=ep.ml_valor,
         avulso_valor=ep.avulso_valor,
+        coleta_valor=ep.coleta_valor,
     )
 
 
@@ -1657,8 +1676,8 @@ def post_entregador_precos(
     current_user=Depends(get_current_user),
 ):
     """Compatibilidade legado: salva exceção por entregador."""
-    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
-        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
+    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None and body.coleta_valor is None:
+        raise HTTPException(status_code=422, detail="Envie ao menos um campo de preço.")
     sub_base_user = _resolve_user_base(db, current_user)
     return _salvar_preco_por_entregador(db, sub_base_user, id_entregador, body)
 
@@ -1671,8 +1690,8 @@ def post_motoboy_precos(
     current_user=Depends(get_current_user),
 ):
     """Novo contrato: salva exceção selecionando motoboy ativo."""
-    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None:
-        raise HTTPException(status_code=422, detail="Envie ao menos um campo: shopee_valor, ml_valor ou avulso_valor.")
+    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None and body.coleta_valor is None:
+        raise HTTPException(status_code=422, detail="Envie ao menos um campo de preço.")
     sub_base_user = _resolve_user_base(db, current_user)
     motoboys = _carregar_motoboys_ativos_da_subbase(db, sub_base_user)
     mb_ids = {int(m.id_motoboy) for m in motoboys}

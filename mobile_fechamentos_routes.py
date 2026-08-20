@@ -51,6 +51,9 @@ class FechamentoMobileOut(BaseModel):
     periodo_inicio: date
     periodo_fim: date
     valor_base: Decimal
+    valor_entregas: Decimal = Decimal("0.00")
+    valor_coletas: Decimal = Decimal("0.00")
+    qtd_dias_coleta: int = 0
     valor_adicao: Decimal
     valor_subtracao: Decimal
     valor_final: Decimal
@@ -69,6 +72,9 @@ def _to_out(fech: EntregadorFechamento, chave_pix: Optional[str]) -> FechamentoM
         periodo_inicio=fech.periodo_inicio,
         periodo_fim=fech.periodo_fim,
         valor_base=fech.valor_base,
+        valor_entregas=fech.valor_entregas,
+        valor_coletas=fech.valor_coletas,
+        qtd_dias_coleta=fech.qtd_dias_coleta,
         valor_adicao=fech.valor_adicao,
         valor_subtracao=fech.valor_subtracao,
         valor_final=fech.valor_final,

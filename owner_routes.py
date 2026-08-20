@@ -13,6 +13,7 @@ from auth import get_current_user
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
 
 router = APIRouter(prefix="/owner", tags=["Owner"])
+MODOS_OPERACAO = {"codigo", "coleta_manual", "ambos"}
 
 # ============================================================
 # SCHEMAS
@@ -104,14 +105,12 @@ def create_owner(
     if exists:
         raise HTTPException(409, "Já existe um Owner para esta sub_base.")
 
-    # Na criação, ignorar_coleta é sempre False — só modo codigo permitido
-    ignorar_coleta = False
-    modo_operacao = body.modo_operacao if body.modo_operacao is not None else "codigo"
-    if modo_operacao in ("saida", "coleta_manual"):
-        raise HTTPException(
-            400,
-            "Modos 'saida' e 'coleta_manual' exigem 'Ignorar Coleta' ativo. Configure após criar o owner."
-        )
+    modo_recebido = (body.modo_operacao or "codigo").strip().lower()
+    # Compatibilidade com clientes antigos que enviavam modo=saida.
+    ignorar_coleta = modo_recebido == "saida"
+    modo_operacao = "codigo" if ignorar_coleta else modo_recebido
+    if modo_operacao not in MODOS_OPERACAO:
+        raise HTTPException(422, "modo_operacao deve ser 'codigo', 'coleta_manual' ou 'ambos'.")
 
     tipo_owner = _normalize_tipo_owner(body.tipo_owner)
 
@@ -206,27 +205,21 @@ def update_owner(
     if body.ativo is not None:
         owner.ativo = body.ativo
 
-    if body.ignorar_coleta is not None:
-        owner.ignorar_coleta = body.ignorar_coleta
-        if not body.ignorar_coleta and owner.modo_operacao in ("saida", "coleta_manual"):
-            owner.modo_operacao = "codigo"
-
     if body.teste is not None:
         owner.teste = body.teste
 
     if body.modo_operacao is not None:
-        ign = body.ignorar_coleta if body.ignorar_coleta is not None else owner.ignorar_coleta
-        if body.modo_operacao in ("saida", "coleta_manual") and not ign:
-            raise HTTPException(
-                400,
-                "Para usar modo 'saida' ou 'coleta_manual', o campo 'Ignorar Coleta' deve estar ativo."
-            )
-        if body.modo_operacao == "codigo" and ign:
-            raise HTTPException(
-                400,
-                "Modo 'codigo' requer 'Ignorar Coleta' desativado."
-            )
-        owner.modo_operacao = body.modo_operacao
+        modo = body.modo_operacao.strip().lower()
+        if modo == "saida":
+            # Compatibilidade: desativa coleta sem gravar um quarto modo.
+            owner.ignorar_coleta = True
+        elif modo not in MODOS_OPERACAO:
+            raise HTTPException(422, "modo_operacao deve ser 'codigo', 'coleta_manual' ou 'ambos'.")
+        else:
+            owner.modo_operacao = modo
+
+    if body.ignorar_coleta is not None:
+        owner.ignorar_coleta = bool(body.ignorar_coleta)
 
     if body.tipo_owner is not None:
         owner.tipo_owner = _normalize_tipo_owner(body.tipo_owner)

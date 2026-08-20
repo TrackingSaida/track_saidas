@@ -156,6 +156,9 @@ class Motoboy(Base):
     data_cadastro = Column(Date)
 
     pode_ler_coleta = Column(Boolean, default=False, nullable=False)
+    # Permissão canônica para participar de coleta por leitura e/ou manual.
+    # pode_ler_coleta é mantido por compatibilidade com clientes antigos.
+    pode_realizar_coleta = Column(Boolean, default=False, nullable=False, server_default=text("false"))
     pode_ler_saida = Column(Boolean, default=True, nullable=False)
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
     pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
@@ -208,6 +211,8 @@ class Coleta(Base):
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     origem = Column(Text, nullable=False, server_default=text("'codigo'"))
+    execucao_id = Column(BigInteger, ForeignKey("coleta_execucoes.id_execucao", ondelete="SET NULL"), nullable=True)
+    participante_id = Column(BigInteger, ForeignKey("coleta_execucao_participantes.id_participante", ondelete="SET NULL"), nullable=True)
 
     saidas = relationship("Saida", back_populates="coleta")
 
@@ -216,6 +221,83 @@ class Coleta(Base):
             f"<Coleta id_coleta={self.id_coleta} "
             f"sub_base={self.sub_base!r} username_entregador={self.username_entregador!r}>"
         )
+
+
+# ==========================
+# Execução operacional de coleta por base/dia
+# ==========================
+class ColetaExecucao(Base):
+    __tablename__ = "coleta_execucoes"
+    __table_args__ = (
+        UniqueConstraint("sub_base", "base_id", "data_operacao", name="uq_coleta_execucao_base_dia"),
+    )
+
+    id_execucao = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    base_id = Column(BigInteger, ForeignKey("base.id_base", ondelete="RESTRICT"), nullable=False)
+    data_operacao = Column(Date, nullable=False)
+    modo = Column(Text, nullable=False)  # codigo | coleta_manual
+    status = Column(Text, nullable=False, server_default=text("'coletado'"))
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    base_ref = relationship("BasePreco")
+    participantes = relationship(
+        "ColetaExecucaoParticipante",
+        back_populates="execucao",
+        cascade="all, delete-orphan",
+    )
+
+
+class ColetaExecucaoParticipante(Base):
+    __tablename__ = "coleta_execucao_participantes"
+    __table_args__ = (
+        UniqueConstraint("execucao_id", "user_id", name="uq_coleta_participante_usuario"),
+        UniqueConstraint("sub_base", "client_request_id", name="uq_coleta_participante_request"),
+    )
+
+    id_participante = Column(BigInteger, primary_key=True, autoincrement=True)
+    execucao_id = Column(
+        BigInteger,
+        ForeignKey("coleta_execucoes.id_execucao", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sub_base = Column(Text, nullable=False)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="SET NULL"), nullable=True)
+    username = Column(Text, nullable=False)
+    shopee = Column(Integer, nullable=False, server_default=text("0"))
+    mercado_livre = Column(Integer, nullable=False, server_default=text("0"))
+    avulso = Column(Integer, nullable=False, server_default=text("0"))
+    pacotes_g = Column(Integer, nullable=False, server_default=text("0"))
+    g_shopee = Column(Integer, nullable=False, server_default=text("0"))
+    g_ml = Column(Integer, nullable=False, server_default=text("0"))
+    g_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    sem_volume = Column(Boolean, nullable=False, server_default=text("false"))
+    client_request_id = Column(Text, nullable=True)
+    versao = Column(Integer, nullable=False, server_default=text("1"))
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizado_por_user_id = Column(BigInteger, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+
+    execucao = relationship("ColetaExecucao", back_populates="participantes")
+    usuario = relationship("User", foreign_keys=[user_id])
+
+
+class ColetaCalendarioExcecao(Base):
+    __tablename__ = "coleta_calendario_excecoes"
+
+    id_excecao = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    base_id = Column(BigInteger, ForeignKey("base.id_base", ondelete="CASCADE"), nullable=True)
+    data = Column(Date, nullable=False)
+    tipo = Column(Text, nullable=False)  # FERIADO | SEM_COLETA | COLETA_EXTRA | JUSTIFICADO
+    motivo = Column(Text, nullable=False)
+    criado_por_user_id = Column(BigInteger, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    base_ref = relationship("BasePreco")
 
 
 # ==========================
@@ -235,6 +317,10 @@ class BasePreco(Base):
     ml = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     avulso = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     ativo = Column(Boolean, nullable=False, server_default=text("false"))
+    # ISO-8601: segunda=1 ... domingo=7. O preset inicial é segunda a sábado,
+    # mas só passa a bloquear alertas/fechamentos após confirmação do admin.
+    dias_coleta = Column(JSON, nullable=False, server_default=text("'[1,2,3,4,5,6]'::json"))
+    agenda_coleta_confirmada = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
         return f"<BasePreco id_base={self.id_base} sub_base={self.sub_base!r} username={self.username!r}>"
@@ -324,6 +410,7 @@ class EntregadorPrecoGlobal(Base):
     shopee_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     ml_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     avulso_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    coleta_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     considerar_pacote_g_adicional = Column(Boolean, nullable=False, server_default=text("false"))
 
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
@@ -350,6 +437,7 @@ class EntregadorPreco(Base):
     shopee_valor = Column(Numeric(12, 2), nullable=True)
     ml_valor = Column(Numeric(12, 2), nullable=True)
     avulso_valor = Column(Numeric(12, 2), nullable=True)
+    coleta_valor = Column(Numeric(12, 2), nullable=True)
 
     usa_preco_global = Column(Boolean, nullable=False, server_default=text("true"))
 
@@ -464,6 +552,9 @@ class EntregadorFechamento(Base):
     periodo_fim = Column(Date, nullable=False)
 
     valor_base = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_entregas = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_coletas = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    qtd_dias_coleta = Column(Integer, nullable=False, server_default=text("0"))
     valor_adicao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     motivo_adicao = Column(Text, nullable=True)
     valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
@@ -483,6 +574,27 @@ class EntregadorFechamento(Base):
             f"<EntregadorFechamento id_fechamento={self.id_fechamento} "
             f"id_entregador={self.id_entregador} id_motoboy={self.id_motoboy} status={self.status!r}>"
         )
+
+
+class EntregadorFechamentoColetaItem(Base):
+    __tablename__ = "entregador_fechamento_coleta_itens"
+    __table_args__ = (
+        UniqueConstraint("id_fechamento", "data", name="uq_entregador_fechamento_coleta_dia"),
+        UniqueConstraint("sub_base", "motoboy_id", "data", name="uq_entregador_coleta_motoboy_dia"),
+    )
+
+    id_item = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_fechamento = Column(
+        BigInteger,
+        ForeignKey("entregador_fechamentos.id_fechamento", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="RESTRICT"), nullable=False)
+    data = Column(Date, nullable=False)
+    bases = Column(JSON, nullable=False, server_default=text("'[]'::json"))
+    valor_diaria = Column(Numeric(12, 2), nullable=False)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
 
 # ==========================
@@ -514,6 +626,8 @@ class BaseFechamento(Base):
     status = Column(Text, nullable=False, server_default=text("'GERADO'"))
 
     criado_em = Column(DateTime(timezone=False), server_default=func.now())
+    recebido_em = Column(DateTime(timezone=False), nullable=True)
+    recebido_por = Column(Text, nullable=True)
 
     itens = relationship("BaseFechamentoItem", back_populates="fechamento", cascade="all, delete-orphan")
 
