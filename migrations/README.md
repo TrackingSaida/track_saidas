@@ -18,6 +18,16 @@ agenda não confirmada; por isso não bloqueiam fechamento até revisão do admi
 
 Execute no **banco do Render** (e em qualquer ambiente) após deploy que inclua a coluna correspondente no modelo.
 
+## coleta_operacao_em_andamento.sql
+
+Obrigatória após `coleta_flexivel.sql`. Adiciona os estados `em_coleta` e
+`finalizado`, usados para reservar uma base, exibir quem está coletando e permitir
+que outro motoboy ajude na mesma execução.
+
+```bash
+psql "$DATABASE_URL" -f migrations/coleta_operacao_em_andamento.sql
+```
+
 ## motoboy_refresh_tokens.sql + rotas_motoboy_continuidade.sql
 
 **Obrigatório** após deploy da sessão estável + continuidade de rota (PR backend).

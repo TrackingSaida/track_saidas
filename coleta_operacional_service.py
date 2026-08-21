@@ -20,6 +20,28 @@ from models import (
 MODOS_COM_COLETA = {"codigo", "coleta_manual", "ambos"}
 
 
+def combinar_modo_execucao(atual: str, solicitado: str) -> str:
+    """Mantém o modo real usado na execução sem impedir colaboração no modo ambos."""
+    if atual == solicitado:
+        return atual
+    if atual == "ambos" or solicitado == "ambos":
+        return "ambos"
+    if {atual, solicitado} == {"codigo", "coleta_manual"}:
+        return "ambos"
+    return solicitado
+
+
+def atualizar_status_execucao(execucao: ColetaExecucao) -> None:
+    participantes = list(execucao.participantes or [])
+    if any(getattr(item, "status", "finalizado") == "em_coleta" for item in participantes):
+        execucao.status = "em_coleta"
+    elif participantes and all(bool(item.sem_volume) for item in participantes):
+        execucao.status = "sem_volume"
+    else:
+        execucao.status = "coletado"
+    execucao.atualizado_em = datetime.now()
+
+
 def obter_owner(db: Session, sub_base: str) -> Owner:
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     if not owner:
@@ -96,10 +118,7 @@ def obter_ou_criar_execucao(
     )
     if execucao:
         if execucao.modo != modo:
-            raise HTTPException(
-                409,
-                "A base já possui coleta registrada por outro modo nesta data. Edite o lançamento existente para evitar duplicidade.",
-            )
+            execucao.modo = combinar_modo_execucao(execucao.modo, modo)
         return execucao
     execucao = ColetaExecucao(
         sub_base=sub_base,
@@ -148,6 +167,7 @@ def agregar_leitura(
             mercado_livre=int(coleta.mercado_livre or 0),
             avulso=int(coleta.avulso or 0),
             pacotes_g=int(coleta.pacotes_g or 0),
+            status="finalizado",
             atualizado_por_user_id=current_user.id,
         )
         db.add(participante)
@@ -161,8 +181,7 @@ def agregar_leitura(
     participante.versao += 1
     participante.atualizado_em = datetime.now()
     participante.atualizado_por_user_id = current_user.id
-    execucao.status = "coletado"
-    execucao.atualizado_em = datetime.now()
+    atualizar_status_execucao(execucao)
     coleta.execucao_id = execucao.id_execucao
     coleta.participante_id = participante.id_participante
     return participante

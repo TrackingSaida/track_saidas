@@ -236,8 +236,8 @@ class ColetaExecucao(Base):
     sub_base = Column(Text, nullable=False)
     base_id = Column(BigInteger, ForeignKey("base.id_base", ondelete="RESTRICT"), nullable=False)
     data_operacao = Column(Date, nullable=False)
-    modo = Column(Text, nullable=False)  # codigo | coleta_manual
-    status = Column(Text, nullable=False, server_default=text("'coletado'"))
+    modo = Column(Text, nullable=False)  # codigo | coleta_manual | ambos
+    status = Column(Text, nullable=False, server_default=text("'coletado'"))  # em_coleta | coletado | sem_volume
     criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
     atualizado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
@@ -274,6 +274,7 @@ class ColetaExecucaoParticipante(Base):
     g_ml = Column(Integer, nullable=False, server_default=text("0"))
     g_avulso = Column(Integer, nullable=False, server_default=text("0"))
     sem_volume = Column(Boolean, nullable=False, server_default=text("false"))
+    status = Column(Text, nullable=False, server_default=text("'finalizado'"))  # em_coleta | finalizado
     client_request_id = Column(Text, nullable=True)
     versao = Column(Integer, nullable=False, server_default=text("1"))
     criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())

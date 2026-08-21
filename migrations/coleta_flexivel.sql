@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS coleta_execucao_participantes (
     g_ml INTEGER NOT NULL DEFAULT 0 CHECK (g_ml >= 0),
     g_avulso INTEGER NOT NULL DEFAULT 0 CHECK (g_avulso >= 0),
     sem_volume BOOLEAN NOT NULL DEFAULT FALSE,
+    status TEXT NOT NULL DEFAULT 'finalizado'
+        CHECK (status IN ('em_coleta', 'finalizado')),
     client_request_id TEXT NULL,
     versao INTEGER NOT NULL DEFAULT 1,
     criado_em TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -86,9 +88,33 @@ CREATE TABLE IF NOT EXISTS coleta_execucao_participantes (
     CONSTRAINT uq_coleta_participante_usuario UNIQUE (execucao_id, user_id),
     CONSTRAINT uq_coleta_participante_request UNIQUE (sub_base, client_request_id),
     CONSTRAINT ck_coleta_participante_volume CHECK (
-        sem_volume OR shopee + mercado_livre + avulso > 0
+        status = 'em_coleta' OR sem_volume OR shopee + mercado_livre + avulso > 0
     )
 );
+
+-- Compatibilidade para bancos onde a primeira versão da migration já foi aplicada.
+ALTER TABLE coleta_execucoes
+    DROP CONSTRAINT IF EXISTS coleta_execucoes_status_check;
+ALTER TABLE coleta_execucoes
+    DROP CONSTRAINT IF EXISTS ck_coleta_execucoes_status;
+ALTER TABLE coleta_execucoes
+    ADD CONSTRAINT ck_coleta_execucoes_status
+    CHECK (status IN ('em_coleta', 'coletado', 'sem_volume'));
+
+ALTER TABLE coleta_execucao_participantes
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'finalizado';
+ALTER TABLE coleta_execucao_participantes
+    DROP CONSTRAINT IF EXISTS coleta_execucao_participantes_status_check;
+ALTER TABLE coleta_execucao_participantes
+    DROP CONSTRAINT IF EXISTS ck_coleta_participantes_status;
+ALTER TABLE coleta_execucao_participantes
+    ADD CONSTRAINT ck_coleta_participantes_status
+    CHECK (status IN ('em_coleta', 'finalizado'));
+ALTER TABLE coleta_execucao_participantes
+    DROP CONSTRAINT IF EXISTS ck_coleta_participante_volume;
+ALTER TABLE coleta_execucao_participantes
+    ADD CONSTRAINT ck_coleta_participante_volume
+    CHECK (status = 'em_coleta' OR sem_volume OR shopee + mercado_livre + avulso > 0);
 
 CREATE TABLE IF NOT EXISTS coleta_calendario_excecoes (
     id_excecao BIGSERIAL PRIMARY KEY,

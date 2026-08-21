@@ -47,6 +47,13 @@ MENU_DEFS = [
                 "group": "registros"
             },
             {
+                "label": "Consultar Coletas",
+                "href": "tracking-coletas-operacao.html",
+                "roles": [0, 1, 2, 3],
+                "group": "registros",
+                "coleta_only": True,
+            },
+            {
                 "label": "Acompanhamento do Dia",
                 "href": "tracking-acompanhamento.html",
                 "roles": [0, 1, 2, 3],

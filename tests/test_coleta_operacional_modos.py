@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-from coleta_operacional_service import exigir_modo, modo_coleta
+from coleta_operacional_service import combinar_modo_execucao, exigir_modo, modo_coleta
 from base_fechamento_routes import _exigir_admin_financeiro
 from routes_ui import menu_for_role
 
@@ -37,6 +37,12 @@ def test_modo_manual_bloqueia_leitura():
     assert exc.value.status_code == 403
 
 
+def test_execucao_combina_leitura_e_manual_sem_duplicar_base():
+    assert combinar_modo_execucao("codigo", "coleta_manual") == "ambos"
+    assert combinar_modo_execucao("coleta_manual", "codigo") == "ambos"
+    assert combinar_modo_execucao("codigo", "codigo") == "codigo"
+
+
 def _hrefs_menu(menu):
     return {item["href"] for secao in menu for item in secao["items"]}
 
@@ -53,6 +59,7 @@ def test_menu_manual_oculta_scanner_mas_mantem_gestao():
     hrefs = _hrefs_menu(menu_for_role(1, ignorar_coleta=False, modo_operacao="coleta_manual"))
     assert "tracking-coleta-leitura.html" not in hrefs
     assert "tracking-coletas-resumo.html" in hrefs
+    assert "tracking-coletas-operacao.html" in hrefs
 
 
 def test_menu_financeiro_separa_saidas_e_coletas():

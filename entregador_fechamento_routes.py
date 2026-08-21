@@ -207,6 +207,7 @@ def _calcular_diarias_coleta_motoboy(
             ColetaExecucao.sub_base == sub_base,
             ColetaExecucaoParticipante.sub_base == sub_base,
             ColetaExecucaoParticipante.motoboy_id == motoboy_id,
+            ColetaExecucaoParticipante.status == "finalizado",
             ColetaExecucao.data_operacao >= periodo_inicio,
             ColetaExecucao.data_operacao <= periodo_fim,
         )

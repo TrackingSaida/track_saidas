@@ -7,10 +7,13 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from coleta_operacional_service import (
+    atualizar_status_execucao,
+    combinar_modo_execucao,
     exigir_modo,
     modo_coleta,
     obter_ou_criar_execucao,
@@ -161,6 +164,7 @@ class ParticipanteOut(BaseModel):
     g_ml: int
     g_avulso: int
     sem_volume: bool
+    status: str
     versao: int
     total: int
     pode_editar: bool
@@ -178,6 +182,27 @@ class ExecucaoOut(BaseModel):
     mercado_livre: int
     avulso: int
     participantes: list[ParticipanteOut]
+
+
+class IniciarColetaIn(BaseModel):
+    ajudar: bool = False
+    metodo: Literal["codigo", "coleta_manual"]
+
+
+def _participante_atual(execucao: ColetaExecucao, user_id: int) -> Optional[ColetaExecucaoParticipante]:
+    return next((item for item in execucao.participantes if item.user_id == user_id), None)
+
+
+def _participantes_resumo(execucao: ColetaExecucao) -> list[dict]:
+    return [
+        {
+            "user_id": item.user_id,
+            "username": item.username,
+            "status": getattr(item, "status", "finalizado"),
+            "total": _quantidade_total(item),
+        }
+        for item in execucao.participantes
+    ]
 
 
 def _serializar_execucao(execucao: ColetaExecucao, current_user: User, participantes) -> ExecucaoOut:
@@ -200,6 +225,7 @@ def _serializar_execucao(execucao: ColetaExecucao, current_user: User, participa
                 g_ml=p.g_ml,
                 g_avulso=p.g_avulso,
                 sem_volume=bool(p.sem_volume),
+                status=getattr(p, "status", "finalizado"),
                 versao=p.versao,
                 total=_quantidade_total(p),
                 pode_editar=(p.user_id == current_user.id and execucao.data_operacao == date.today()) or is_admin,
@@ -212,10 +238,10 @@ def _serializar_execucao(execucao: ColetaExecucao, current_user: User, participa
         data_operacao=execucao.data_operacao,
         modo=execucao.modo,
         status=execucao.status,
-        total=sum(item.total for item in itens),
-        shopee=sum(item.shopee for item in itens),
-        mercado_livre=sum(item.mercado_livre for item in itens),
-        avulso=sum(item.avulso for item in itens),
+        total=sum(_quantidade_total(p) for p in participantes),
+        shopee=sum(int(p.shopee or 0) for p in participantes),
+        mercado_livre=sum(int(p.mercado_livre or 0) for p in participantes),
+        avulso=sum(int(p.avulso or 0) for p in participantes),
         participantes=itens,
     )
 
@@ -264,6 +290,212 @@ def obter_configuracao(
     }
 
 
+@router.get("/situacao")
+def consultar_situacao_bases(
+    data_operacao: date = Query(default_factory=date.today),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base(current_user)
+    _exigir_coleta_habilitada(db, sub_base)
+    resolver_executor(db, current_user)
+    bases = db.scalars(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base,
+            BasePreco.ativo.is_(True),
+        ).order_by(BasePreco.base)
+    ).all()
+    execucoes = db.scalars(
+        select(ColetaExecucao).where(
+            ColetaExecucao.sub_base == sub_base,
+            ColetaExecucao.data_operacao == data_operacao,
+        )
+    ).all()
+    por_base = {item.base_id: item for item in execucoes}
+    itens = []
+    for base in bases:
+        execucao = por_base.get(base.id_base)
+        status = execucao.status if execucao else "pendente"
+        participantes = _participantes_resumo(execucao) if execucao else []
+        itens.append(
+            {
+                "base_id": base.id_base,
+                "base": base.base,
+                "endereco_completo": getattr(base, "endereco_completo", None),
+                "status": status,
+                "id_execucao": execucao.id_execucao if execucao else None,
+                "modo": execucao.modo if execucao else None,
+                "total": sum(item["total"] for item in participantes),
+                "shopee": sum(int(p.shopee or 0) for p in execucao.participantes) if execucao else 0,
+                "mercado_livre": sum(int(p.mercado_livre or 0) for p in execucao.participantes) if execucao else 0,
+                "avulso": sum(int(p.avulso or 0) for p in execucao.participantes) if execucao else 0,
+                "participantes": participantes,
+                "participando": any(
+                    p.user_id == current_user.id and getattr(p, "status", "finalizado") == "em_coleta"
+                    for p in execucao.participantes
+                ) if execucao else False,
+                "pode_ajudar": bool(execucao and execucao.status == "em_coleta" and not any(p.user_id == current_user.id for p in execucao.participantes)),
+                "atualizado_em": execucao.atualizado_em if execucao else None,
+            }
+        )
+    return {
+        "data_operacao": data_operacao,
+        "resumo": {
+            "pendentes": sum(item["status"] == "pendente" for item in itens),
+            "em_coleta": sum(item["status"] == "em_coleta" for item in itens),
+            "coletadas": sum(item["status"] in ("coletado", "sem_volume") for item in itens),
+        },
+        "itens": itens,
+    }
+
+
+@router.post("/bases/{base_id}/iniciar", response_model=ExecucaoOut)
+def iniciar_coleta(
+    base_id: int,
+    body: IniciarColetaIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base(current_user)
+    exigir_modo(db, sub_base, body.metodo)
+    base = resolver_base(db, sub_base, base_id=base_id)
+    executor, motoboy_id = resolver_executor(db, current_user)
+    execucao = db.scalar(
+        select(ColetaExecucao).where(
+            ColetaExecucao.sub_base == sub_base,
+            ColetaExecucao.base_id == base.id_base,
+            ColetaExecucao.data_operacao == date.today(),
+        ).with_for_update()
+    )
+    if not execucao:
+        execucao = ColetaExecucao(
+            sub_base=sub_base,
+            base_id=base.id_base,
+            data_operacao=date.today(),
+            modo=body.metodo,
+            status="em_coleta",
+        )
+        db.add(execucao)
+        try:
+            db.flush()
+        except IntegrityError:
+            # Duas pessoas podem tocar a mesma base quase simultaneamente.
+            # A unique key base/dia decide a execução canônica; a segunda requisição passa a colaborar nela.
+            db.rollback()
+            execucao = db.scalar(
+                select(ColetaExecucao).where(
+                    ColetaExecucao.sub_base == sub_base,
+                    ColetaExecucao.base_id == base_id,
+                    ColetaExecucao.data_operacao == date.today(),
+                ).with_for_update()
+            )
+            if not execucao:
+                raise HTTPException(409, "A situação desta base mudou. Atualize a lista e tente novamente.")
+    if execucao.status in ("coletado", "sem_volume"):
+        raise HTTPException(409, "Esta base já foi coletada hoje.")
+    execucao.modo = combinar_modo_execucao(execucao.modo, body.metodo)
+    participante = _participante_atual(execucao, executor.id)
+    outros_ativos = [p.username for p in execucao.participantes if p.user_id != executor.id and getattr(p, "status", "finalizado") == "em_coleta"]
+    if not participante and outros_ativos and not body.ajudar:
+        raise HTTPException(
+            409,
+            {
+                "mensagem": f"Esta base já está em coleta por {', '.join(outros_ativos)}.",
+                "participantes": outros_ativos,
+                "pode_ajudar": True,
+            },
+        )
+    if not participante:
+        participante = ColetaExecucaoParticipante(
+            execucao=execucao,
+            sub_base=sub_base,
+            user_id=executor.id,
+            motoboy_id=motoboy_id,
+            username=executor.username,
+            status="em_coleta",
+            atualizado_por_user_id=current_user.id,
+        )
+        db.add(participante)
+    elif getattr(participante, "status", "finalizado") != "em_coleta":
+        raise HTTPException(409, "Sua participação nesta coleta já foi finalizada.")
+    atualizar_status_execucao(execucao)
+    db.commit()
+    db.refresh(execucao)
+    return _serializar_execucao(execucao, current_user, execucao.participantes)
+
+
+@router.post("/execucoes/{id_execucao}/finalizar", response_model=ExecucaoOut)
+def finalizar_coleta(
+    id_execucao: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base(current_user)
+    execucao = db.scalar(
+        select(ColetaExecucao).where(
+            ColetaExecucao.id_execucao == id_execucao,
+            ColetaExecucao.sub_base == sub_base,
+        ).with_for_update()
+    )
+    if not execucao:
+        raise HTTPException(404, "Coleta não encontrada.")
+    participante = _participante_atual(execucao, current_user.id)
+    if not participante and not _admin(current_user):
+        raise HTTPException(403, "Você não participa desta coleta.")
+    if participante:
+        if _quantidade_total(participante) == 0 and not participante.sem_volume:
+            raise HTTPException(422, "Registre ao menos um pacote/quantidade ou informe coleta sem volume.")
+        participante.status = "finalizado"
+        participante.versao += 1
+        participante.atualizado_em = datetime.now()
+        participante.atualizado_por_user_id = current_user.id
+    elif _admin(current_user):
+        for item in execucao.participantes:
+            if _quantidade_total(item) == 0 and not item.sem_volume:
+                raise HTTPException(422, f"{item.username} ainda não informou volume.")
+            item.status = "finalizado"
+    atualizar_status_execucao(execucao)
+    db.commit()
+    db.refresh(execucao)
+    return _serializar_execucao(execucao, current_user, execucao.participantes)
+
+
+@router.delete("/execucoes/{id_execucao}/participacao", status_code=204)
+def liberar_participacao(
+    id_execucao: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base(current_user)
+    execucao = db.scalar(
+        select(ColetaExecucao).where(
+            ColetaExecucao.id_execucao == id_execucao,
+            ColetaExecucao.sub_base == sub_base,
+        ).with_for_update()
+    )
+    if not execucao:
+        raise HTTPException(404, "Coleta não encontrada.")
+    participante = _participante_atual(execucao, current_user.id)
+    if not participante:
+        raise HTTPException(404, "Participação não encontrada.")
+    if _quantidade_total(participante) or participante.sem_volume:
+        raise HTTPException(409, "Não é possível sair após registrar volumes. Finalize a coleta.")
+    db.delete(participante)
+    db.flush()
+    restantes = [item for item in execucao.participantes if item.id_participante != participante.id_participante]
+    if not restantes:
+        db.delete(execucao)
+    else:
+        if any(getattr(item, "status", "finalizado") == "em_coleta" for item in restantes):
+            execucao.status = "em_coleta"
+        elif all(bool(item.sem_volume) for item in restantes):
+            execucao.status = "sem_volume"
+        else:
+            execucao.status = "coletado"
+        execucao.atualizado_em = datetime.now()
+    db.commit()
+
+
 @router.post("/manual", response_model=ExecucaoOut, status_code=201)
 def lancar_manual(
     body: ContribuicaoManualIn,
@@ -306,28 +538,32 @@ def lancar_manual(
             ColetaExecucaoParticipante.user_id == executor.id,
         )
     )
-    if existente:
+    if existente and getattr(existente, "status", "finalizado") != "em_coleta":
         raise HTTPException(409, "Este usuário já lançou a coleta nesta base. Use Editar.")
-    participante = ColetaExecucaoParticipante(
+    participante = existente or ColetaExecucaoParticipante(
         execucao_id=execucao.id_execucao,
         sub_base=sub_base,
         user_id=executor.id,
         motoboy_id=motoboy_id,
         username=executor.username,
-        shopee=body.shopee,
-        mercado_livre=body.mercado_livre,
-        avulso=body.avulso,
-        pacotes_g=body.pacotes_g,
-        g_shopee=body.g_shopee,
-        g_ml=body.g_ml,
-        g_avulso=body.g_avulso,
-        sem_volume=body.sem_volume,
-        client_request_id=body.client_request_id,
         atualizado_por_user_id=current_user.id,
     )
-    db.add(participante)
+    participante.shopee = body.shopee
+    participante.mercado_livre = body.mercado_livre
+    participante.avulso = body.avulso
+    participante.pacotes_g = body.pacotes_g
+    participante.g_shopee = body.g_shopee
+    participante.g_ml = body.g_ml
+    participante.g_avulso = body.g_avulso
+    participante.sem_volume = body.sem_volume
+    participante.client_request_id = body.client_request_id
+    participante.status = "finalizado"
+    participante.atualizado_em = datetime.now()
+    participante.atualizado_por_user_id = current_user.id
+    if not existente:
+        db.add(participante)
     db.flush()
-    execucao.status = "sem_volume" if body.sem_volume else "coletado"
+    atualizar_status_execucao(execucao)
     _sincronizar_coleta_legada(db, participante, execucao)
     db.commit()
     db.refresh(execucao)
@@ -365,8 +601,8 @@ def editar_participante(
     participante.versao += 1
     participante.atualizado_em = datetime.now()
     participante.atualizado_por_user_id = current_user.id
-    execucao.status = "sem_volume" if all(p.sem_volume for p in execucao.participantes) else "coletado"
-    execucao.atualizado_em = datetime.now()
+    participante.status = "finalizado"
+    atualizar_status_execucao(execucao)
     _sincronizar_coleta_legada(db, participante, execucao)
     db.commit()
     db.refresh(execucao)
@@ -570,7 +806,7 @@ def consultar_pendencias(
                 }
             )
         cursor += timedelta(days=1)
-    pendentes = [item for item in itens if item["status"] == "PENDENTE"]
+    pendentes = [item for item in itens if item["status"] in ("PENDENTE", "EM_COLETA")]
     return {
         "pronto_para_fechamento": not pendentes,
         "total_pendentes": len(pendentes),

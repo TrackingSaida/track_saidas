@@ -20,6 +20,7 @@ from leitura_manual_auth import ensure_lancar_avulso_allowed
 from saidas_routes import _gerar_codigo_avulso, _normalizar_label_avulso
 from coleta_operacional_service import (
     agregar_leitura,
+    atualizar_status_execucao,
     exigir_modo,
     obter_ou_criar_execucao,
     resolver_base,
@@ -610,27 +611,39 @@ def criar_coleta_manual(
         data_operacao=payload.data,
         modo="coleta_manual",
     )
-    participante = ColetaExecucaoParticipante(
+    participante = db.scalar(
+        select(ColetaExecucaoParticipante).where(
+            ColetaExecucaoParticipante.execucao_id == execucao.id_execucao,
+            ColetaExecucaoParticipante.user_id == executor.id,
+        )
+    )
+    if participante and getattr(participante, "status", "finalizado") != "em_coleta":
+        raise HTTPException(409, "Este usuário já lançou a coleta nesta base.")
+    participante = participante or ColetaExecucaoParticipante(
         execucao_id=execucao.id_execucao,
         sub_base=sub_base,
         user_id=executor.id,
         motoboy_id=motoboy_id,
         username=executor.username,
-        shopee=payload.shopee,
-        mercado_livre=payload.mercado_livre,
-        avulso=payload.avulso,
-        pacotes_g=pacotes_g_val,
-        g_shopee=g_shopee_val,
-        g_ml=g_ml_val,
-        g_avulso=g_avulso_val,
-        sem_volume=(payload.shopee + payload.mercado_livre + payload.avulso == 0),
         atualizado_por_user_id=current_user.id,
     )
-    db.add(participante)
+    participante.shopee = payload.shopee
+    participante.mercado_livre = payload.mercado_livre
+    participante.avulso = payload.avulso
+    participante.pacotes_g = pacotes_g_val
+    participante.g_shopee = g_shopee_val
+    participante.g_ml = g_ml_val
+    participante.g_avulso = g_avulso_val
+    participante.sem_volume = payload.shopee + payload.mercado_livre + payload.avulso == 0
+    participante.status = "finalizado"
+    participante.atualizado_em = datetime.datetime.now()
+    participante.atualizado_por_user_id = current_user.id
+    if participante.id_participante is None:
+        db.add(participante)
     db.flush()
     coleta.execucao_id = execucao.id_execucao
     coleta.participante_id = participante.id_participante
-    execucao.status = "sem_volume" if participante.sem_volume else "coletado"
+    atualizar_status_execucao(execucao)
     db.commit()
     db.refresh(coleta)
 
@@ -698,9 +711,11 @@ def atualizar_coleta_manual(
         participante.sem_volume = (
             int(coleta.shopee or 0) + int(coleta.mercado_livre or 0) + int(coleta.avulso or 0) == 0
         )
+        participante.status = "finalizado"
         participante.versao += 1
         participante.atualizado_em = datetime.datetime.now()
         participante.atualizado_por_user_id = current_user.id
+        atualizar_status_execucao(participante.execucao)
 
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
     coleta.valor_total = (
