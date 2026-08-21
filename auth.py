@@ -832,6 +832,16 @@ async def read_users_me(
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
 
     nome_val, sobrenome_val = _nome_exibicao(current_user)
+    # tipo_owner vivo do Owner (não só do JWT) — sessão mobile longa pode ficar desatualizada
+    tipo_owner = getattr(current_user, "tipo_owner", None) or "subbase"
+    sub_base = (getattr(db_user, "sub_base", None) or getattr(current_user, "sub_base", None) or "").strip()
+    if sub_base:
+        owner = run_db_query_with_retry(
+            db,
+            lambda: db.scalar(select(Owner).where(Owner.sub_base == sub_base)),
+        )
+        if owner is not None:
+            tipo_owner = _tipo_owner_from_owner(owner)
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
@@ -843,7 +853,7 @@ async def read_users_me(
         sub_base=current_user.sub_base,
         ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
         modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
-        tipo_owner=getattr(current_user, "tipo_owner", None) or "subbase",
+        tipo_owner=tipo_owner,
         must_change_password=bool(getattr(db_user, "must_change_password", False)),
         entrada_obrigatoria_habilitada=bool(
             getattr(current_user, "entrada_obrigatoria_habilitada", False)
