@@ -259,6 +259,7 @@ class SellerDadosBase(BaseModel):
     cidade: Optional[str] = None
     estado: Optional[str] = None
     cep: Optional[str] = None
+    chave_pix: Optional[str] = None
     base_id: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -313,14 +314,16 @@ def upsert_seller_dados(
     seller = db.scalar(stmt)
 
     if not seller:
-        # criação exige CNPJ e endereço mínimo
         cnpj = (data.get("cnpj") or "").strip()
         rua = (data.get("rua") or "").strip()
         numero = (data.get("numero") or "").strip()
         bairro = (data.get("bairro") or "").strip()
         cidade = (data.get("cidade") or "").strip()
         cep = (data.get("cep") or "").strip()
-        if not all([cnpj, rua, numero, bairro, cidade, cep]):
+        chave_pix = (data.get("chave_pix") or "").strip() or None
+        tipo_owner = (getattr(owner, "tipo_owner", None) or "subbase").strip().lower()
+        # Owner tipo Base (Seller) exige CNPJ e endereço. Subbase: todos opcionais, inclusive PIX.
+        if tipo_owner == "base" and not all([cnpj, rua, numero, bairro, cidade, cep]):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Campos obrigatórios para criar seller: cnpj, rua, numero, bairro, cidade, cep.",
@@ -337,6 +340,7 @@ def upsert_seller_dados(
             cidade=cidade,
             estado=(data.get("estado") or "").strip() or None,
             cep=cep,
+            chave_pix=chave_pix,
         )
         db.add(seller)
 
@@ -360,6 +364,8 @@ def upsert_seller_dados(
             seller.estado = (data["estado"] or "").strip() or None
         if "cep" in data:
             seller.cep = (data["cep"] or "").strip() or seller.cep
+        if "chave_pix" in data:
+            seller.chave_pix = (data["chave_pix"] or "").strip() or None
 
     db.commit()
     db.refresh(seller)
