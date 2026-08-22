@@ -120,10 +120,13 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
         except Exception:
             cnpj_fmt = cnpj_raw
 
+    chave_pix = (getattr(seller, "chave_pix", None) or "").strip() or None
+
     info: Dict[str, Any] = {
         "nome_base": base_norm,
         "cnpj": cnpj_fmt,
         "endereco_completo": endereco_completo or None,
+        "chave_pix": chave_pix,
     }
     return info
 

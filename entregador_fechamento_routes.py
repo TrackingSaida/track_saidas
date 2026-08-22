@@ -148,6 +148,27 @@ def _get_motoboy_chave_pix(db: Session, motoboy_id: int) -> Optional[str]:
     return (getattr(motoboy, "chave_pix", None) or "").strip() or None
 
 
+def _resolver_avulso_valor(
+    db: Session,
+    sub_base: str,
+    *,
+    id_entregador: Optional[int] = None,
+    id_motoboy: Optional[int] = None,
+) -> Decimal:
+    """Preço unitário de avulso: exceção do motoboy/entregador ou global da sub_base."""
+    zero = Decimal("0.00")
+    if id_motoboy is not None:
+        precos = resolver_precos_motoboy(db, sub_base, id_motoboy)
+    elif id_entregador is not None:
+        precos = resolver_precos_entregador(db, id_entregador, sub_base)
+    else:
+        return zero
+    try:
+        return Decimal(str(precos.get("avulso_valor") or 0)).quantize(Decimal("0.01"))
+    except Exception:
+        return zero
+
+
 def _status_norm(fech: EntregadorFechamento) -> str:
     st = (fech.status or "").strip().upper()
     if st == "FECHADO":
@@ -298,6 +319,7 @@ class FechamentoOut(BaseModel):
     alerta_pos_pago: Optional[bool] = None
     tem_pdf: Optional[bool] = None
     codigo: Optional[str] = None
+    avulso_valor: Optional[Decimal] = None
 
 
 class FechamentoListaTotais(BaseModel):
@@ -492,6 +514,7 @@ def calcular_valor_base_preview(
             "g_total": g["total"],
             "conferencia_habilitada": conferencia_habilitada,
             "conferencia_por_dia": conferencia_por_dia,
+            "avulso_valor": _resolver_avulso_valor(db, sub_base, id_motoboy=motoboy_id),
         }
 
     ent = db.get(Entregador, entregador_id)
@@ -514,6 +537,7 @@ def calcular_valor_base_preview(
         "g_total": g["total"],
         "conferencia_habilitada": conferencia_habilitada,
         "conferencia_por_dia": [],
+        "avulso_valor": _resolver_avulso_valor(db, sub_base, id_entregador=entregador_id),
     }
 
 
@@ -871,7 +895,14 @@ def obter_fechamento(
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
 
-    return _fechamento_to_out(db, sub_base, fech)
+    out = _fechamento_to_out(db, sub_base, fech)
+    out.avulso_valor = _resolver_avulso_valor(
+        db,
+        sub_base,
+        id_entregador=out.id_entregador,
+        id_motoboy=out.id_motoboy,
+    )
+    return out
 
 
 # =========================================================

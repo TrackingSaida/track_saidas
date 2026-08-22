@@ -119,6 +119,7 @@ class BaseSellerDados(Base):
     cidade = Column(Text, nullable=False)
     estado = Column(Text, nullable=True)
     cep = Column(Text, nullable=False)
+    chave_pix = Column(Text, nullable=True)
 
     owner = relationship("Owner", backref="seller_dados")
     base = relationship("BasePreco", backref="seller_dados", uselist=False)
