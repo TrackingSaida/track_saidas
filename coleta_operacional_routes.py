@@ -31,6 +31,11 @@ from models import (
     EntregadorFechamento,
     User,
 )
+from coleta_leituras_service import (
+    listar_leituras,
+    remover_leitura,
+    resumo_base_dia,
+)
 
 router = APIRouter(prefix="/coletas/operacionais", tags=["Coletas operacionais"])
 ADMIN_ROLES = {0, 1, 2}
@@ -487,6 +492,77 @@ def consultar_situacao_bases(
         },
         "itens": itens,
     }
+
+@router.get("/bases/{base_id}/resumo")
+def consultar_resumo_base(
+    base_id: int,
+    data_operacao: date = Query(default_factory=date.today),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base(current_user)
+    _exigir_coleta_habilitada(db, sub_base)
+    resolver_executor(db, current_user)
+    return resumo_base_dia(
+        db,
+        sub_base=sub_base,
+        base_id=base_id,
+        data_operacao=data_operacao,
+    )
+
+
+@router.get("/leituras")
+def consultar_leituras_coleta(
+    base_id: int = Query(...),
+    data_operacao: date = Query(default_factory=date.today),
+    limit: int = Query(40, ge=1, le=100),
+    cursor: Optional[str] = Query(default=None),
+    somente_minhas: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base(current_user)
+    _exigir_coleta_habilitada(db, sub_base)
+    exigir_modo(db, sub_base, "codigo")
+    resolver_executor(db, current_user)
+    return listar_leituras(
+        db,
+        sub_base=sub_base,
+        current_user=current_user,
+        base_id=base_id,
+        data_operacao=data_operacao,
+        limit=limit,
+        cursor=cursor,
+        somente_minhas=somente_minhas,
+    )
+
+
+@router.delete("/leituras/{id_saida}")
+def deletar_leitura_coleta(
+    id_saida: int,
+    motivo: Optional[str] = Query(default=None, max_length=500),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base = _sub_base(current_user)
+    _exigir_coleta_habilitada(db, sub_base)
+    exigir_modo(db, sub_base, "codigo")
+    resolver_executor(db, current_user)
+    try:
+        return remover_leitura(
+            db,
+            sub_base=sub_base,
+            current_user=current_user,
+            id_saida=id_saida,
+            motivo=motivo,
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Falha ao remover leitura de coleta.")
+
 
 @router.post("/bases/{base_id}/iniciar", response_model=ExecucaoOut)
 def iniciar_coleta(
