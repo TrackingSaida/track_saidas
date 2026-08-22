@@ -299,7 +299,26 @@ class ColetaCalendarioExcecao(Base):
     criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
     atualizado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
-    base_ref = relationship("BasePreco")
+
+class ColetaLeituraRemocao(Base):
+    """Auditoria de remoção de leitura de coleta (saída apagada após o registro)."""
+
+    __tablename__ = "coleta_leitura_remocoes"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    base_id = Column(BigInteger, nullable=True)
+    base = Column(Text, nullable=False)
+    data_operacao = Column(Date, nullable=False)
+    id_saida = Column(BigInteger, nullable=False)
+    codigo = Column(Text, nullable=False)
+    servico = Column(Text, nullable=True)
+    operador_user_id = Column(BigInteger, nullable=True)
+    operador_username = Column(Text, nullable=True)
+    removido_por_user_id = Column(BigInteger, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    removido_por_username = Column(Text, nullable=False)
+    motivo = Column(Text, nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
 
 # ==========================

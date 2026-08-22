@@ -27,6 +27,7 @@ from coleta_operacional_service import (
     resolver_executor,
 )
 from models import ColetaExecucaoParticipante
+from coleta_leituras_service import obter_totais_por_nome_base
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -113,10 +114,18 @@ class SaidaCriadaLote(BaseModel):
     id_saida: int
 
 
+class TotaisColetaBase(BaseModel):
+    total: int = 0
+    shopee: int = 0
+    mercado_livre: int = 0
+    avulso: int = 0
+
+
 class LoteResponse(BaseModel):
     coleta: ColetaOut
     resumo: ResumoLote
     saidas_criadas: List[SaidaCriadaLote] = Field(default_factory=list)
+    totais: Optional[TotaisColetaBase] = None
 
 
 class ColetaAvulsoSaidaOut(BaseModel):
@@ -132,6 +141,7 @@ class ColetaLancarAvulsoOut(BaseModel):
     saidas: List[ColetaAvulsoSaidaOut]
     coleta: ColetaOut
     mensagem: str
+    totais: Optional[TotaisColetaBase] = None
 
 
 # ============================================================
@@ -441,6 +451,12 @@ def registrar_coleta_em_lote(
         db.rollback()
         raise HTTPException(500, f"Falha ao registrar lote: {e}")
 
+    totais = obter_totais_por_nome_base(
+        db,
+        sub_base=sub_base,
+        base_nome=payload.base,
+        data_operacao=date.today(),
+    )
     return LoteResponse(
         coleta=ColetaOut.model_validate(coleta),
         resumo=ResumoLote(
@@ -456,6 +472,7 @@ def registrar_coleta_em_lote(
             total=_fmt_money(coleta.valor_total),
         ),
         saidas_criadas=saidas_criadas,
+        totais=TotaisColetaBase(**totais),
     )
 
 
@@ -518,6 +535,7 @@ def lancar_avulso_coleta(
         saidas=saidas,
         coleta=lote.coleta,
         mensagem=mensagem,
+        totais=lote.totais,
     )
 
 
