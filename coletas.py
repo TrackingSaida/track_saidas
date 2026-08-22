@@ -763,10 +763,10 @@ def list_coletas(
         stmt = stmt.where(Coleta.timestamp <= dt_end)
 
     stmt = stmt.where(
-        (Coleta.shopee > 0) |
-        (Coleta.mercado_livre > 0) |
-        (Coleta.avulso > 0) |
-        (Coleta.valor_total > 0)
+        (Coleta.shopee != 0) |
+        (Coleta.mercado_livre != 0) |
+        (Coleta.avulso != 0) |
+        (Coleta.valor_total != 0)
     )
 
     stmt = stmt.order_by(Coleta.timestamp.desc())

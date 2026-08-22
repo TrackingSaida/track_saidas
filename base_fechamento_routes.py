@@ -291,14 +291,17 @@ def _build_itens_e_valores(
     dt_start = datetime.combine(periodo_inicio, dt_time.min)
     dt_end = datetime.combine(periodo_fim, dt_time(23, 59, 59))
 
-    # Coletas: agrupar por (data, base)
+    # Coletas: agrupar por (data, base). Inclui ajustes (origem=ajuste) com delta negativo.
     stmt_coletas = select(Coleta).where(
         Coleta.sub_base == sub_base,
         func.upper(Coleta.base) == base_key,
         Coleta.timestamp >= dt_start,
         Coleta.timestamp <= dt_end,
     ).where(
-        (Coleta.shopee > 0) | (Coleta.mercado_livre > 0) | (Coleta.avulso > 0) | (Coleta.valor_total > 0)
+        (Coleta.shopee != 0)
+        | (Coleta.mercado_livre != 0)
+        | (Coleta.avulso != 0)
+        | (Coleta.valor_total != 0)
     )
     rows_coletas = db.scalars(stmt_coletas).all()
 

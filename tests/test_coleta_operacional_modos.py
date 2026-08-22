@@ -78,3 +78,22 @@ def test_baixa_a_receber_exige_admin_ou_root():
     with pytest.raises(HTTPException) as exc:
         _exigir_admin_financeiro(SimpleNamespace(role=4))
     assert exc.value.status_code == 403
+
+
+def test_root_admin_permite_somente_roles_0_e_1():
+    from coleta_operacional_routes import _root_admin
+
+    assert _root_admin(SimpleNamespace(role=0)) is True
+    assert _root_admin(SimpleNamespace(role=1)) is True
+    assert _root_admin(SimpleNamespace(role=2)) is False
+    assert _root_admin(SimpleNamespace(role=3)) is False
+    assert _root_admin(SimpleNamespace(role=4)) is False
+
+
+def test_valor_servicos_calcula_por_preco_da_base():
+    from decimal import Decimal
+
+    from coleta_operacional_routes import _valor_servicos
+
+    base = SimpleNamespace(shopee=Decimal("2.50"), ml=Decimal("3.00"), avulso=Decimal("1.00"))
+    assert _valor_servicos(base, shopee=2, mercado_livre=4, avulso=1) == Decimal("16.00")

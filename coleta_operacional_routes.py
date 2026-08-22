@@ -34,6 +34,8 @@ from models import (
 
 router = APIRouter(prefix="/coletas/operacionais", tags=["Coletas operacionais"])
 ADMIN_ROLES = {0, 1, 2}
+# Correção financeira de quantidade: somente root/admin.
+ROOT_ADMIN_ROLES = {0, 1}
 TIPOS_EXCECAO = {"FERIADO", "SEM_COLETA", "COLETA_EXTRA", "JUSTIFICADO"}
 
 
@@ -50,6 +52,28 @@ def _admin(current_user: User) -> bool:
     except (TypeError, ValueError):
         return False
 
+
+def _root_admin(current_user: User) -> bool:
+    try:
+        return int(current_user.role) in ROOT_ADMIN_ROLES
+    except (TypeError, ValueError):
+        return False
+
+
+def _valor_servicos(base: BasePreco, shopee: int, mercado_livre: int, avulso: int) -> Decimal:
+    return (
+        Decimal(shopee) * Decimal(base.shopee or 0)
+        + Decimal(mercado_livre) * Decimal(base.ml or 0)
+        + Decimal(avulso) * Decimal(base.avulso or 0)
+    ).quantize(Decimal("0.01"))
+
+
+def _precos_base(base: BasePreco) -> dict:
+    return {
+        "shopee": str(Decimal(base.shopee or 0).quantize(Decimal("0.01"))),
+        "mercado_livre": str(Decimal(base.ml or 0).quantize(Decimal("0.01"))),
+        "avulso": str(Decimal(base.avulso or 0).quantize(Decimal("0.01"))),
+    }
 
 def _exigir_coleta_habilitada(db: Session, sub_base: str) -> str:
     modo = modo_coleta(db, sub_base)
@@ -151,6 +175,33 @@ class ContribuicaoManualUpdate(BaseModel):
         return self
 
 
+class CorrigirQuantidadesIn(BaseModel):
+    """Quantidades absolutas por serviço (admin/root). Mínimo 0."""
+
+    shopee: int = Field(ge=0)
+    mercado_livre: int = Field(ge=0)
+    avulso: int = Field(ge=0)
+    versao: int = Field(ge=1)
+    origem_cliente: Literal["web", "mobile"] = "web"
+
+
+class CorrigirQuantidadesOut(BaseModel):
+    id_participante: int
+    base: str
+    data_operacao: date
+    modo: str
+    tipo_ajuste: Literal["manual", "leitura"]
+    shopee: int
+    mercado_livre: int
+    avulso: int
+    delta_shopee: int
+    delta_mercado_livre: int
+    delta_avulso: int
+    valor_anterior: str
+    valor_novo: str
+    versao: int
+
+
 class ParticipanteOut(BaseModel):
     id_participante: int
     user_id: int
@@ -193,20 +244,56 @@ def _participante_atual(execucao: ColetaExecucao, user_id: int) -> Optional[Cole
     return next((item for item in execucao.participantes if item.user_id == user_id), None)
 
 
-def _participantes_resumo(execucao: ColetaExecucao) -> list[dict]:
-    return [
-        {
-            "user_id": item.user_id,
-            "username": item.username,
-            "status": getattr(item, "status", "finalizado"),
-            "total": _quantidade_total(item),
-        }
-        for item in execucao.participantes
-    ]
+def _participantes_resumo(
+    execucao: ColetaExecucao,
+    current_user: User,
+    base: BasePreco,
+) -> list[dict]:
+    is_root = _root_admin(current_user)
+    status_ok = execucao.status in ("coletado", "em_coleta", "sem_volume")
+    modo = execucao.modo or ""
+    # Fase 1: manual/ambos. Fase 2: também leitura (codigo).
+    modo_permite_correcao = modo in ("coleta_manual", "ambos", "codigo")
+    itens = []
+    for item in execucao.participantes:
+        shopee = int(item.shopee or 0)
+        mercado_livre = int(item.mercado_livre or 0)
+        avulso = int(item.avulso or 0)
+        valor = _valor_servicos(base, shopee, mercado_livre, avulso)
+        tem_volume = shopee + mercado_livre + avulso > 0 or bool(item.sem_volume)
+        pode_corrigir = bool(
+            is_root
+            and status_ok
+            and modo_permite_correcao
+            and tem_volume
+        )
+        itens.append(
+            {
+                "id_participante": item.id_participante,
+                "user_id": item.user_id,
+                "username": item.username,
+                "status": getattr(item, "status", "finalizado"),
+                "total": _quantidade_total(item),
+                "shopee": shopee,
+                "mercado_livre": mercado_livre,
+                "avulso": avulso,
+                "versao": int(item.versao or 1),
+                "sem_volume": bool(item.sem_volume),
+                "valor_total": str(valor),
+                "pode_editar": (
+                    (item.user_id == current_user.id and execucao.data_operacao == date.today())
+                    or is_root
+                )
+                and modo in ("coleta_manual", "ambos"),
+                "pode_corrigir": pode_corrigir,
+            }
+        )
+    return itens
 
 
 def _serializar_execucao(execucao: ColetaExecucao, current_user: User, participantes) -> ExecucaoOut:
     is_admin = _admin(current_user)
+    is_root = _root_admin(current_user)
     itens = []
     for p in participantes:
         if not is_admin and p.user_id != current_user.id:
@@ -228,7 +315,8 @@ def _serializar_execucao(execucao: ColetaExecucao, current_user: User, participa
                 status=getattr(p, "status", "finalizado"),
                 versao=p.versao,
                 total=_quantidade_total(p),
-                pode_editar=(p.user_id == current_user.id and execucao.data_operacao == date.today()) or is_admin,
+                pode_editar=(p.user_id == current_user.id and execucao.data_operacao == date.today())
+                or is_root,
             )
         )
     return ExecucaoOut(
@@ -248,11 +336,7 @@ def _serializar_execucao(execucao: ColetaExecucao, current_user: User, participa
 
 def _sincronizar_coleta_legada(db: Session, participante: ColetaExecucaoParticipante, execucao: ColetaExecucao) -> None:
     base = execucao.base_ref
-    valor = (
-        Decimal(participante.shopee) * Decimal(base.shopee or 0)
-        + Decimal(participante.mercado_livre) * Decimal(base.ml or 0)
-        + Decimal(participante.avulso) * Decimal(base.avulso or 0)
-    ).quantize(Decimal("0.01"))
+    valor = _valor_servicos(base, participante.shopee, participante.mercado_livre, participante.avulso)
     coleta = db.scalar(select(Coleta).where(Coleta.participante_id == participante.id_participante))
     if not coleta:
         coleta = Coleta(
@@ -274,6 +358,40 @@ def _sincronizar_coleta_legada(db: Session, participante: ColetaExecucaoParticip
     coleta.g_avulso = participante.g_avulso
     coleta.valor_total = valor
 
+
+def _criar_coleta_ajuste(
+    db: Session,
+    *,
+    participante: ColetaExecucaoParticipante,
+    execucao: ColetaExecucao,
+    delta_shopee: int,
+    delta_ml: int,
+    delta_avulso: int,
+) -> None:
+    """Ajuste financeiro na leitura: não cria/apaga Saída; só lança delta na Coleta."""
+    if delta_shopee == 0 and delta_ml == 0 and delta_avulso == 0:
+        return
+    base = execucao.base_ref
+    valor = _valor_servicos(base, delta_shopee, delta_ml, delta_avulso)
+    db.add(
+        Coleta(
+            sub_base=participante.sub_base,
+            base=base.base,
+            username_entregador=participante.username,
+            origem="ajuste",
+            timestamp=datetime.now(),
+            execucao_id=execucao.id_execucao,
+            participante_id=participante.id_participante,
+            shopee=delta_shopee,
+            mercado_livre=delta_ml,
+            avulso=delta_avulso,
+            pacotes_g=0,
+            g_shopee=0,
+            g_ml=0,
+            g_avulso=0,
+            valor_total=valor,
+        )
+    )
 
 @router.get("/config")
 def obter_configuracao(
@@ -312,11 +430,25 @@ def consultar_situacao_bases(
         )
     ).all()
     por_base = {item.base_id: item for item in execucoes}
+    is_root = _root_admin(current_user)
     itens = []
     for base in bases:
         execucao = por_base.get(base.id_base)
         status = execucao.status if execucao else "pendente"
-        participantes = _participantes_resumo(execucao) if execucao else []
+        participantes = _participantes_resumo(execucao, current_user, base) if execucao else []
+        shopee = sum(int(p.shopee or 0) for p in execucao.participantes) if execucao else 0
+        mercado_livre = sum(int(p.mercado_livre or 0) for p in execucao.participantes) if execucao else 0
+        avulso = sum(int(p.avulso or 0) for p in execucao.participantes) if execucao else 0
+        valor_total = _valor_servicos(base, shopee, mercado_livre, avulso)
+        modo = execucao.modo if execucao else None
+        status_ok = status in ("coletado", "em_coleta", "sem_volume")
+        pode_corrigir = bool(
+            is_root
+            and execucao
+            and status_ok
+            and modo in ("coleta_manual", "ambos", "codigo")
+            and any(p.get("pode_corrigir") for p in participantes)
+        )
         itens.append(
             {
                 "base_id": base.id_base,
@@ -324,22 +456,30 @@ def consultar_situacao_bases(
                 "endereco_completo": getattr(base, "endereco_completo", None),
                 "status": status,
                 "id_execucao": execucao.id_execucao if execucao else None,
-                "modo": execucao.modo if execucao else None,
+                "modo": modo,
                 "total": sum(item["total"] for item in participantes),
-                "shopee": sum(int(p.shopee or 0) for p in execucao.participantes) if execucao else 0,
-                "mercado_livre": sum(int(p.mercado_livre or 0) for p in execucao.participantes) if execucao else 0,
-                "avulso": sum(int(p.avulso or 0) for p in execucao.participantes) if execucao else 0,
+                "shopee": shopee,
+                "mercado_livre": mercado_livre,
+                "avulso": avulso,
+                "valor_total": str(valor_total),
+                "precos": _precos_base(base),
                 "participantes": participantes,
                 "participando": any(
                     p.user_id == current_user.id and getattr(p, "status", "finalizado") == "em_coleta"
                     for p in execucao.participantes
                 ) if execucao else False,
-                "pode_ajudar": bool(execucao and execucao.status == "em_coleta" and not any(p.user_id == current_user.id for p in execucao.participantes)),
+                "pode_ajudar": bool(
+                    execucao
+                    and execucao.status == "em_coleta"
+                    and not any(p.user_id == current_user.id for p in execucao.participantes)
+                ),
+                "pode_corrigir": pode_corrigir,
                 "atualizado_em": execucao.atualizado_em if execucao else None,
             }
         )
     return {
         "data_operacao": data_operacao,
+        "pode_corrigir_quantidades": is_root,
         "resumo": {
             "pendentes": sum(item["status"] == "pendente" for item in itens),
             "em_coleta": sum(item["status"] == "em_coleta" for item in itens),
@@ -347,7 +487,6 @@ def consultar_situacao_bases(
         },
         "itens": itens,
     }
-
 
 @router.post("/bases/{base_id}/iniciar", response_model=ExecucaoOut)
 def iniciar_coleta(
@@ -583,7 +722,8 @@ def editar_participante(
     if not participante or participante.sub_base != sub_base:
         raise HTTPException(404, "Lançamento não encontrado.")
     execucao = participante.execucao
-    if participante.user_id != current_user.id and not _admin(current_user):
+    # Edição de lançamento próprio: usuário do dia. Edição de outro: só root/admin.
+    if participante.user_id != current_user.id and not _root_admin(current_user):
         raise HTTPException(403, "Você só pode editar seu próprio lançamento.")
     _validar_data_edicao(current_user, execucao.data_operacao, body.origem_cliente)
     if participante.versao != body.versao:
@@ -608,6 +748,118 @@ def editar_participante(
     db.refresh(execucao)
     return _serializar_execucao(execucao, current_user, execucao.participantes)
 
+
+@router.post("/participantes/{id_participante}/corrigir", response_model=CorrigirQuantidadesOut)
+def corrigir_quantidades_participante(
+    id_participante: int,
+    body: CorrigirQuantidadesIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Correção de quantidade absoluta por serviço (Flex/Shopee/Avulso).
+    - Manual: sincroniza Coleta ligada ao participante.
+    - Leitura: lança Coleta origem=ajuste com o delta (sem criar/apagar Saída).
+    Somente root/admin (roles 0 e 1).
+    """
+    if not _root_admin(current_user):
+        raise HTTPException(403, "Somente administrador ou root pode corrigir quantidades.")
+    sub_base = _sub_base(current_user)
+    _exigir_coleta_habilitada(db, sub_base)
+    participante = db.get(ColetaExecucaoParticipante, id_participante)
+    if not participante or participante.sub_base != sub_base:
+        raise HTTPException(404, "Lançamento não encontrado.")
+    execucao = participante.execucao
+    if not execucao:
+        raise HTTPException(404, "Execução não encontrada.")
+    if execucao.status not in ("coletado", "em_coleta", "sem_volume"):
+        raise HTTPException(409, "Só é possível corrigir bases em coleta ou já coletadas.")
+    if execucao.modo not in ("coleta_manual", "ambos", "codigo"):
+        raise HTTPException(409, "Modo de coleta não permite correção.")
+    _validar_data_edicao(current_user, execucao.data_operacao, body.origem_cliente)
+    if participante.versao != body.versao:
+        raise HTTPException(409, "O lançamento foi atualizado em outro dispositivo. Recarregue os dados.")
+    _garantir_nao_fechado(
+        db,
+        sub_base=sub_base,
+        base_nome=execucao.base_ref.base,
+        data_operacao=execucao.data_operacao,
+        motoboy_id=participante.motoboy_id,
+    )
+
+    ant_shopee = int(participante.shopee or 0)
+    ant_ml = int(participante.mercado_livre or 0)
+    ant_avulso = int(participante.avulso or 0)
+    if ant_shopee + ant_ml + ant_avulso == 0 and not participante.sem_volume:
+        raise HTTPException(409, "Não há quantidade para corrigir. Registre a coleta primeiro.")
+
+    delta_shopee = body.shopee - ant_shopee
+    delta_ml = body.mercado_livre - ant_ml
+    delta_avulso = body.avulso - ant_avulso
+    if delta_shopee == 0 and delta_ml == 0 and delta_avulso == 0:
+        raise HTTPException(422, "Nenhuma quantidade foi alterada.")
+
+    base = execucao.base_ref
+    valor_anterior = _valor_servicos(base, ant_shopee, ant_ml, ant_avulso)
+    valor_novo = _valor_servicos(base, body.shopee, body.mercado_livre, body.avulso)
+
+    # Leitura pura ou ambos com origem de códigos: ajuste financeiro separado.
+    # Manual puro: sincroniza a Coleta legado do participante.
+    coletas_ligadas = db.scalars(
+        select(Coleta).where(Coleta.participante_id == participante.id_participante)
+    ).all()
+    tem_leitura = any((c.origem or "") in ("codigo", "leitura", "lote") for c in coletas_ligadas)
+    # Manual puro: sincroniza a Coleta do participante.
+    # Leitura (ou mistura com leitura): lança ajuste financeiro sem criar/apagar Saída.
+    if execucao.modo == "coleta_manual":
+        usar_ajuste_leitura = False
+    elif execucao.modo == "codigo":
+        usar_ajuste_leitura = True
+    else:
+        # ambos: se houver leitura vinculada, não sobrescreve lotes
+        usar_ajuste_leitura = tem_leitura
+
+    participante.shopee = body.shopee
+    participante.mercado_livre = body.mercado_livre
+    participante.avulso = body.avulso
+    participante.sem_volume = body.shopee + body.mercado_livre + body.avulso == 0
+    participante.versao += 1
+    participante.atualizado_em = datetime.now()
+    participante.atualizado_por_user_id = current_user.id
+    participante.status = "finalizado"
+    atualizar_status_execucao(execucao)
+
+    if usar_ajuste_leitura:
+        _criar_coleta_ajuste(
+            db,
+            participante=participante,
+            execucao=execucao,
+            delta_shopee=delta_shopee,
+            delta_ml=delta_ml,
+            delta_avulso=delta_avulso,
+        )
+        tipo_ajuste: Literal["manual", "leitura"] = "leitura"
+    else:
+        _sincronizar_coleta_legada(db, participante, execucao)
+        tipo_ajuste = "manual"
+
+    db.commit()
+    return CorrigirQuantidadesOut(
+        id_participante=participante.id_participante,
+        base=base.base,
+        data_operacao=execucao.data_operacao,
+        modo=execucao.modo,
+        tipo_ajuste=tipo_ajuste,
+        shopee=participante.shopee,
+        mercado_livre=participante.mercado_livre,
+        avulso=participante.avulso,
+        delta_shopee=delta_shopee,
+        delta_mercado_livre=delta_ml,
+        delta_avulso=delta_avulso,
+        valor_anterior=str(valor_anterior),
+        valor_novo=str(valor_novo),
+        versao=participante.versao,
+    )
 
 @router.get("/", response_model=list[ExecucaoOut])
 def listar_execucoes(
