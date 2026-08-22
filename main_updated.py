@@ -129,6 +129,7 @@ from saidas_routes import router as saidas_router, pedidos_router
 from owner_routes import router as owners_router
 from base import router as base_router
 from coletas import router as coletas_router
+from coleta_operacional_routes import router as coleta_operacional_router
 from base_fechamento_routes import router as base_fechamento_router
 from routes_ui import router as ui_router
 from ml_int_routes import router as ml_int_router
@@ -156,6 +157,7 @@ app.include_router(contabilidade_router, prefix=API_PREFIX)
 app.include_router(dashboard_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
 app.include_router(coletas_router, prefix=API_PREFIX)
+app.include_router(coleta_operacional_router, prefix=API_PREFIX)
 app.include_router(base_fechamento_router, prefix=f"{API_PREFIX}/coletas")
 app.include_router(users_router,        prefix=API_PREFIX)
 # Fechamentos ANTES de entregadores: evita que GET /entregadores/{id_entregador}
@@ -459,6 +461,26 @@ def internal_notificar_atraso_d1(request: Request):
     try:
         return {"status": "ok", **notificar_atraso_d1(db)}
     except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
+
+@app.post(f"{API_PREFIX}/internal/notificar-coletas-pendentes", tags=["Internal"])
+def internal_notificar_coletas_pendentes(request: Request):
+    """Executar de hora em hora; envia somente entre 19h e 23h (horário de São Paulo)."""
+    secret = os.getenv("CRON_PUSH_SECRET") or os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_PUSH_SECRET não configurado"})
+    if request.headers.get("X-Cron-Secret") != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    from coleta_alerta_service import notificar_coletas_pendentes
+
+    db = SessionLocal()
+    try:
+        return {"status": "ok", **notificar_coletas_pendentes(db)}
+    except Exception as e:
+        db.rollback()
         return JSONResponse(status_code=500, content={"detail": str(e)})
     finally:
         db.close()

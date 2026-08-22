@@ -369,9 +369,14 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
 
 def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -> Dict[str, Any]:
     """Claims para JWT de motoboy (role=4)."""
-    pode_ler_coleta = motoboy.pode_ler_coleta
+    pode_realizar_coleta = bool(
+        getattr(motoboy, "pode_realizar_coleta", motoboy.pode_ler_coleta)
+    )
+    modo = (getattr(owner, "modo_operacao", None) or "codigo").strip().lower()
+    pode_ler_coleta = pode_realizar_coleta and modo in ("codigo", "ambos")
     if owner.ignorar_coleta:
         pode_ler_coleta = False
+        pode_realizar_coleta = False
     return {
         "sub": _subject(user),
         "uid": user.id,
@@ -382,6 +387,7 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "motoboy_id": motoboy.id_motoboy,
         "sub_base": sub_base,
         "pode_ler_coleta": bool(pode_ler_coleta),
+        "pode_realizar_coleta": bool(pode_realizar_coleta),
         "pode_ler_saida": bool(motoboy.pode_ler_saida),
         "pode_digitar_codigo_manual": bool(getattr(motoboy, "pode_digitar_codigo_manual", True)),
         "pode_lancar_avulso": bool(getattr(motoboy, "pode_lancar_avulso", True)),
@@ -432,6 +438,7 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     if u.tipo_owner not in ("base", "subbase"):
         u.tipo_owner = "subbase"
     u.pode_ler_coleta = bool(payload.get("pode_ler_coleta", False))
+    u.pode_realizar_coleta = bool(payload.get("pode_realizar_coleta", u.pode_ler_coleta))
     u.devolucao_sub_base_habilitada = bool(payload.get("devolucao_sub_base_habilitada", False))
     u.entrada_obrigatoria_habilitada = bool(payload.get("entrada_obrigatoria_habilitada", False))
     u.conferencia_saida_habilitada = bool(payload.get("conferencia_saida_habilitada", False))

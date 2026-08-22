@@ -18,6 +18,15 @@ from models import Coleta, Entregador, BasePreco, User, Saida, Owner, BaseFecham
 from models import OwnerCobrancaItem, SaidaHistorico
 from leitura_manual_auth import ensure_lancar_avulso_allowed
 from saidas_routes import _gerar_codigo_avulso, _normalizar_label_avulso
+from coleta_operacional_service import (
+    agregar_leitura,
+    atualizar_status_execucao,
+    exigir_modo,
+    obter_ou_criar_execucao,
+    resolver_base,
+    resolver_executor,
+)
+from models import ColetaExecucaoParticipante
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -60,23 +69,23 @@ class ResumoLote(BaseModel):
 class ColetaManualCreate(BaseModel):
     data: date
     base: str = Field(min_length=1)
-    shopee: int = 0
-    mercado_livre: int = 0
-    avulso: int = 0
-    pacotes_g: int = 0
-    g_shopee: int = 0
-    g_ml: int = 0
-    g_avulso: int = 0
+    shopee: int = Field(default=0, ge=0)
+    mercado_livre: int = Field(default=0, ge=0)
+    avulso: int = Field(default=0, ge=0)
+    pacotes_g: int = Field(default=0, ge=0)
+    g_shopee: int = Field(default=0, ge=0)
+    g_ml: int = Field(default=0, ge=0)
+    g_avulso: int = Field(default=0, ge=0)
 
 
 class ColetaManualUpdate(BaseModel):
-    shopee: Optional[int] = None
-    mercado_livre: Optional[int] = None
-    avulso: Optional[int] = None
-    pacotes_g: Optional[int] = None
-    g_shopee: Optional[int] = None
-    g_ml: Optional[int] = None
-    g_avulso: Optional[int] = None
+    shopee: Optional[int] = Field(default=None, ge=0)
+    mercado_livre: Optional[int] = Field(default=None, ge=0)
+    avulso: Optional[int] = Field(default=None, ge=0)
+    pacotes_g: Optional[int] = Field(default=None, ge=0)
+    g_shopee: Optional[int] = Field(default=None, ge=0)
+    g_ml: Optional[int] = Field(default=None, ge=0)
+    g_avulso: Optional[int] = Field(default=None, ge=0)
 
 
 class ColetaOut(BaseModel):
@@ -294,6 +303,7 @@ def registrar_coleta_em_lote(
 ):
     # 1) Resolve sub_base + entregador: prioriza payload.entregador_id, senão JWT
     sub_base = _sub_base_from_token_or_422(current_user)
+    exigir_modo(db, sub_base, "codigo")
     if payload.entregador_id is not None:
         ent = db.get(Entregador, payload.entregador_id)
         if not ent or ent.sub_base != sub_base:
@@ -414,6 +424,13 @@ def registrar_coleta_em_lote(
             count["avulso"] * p_avulso
         ).quantize(Decimal("0.01"))
 
+        agregar_leitura(
+            db,
+            current_user=current_user,
+            coleta=coleta,
+            base_nome=payload.base,
+        )
+
         db.commit()
         db.refresh(coleta)
 
@@ -505,22 +522,12 @@ def lancar_avulso_coleta(
 
 
 # ============================================================
-# POST /coletas/manual — Coleta Manual (quando modo_operacao == "coleta_manual" OU ignorar_coleta == False)
+# POST /coletas/manual — endpoint legado; respeita manual/ambos e a chave ignorar_coleta
 # ============================================================
 
 def _require_coleta_manual_permitida(db: Session, sub_base: str) -> None:
-    """Permite coleta manual quando ignorar_coleta=False (coleta ativa) ou modo_operacao=coleta_manual. Levanta 403 caso contrário."""
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    if not owner:
-        raise HTTPException(403, "Owner não encontrado para esta sub_base.")
-    modo = getattr(owner, "modo_operacao", None) or "codigo"
-    ignorar_coleta = bool(getattr(owner, "ignorar_coleta", True))
-    # Permitir quando: coleta ativa (ignorar_coleta=False) OU modo explícito coleta_manual
-    if ignorar_coleta and modo != "coleta_manual":
-        raise HTTPException(
-            403,
-            "Coleta manual disponível apenas quando 'Ignorar Coleta' está desativado (coleta ativa) ou o modo de operação do owner é 'Coleta Manual'. Verifique as configurações do owner.",
-        )
+    """Mantém o endpoint legado, mas respeita a exclusividade configurada pelo owner."""
+    exigir_modo(db, sub_base, "coleta_manual")
 
 
 @router.post("/manual", response_model=ColetaOut, status_code=201)
@@ -531,6 +538,10 @@ def criar_coleta_manual(
 ):
     sub_base = _sub_base_from_token_or_422(current_user)
     _require_coleta_manual_permitida(db, sub_base)
+    role_raw = getattr(current_user, "role", -1)
+    role = int(role_raw) if role_raw is not None else -1
+    if role not in (0, 1, 2) and payload.data != date.today():
+        raise HTTPException(403, "O usuário pode lançar coleta somente no dia atual.")
 
     base_norm = payload.base.strip()
     # Impedir duplicata: um único lançamento manual por (data, base) na mesma sub_base
@@ -582,6 +593,57 @@ def criar_coleta_manual(
         g_avulso=g_avulso_val,
     )
     db.add(coleta)
+    db.flush()
+    base_ref = resolver_base(db, sub_base, nome=base_norm)
+    executor, motoboy_id = resolver_executor(db, current_user)
+    from coleta_operacional_routes import _garantir_nao_fechado
+    _garantir_nao_fechado(
+        db,
+        sub_base=sub_base,
+        base_nome=base_norm,
+        data_operacao=payload.data,
+        motoboy_id=motoboy_id,
+    )
+    execucao = obter_ou_criar_execucao(
+        db,
+        sub_base=sub_base,
+        base=base_ref,
+        data_operacao=payload.data,
+        modo="coleta_manual",
+    )
+    participante = db.scalar(
+        select(ColetaExecucaoParticipante).where(
+            ColetaExecucaoParticipante.execucao_id == execucao.id_execucao,
+            ColetaExecucaoParticipante.user_id == executor.id,
+        )
+    )
+    if participante and getattr(participante, "status", "finalizado") != "em_coleta":
+        raise HTTPException(409, "Este usuário já lançou a coleta nesta base.")
+    participante = participante or ColetaExecucaoParticipante(
+        execucao_id=execucao.id_execucao,
+        sub_base=sub_base,
+        user_id=executor.id,
+        motoboy_id=motoboy_id,
+        username=executor.username,
+        atualizado_por_user_id=current_user.id,
+    )
+    participante.shopee = payload.shopee
+    participante.mercado_livre = payload.mercado_livre
+    participante.avulso = payload.avulso
+    participante.pacotes_g = pacotes_g_val
+    participante.g_shopee = g_shopee_val
+    participante.g_ml = g_ml_val
+    participante.g_avulso = g_avulso_val
+    participante.sem_volume = payload.shopee + payload.mercado_livre + payload.avulso == 0
+    participante.status = "finalizado"
+    participante.atualizado_em = datetime.datetime.now()
+    participante.atualizado_por_user_id = current_user.id
+    if participante.id_participante is None:
+        db.add(participante)
+    db.flush()
+    coleta.execucao_id = execucao.id_execucao
+    coleta.participante_id = participante.id_participante
+    atualizar_status_execucao(execucao)
     db.commit()
     db.refresh(coleta)
 
@@ -610,6 +672,23 @@ def atualizar_coleta_manual(
     if origem != "manual":
         raise HTTPException(403, "Só é possível editar coletas com origem 'manual'.")
 
+    role_raw = getattr(current_user, "role", -1)
+    role = int(role_raw) if role_raw is not None else -1
+    participante_atual = db.get(ColetaExecucaoParticipante, coleta.participante_id) if coleta.participante_id else None
+    if role not in (0, 1, 2):
+        if not participante_atual or participante_atual.user_id != current_user.id:
+            raise HTTPException(403, "Você só pode editar seu próprio lançamento.")
+        if coleta.timestamp.date() != date.today():
+            raise HTTPException(403, "O usuário pode editar somente a coleta do dia atual.")
+    from coleta_operacional_routes import _garantir_nao_fechado
+    _garantir_nao_fechado(
+        db,
+        sub_base=sub_base,
+        base_nome=coleta.base,
+        data_operacao=coleta.timestamp.date(),
+        motoboy_id=participante_atual.motoboy_id if participante_atual else None,
+    )
+
     if payload.shopee is not None:
         coleta.shopee = payload.shopee
     if payload.mercado_livre is not None:
@@ -624,6 +703,19 @@ def atualizar_coleta_manual(
         coleta.g_ml = payload.g_ml
     if payload.g_avulso is not None:
         coleta.g_avulso = payload.g_avulso
+
+    participante = participante_atual
+    if participante:
+        for campo in ("shopee", "mercado_livre", "avulso", "pacotes_g", "g_shopee", "g_ml", "g_avulso"):
+            setattr(participante, campo, getattr(coleta, campo) or 0)
+        participante.sem_volume = (
+            int(coleta.shopee or 0) + int(coleta.mercado_livre or 0) + int(coleta.avulso or 0) == 0
+        )
+        participante.status = "finalizado"
+        participante.versao += 1
+        participante.atualizado_em = datetime.datetime.now()
+        participante.atualizado_por_user_id = current_user.id
+        atualizar_status_execucao(participante.execucao)
 
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
     coleta.valor_total = (
@@ -671,10 +763,10 @@ def list_coletas(
         stmt = stmt.where(Coleta.timestamp <= dt_end)
 
     stmt = stmt.where(
-        (Coleta.shopee > 0) |
-        (Coleta.mercado_livre > 0) |
-        (Coleta.avulso > 0) |
-        (Coleta.valor_total > 0)
+        (Coleta.shopee != 0) |
+        (Coleta.mercado_livre != 0) |
+        (Coleta.avulso != 0) |
+        (Coleta.valor_total != 0)
     )
 
     stmt = stmt.order_by(Coleta.timestamp.desc())
@@ -734,7 +826,7 @@ def resumo_coletas(
     base: Optional[str] = Query(None),
     data_inicio: Optional[datetime.date] = Query(None),
     data_fim: Optional[datetime.date] = Query(None),
-    fechamento_status: Optional[str] = Query(None),  # PENDENTE | GERADO | REAJUSTADO
+    fechamento_status: Optional[str] = Query(None),  # PENDENTE | GERADO | REAJUSTADO | RECEBIDO
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),

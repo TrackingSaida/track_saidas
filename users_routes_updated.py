@@ -44,6 +44,7 @@ class MotoboyOut(BaseModel):
     estado: Optional[str] = None
     cep: Optional[str] = None
     pode_ler_coleta: bool = False
+    pode_realizar_coleta: bool = False
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = True
     pode_lancar_avulso: bool = True
@@ -77,6 +78,7 @@ class UserCreate(BaseModel):
     estado: Optional[str] = None
     cep: Optional[str] = None
     pode_ler_coleta: Optional[bool] = None
+    pode_realizar_coleta: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
@@ -129,6 +131,7 @@ class AdminUserUpdate(BaseModel):
     estado: Optional[str] = None
     cep: Optional[str] = None
     pode_ler_coleta: Optional[bool] = None
+    pode_realizar_coleta: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
@@ -536,6 +539,11 @@ def create_user(
 
         if body.role == 4:
             pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else False
+            pode_realizar_coleta = (
+                body.pode_realizar_coleta
+                if body.pode_realizar_coleta is not None
+                else pode_ler_coleta
+            )
             pode_ler_saida = body.pode_ler_saida if body.pode_ler_saida is not None else True
             pode_digitar_codigo_manual = (
                 body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else True
@@ -548,6 +556,7 @@ def create_user(
                 avulso_exige_foto = False
             if owner.ignorar_coleta:
                 pode_ler_coleta = False
+                pode_realizar_coleta = False
 
             motoboy = Motoboy(
                 user_id=new_user.id,
@@ -565,6 +574,7 @@ def create_user(
                 ativo=True,
                 data_cadastro=date.today(),
                 pode_ler_coleta=pode_ler_coleta,
+                pode_realizar_coleta=pode_realizar_coleta,
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=pode_digitar_codigo_manual,
                 pode_lancar_avulso=pode_lancar_avulso,
@@ -874,7 +884,7 @@ def admin_update_user(
     # Campos Motoboy (role=4)
     motoboy_fields = {
         "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
-        "pode_ler_coleta", "pode_ler_saida", "pode_digitar_codigo_manual", "pode_lancar_avulso",
+        "pode_ler_coleta", "pode_realizar_coleta", "pode_ler_saida", "pode_digitar_codigo_manual", "pode_lancar_avulso",
         "avulso_exige_foto",
     }
     sub_base = current_user.sub_base or ""
@@ -887,7 +897,13 @@ def admin_update_user(
                         val = (val or "").strip() or None
                     if field == "pode_ler_coleta" and owner and owner.ignorar_coleta:
                         val = False
+                    if field == "pode_realizar_coleta" and owner and owner.ignorar_coleta:
+                        val = False
                     setattr(user.motoboy, field, val)
+            if "pode_realizar_coleta" in updates:
+                user.motoboy.pode_ler_coleta = bool(user.motoboy.pode_realizar_coleta)
+            elif "pode_ler_coleta" in updates:
+                user.motoboy.pode_realizar_coleta = bool(user.motoboy.pode_ler_coleta)
             if not bool(getattr(user.motoboy, "pode_lancar_avulso", True)):
                 user.motoboy.avulso_exige_foto = False
         else:
@@ -897,6 +913,7 @@ def admin_update_user(
             if faltando:
                 raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
             pode_ler_coleta = updates.get("pode_ler_coleta", False) or False
+            pode_realizar_coleta = updates.get("pode_realizar_coleta", pode_ler_coleta) or False
             pode_ler_saida = updates.get("pode_ler_saida", True) if updates.get("pode_ler_saida") is not None else True
             pode_digitar_codigo_manual = (
                 updates.get("pode_digitar_codigo_manual", True)
@@ -911,6 +928,7 @@ def admin_update_user(
             avulso_exige_foto = bool(updates.get("avulso_exige_foto", False)) and bool(pode_lancar_avulso)
             if owner and owner.ignorar_coleta:
                 pode_ler_coleta = False
+                pode_realizar_coleta = False
             motoboy = Motoboy(
                 user_id=user.id,
                 sub_base=sub_base,
@@ -927,6 +945,7 @@ def admin_update_user(
                 ativo=True,
                 data_cadastro=date.today(),
                 pode_ler_coleta=pode_ler_coleta,
+                pode_realizar_coleta=pode_realizar_coleta,
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=bool(pode_digitar_codigo_manual),
                 pode_lancar_avulso=bool(pode_lancar_avulso),
