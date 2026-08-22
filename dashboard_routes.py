@@ -11,8 +11,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func, and_, or_, cast
-from sqlalchemy.types import Date
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -24,13 +23,20 @@ from models import (
     Entregador,
     Motoboy,
     Owner,
-    OwnerCobrancaItem,
     Saida,
     SaidaHistorico,
     User,
 )
 
 from contabilidade_routes import _get_motoboy_nome as _contab_motoboy_nome, _resolve_actor_saida
+from dashboard_admin_cobranca import (
+    buscar_ids_entrada_periodo,
+    carregar_cobranca_admin,
+    detalhe_base_cobranca,
+    receita_admin_owner,
+    tipo_operacao_owner,
+    valor_owner,
+)
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -1348,6 +1354,7 @@ def get_dashboard_saidas(
 
 class DashboardAdminCardsOut(BaseModel):
     total_coletas: int
+    total_entradas: int = 0
     total_saidas: int
     receita_admin: Decimal
     owners_ativos: int
@@ -1356,6 +1363,7 @@ class DashboardAdminCardsOut(BaseModel):
 class DashboardAdminVolumeOwnerOut(BaseModel):
     sub_base: str
     coletas: int
+    entradas: int = 0
     saidas: int
     receita: Decimal
 
@@ -1368,10 +1376,15 @@ class DashboardAdminReceitaOwnerOut(BaseModel):
 
 class DashboardAdminPerformanceOwnerOut(BaseModel):
     sub_base: str
-    tipo: str  # "Coleta" | "Só Saída"
+    tipo: str  # "Coleta" | "Só Saída" | "Entrada" | "Coleta + Entrada"
     coletas: int
+    entradas: int = 0
     saidas: int
     base_cobranca: int
+    cobranca_coleta: int = 0
+    cobranca_entrada: int = 0
+    cobranca_saida: int = 0
+    base_cobranca_detalhe: str = ""
     receita_admin: Decimal
 
 
@@ -1406,12 +1419,6 @@ def get_dashboard_admin(
 
     sub_bases_filter = [sub_base] if sub_base and sub_base.strip() else None
 
-    def _decimal(v) -> Decimal:
-        try:
-            return Decimal(str(v or 0))
-        except Exception:
-            return Decimal("0")
-
     # Considera apenas owners ativos e não marcados como teste
     owners = db.scalars(
         select(Owner).where(
@@ -1426,6 +1433,7 @@ def get_dashboard_admin(
         return DashboardAdminResponse(
             cards=DashboardAdminCardsOut(
                 total_coletas=0,
+                total_entradas=0,
                 total_saidas=0,
                 receita_admin=Decimal("0"),
                 owners_ativos=0,
@@ -1464,42 +1472,46 @@ def get_dashboard_admin(
     rows_saidas = db.execute(stmt_saidas).scalars().all()
     total_saidas = len(rows_saidas)
 
-    stmt_cob = select(OwnerCobrancaItem).where(
-        OwnerCobrancaItem.sub_base.in_(sub_bases),
-        cast(OwnerCobrancaItem.timestamp, Date) >= data_inicio,
-        cast(OwnerCobrancaItem.timestamp, Date) <= data_fim,
-        OwnerCobrancaItem.cancelado.is_(False),
+    start_hist, end_hist = _bounds_periodo_operacional(data_inicio, data_fim)
+    entradas_ops = buscar_ids_entrada_periodo(
+        db, sub_bases, start_hist, end_hist, somente_sem_coleta=False
     )
-    rows_cob = db.execute(stmt_cob).scalars().all()
-    # Usa Decimal("0") como acumulador inicial para evitar int puro quando não houver linhas
-    receita_admin_total = sum(
-        (_decimal(c.valor) for c in rows_cob),
-        start=Decimal("0"),
-    ).quantize(Decimal("0.01"))
+    cobranca_por_sb = carregar_cobranca_admin(
+        db,
+        sub_bases,
+        data_inicio=data_inicio,
+        data_fim=data_fim,
+        dt_min=dt_min,
+        dt_max=dt_max,
+        start_hist=start_hist,
+        end_hist=end_hist,
+    )
 
     owner_map = {o.sub_base: o for o in owners}
     owners_ativos = len([s for s in sub_bases if owner_map.get(s) and owner_map[s].ativo])
 
     coleta_por_sb: Dict[str, int] = {}
+    entrada_por_sb: Dict[str, int] = {}
     saida_por_sb: Dict[str, int] = {}
     cob_por_sb: Dict[str, Decimal] = {}
-    cob_count_por_sb: Dict[str, int] = {}
     for sb in sub_bases:
         coleta_por_sb[sb] = sum(1 for c in rows_coletas if c.sub_base == sb)
+        entrada_por_sb[sb] = sum(1 for _id, s in entradas_ops if s == sb)
         saida_por_sb[sb] = sum(1 for s in rows_saidas if s.sub_base == sb)
-        # Garante sempre Decimal, mesmo quando não houver cobranças para a sub_base
-        cob_por_sb[sb] = sum(
-            (_decimal(c.valor) for c in rows_cob if c.sub_base == sb),
-            start=Decimal("0"),
-        )
-        cob_count_por_sb[sb] = sum(1 for c in rows_cob if c.sub_base == sb)
+        cob = cobranca_por_sb.get(sb)
+        base_n = cob.base_cobranca if cob else 0
+        cob_por_sb[sb] = receita_admin_owner(valor_owner(owner_map.get(sb)), base_n)
+
+    receita_admin_total = sum(cob_por_sb.values(), start=Decimal("0")).quantize(Decimal("0.01"))
+    total_entradas = len(entradas_ops)
 
     volume_por_owner = [
         DashboardAdminVolumeOwnerOut(
             sub_base=sb,
             coletas=coleta_por_sb.get(sb, 0),
+            entradas=entrada_por_sb.get(sb, 0),
             saidas=saida_por_sb.get(sb, 0),
-            receita=cob_por_sb.get(sb, Decimal("0")).quantize(Decimal("0.01")),
+            receita=cob_por_sb.get(sb, Decimal("0")),
         )
         for sb in sub_bases
     ]
@@ -1507,7 +1519,7 @@ def get_dashboard_admin(
     receita_por_owner = sorted(
         [DashboardAdminReceitaOwnerOut(
             sub_base=sb,
-            receita=cob_por_sb.get(sb, Decimal("0")).quantize(Decimal("0.01")),
+            receita=cob_por_sb.get(sb, Decimal("0")),
             pct=round(float(cob_por_sb.get(sb, 0) / receita_admin_total * 100), 1) if receita_admin_total else 0.0,
         ) for sb in sub_bases],
         key=lambda x: -float(x.receita),
@@ -1516,14 +1528,25 @@ def get_dashboard_admin(
     performance_por_owner = []
     for sb in sub_bases:
         o = owner_map.get(sb)
-        tipo = "Só Saída" if o and o.ignorar_coleta else "Coleta"
+        cob = cobranca_por_sb.get(sb)
+        n_coleta = cob.cobranca_coleta if cob else 0
+        n_entrada = cob.cobranca_entrada if cob else 0
+        n_saida = cob.cobranca_saida if cob else 0
         performance_por_owner.append(DashboardAdminPerformanceOwnerOut(
             sub_base=sb,
-            tipo=tipo,
+            tipo=tipo_operacao_owner(
+                bool(o.ignorar_coleta) if o else False,
+                bool(getattr(o, "entrada_obrigatoria_habilitada", False)) if o else False,
+            ),
             coletas=coleta_por_sb.get(sb, 0),
+            entradas=entrada_por_sb.get(sb, 0),
             saidas=saida_por_sb.get(sb, 0),
-            base_cobranca=cob_count_por_sb.get(sb, 0),
-            receita_admin=cob_por_sb.get(sb, Decimal("0")).quantize(Decimal("0.01")),
+            base_cobranca=cob.base_cobranca if cob else 0,
+            cobranca_coleta=n_coleta,
+            cobranca_entrada=n_entrada,
+            cobranca_saida=n_saida,
+            base_cobranca_detalhe=detalhe_base_cobranca(n_coleta, n_entrada, n_saida),
+            receita_admin=cob_por_sb.get(sb, Decimal("0")),
         ))
 
     owners_list = [
@@ -1539,6 +1562,7 @@ def get_dashboard_admin(
     return DashboardAdminResponse(
         cards=DashboardAdminCardsOut(
             total_coletas=total_coletas,
+            total_entradas=total_entradas,
             total_saidas=total_saidas,
             receita_admin=receita_admin_total,
             owners_ativos=owners_ativos,
