@@ -255,16 +255,16 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
 def _emitido_por(db: Session, sub_base: str) -> str:
     """
     Retorna o texto para "Emitido por" no relatório: nome_fantasia do Owner ou sub_base.
-    Nunca lança erro; em caso de owner ausente ou campos vazios usa sub_base ou "Tracking Saídas".
+    Nunca lança erro; em caso de owner ausente ou campos vazios usa sub_base ou "ROTEVO".
     """
     sub = (sub_base or "").strip()
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub)) if sub else None
     if not owner:
-        return sub or "Tracking Saídas"
+        return sub or "ROTEVO"
     nome = (getattr(owner, "nome_fantasia", None) or "").strip()
     if nome:
         return nome
-    return (owner.sub_base or "").strip() or "Tracking Saídas"
+    return (owner.sub_base or "").strip() or "ROTEVO"
 
 
 def _normalizar_servico_saida(serv: str) -> str:

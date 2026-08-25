@@ -159,7 +159,7 @@ def _gerar_pdf_etiqueta(
     # ─────────────────────────────────────────────────────────
     # TOPO — Nome do sistema/marketplace (centralizado)
     # ─────────────────────────────────────────────────────────
-    titulo = "TRACKING SAÍDAS"
+    titulo = "ROTEVO"
     if modo_final == "shopee":
         titulo = "SHOPEE ENTREGA"
     elif modo_final == "ml":
@@ -226,7 +226,7 @@ def _gerar_pdf_etiqueta(
     # ─────────────────────────────────────────────────────────
     # RODAPÉ — Discreto e centralizado
     # ─────────────────────────────────────────────────────────
-    rodape = "Tracking Saídas"
+    rodape = "ROTEVO"
     c.setFont("Helvetica", 6)
     rw = c.stringWidth(rodape, "Helvetica", 6)
     c.drawString(center_x(rw), margin, rodape)
@@ -269,7 +269,7 @@ def _gerar_png_etiqueta(
         w = right - left
         return int((largura - w) / 2)
 
-    titulo = "TRACKING SAÍDAS"
+    titulo = "ROTEVO"
     if modo_final == "shopee":
         titulo = "SHOPEE ENTREGA"
     elif modo_final == "ml":
@@ -310,7 +310,7 @@ def _gerar_png_etiqueta(
         if cidade or cep:
             draw.text((margem, y), f"{cidade} {cep}".strip()[:40], fill="black", font=font_info)
 
-    rodape = "Tracking Saídas"
+    rodape = "ROTEVO"
     font_rodape = _font(20)
     draw.text((_center_x(rodape, font_rodape), altura - margem), rodape, fill="black", font=font_rodape)
 
