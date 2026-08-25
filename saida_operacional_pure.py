@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
+from datetime import date, datetime, time, timedelta
+from typing import Optional, Tuple
 
 EVENTOS_ATRIBUICAO_VALIDOS = {
     "lido",
@@ -170,3 +170,10 @@ def timestamp_operacional_saida(
     if ctx:
         return ctx.operacional_ts or ctx.ultimo_evento_ts or saida_ts
     return saida_ts
+
+
+def janela_timestamp_periodo(inicio: date, fim: date) -> Tuple[datetime, datetime]:
+    """Intervalo [inicio 00:00, fim+1 00:00) para filtrar timestamp sem func.date()."""
+    ts_ini = datetime.combine(inicio, time.min)
+    ts_fim_excl = datetime.combine(fim + timedelta(days=1), time.min)
+    return ts_ini, ts_fim_excl

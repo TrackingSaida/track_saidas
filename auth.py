@@ -369,9 +369,14 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
 
 def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -> Dict[str, Any]:
     """Claims para JWT de motoboy (role=4)."""
-    pode_ler_coleta = motoboy.pode_ler_coleta
+    pode_realizar_coleta = bool(
+        getattr(motoboy, "pode_realizar_coleta", motoboy.pode_ler_coleta)
+    )
+    modo = (getattr(owner, "modo_operacao", None) or "codigo").strip().lower()
+    pode_ler_coleta = pode_realizar_coleta and modo in ("codigo", "ambos")
     if owner.ignorar_coleta:
         pode_ler_coleta = False
+        pode_realizar_coleta = False
     return {
         "sub": _subject(user),
         "uid": user.id,
@@ -382,6 +387,7 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "motoboy_id": motoboy.id_motoboy,
         "sub_base": sub_base,
         "pode_ler_coleta": bool(pode_ler_coleta),
+        "pode_realizar_coleta": bool(pode_realizar_coleta),
         "pode_ler_saida": bool(motoboy.pode_ler_saida),
         "pode_digitar_codigo_manual": bool(getattr(motoboy, "pode_digitar_codigo_manual", True)),
         "pode_lancar_avulso": bool(getattr(motoboy, "pode_lancar_avulso", True)),
@@ -432,6 +438,7 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     if u.tipo_owner not in ("base", "subbase"):
         u.tipo_owner = "subbase"
     u.pode_ler_coleta = bool(payload.get("pode_ler_coleta", False))
+    u.pode_realizar_coleta = bool(payload.get("pode_realizar_coleta", u.pode_ler_coleta))
     u.devolucao_sub_base_habilitada = bool(payload.get("devolucao_sub_base_habilitada", False))
     u.entrada_obrigatoria_habilitada = bool(payload.get("entrada_obrigatoria_habilitada", False))
     u.conferencia_saida_habilitada = bool(payload.get("conferencia_saida_habilitada", False))
@@ -832,6 +839,16 @@ async def read_users_me(
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
 
     nome_val, sobrenome_val = _nome_exibicao(current_user)
+    # tipo_owner vivo do Owner (não só do JWT) — sessão mobile longa pode ficar desatualizada
+    tipo_owner = getattr(current_user, "tipo_owner", None) or "subbase"
+    sub_base = (getattr(db_user, "sub_base", None) or getattr(current_user, "sub_base", None) or "").strip()
+    if sub_base:
+        owner = run_db_query_with_retry(
+            db,
+            lambda: db.scalar(select(Owner).where(Owner.sub_base == sub_base)),
+        )
+        if owner is not None:
+            tipo_owner = _tipo_owner_from_owner(owner)
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
@@ -843,7 +860,7 @@ async def read_users_me(
         sub_base=current_user.sub_base,
         ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
         modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
-        tipo_owner=getattr(current_user, "tipo_owner", None) or "subbase",
+        tipo_owner=tipo_owner,
         must_change_password=bool(getattr(db_user, "must_change_password", False)),
         entrada_obrigatoria_habilitada=bool(
             getattr(current_user, "entrada_obrigatoria_habilitada", False)

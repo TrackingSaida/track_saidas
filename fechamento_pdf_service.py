@@ -21,7 +21,7 @@ from reportlab.platypus import Table, TableStyle
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from models import EntregadorFechamento, Saida
+from models import EntregadorFechamento, EntregadorFechamentoColetaItem, Saida
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 from upload_storage_utils import B2_BUCKET_NAME, b2_configured, get_s3_client_optional
 
@@ -292,7 +292,11 @@ def _gerar_pdf_simples(fech: EntregadorFechamento, chave_pix: Optional[str] = No
     y -= 8 * mm
 
     line("Resumo financeiro", 13, 7 * mm, bold=True)
-    line(f"Valor base: {_fmt_brl(fech.valor_base)}")
+    line(f"Entregas: {_fmt_brl(getattr(fech, 'valor_entregas', fech.valor_base))}")
+    line(
+        f"Diárias de coleta ({int(getattr(fech, 'qtd_dias_coleta', 0) or 0)} dias): "
+        f"{_fmt_brl(getattr(fech, 'valor_coletas', 0))}"
+    )
     line(f"Adições: {_fmt_brl(fech.valor_adicao)}")
     if fech.motivo_adicao:
         line(f"  Motivo adição: {fech.motivo_adicao}", 9, 5 * mm)
@@ -406,6 +410,10 @@ def _gerar_pdf_rico(
         ["Valor bruto das entregas", _fmt_brl(valor_feitos)],
         ["Desconto por cancelamentos", _fmt_desconto(valor_cancelados)],
         ["Valor base", _fmt_brl(valor_base_calc)],
+        [
+            f"Diárias de coleta ({int(getattr(fech, 'qtd_dias_coleta', 0) or 0)} dias)",
+            _fmt_brl(getattr(fech, "valor_coletas", 0)),
+        ],
         ["Ajustes manuais", _fmt_signed(total_ajustes)],
         ["TOTAL A PAGAR", _fmt_brl(fech.valor_final)],
     ]
@@ -458,6 +466,24 @@ def _gerar_pdf_rico(
         needed = 8 * mm + len(chunk) * 5 * mm
         y = ensure_space(y, needed)
         y = _draw_table(c, [header] + chunk, M, y, [col_w] * 10)
+        y -= 5 * mm
+
+    coletas_fechamento = db.scalars(
+        select(EntregadorFechamentoColetaItem)
+        .where(EntregadorFechamentoColetaItem.id_fechamento == fech.id_fechamento)
+        .order_by(EntregadorFechamentoColetaItem.data)
+    ).all()
+    if coletas_fechamento:
+        y = ensure_space(y, 20 * mm)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(M, y, "Diárias de coleta")
+        y -= 3 * mm
+        coleta_rows = [["Data", "Bases coletadas", "Valor da diária"]]
+        for item in coletas_fechamento:
+            coleta_rows.append(
+                [_fmt_date(item.data), ", ".join(item.bases or []) or "—", _fmt_brl(item.valor_diaria)]
+            )
+        y = _draw_table(c, coleta_rows, M, y, [usable_w * 0.18, usable_w * 0.57, usable_w * 0.25])
         y -= 5 * mm
 
     y = ensure_space(y, 25 * mm)
