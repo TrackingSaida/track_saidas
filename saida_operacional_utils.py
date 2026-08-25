@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from db_utils import run_db_query_with_retry
-from models import SaidaHistorico, User
+from models import Saida, SaidaHistorico, User
 from saida_operacional_pure import (
     EVENTOS_ATRIBUICAO_VALIDOS,
     EVENTOS_INVALIDANTES,
@@ -18,6 +18,7 @@ from saida_operacional_pure import (
     SaidaOperacionalContext,
     deve_excluir_saida_operacional,
     eh_reatribuicao_real,
+    janela_timestamp_periodo,
     normalizar_evento_atribuicao,
     resolver_chave_acao,
     rotulo_acao_evento,
@@ -43,6 +44,8 @@ __all__ = [
     "deve_excluir_saida_operacional",
     "timestamp_operacional_saida",
     "filtrar_saidas_por_periodo_operacional",
+    "carregar_saidas_candidatas_periodo",
+    "janela_timestamp_periodo",
 ]
 
 
@@ -219,3 +222,46 @@ def filtrar_saidas_por_periodo_operacional(
             continue
         filtradas.append(s)
     return filtradas, ctx_map
+
+
+def carregar_saidas_candidatas_periodo(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_ids: Sequence[int],
+    inicio: date,
+    fim: date,
+) -> List[Saida]:
+    """Candidatas do período sem varrer o histórico inteiro do motoboy.
+
+    Inclui:
+    - Saida.data no intervalo;
+    - Saida.timestamp no intervalo;
+    - pacote antigo reatribuído no intervalo (evento de atribuição no histórico).
+    """
+    ids = list(dict.fromkeys(int(m) for m in motoboy_ids if m is not None))
+    if not ids or not (sub_base or "").strip():
+        return []
+    ts_ini, ts_fim_excl = janela_timestamp_periodo(inicio, fim)
+    hist_ids = (
+        select(SaidaHistorico.id_saida)
+        .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
+        .where(
+            Saida.sub_base == sub_base,
+            Saida.motoboy_id.in_(ids),
+            SaidaHistorico.evento.in_(tuple(EVENTOS_ATRIBUICAO_VALIDOS)),
+            SaidaHistorico.timestamp >= ts_ini,
+            SaidaHistorico.timestamp < ts_fim_excl,
+        )
+    )
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base,
+        Saida.motoboy_id.in_(ids),
+        Saida.codigo.isnot(None),
+        or_(
+            and_(Saida.data >= inicio, Saida.data <= fim),
+            and_(Saida.timestamp >= ts_ini, Saida.timestamp < ts_fim_excl),
+            Saida.id_saida.in_(hist_ids),
+        ),
+    )
+    return list(db.scalars(stmt).all())

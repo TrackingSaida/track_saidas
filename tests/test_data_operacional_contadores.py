@@ -1,7 +1,7 @@
 """Data operacional: reatribuição em D conta no dia D (não em Saida.data antiga)."""
 from datetime import date, datetime
 
-from saida_operacional_pure import SaidaOperacionalContext, timestamp_operacional_saida
+from saida_operacional_pure import SaidaOperacionalContext, janela_timestamp_periodo, timestamp_operacional_saida
 
 
 def _ctx(
@@ -53,3 +53,12 @@ def test_removido_sem_inicio_nao_tem_data_operacional():
         datetime(2026, 8, 1, 10, 0, 0),
     )
     assert ts is None
+
+
+def test_janela_timestamp_periodo_e_exclusiva_no_fim():
+    inicio, fim_excl = janela_timestamp_periodo(date(2026, 8, 19), date(2026, 8, 19))
+    assert inicio == datetime(2026, 8, 19, 0, 0, 0)
+    assert fim_excl == datetime(2026, 8, 20, 0, 0, 0)
+    assert datetime(2026, 8, 19, 23, 59, 59) >= inicio
+    assert datetime(2026, 8, 19, 23, 59, 59) < fim_excl
+    assert datetime(2026, 8, 20, 0, 0, 0) >= fim_excl

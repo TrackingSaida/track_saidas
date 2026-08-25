@@ -224,6 +224,7 @@ Push remoto para motoboy e staff (Expo Push API). Depende de tokens registrados 
 |-----|----------|--------|
 | Flush de digest | `POST /api/internal/flush-push-digests` | Agrega atribuições web (~60s) e envia push “novos pacotes” |
 | Atraso D+1 | `POST /api/internal/notificar-atraso-d1` | 1 push/dia por motoboy com pendências de dias anteriores |
+| Coletas pendentes | `POST /api/internal/notificar-coletas-pendentes` | Alerta o staff, de hora em hora entre 19h e 23h BRT, sobre bases programadas sem lançamento |
 
 Outros pushes (fechamento, aviso da base, bloqueio por ausência, reconferência) disparam **na hora** no request da API — não precisam de cron.
 
@@ -252,11 +253,17 @@ Outros pushes (fechamento, aviso da base, bloqueio por ausência, reconferência
 - Resposta típica: `{ "status": "ok", "motoboys": N, "messages": M, "data": "YYYY-MM-DD" }`
 - Dedupe: no máximo 1 envio por motoboy/sub_base/dia (tabela `push_envio_log`)
 
+**Coletas pendentes**
+
+- `POST /api/internal/notificar-coletas-pendentes`
+- Header: `X-Cron-Secret: <CRON_PUSH_SECRET ou CRON_REFRESH_SECRET>`
+- Fora da janela das 19h às 23h de São Paulo, o endpoint responde sem enviar alertas.
+
 ### Onde configurar no Render
 
 1. Dashboard → [Render](https://dashboard.render.com) → Web Service da API (ex.: `track-saidas-api`).
 2. **Environment** → adicionar `CRON_PUSH_SECRET` (valor forte, igual ao usado nos Cron Jobs).
-3. Criar **dois Cron Jobs** (New → Cron Job) apontando para a URL da API, com a mesma env do secret (ou herdar do serviço, conforme o plano).
+3. Criar os Cron Jobs (New → Cron Job) apontando para a URL da API, com a mesma env do secret (ou herdar do serviço, conforme o plano).
 
 ### Agendamento recomendado
 
@@ -285,6 +292,17 @@ curl -sf -X POST \
 ```
 
 Dica: se `CRON_PUSH_SECRET` não estiver no Cron Job, use `$CRON_REFRESH_SECRET` no header (mesmo fallback do código).
+
+**3) Coletas pendentes** — de hora em hora; a própria API limita os envios à janela de 19h–23h BRT:
+
+- Schedule: `0 * * * *`
+- Command:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_PUSH_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/notificar-coletas-pendentes"
+```
 
 ### Smoke test manual
 

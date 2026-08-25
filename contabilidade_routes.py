@@ -205,7 +205,7 @@ def get_resumo_contabilidade(
             Coleta.timestamp <= dt_end,
         )
         .where(
-            (Coleta.shopee > 0) | (Coleta.mercado_livre > 0) | (Coleta.avulso > 0) | (Coleta.valor_total > 0)
+            (Coleta.shopee != 0) | (Coleta.mercado_livre != 0) | (Coleta.avulso != 0) | (Coleta.valor_total != 0)
         )
     )
     rows_coletas = db.scalars(stmt_coletas).all()
@@ -607,7 +607,7 @@ def get_resumo_contabilidade(
                     Coleta.timestamp >= dt_prev_start,
                     Coleta.timestamp <= dt_prev_end,
                 ).where(
-                    (Coleta.shopee > 0) | (Coleta.mercado_livre > 0) | (Coleta.avulso > 0) | (Coleta.valor_total > 0)
+                    (Coleta.shopee != 0) | (Coleta.mercado_livre != 0) | (Coleta.avulso != 0) | (Coleta.valor_total != 0)
                 )
             ).all()
             rows_f_prev = db.scalars(
