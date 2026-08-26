@@ -38,6 +38,15 @@ from models import (
 )
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 from fechamento_pdf_service import build_fechamento_code, get_fechamento_pdf_bytes
+from entregador_fechamento_status_pure import (
+    STATUS_ELEGIVEIS_PAGAMENTO,
+    STATUS_GERADO,
+    STATUS_PAGO,
+    STATUS_PERMITE_REAJUSTE,
+    STATUS_REAJUSTADO,
+    normalizar_status_fechamento,
+    status_permite_reajuste,
+)
 
 from entregador_routes import (
     _resolve_user_base,
@@ -52,13 +61,6 @@ from entregador_routes import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["Fechamentos"])
-
-# Status aceitos
-STATUS_GERADO = "GERADO"
-STATUS_REAJUSTADO = "REAJUSTADO"
-STATUS_PAGO = "PAGO"
-STATUS_ELEGIVEIS_PAGAMENTO = (STATUS_GERADO, STATUS_REAJUSTADO)
-STATUS_PERMITE_REAJUSTE = ()
 
 # Status válidos para saidas no cálculo (fonte única compartilhada)
 STATUS_SAIDAS_VALIDOS = STATUS_VALOR_BASE_VALIDOS
@@ -183,10 +185,7 @@ def _resolver_avulso_valor(
 
 
 def _status_norm(fech: EntregadorFechamento) -> str:
-    st = (fech.status or "").strip().upper()
-    if st == "FECHADO":
-        return STATUS_GERADO
-    return st
+    return normalizar_status_fechamento(fech.status)
 
 
 def _recalcular_valor_base_fechamento(
@@ -245,6 +244,51 @@ def _calcular_diarias_coleta_motoboy(
         for dia, bases in sorted(bases_por_dia.items())
     ]
     return len(itens), (valor_diaria * len(itens)).quantize(Decimal("0.01")), itens
+
+
+def _sincronizar_itens_coleta_fechamento(
+    db: Session,
+    sub_base: str,
+    fech: EntregadorFechamento,
+    dias_coleta: list[dict],
+) -> None:
+    """Atualiza o snapshot de diárias deste fechamento, sem pegar dia de outro."""
+    motoboy_id = getattr(fech, "id_motoboy", None)
+    if motoboy_id is None:
+        return
+    if dias_coleta:
+        dias = [item["data"] for item in dias_coleta]
+        dia_ja_pago = db.scalar(
+            select(EntregadorFechamentoColetaItem.data).where(
+                EntregadorFechamentoColetaItem.sub_base == sub_base,
+                EntregadorFechamentoColetaItem.motoboy_id == motoboy_id,
+                EntregadorFechamentoColetaItem.data.in_(dias),
+                EntregadorFechamentoColetaItem.id_fechamento != fech.id_fechamento,
+            )
+        )
+        if dia_ja_pago:
+            raise HTTPException(
+                409,
+                f"A diária de coleta de {dia_ja_pago.strftime('%d/%m/%Y')} já pertence a outro fechamento.",
+            )
+    for item in db.scalars(
+        select(EntregadorFechamentoColetaItem).where(
+            EntregadorFechamentoColetaItem.id_fechamento == fech.id_fechamento
+        )
+    ).all():
+        db.delete(item)
+    db.flush()
+    for item in dias_coleta:
+        db.add(
+            EntregadorFechamentoColetaItem(
+                id_fechamento=fech.id_fechamento,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                data=item["data"],
+                bases=item["bases"],
+                valor_diaria=item["valor_diaria"],
+            )
+        )
 
 
 def _fmt_brl_push(v) -> str:
@@ -1038,38 +1082,47 @@ def atualizar_fechamento(
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
 
-    raise HTTPException(
-        409,
-        "Fechamentos gerados são imutáveis. Ajuste os lançamentos antes de gerar um novo fechamento.",
-    )
-
     st = _status_norm(fech)
     if st == STATUS_PAGO:
         raise HTTPException(
             400,
             "Fechamentos com status PAGO não podem ser reajustados.",
         )
-    if st not in STATUS_PERMITE_REAJUSTE:
+    if not status_permite_reajuste(st):
         raise HTTPException(
             400,
             "Apenas fechamentos com status GERADO ou REAJUSTADO podem ser reajustados.",
         )
 
     chave_pix: Optional[str] = None
+    dias_coleta: list[dict] = []
     if getattr(fech, "id_motoboy", None) is not None:
         chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
-        valor_base_recalc = _calcular_valor_base_motoboy_periodo(
+        valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
         )
+        qtd_dias_coleta, valor_coletas, dias_coleta = _calcular_diarias_coleta_motoboy(
+            db, sub_base, fech.id_motoboy,
+            fech.periodo_inicio, fech.periodo_fim,
+        )
+        valor_base_recalc = (valor_entregas + valor_coletas).quantize(Decimal("0.01"))
     else:
-        valor_base_recalc = _calcular_valor_base_periodo(
+        valor_entregas = _calcular_valor_base_periodo(
             db, sub_base, fech.id_entregador,
             fech.periodo_inicio, fech.periodo_fim,
         )
+        valor_coletas = Decimal("0.00")
+        qtd_dias_coleta = 0
+        valor_base_recalc = valor_entregas
 
     if payload.atualizar_valor_base is True:
+        if getattr(fech, "id_motoboy", None) is not None:
+            _sincronizar_itens_coleta_fechamento(db, sub_base, fech, dias_coleta)
         fech.valor_base = valor_base_recalc
+        fech.valor_entregas = valor_entregas
+        fech.valor_coletas = valor_coletas
+        fech.qtd_dias_coleta = qtd_dias_coleta
 
     # Atualizar adição/subtração
     if payload.valor_adicao is not None:
