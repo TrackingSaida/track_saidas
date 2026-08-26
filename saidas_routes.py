@@ -36,6 +36,12 @@ from saida_operacional_utils import (
 from saidas_listar_service import invalidate_listar_cache, listar_saidas_paginado
 from codigo_normalizer import canonicalize_servico, normalize_codigo
 from saida_historico_service import SaidaHistoricoItemOut, listar_historico_saida
+from saida_status_finalizado_pure import (
+    aplicar_flag_cancelado_cobranca,
+    mensagem_bloqueio_cancelado,
+    pode_alterar_pedido_cancelado,
+    resolver_status_antes_do_cancelamento,
+)
 from pedido_campos_obrigatorios_service import (
     validate_campos_obrigatorios_conclusao,
     raise_if_campos_obrigatorios_faltando,
@@ -161,6 +167,7 @@ class SaidaUpdate(BaseModel):
     servico: Optional[str] = None
     base: Optional[str] = None
     is_grande: Optional[bool] = None  # apenas admin, root ou operador (role 0,1,2) podem alterar
+    reverter_cancelamento: Optional[bool] = False
 
 
 class SaidaLerIn(BaseModel):
@@ -347,12 +354,22 @@ def _validar_alteracao_saida_finalizada(
     obj: Saida,
     status_anterior: str,
     payload: SaidaUpdate,
+    current_user: Optional[User] = None,
 ) -> None:
-    """Bloqueia alterações inválidas em status finalizado; permite ENTREGUE→CANCELADO e reatribuição."""
+    """Bloqueia alterações inválidas em status finalizado.
+
+    Exceções:
+    - ENTREGUE → CANCELADO ou reatribuição;
+    - CANCELADO → alteração por root/admin (reverter cancelamento indevido).
+    """
     if not _status_esta_finalizado(status_anterior):
         return
     if status_anterior == STATUS_CANCELADO:
-        raise HTTPException(status_code=422, detail=_status_finalizado_detail(obj, status_anterior))
+        if pode_alterar_pedido_cancelado(getattr(current_user, "role", None)):
+            return
+        detail = dict(_status_finalizado_detail(obj, status_anterior))
+        detail["message"] = mensagem_bloqueio_cancelado()
+        raise HTTPException(status_code=422, detail=detail)
     if status_anterior == STATUS_ENTREGUE:
         cancelando = (
             payload.status is not None
@@ -407,6 +424,51 @@ def _aplicar_detail_reatribuicao_entregue(
                 tentativa=2,
             )
         )
+
+
+def _aplicar_cobranca_por_status_cancelamento(
+    db: Session,
+    id_saida: int,
+    status_anterior: str,
+    status_novo: str,
+) -> None:
+    """Marca/desmarca cobrança ao cancelar ou reabrir pedido cancelado.
+
+    Itens já fechados não são reabertos: o período financeiro permanece intacto.
+    """
+    if status_anterior == status_novo:
+        return
+    if status_novo != STATUS_CANCELADO and status_anterior != STATUS_CANCELADO:
+        return
+    itens = db.scalars(
+        select(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida == id_saida)
+    ).all()
+    aplicar_flag_cancelado_cobranca(itens, status_anterior, status_novo)
+
+
+def _resolver_status_para_reverter_cancelamento(
+    db: Session,
+    obj: Saida,
+    status_anterior: str,
+    current_user: User,
+) -> str:
+    if status_anterior != STATUS_CANCELADO:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "STATUS_NAO_CANCELADO",
+                "id_saida": obj.id_saida,
+                "status_atual": status_anterior,
+                "message": "Só é possível reverter o status de um pedido cancelado.",
+            },
+        )
+    if not pode_alterar_pedido_cancelado(getattr(current_user, "role", None)):
+        detail = dict(_status_finalizado_detail(obj, status_anterior))
+        detail["message"] = mensagem_bloqueio_cancelado()
+        raise HTTPException(status_code=422, detail=detail)
+    historico = listar_historico_saida(db, obj.id_saida)
+    restaurado = resolver_status_antes_do_cancelamento(historico)
+    return restaurado or "saiu"
 
 
 def _evento_status_manual(status_norm: str) -> Optional[str]:
@@ -2445,7 +2507,12 @@ def atualizar_saida(
     sub_base = current_user.sub_base
     obj = _get_owned_saida(db, sub_base, id_saida)
     status_anterior = normalizar_status_saida(obj.status)
-    _validar_alteracao_saida_finalizada(obj, status_anterior, payload)
+    if payload.reverter_cancelamento:
+        restaurado = _resolver_status_para_reverter_cancelamento(
+            db, obj, status_anterior, current_user
+        )
+        payload = payload.model_copy(update={"status": restaurado})
+    _validar_alteracao_saida_finalizada(obj, status_anterior, payload, current_user)
     motoboy_anterior = obj.motoboy_id
     entregador_anterior = (obj.entregador or "").strip()
     payload_changed = {
@@ -2558,13 +2625,6 @@ def atualizar_saida(
             raise_if_campos_obrigatorios_faltando(faltantes)
         payload_changed["status"] = payload_changed["status"] or (novo_status != normalizar_status_saida(obj.status))
         obj.status = novo_status
-        # Se alterou para cancelado, marcar cobrança como cancelada (não contabilizada)
-        if novo_status == STATUS_CANCELADO:
-            itens = db.scalars(
-                select(OwnerCobrancaItem).where(OwnerCobrancaItem.id_saida == obj.id_saida)
-            ).all()
-            for item in itens:
-                item.cancelado = True
 
     if payload.servico is not None:
         obj.servico = canonicalize_servico(payload.servico)
@@ -2585,6 +2645,10 @@ def atualizar_saida(
     status_mudou = status_novo != status_anterior
     motoboy_novo = obj.motoboy_id
     executor_mudou = payload_changed["executor"] or ((obj.entregador or "").strip() != entregador_anterior)
+    if status_mudou:
+        _aplicar_cobranca_por_status_cancelamento(
+            db, obj.id_saida, status_anterior, status_novo
+        )
     evento_historico = None
     if status_mudou:
         evento_historico = _evento_status_manual(status_novo)
