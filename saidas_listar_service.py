@@ -47,13 +47,16 @@ class SaidaListRow:
     is_grande: bool
 
 
-def clamp_listar_limit(limit: Optional[int]) -> Optional[int]:
+def clamp_listar_limit(limit: Optional[int], cap: int = MAX_LISTAR_LIMIT) -> Optional[int]:
     if limit is None:
         return None
     value = int(limit)
     if value < 0:
         return 0
-    return min(value, MAX_LISTAR_LIMIT)
+    cap_val = int(cap) if cap is not None else MAX_LISTAR_LIMIT
+    if cap_val < 0:
+        cap_val = 0
+    return min(value, cap_val)
 
 
 def _norm_text(value: Optional[str]) -> str:
@@ -752,6 +755,8 @@ def listar_saidas_paginado(
     limit: Optional[int] = None,
     offset: int = 0,
     montar_item,
+    limit_cap: int = MAX_LISTAR_LIMIT,
+    use_cache: bool = True,
 ) -> Dict[str, Any]:
     """Lista saídas com filtro operacional, totais e página resolvidos no SQL.
 
@@ -761,7 +766,7 @@ def listar_saidas_paginado(
 
     from db_utils import run_db_query_with_retry
 
-    limit = clamp_listar_limit(limit)
+    limit = clamp_listar_limit(limit, cap=limit_cap)
     offset = max(0, int(offset or 0))
 
     cache_key = _listar_cache_key(
@@ -780,7 +785,7 @@ def listar_saidas_paginado(
         limit=limit,
         offset=offset,
     )
-    cached = _listar_cache_get(cache_key)
+    cached = _listar_cache_get(cache_key) if use_cache else None
     if cached is not None:
         cached["_cache"] = "HIT"
         return cached
@@ -1105,6 +1110,10 @@ def listar_saidas_paginado(
     def _run():
         return db.execute(stmt, params).mappings().all()
 
+    def _maybe_cache_set(payload: Dict[str, Any]) -> None:
+        if use_cache:
+            _listar_cache_set(cache_key, {k: v for k, v in payload.items() if k != "_cache"})
+
     rows = run_db_query_with_retry(db, _run)
     if not rows:
         empty = {
@@ -1115,7 +1124,7 @@ def listar_saidas_paginado(
             "items": [],
             "_cache": "MISS",
         }
-        _listar_cache_set(cache_key, {k: v for k, v in empty.items() if k != "_cache"})
+        _maybe_cache_set(empty)
         return empty
 
     totals = {
@@ -1135,7 +1144,7 @@ def listar_saidas_paginado(
             "items": [],
             "_cache": "MISS",
         }
-        _listar_cache_set(cache_key, {k: v for k, v in result.items() if k != "_cache"})
+        _maybe_cache_set(result)
         return result
 
     page_ids = [int(r["id_saida"]) for r in page_rows_raw]
@@ -1186,5 +1195,5 @@ def listar_saidas_paginado(
         "items": items,
         "_cache": "MISS",
     }
-    _listar_cache_set(cache_key, {k: v for k, v in result.items() if k != "_cache"})
+    _maybe_cache_set(result)
     return result

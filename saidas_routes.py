@@ -13,7 +13,7 @@ from datetime import datetime, date, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select, func, or_, exists, text
 from sqlalchemy.orm import Session
@@ -34,6 +34,13 @@ from saida_operacional_utils import (
     SaidaOperacionalContext,
 )
 from saidas_listar_service import invalidate_listar_cache, listar_saidas_paginado
+from saidas_exportar_service import (
+    MAX_EXPORTAR_LIMIT,
+    ExportarSaidasError,
+    content_disposition,
+    gerar_arquivo,
+    validar_total_exportacao,
+)
 from codigo_normalizer import canonicalize_servico, normalize_codigo
 from saida_historico_service import SaidaHistoricoItemOut, listar_historico_saida
 from saida_status_finalizado_pure import (
@@ -125,6 +132,22 @@ class SaidaCreate(BaseModel):
     servico: str = Field(min_length=1)
     status: Optional[str] = None
     qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
+
+
+class SaidaExportarIn(BaseModel):
+    formato: str
+    colunas: Optional[List[str]] = None
+    de: Optional[date] = None
+    ate: Optional[date] = None
+    base: Optional[str] = None
+    entregador: Optional[str] = None
+    status: Optional[List[str]] = None
+    servico: Optional[List[str]] = None
+    acao: Optional[List[str]] = None
+    localizar: Optional[str] = None
+    codigo: Optional[str] = None
+    codigo_exato: bool = False
+    somente_g: Optional[bool] = None
 
 
 class SaidaOut(BaseModel):
@@ -2141,6 +2164,109 @@ def listar_saidas(
     # Campo interno de diagnóstico — não faz parte do contrato da API.
     result.pop("_cache", None)
     return result
+
+
+def _listar_saidas_para_exportar(
+    db: Session,
+    *,
+    sub_base: str,
+    de: Optional[date],
+    ate: Optional[date],
+    base: Optional[str],
+    entregador: Optional[str],
+    status_: Optional[List[str]],
+    codigo: Optional[str],
+    servico: Optional[List[str]],
+    acao: Optional[List[str]],
+    localizar: Optional[str],
+    somente_g: Optional[bool],
+    codigo_exato: bool,
+) -> Dict[str, Any]:
+    """Mesmos filtros de GET /listar, sem o teto da página da tela."""
+    if codigo and codigo.strip() and codigo_exato:
+        return _listar_saidas_codigo_exato(
+            db=db,
+            sub_base=sub_base,
+            codigo=codigo,
+            de=de,
+            ate=ate,
+            base=base,
+            entregador=entregador,
+            status_=status_,
+            servico=servico,
+            acao=acao,
+            somente_g=somente_g,
+            limit=MAX_EXPORTAR_LIMIT,
+            offset=0,
+        )
+    result = listar_saidas_paginado(
+        db,
+        sub_base=sub_base,
+        de=de,
+        ate=ate,
+        base=base,
+        entregador=entregador,
+        status_=status_,
+        codigo=codigo,
+        servico=servico,
+        acao=acao,
+        localizar=localizar,
+        somente_g=somente_g,
+        codigo_exato=False,
+        limit=MAX_EXPORTAR_LIMIT,
+        offset=0,
+        montar_item=_montar_item_listar_saida,
+        limit_cap=MAX_EXPORTAR_LIMIT,
+        use_cache=False,
+    )
+    result.pop("_cache", None)
+    return result
+
+
+@router.post("/exportar")
+def exportar_saidas(
+    body: SaidaExportarIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Exporta o conjunto filtrado da tela de Registros (CSV ou XLSX)."""
+    sub_base = current_user.sub_base
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+
+    try:
+        listed = _listar_saidas_para_exportar(
+            db,
+            sub_base=sub_base,
+            de=body.de,
+            ate=body.ate,
+            base=body.base,
+            entregador=body.entregador,
+            status_=body.status,
+            codigo=body.codigo,
+            servico=body.servico,
+            acao=body.acao,
+            localizar=body.localizar,
+            somente_g=body.somente_g,
+            codigo_exato=bool(body.codigo_exato),
+        )
+        validar_total_exportacao(int(listed.get("total") or 0))
+        payload, filename, media_type = gerar_arquivo(
+            body.formato,
+            body.colunas,
+            listed.get("items") or [],
+        )
+    except ExportarSaidasError as exc:
+        raise HTTPException(status_code=400, detail=exc.message) from exc
+
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": content_disposition(filename),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ============================================================
