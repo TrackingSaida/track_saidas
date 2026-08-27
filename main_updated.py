@@ -116,7 +116,7 @@ app.add_middleware(
         "Cache-Control", "Pragma",
     ],
     max_age=86400,                           # cache do preflight
-    expose_headers=["X-Backend-Process-Time"],  # frontend lê para logs de performance
+    expose_headers=["X-Backend-Process-Time", "Content-Disposition"],
 )
 
 # ──────────────────────────────────────────────────────────────────
