@@ -25,3 +25,31 @@ def status_conta_na_conferencia(status: Optional[str]) -> bool:
 
 def filtrar_status_conferencia(rows: Iterable[T]) -> List[T]:
     return [s for s in rows if status_conta_na_conferencia(getattr(s, "status", None))]
+
+
+STATUS_CONFERIDA = "conferida"
+
+
+def montar_dias_conferencia_periodo(
+    registros: Iterable[dict],
+    datas_operacionais: Iterable[str],
+) -> List[dict]:
+    """Junta dias operacionais e registros de conferência.
+
+    Dia com status conferida → Conferido.
+    Qualquer outro (pendente, reconferir ou sem registro) → Não conferido.
+    """
+    by_date = {str(r.get("data") or ""): r for r in registros if r.get("data")}
+    all_dates = sorted({str(d) for d in datas_operacionais if d} | {k for k in by_date if k})
+    out: List[dict] = []
+    for dia in all_dates:
+        row = by_date.get(dia) or {}
+        conferido = str(row.get("status") or "").strip().lower() == STATUS_CONFERIDA
+        out.append(
+            {
+                "data": dia,
+                "conferido": conferido,
+                "label": "Conferido" if conferido else "Não conferido",
+            }
+        )
+    return out
