@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from models import EntregadorFechamento, EntregadorFechamentoColetaItem, Saida
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 from upload_storage_utils import B2_BUCKET_NAME, b2_configured, get_s3_client_optional
+from fechamento_resumo_utils import agregar_resumo_fechamento
 
 logger = logging.getLogger(__name__)
 
@@ -193,11 +194,16 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
         valor_flex = Decimal(item["qtde_flex"]) * precos["ml_valor"]
         valor_avulso = Decimal(item["qtde_avulso"]) * precos["avulso_valor"]
         valor_feitos = (valor_shopee + valor_flex + valor_avulso).quantize(Decimal("0.01"))
-        valor_cancelados = (
-            Decimal(item["cancel_shopee"]) * precos["shopee_valor"]
-            + Decimal(item["cancel_flex"]) * precos["ml_valor"]
-            + Decimal(item["cancel_avulso"]) * precos["avulso_valor"]
-        ).quantize(Decimal("0.01"))
+        valor_cancel_shopee = (Decimal(item["cancel_shopee"]) * precos["shopee_valor"]).quantize(
+            Decimal("0.01")
+        )
+        valor_cancel_flex = (Decimal(item["cancel_flex"]) * precos["ml_valor"]).quantize(Decimal("0.01"))
+        valor_cancel_avulso = (Decimal(item["cancel_avulso"]) * precos["avulso_valor"]).quantize(
+            Decimal("0.01")
+        )
+        valor_cancelados = (valor_cancel_shopee + valor_cancel_flex + valor_cancel_avulso).quantize(
+            Decimal("0.01")
+        )
         total_dia = (valor_feitos - valor_cancelados).quantize(Decimal("0.01"))
         out.append(
             {
@@ -205,18 +211,43 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
                 "flex": item["qtde_flex"],
                 "shopee": item["qtde_shopee"],
                 "avulso": item["qtde_avulso"],
+                "cancel_shopee": item["cancel_shopee"],
+                "cancel_flex": item["cancel_flex"],
+                "cancel_avulso": item["cancel_avulso"],
                 "g_total": item["g_total"],
                 "g_shopee": item["g_shopee"],
                 "g_flex": item["g_flex"],
                 "g_avulso": item["g_avulso"],
                 "total_feitos": item["total_feitos"],
                 "total_cancelado": item["total_cancelado"],
+                "valor_shopee": valor_shopee.quantize(Decimal("0.01")),
+                "valor_flex": valor_flex.quantize(Decimal("0.01")),
+                "valor_avulso": valor_avulso.quantize(Decimal("0.01")),
+                "valor_cancel_shopee": valor_cancel_shopee,
+                "valor_cancel_flex": valor_cancel_flex,
+                "valor_cancel_avulso": valor_cancel_avulso,
                 "valor_feitos": valor_feitos,
                 "valor_cancelados": valor_cancelados,
                 "valor_total": total_dia,
             }
         )
     return out
+
+
+def montar_resumo_e_datas(db: Session, fech: EntregadorFechamento) -> tuple[Dict[str, Any], List[str]]:
+    itens = _collect_itens_diarios(db, fech)
+    datas = sorted({str(r.get("data")) for r in itens if r.get("data")})
+    resumo = agregar_resumo_fechamento(
+        itens,
+        valor_adicao=getattr(fech, "valor_adicao", 0),
+        valor_subtracao=getattr(fech, "valor_subtracao", 0),
+    )
+    return resumo, datas
+
+
+def montar_resumo_fechamento(db: Session, fech: EntregadorFechamento) -> Dict[str, Any]:
+    resumo, _ = montar_resumo_e_datas(db, fech)
+    return resumo
 
 
 def _draw_table(c: canvas.Canvas, data: List[List[str]], x: float, y: float, col_widths: List[float]) -> float:

@@ -1,7 +1,11 @@
 """Contador de conferência: lidos do dia sem cancelado/encerrado."""
 from types import SimpleNamespace
 
-from conferencia_saida_pure import filtrar_status_conferencia, status_conta_na_conferencia
+from conferencia_saida_pure import (
+    filtrar_status_conferencia,
+    montar_dias_conferencia_periodo,
+    status_conta_na_conferencia,
+)
 
 
 def test_status_conta_na_conferencia_exclui_cancelado_e_encerrado():
@@ -41,3 +45,37 @@ def test_saidas_por_motoboy_mesmo_filtro_exclui_um_ml_cancelado():
     assert len(validas) == 24
     assert sum(1 for s in validas if s.servico == "shopee") == 5
     assert sum(1 for s in validas if s.servico == "ml") == 19
+
+
+def test_dia_operacional_sem_registro_nao_conferido():
+    dias = montar_dias_conferencia_periodo([], ["2026-08-01", "2026-08-02"])
+    assert [d["data"] for d in dias] == ["2026-08-01", "2026-08-02"]
+    assert all(d["conferido"] is False for d in dias)
+    assert all(d["label"] == "Não conferido" for d in dias)
+
+
+def test_somente_status_conferida_conta_como_conferido():
+    dias = montar_dias_conferencia_periodo(
+        [
+            {"data": "2026-08-01", "status": "conferida"},
+            {"data": "2026-08-02", "status": "pendente"},
+            {"data": "2026-08-03", "status": "reconferir"},
+        ],
+        ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04"],
+    )
+    by_date = {d["data"]: d for d in dias}
+    assert by_date["2026-08-01"]["conferido"] is True
+    assert by_date["2026-08-01"]["label"] == "Conferido"
+    assert by_date["2026-08-02"]["label"] == "Não conferido"
+    assert by_date["2026-08-03"]["label"] == "Não conferido"
+    assert by_date["2026-08-04"]["label"] == "Não conferido"
+
+
+def test_registro_fora_dos_dias_operacionais_ainda_aparece():
+    dias = montar_dias_conferencia_periodo(
+        [{"data": "2026-08-10", "status": "conferida"}],
+        ["2026-08-01"],
+    )
+    assert [d["data"] for d in dias] == ["2026-08-01", "2026-08-10"]
+    assert dias[0]["conferido"] is False
+    assert dias[1]["conferido"] is True

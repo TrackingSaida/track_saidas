@@ -77,6 +77,7 @@ from codigo_normalizer import (
     is_qr_like_scan_payload,
 )
 from entregador_routes import resolver_precos_motoboy
+from extrato_valor_utils import valor_extrato_por_filtro
 from route_api_status import (
     API_STATUS_EM_ENTREGA,
     build_rotas_ativa_out,
@@ -432,7 +433,10 @@ class ExtratoDiaItem(BaseModel):
     total_pacotes_associados: int
     total_pacotes_filtrados: int
     valor_dia: Decimal
+    valor_feitos: Decimal = Decimal("0.00")
+    valor_cancelados: Decimal = Decimal("0.00")
     itens: List["ExtratoPedidoItem"]
+    itens_cancelados: List["ExtratoPedidoItem"] = Field(default_factory=list)
 
 
 class ExtratoPedidoItem(BaseModel):
@@ -449,11 +453,14 @@ class ExtratoFinanceiroOut(BaseModel):
     periodo_fim: str
     status_filtro: str
     valor_a_receber: Decimal
+    valor_feitos: Decimal = Decimal("0.00")
+    valor_cancelados: Decimal = Decimal("0.00")
     total_pacotes_associados: int
     total_pacotes_filtrados: int
     total_cancelados: int
     resumo_por_servico: Dict[str, int]
     dias: List[ExtratoDiaItem]
+    itens_cancelados: List[ExtratoPedidoItem] = Field(default_factory=list)
 
 
 # ============================================================
@@ -1090,18 +1097,19 @@ def extrato_financeiro_motoboy(
         "flex": precos["ml_valor"],
         "avulso": precos["avulso_valor"],
     }
-    valor_total = Decimal("0.00")
+    valor_feitos = Decimal("0.00")
+    valor_cancelados = Decimal("0.00")
     total_associados = 0
     total_filtrados = 0
     total_cancelados = 0
     por_servico = {"Shopee": 0, "Flex": 0, "Avulso": 0}
+    itens_cancelados_periodo: List[ExtratoPedidoItem] = []
     dias_map: Dict[str, Dict[str, Decimal | int | List[ExtratoPedidoItem]]] = {}
 
     for s in rows:
         status_up = _status_normalizado_upper(s.status)
         is_cancelado = status_up == STATUS_CANCELADO
         is_encerrado = status_up == STATUS_ENCERRADO_SISTEMA
-        is_sem_valor = is_cancelado or is_encerrado
         is_grupo_entregue = status_up in grupo_entregue
         if modo == "cancelados":
             passa_filtro = is_cancelado
@@ -1117,45 +1125,51 @@ def extrato_financeiro_motoboy(
             dias_map[d] = {
                 "total_pacotes_associados": 0,
                 "total_pacotes_filtrados": 0,
-                "valor_dia": Decimal("0.00"),
+                "valor_feitos": Decimal("0.00"),
+                "valor_cancelados": Decimal("0.00"),
                 "itens": [],
+                "itens_cancelados": [],
             }
+
+        item_preco = Decimal("0.00") if is_encerrado else _valor_saida(precos_mobile, s)
+        item_preco = item_preco.quantize(Decimal("0.01"))
+        pedido = ExtratoPedidoItem(
+            id_saida=s.id_saida,
+            codigo=s.codigo,
+            status=s.status or "",
+            exibicao=_status_exibicao(s.status),
+            servico=_servico_tipo(s.servico),
+            valor=item_preco,
+        )
 
         if is_cancelado:
             total_cancelados += 1
+            valor_cancelados += item_preco
+            itens_cancelados_periodo.append(pedido)
+            if d:
+                dias_map[d]["valor_cancelados"] += item_preco
+                dias_map[d]["itens_cancelados"].append(pedido)
         else:
             total_associados += 1
             if d:
                 dias_map[d]["total_pacotes_associados"] += 1
+            if is_grupo_entregue:
+                valor_feitos += item_preco
+                if d:
+                    dias_map[d]["valor_feitos"] += item_preco
 
         if not passa_filtro:
             continue
         total_filtrados += 1
-        item_valor = Decimal("0.00") if is_sem_valor else _valor_saida(precos_mobile, s)
         if d:
             dias_map[d]["total_pacotes_filtrados"] += 1
-            dias_map[d]["itens"].append(
-                ExtratoPedidoItem(
-                    id_saida=s.id_saida,
-                    codigo=s.codigo,
-                    status=s.status or "",
-                    exibicao=_status_exibicao(s.status),
-                    servico=_servico_tipo(s.servico),
-                    valor=item_valor.quantize(Decimal("0.01")),
-                )
-            )
+            dias_map[d]["itens"].append(pedido)
 
         tipo = _servico_tipo(s.servico)
         if tipo in por_servico:
             por_servico[tipo] += 1
 
-        if is_sem_valor:
-            continue
-        valor = item_valor
-        valor_total += valor
-        if d:
-            dias_map[d]["valor_dia"] += valor
-
+    valor_total = valor_extrato_por_filtro(valor_feitos, valor_cancelados, modo)
     dias = []
     for d, v in dias_map.items():
         if int(v["total_pacotes_filtrados"]) <= 0:
@@ -1165,8 +1179,15 @@ def extrato_financeiro_motoboy(
                 data=d,
                 total_pacotes_associados=int(v["total_pacotes_associados"]),
                 total_pacotes_filtrados=int(v["total_pacotes_filtrados"]),
-                valor_dia=Decimal(v["valor_dia"]).quantize(Decimal("0.01")),
+                valor_dia=valor_extrato_por_filtro(
+                    Decimal(v["valor_feitos"]),
+                    Decimal(v["valor_cancelados"]),
+                    modo,
+                ),
+                valor_feitos=Decimal(v["valor_feitos"]).quantize(Decimal("0.01")),
+                valor_cancelados=Decimal(v["valor_cancelados"]).quantize(Decimal("0.01")),
                 itens=list(v["itens"]),
+                itens_cancelados=list(v["itens_cancelados"]) if modo == "grupo_entregue" else [],
             )
         )
     dias.sort(key=lambda item: item.data, reverse=True)
@@ -1175,7 +1196,9 @@ def extrato_financeiro_motoboy(
         periodo_inicio=periodo_inicio.isoformat(),
         periodo_fim=periodo_fim.isoformat(),
         status_filtro=modo,
-        valor_a_receber=valor_total.quantize(Decimal("0.01")),
+        valor_a_receber=valor_total,
+        valor_feitos=valor_feitos.quantize(Decimal("0.01")),
+        valor_cancelados=valor_cancelados.quantize(Decimal("0.01")),
         total_pacotes_associados=total_associados,
         total_pacotes_filtrados=total_filtrados,
         total_cancelados=total_cancelados,
@@ -1185,6 +1208,7 @@ def extrato_financeiro_motoboy(
             "avulso": por_servico["Avulso"],
         },
         dias=dias,
+        itens_cancelados=itens_cancelados_periodo if modo == "grupo_entregue" else [],
     )
 
 
