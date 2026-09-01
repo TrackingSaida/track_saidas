@@ -25,6 +25,7 @@ from ml_int_service import (
     fetch_shipments_by_tracking,
     get_me,
     get_valid_access_token,
+    ml_conexao_status,
 )
 
 router = APIRouter(prefix="/ml-int", tags=["ML Int"])
@@ -102,7 +103,8 @@ def ml_int_callback(
 
     if existente:
         existente.access_token = access_token
-        existente.refresh_token = refresh_token
+        if refresh_token:
+            existente.refresh_token = refresh_token
         existente.expires_at = expires_at
         existente.atualizado_em = datetime.utcnow()
         if sub_base_value is not None:
@@ -116,7 +118,7 @@ def ml_int_callback(
         user_id_ml=user_id_ml,
         user_nickname_ml=nickname or None,
         access_token=access_token,
-        refresh_token=refresh_token,
+        refresh_token=refresh_token or "",
         expires_at=expires_at,
     )
     db.add(novo)
@@ -136,14 +138,13 @@ def ml_int_sellers(
     sub_base = getattr(user, "sub_base", None)
     q = db.query(MLConexao).filter(MLConexao.sub_base == sub_base)
     conexoes = q.order_by(MLConexao.criado_em.desc()).all()
-    now = datetime.utcnow()
     return [
         {
             "id": c.id,
             "user_id_ml": c.user_id_ml,
             "user_nickname_ml": c.user_nickname_ml,
             "sub_base": c.sub_base,
-            "status": "conectado" if (c.expires_at and c.expires_at > now) else "expirado",
+            "status": ml_conexao_status(c),
             "criado_em": c.criado_em.isoformat() if c.criado_em else None,
         }
         for c in conexoes
@@ -172,6 +173,8 @@ def ml_int_volume_pendente(
             user_id_ml,
             order_status="paid",
             limit=100,
+            db=db,
+            sub_base=sub_base,
         )
     except requests.HTTPError as e:
         raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
@@ -221,6 +224,8 @@ def ml_int_vendas_seller(
             date_to=date_to,
             offset=offset,
             limit=limit,
+            db=db,
+            sub_base=sub_base,
         )
     except requests.HTTPError as e:
         raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
@@ -248,7 +253,9 @@ def ml_int_envios_seller(
     except (LookupError, RuntimeError) as e:
         raise HTTPException(404, str(e))
     try:
-        search = fetch_orders_search(token, user_id_ml, limit=limit)
+        search = fetch_orders_search(
+            token, user_id_ml, limit=limit, db=db, sub_base=sub_base,
+        )
     except requests.HTTPError as e:
         raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
     results = search.get("results") or []
@@ -256,7 +263,9 @@ def ml_int_envios_seller(
     seen_shipment = set()
     for order_id in results[:limit]:
         try:
-            order = fetch_order(token, str(order_id))
+            order = fetch_order(
+                token, str(order_id), db=db, user_id_ml=user_id_ml, sub_base=sub_base,
+            )
         except Exception:
             continue
         shipping = order.get("shipping") or {}
@@ -265,7 +274,9 @@ def ml_int_envios_seller(
             continue
         seen_shipment.add(sid)
         try:
-            ship = fetch_shipment(token, int(sid))
+            ship = fetch_shipment(
+                token, int(sid), db=db, user_id_ml=user_id_ml, sub_base=sub_base,
+            )
         except Exception:
             continue
         dest = ship.get("destination") or {}
@@ -306,7 +317,9 @@ def ml_int_envio_detail(
     for c in conexoes:
         try:
             token = get_valid_access_token(db, c.user_id_ml, sub_base)
-            ship = fetch_shipment(token, shipment_id)
+            ship = fetch_shipment(
+                token, shipment_id, db=db, user_id_ml=c.user_id_ml, sub_base=sub_base,
+            )
             dest = ship.get("destination") or {}
             return {
                 "shipment_id": shipment_id,
@@ -336,13 +349,17 @@ def ml_int_envio_by_tracking(
     for c in conexoes:
         try:
             token = get_valid_access_token(db, c.user_id_ml, sub_base)
-            data = fetch_shipments_by_tracking(token, tracking_number)
+            data = fetch_shipments_by_tracking(
+                token, tracking_number, db=db, user_id_ml=c.user_id_ml, sub_base=sub_base,
+            )
             results = data.get("results") or []
             if not results:
                 continue
             sid = results[0].get("id")
             if sid:
-                ship = fetch_shipment(token, int(sid))
+                ship = fetch_shipment(
+                    token, int(sid), db=db, user_id_ml=c.user_id_ml, sub_base=sub_base,
+                )
                 dest = ship.get("destination") or {}
                 return {
                     "shipment_id": sid,
@@ -371,7 +388,9 @@ def ml_int_etiqueta(
     for c in conexoes:
         try:
             token = get_valid_access_token(db, c.user_id_ml, sub_base)
-            ship = fetch_shipment(token, shipment_id)
+            ship = fetch_shipment(
+                token, shipment_id, db=db, user_id_ml=c.user_id_ml, sub_base=sub_base,
+            )
             # Doc ML BR: endpoint de etiqueta a confirmar; por ora retornar dados do envio
             return {
                 "shipment_id": shipment_id,
@@ -426,14 +445,19 @@ def ml_int_sync_envios(
             errors.append({"user_id_ml": conexao.user_id_ml, "error": str(e)})
             continue
         try:
-            search = fetch_orders_search(token, conexao.user_id_ml, limit=50)
+            search = fetch_orders_search(
+                token, conexao.user_id_ml, limit=50, db=db, sub_base=sub_base,
+            )
         except requests.HTTPError as e:
             errors.append({"user_id_ml": conexao.user_id_ml, "error": e.response.text or str(e)})
             continue
         results = search.get("results") or []
         for order_id in results:
             try:
-                order = fetch_order(token, str(order_id))
+                order = fetch_order(
+                    token, str(order_id),
+                    db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base,
+                )
             except Exception:
                 continue
             shipping = order.get("shipping") or {}
@@ -445,7 +469,10 @@ def ml_int_sync_envios(
             if existing:
                 continue
             try:
-                ship = fetch_shipment(token, int(sid))
+                ship = fetch_shipment(
+                    token, int(sid),
+                    db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base,
+                )
             except Exception:
                 continue
             status_ship = (ship.get("status") or "").lower()
