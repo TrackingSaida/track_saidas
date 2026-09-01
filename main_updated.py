@@ -262,12 +262,13 @@ def health():
     return {"status": "ok", "version": app.version}
 
 # ──────────────────────────────────────────────────────────────────
-# Endpoint interno: refresh de tokens (Cron Render — a cada ~5h)
+# Endpoint interno: refresh de tokens (Cron Render — recomendado a cada 1h)
 @app.post(f"{API_PREFIX}/internal/refresh-tokens", tags=["Internal"])
 def internal_refresh_tokens(request: Request):
     """
-    Renova tokens ML Int e Shopee. Protegido por header X-Cron-Secret (CRON_REFRESH_SECRET).
-    Uso: Cron Job no Render a cada 5h.
+    Renova tokens ML Int e Shopee expirados (não renova tokens ainda válidos).
+    Protegido por header X-Cron-Secret (CRON_REFRESH_SECRET).
+    Uso: Cron Job no Render a cada 1h (0 * * * *).
     """
     secret = os.getenv("CRON_REFRESH_SECRET")
     if not secret:
@@ -277,9 +278,15 @@ def internal_refresh_tokens(request: Request):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     db = SessionLocal()
     try:
-        ml_count = refresh_all_ml_int_tokens(db)
-        shopee_count = refresh_all_shopee_tokens(db)
-        return {"status": "ok", "ml_refreshed": ml_count, "shopee_refreshed": shopee_count}
+        ml_stats = refresh_all_ml_int_tokens(db)
+        shopee_stats = refresh_all_shopee_tokens(db)
+        return {
+            "status": "ok",
+            "ml_refreshed": ml_stats["refreshed"],
+            "shopee_refreshed": shopee_stats["refreshed"],
+            "ml": ml_stats,
+            "shopee": shopee_stats,
+        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
     finally:

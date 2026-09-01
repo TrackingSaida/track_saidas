@@ -214,6 +214,56 @@ Filtro opcional por tenant na primeira limpeza grande:
 ".../encerrar-pendentes-quinzena?dry_run=true&sub_base=NOME_DA_SUB_BASE"
 ```
 
+## Refresh de tokens (Mercado Livre / Shopee) — Cron Job no Render
+
+Renovação de `access_token` via `refresh_token` para integrações ML Int e Shopee.
+
+### Comportamento
+
+- O Mercado Livre recomenda renovar o access token **somente quando perder validade** (refresh_token é de uso único).
+- O backend renova automaticamente:
+  - **on-demand** nas consultas à API (`get_valid_access_token`);
+  - **via cron** como rede de segurança para sellers sem consulta recente.
+- Buffer operacional default: **5 minutos** antes da expiração (`ML_TOKEN_REFRESH_BUFFER_SECONDS` / `SHOPEE_TOKEN_REFRESH_BUFFER_SECONDS`).
+
+### Pré-requisitos
+
+1. Variáveis no Web Service:
+   - `ML_CLIENT_ID`, `ML_CLIENT_SECRET`, `ML_REDIRECT_URI`
+   - `CRON_REFRESH_SECRET`
+2. Cron Job no Render com o mesmo `CRON_REFRESH_SECRET`.
+
+### Endpoint interno
+
+- `POST /api/internal/refresh-tokens`
+- Header: `X-Cron-Secret: <CRON_REFRESH_SECRET>`
+- Resposta típica:
+
+```json
+{
+  "status": "ok",
+  "ml_refreshed": 1,
+  "shopee_refreshed": 0,
+  "ml": { "total": 3, "refreshed": 1, "skipped_valid": 2, "failed": 0 },
+  "shopee": { "total": 0, "refreshed": 0, "skipped_valid": 0, "failed": 0 }
+}
+```
+
+`skipped_valid` indica tokens ainda válidos que **não** foram renovados (comportamento esperado).
+
+### Agendamento recomendado no Render
+
+- Schedule: `0 * * * *` (a cada 1 hora)
+- Command:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_REFRESH_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/refresh-tokens"
+```
+
+> Se o cron anterior rodava a cada 5h, altere o schedule para 1h. O código agora só renova tokens expirados.
+
 ## Notificações push (mobile) — Cron Jobs no Render
 
 Push remoto para motoboy e staff (Expo Push API). Depende de tokens registrados pelo app (`POST /api/mobile/push/register`) e das tabelas criadas pela migração de notificações.
