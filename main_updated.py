@@ -496,6 +496,26 @@ def internal_notificar_coletas_pendentes(request: Request):
         db.close()
 
 
+@app.post(f"{API_PREFIX}/internal/notificar-entrada-sem-saida", tags=["Internal"])
+def internal_notificar_entrada_sem_saida(request: Request):
+    """Push de pacotes do dia com entrada e ainda sem saída. Janela/intervalo no Cron Render."""
+    secret = os.getenv("CRON_PUSH_SECRET") or os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_PUSH_SECRET não configurado"})
+    if request.headers.get("X-Cron-Secret") != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    from entrada_alerta_service import notificar_entrada_sem_saida
+
+    db = SessionLocal()
+    try:
+        return {"status": "ok", **notificar_entrada_sem_saida(db)}
+    except Exception as e:
+        db.rollback()
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
+
 # ──────────────────────────────────────────────────────────────────
 # Execução local
 if __name__ == "__main__":

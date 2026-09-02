@@ -374,6 +374,7 @@ def send_to_staff_sub_base(
     data: Optional[Dict[str, Any]] = None,
     roles: Sequence[int] = (0, 1, 2, 3),
     exclude_user_id: Optional[int] = None,
+    chave_dedupe: Optional[str] = None,
 ) -> int:
     data = dict(data or {})
     q = select(DevicePushToken).where(
@@ -389,7 +390,17 @@ def send_to_staff_sub_base(
         return 0
 
     messages: List[Dict[str, Any]] = []
+    marked_users: set[int] = set()
     for t in tokens:
+        if chave_dedupe and already_sent(
+            db,
+            destinatario_tipo="staff",
+            destinatario_id=int(t.user_id),
+            sub_base=sub_base,
+            tipo=tipo,
+            chave_dedupe=chave_dedupe,
+        ):
+            continue
         prefs = db.scalar(
             select(NotifPrefs).where(
                 NotifPrefs.user_id == t.user_id,
@@ -401,10 +412,26 @@ def send_to_staff_sub_base(
         messages.append(
             _build_message(t.expo_push_token, title=title, body=body, data=data, tipo=tipo)
         )
+        marked_users.add(int(t.user_id))
+
+    if not messages:
+        return 0
+
     invalid = _send_expo(messages)
     if invalid:
         _deactivate_invalid_tokens(db, invalid)
         db.flush()
+
+    if chave_dedupe:
+        for uid in marked_users:
+            mark_sent(
+                db,
+                destinatario_tipo="staff",
+                destinatario_id=uid,
+                sub_base=sub_base,
+                tipo=tipo,
+                chave_dedupe=chave_dedupe,
+            )
     return len(messages)
 
 
