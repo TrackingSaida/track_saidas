@@ -125,7 +125,7 @@ def obter_ou_criar_execucao(
         base_id=base.id_base,
         data_operacao=data_operacao,
         modo=modo,
-        status="coletado",
+        status="em_coleta",
     )
     db.add(execucao)
     db.flush()
@@ -150,6 +150,9 @@ def agregar_leitura(
         data_operacao=date.today(),
         modo="codigo",
     )
+    # Se a execução ainda está pendente de início, marca Em coleta para os demais verem.
+    if execucao.status not in ("coletado", "sem_volume", "em_coleta"):
+        execucao.status = "em_coleta"
     participante = db.scalar(
         select(ColetaExecucaoParticipante).where(
             ColetaExecucaoParticipante.execucao_id == execucao.id_execucao,
@@ -177,6 +180,9 @@ def agregar_leitura(
         participante.mercado_livre += int(coleta.mercado_livre or 0)
         participante.avulso += int(coleta.avulso or 0)
         participante.pacotes_g += int(coleta.pacotes_g or 0)
+        # Após o primeiro lançamento por leitura, encerra a participação ativa.
+        if (int(participante.shopee or 0) + int(participante.mercado_livre or 0) + int(participante.avulso or 0)) > 0:
+            participante.status = "finalizado"
     participante.sem_volume = False
     participante.versao += 1
     participante.atualizado_em = datetime.now()
