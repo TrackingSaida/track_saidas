@@ -31,15 +31,88 @@ def combinar_modo_execucao(atual: str, solicitado: str) -> str:
     return solicitado
 
 
+def _quantidade_participante(item: ColetaExecucaoParticipante) -> int:
+    return int(item.shopee or 0) + int(item.mercado_livre or 0) + int(item.avulso or 0)
+
+
 def atualizar_status_execucao(execucao: ColetaExecucao) -> None:
     participantes = list(execucao.participantes or [])
     if any(getattr(item, "status", "finalizado") == "em_coleta" for item in participantes):
         execucao.status = "em_coleta"
-    elif participantes and all(bool(item.sem_volume) for item in participantes):
+    elif not participantes:
+        # Sem participantes a execução deve ser removida pelo caller; não marca coletado.
+        execucao.atualizado_em = datetime.now()
+        return
+    elif all(bool(item.sem_volume) for item in participantes):
         execucao.status = "sem_volume"
     else:
         execucao.status = "coletado"
     execucao.atualizado_em = datetime.now()
+
+
+def participante_sem_lancamento(participante: ColetaExecucaoParticipante) -> bool:
+    """True quando o usuário só selecionou a base, sem volume/leitura/sem_volume."""
+    return _quantidade_participante(participante) == 0 and not bool(participante.sem_volume)
+
+
+def liberar_participacao_vazia(
+    db: Session,
+    *,
+    execucao: ColetaExecucao,
+    participante: ColetaExecucaoParticipante,
+) -> bool:
+    """
+    Remove participação sem lançamento. Se ninguém restar, apaga a execução
+    (base volta a Pendente). Retorna True se removeu.
+    """
+    if not participante_sem_lancamento(participante):
+        return False
+    db.delete(participante)
+    db.flush()
+    restantes = [
+        item
+        for item in (execucao.participantes or [])
+        if item.id_participante != participante.id_participante
+    ]
+    if not restantes:
+        db.delete(execucao)
+    else:
+        atualizar_status_execucao(execucao)
+    return True
+
+
+def liberar_participacoes_vazias_do_usuario(
+    db: Session,
+    *,
+    sub_base: str,
+    user_id: int,
+    data_operacao: date,
+    exceto_base_id: Optional[int] = None,
+) -> int:
+    """
+    Ao trocar de base sem informar volume, libera as outras participações
+    'em_coleta' vazias do mesmo usuário no dia.
+    """
+    stmt = (
+        select(ColetaExecucaoParticipante)
+        .join(ColetaExecucao, ColetaExecucaoParticipante.execucao_id == ColetaExecucao.id_execucao)
+        .where(
+            ColetaExecucaoParticipante.sub_base == sub_base,
+            ColetaExecucaoParticipante.user_id == user_id,
+            ColetaExecucaoParticipante.status == "em_coleta",
+            ColetaExecucao.data_operacao == data_operacao,
+        )
+    )
+    if exceto_base_id is not None:
+        stmt = stmt.where(ColetaExecucao.base_id != exceto_base_id)
+    liberados = 0
+    for participante in list(db.scalars(stmt).all()):
+        execucao = participante.execucao
+        if not execucao:
+            continue
+        if liberar_participacao_vazia(db, execucao=execucao, participante=participante):
+            liberados += 1
+    return liberados
 
 
 def obter_owner(db: Session, sub_base: str) -> Owner:
