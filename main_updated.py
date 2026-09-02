@@ -197,11 +197,14 @@ def _cors_headers_for_request(request: Request):
 
 @app.exception_handler(FastAPIHTTPException)
 async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
-    """Garante que respostas HTTPException (401, 404, etc.) tenham CORS para o browser não bloquear."""
+    """Garante CORS e preserva detail estruturado (ex.: mensagem/pode_ajudar)."""
     detail = exc.detail
-    if isinstance(detail, dict):
-        detail = detail.get("message", detail.get("detail", str(detail)))
-    body = {"detail": str(detail) if detail else "Erro"}
+    # Dict/list devem ir intactos para o cliente montar UI (ex.: "Deseja ajudar?").
+    # Strings simples continuam em {"detail": "..."}.
+    if isinstance(detail, (dict, list)):
+        body = {"detail": detail}
+    else:
+        body = {"detail": str(detail) if detail else "Erro"}
     headers = dict(_cors_headers_for_request(request))
     return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
 
