@@ -97,3 +97,38 @@ def test_valor_servicos_calcula_por_preco_da_base():
 
     base = SimpleNamespace(shopee=Decimal("2.50"), ml=Decimal("3.00"), avulso=Decimal("1.00"))
     assert _valor_servicos(base, shopee=2, mercado_livre=4, avulso=1) == Decimal("16.00")
+
+
+def test_participante_sem_lancamento_e_liberacao_volta_pendente():
+    from coleta_operacional_service import liberar_participacao_vazia, participante_sem_lancamento
+
+    vazio = SimpleNamespace(
+        shopee=0,
+        mercado_livre=0,
+        avulso=0,
+        sem_volume=False,
+        id_participante=1,
+        status="em_coleta",
+    )
+    com_volume = SimpleNamespace(
+        shopee=1,
+        mercado_livre=0,
+        avulso=0,
+        sem_volume=False,
+        id_participante=2,
+        status="em_coleta",
+    )
+    assert participante_sem_lancamento(vazio) is True
+    assert participante_sem_lancamento(com_volume) is False
+
+    db = MagicMock()
+    execucao = SimpleNamespace(participantes=[vazio], status="em_coleta", atualizado_em=None)
+    assert liberar_participacao_vazia(db, execucao=execucao, participante=vazio) is True
+    assert db.delete.call_count == 2
+    db.delete.assert_any_call(vazio)
+    db.delete.assert_any_call(execucao)
+
+    db2 = MagicMock()
+    execucao2 = SimpleNamespace(participantes=[com_volume], status="em_coleta", atualizado_em=None)
+    assert liberar_participacao_vazia(db2, execucao=execucao2, participante=com_volume) is False
+    db2.delete.assert_not_called()

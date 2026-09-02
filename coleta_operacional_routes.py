@@ -15,8 +15,11 @@ from coleta_operacional_service import (
     atualizar_status_execucao,
     combinar_modo_execucao,
     exigir_modo,
+    liberar_participacao_vazia,
+    liberar_participacoes_vazias_do_usuario,
     modo_coleta,
     obter_ou_criar_execucao,
+    participante_sem_lancamento,
     resolver_base,
     resolver_executor,
 )
@@ -575,6 +578,17 @@ def iniciar_coleta(
     exigir_modo(db, sub_base, body.metodo)
     base = resolver_base(db, sub_base, base_id=base_id)
     executor, motoboy_id = resolver_executor(db, current_user)
+    # Trocar de base sem lançamento: libera a(s) anterior(es) e volta status para Pendente.
+    # Commit antecipado: se o iniciar falhar (ex.: base ocupada), a liberação não é desfeita.
+    liberados = liberar_participacoes_vazias_do_usuario(
+        db,
+        sub_base=sub_base,
+        user_id=executor.id,
+        data_operacao=date.today(),
+        exceto_base_id=base.id_base,
+    )
+    if liberados:
+        db.commit()
     execucao = db.scalar(
         select(ColetaExecucao).where(
             ColetaExecucao.sub_base == sub_base,
@@ -693,21 +707,10 @@ def liberar_participacao(
     participante = _participante_atual(execucao, current_user.id)
     if not participante:
         raise HTTPException(404, "Participação não encontrada.")
-    if _quantidade_total(participante) or participante.sem_volume:
+    if not participante_sem_lancamento(participante):
         raise HTTPException(409, "Não é possível sair após registrar volumes. Finalize a coleta.")
-    db.delete(participante)
-    db.flush()
-    restantes = [item for item in execucao.participantes if item.id_participante != participante.id_participante]
-    if not restantes:
-        db.delete(execucao)
-    else:
-        if any(getattr(item, "status", "finalizado") == "em_coleta" for item in restantes):
-            execucao.status = "em_coleta"
-        elif all(bool(item.sem_volume) for item in restantes):
-            execucao.status = "sem_volume"
-        else:
-            execucao.status = "coletado"
-        execucao.atualizado_em = datetime.now()
+    if not liberar_participacao_vazia(db, execucao=execucao, participante=participante):
+        raise HTTPException(409, "Não é possível sair após registrar volumes. Finalize a coleta.")
     db.commit()
 
 
