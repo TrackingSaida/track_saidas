@@ -28,6 +28,62 @@ from ml_int_service import (
     ml_conexao_status,
 )
 
+
+def _normalize_sub_base(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _upsert_ml_conexao(
+    db: Session,
+    *,
+    user_id_ml: int,
+    sub_base_value: str,
+    access_token: str,
+    refresh_token: str | None,
+    expires_at: datetime,
+    nickname: str,
+) -> MLConexao:
+    """
+    Atualiza a conexão mais recente do par (user_id_ml, sub_base) e remove duplicatas.
+    Evita múltiplas linhas do mesmo seller na mesma sub_base.
+    """
+    existentes = (
+        db.query(MLConexao)
+        .filter(
+            MLConexao.user_id_ml == user_id_ml,
+            MLConexao.sub_base == sub_base_value,
+        )
+        .order_by(MLConexao.criado_em.desc(), MLConexao.id.desc())
+        .all()
+    )
+    if existentes:
+        principal = existentes[0]
+        principal.access_token = access_token
+        if refresh_token:
+            principal.refresh_token = refresh_token
+        principal.expires_at = expires_at
+        principal.atualizado_em = datetime.utcnow()
+        if nickname:
+            principal.user_nickname_ml = nickname
+        for dup in existentes[1:]:
+            db.delete(dup)
+        db.commit()
+        db.refresh(principal)
+        return principal
+
+    novo = MLConexao(
+        sub_base=sub_base_value,
+        user_id_ml=user_id_ml,
+        user_nickname_ml=nickname or None,
+        access_token=access_token,
+        refresh_token=refresh_token or "",
+        expires_at=expires_at,
+    )
+    db.add(novo)
+    db.commit()
+    db.refresh(novo)
+    return novo
+
 router = APIRouter(prefix="/ml-int", tags=["ML Int"])
 
 ML_AUTH_BASE = "https://auth.mercadolivre.com.br/authorization"
@@ -70,16 +126,11 @@ def ml_int_callback(
     user_me = get_me(access_token)
     user_id_ml = user_me["id"]
 
-    existente = (
-        db.query(MLConexao)
-        .filter(MLConexao.user_id_ml == user_id_ml, MLConexao.sub_base == (state or "").strip() or None)
-        .first()
-    )
     base_url = (FRONTEND_AFTER_CALLBACK or "").rstrip("/")
     success_page = f"{base_url}/autenticacao-sucesso.html"
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
-    sub_base_value = (state or "").strip() or None
+    sub_base_value = _normalize_sub_base(state)
     nickname = (user_me.get("nickname") or "").strip()
 
     # Nome fantasia do owner para exibir na página de sucesso (prioridade sobre sub_base)
@@ -101,28 +152,15 @@ def ml_int_callback(
         params.append("_t=" + str(int(time.time())))
         return success_page + "?" + "&".join(params)
 
-    if existente:
-        existente.access_token = access_token
-        if refresh_token:
-            existente.refresh_token = refresh_token
-        existente.expires_at = expires_at
-        existente.atualizado_em = datetime.utcnow()
-        if sub_base_value is not None:
-            existente.sub_base = sub_base_value
-        if nickname:
-            existente.user_nickname_ml = nickname
-        db.commit()
-        return RedirectResponse(url=success_url())
-    novo = MLConexao(
-        sub_base=sub_base_value or "",
+    _upsert_ml_conexao(
+        db,
         user_id_ml=user_id_ml,
-        user_nickname_ml=nickname or None,
+        sub_base_value=sub_base_value,
         access_token=access_token,
-        refresh_token=refresh_token or "",
+        refresh_token=refresh_token,
         expires_at=expires_at,
+        nickname=nickname,
     )
-    db.add(novo)
-    db.commit()
     return RedirectResponse(url=success_url())
 
 
@@ -132,12 +170,20 @@ def ml_int_sellers(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Lista conexões (sellers) da sub_base do usuário."""
+    """Lista conexões (sellers) da sub_base do usuário (1 linha por user_id_ml)."""
     if user.role not in (0, 1):
         raise HTTPException(403, "Acesso restrito a root e admin.")
     sub_base = getattr(user, "sub_base", None)
     q = db.query(MLConexao).filter(MLConexao.sub_base == sub_base)
-    conexoes = q.order_by(MLConexao.criado_em.desc()).all()
+    conexoes = q.order_by(MLConexao.criado_em.desc(), MLConexao.id.desc()).all()
+    # Deduplica por seller: mantém a conexão mais recente
+    vistos: set[int] = set()
+    unicos: list[MLConexao] = []
+    for c in conexoes:
+        if c.user_id_ml in vistos:
+            continue
+        vistos.add(c.user_id_ml)
+        unicos.append(c)
     return [
         {
             "id": c.id,
@@ -147,7 +193,7 @@ def ml_int_sellers(
             "status": ml_conexao_status(c),
             "criado_em": c.criado_em.isoformat() if c.criado_em else None,
         }
-        for c in conexoes
+        for c in unicos
     ]
 
 

@@ -68,13 +68,31 @@ def ml_token_precisa_renovar(conexao: MLConexao, buffer_seconds: int | None = No
 def ml_conexao_status(conexao: MLConexao) -> str:
     """
     Status amigável da conexão:
-    - conectado: access válido ou refresh_token disponível para renovação automática
-    - requer_reautorizacao: sem refresh_token (seller precisa autorizar de novo)
+    - conectado: refresh_token presente (renovação automática possível)
+    - requer_reautorizacao: sem refresh_token (invalid_grant / revogado / nunca gravado)
     """
     has_refresh = bool((conexao.refresh_token or "").strip())
     if not has_refresh:
         return "requer_reautorizacao"
     return "conectado"
+
+
+def invalidate_ml_conexao(db: Session, conexao: MLConexao, *, reason: str = "") -> None:
+    """
+    Marca conexão como inválida: limpa refresh_token para exigir nova autorização.
+    Mantém access_token antigo apenas para auditoria (não será usado após expires_at).
+    """
+    conexao.refresh_token = ""
+    conexao.expires_at = _utcnow()
+    conexao.atualizado_em = _utcnow()
+    db.commit()
+    db.refresh(conexao)
+    logger.warning(
+        "invalidate_ml_conexao: user_id_ml=%s sub_base=%s reason=%s",
+        conexao.user_id_ml,
+        conexao.sub_base,
+        reason or "unknown",
+    )
 
 
 def _resolve_conexao(db: Session, user_id_ml: int, sub_base: str) -> Optional[MLConexao]:
@@ -191,6 +209,18 @@ def refresh_ml_int_token(
                 conexao.sub_base,
                 body_preview,
             )
+            # invalid_grant = refresh já usado, expirado ou autorização revogada no ML
+            error_code = ""
+            try:
+                error_code = str((resp.json() or {}).get("error") or "")
+            except Exception:
+                error_code = ""
+            if resp.status_code in (400, 401) and error_code in ("invalid_grant", "invalid_token"):
+                invalidate_ml_conexao(
+                    db,
+                    conexao,
+                    reason=f"ml_{resp.status_code}_{error_code}",
+                )
             return None
 
         payload = resp.json()
@@ -393,11 +423,20 @@ def refresh_all_ml_int_tokens(db: Session) -> dict[str, int]:
     Varre ml_conexoes e renova apenas tokens expirados (ou no buffer).
     Retorna estatísticas para o cron/startup.
     """
-    stats = {"total": 0, "refreshed": 0, "skipped_valid": 0, "failed": 0}
+    stats = {
+        "total": 0,
+        "refreshed": 0,
+        "skipped_valid": 0,
+        "skipped_invalid": 0,
+        "failed": 0,
+    }
     conexoes = db.query(MLConexao).all()
     for c in conexoes:
         stats["total"] += 1
         try:
+            if not (c.refresh_token or "").strip():
+                stats["skipped_invalid"] += 1
+                continue
             if not ml_token_precisa_renovar(c):
                 stats["skipped_valid"] += 1
                 continue
