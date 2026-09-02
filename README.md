@@ -275,6 +275,7 @@ Push remoto para motoboy e staff (Expo Push API). Depende de tokens registrados 
 | Flush de digest | `POST /api/internal/flush-push-digests` | Agrega atribuições web (~60s) e envia push “novos pacotes” |
 | Atraso D+1 | `POST /api/internal/notificar-atraso-d1` | 1 push/dia por motoboy com pendências de dias anteriores |
 | Coletas pendentes | `POST /api/internal/notificar-coletas-pendentes` | Alerta o staff, de hora em hora entre 19h e 23h BRT, sobre bases programadas sem lançamento |
+| Entrada sem saída | `POST /api/internal/notificar-entrada-sem-saida` | Alerta staff (roles 0/1/2) quando há pacotes do dia ainda na base; janela/intervalo só no Cron Render |
 
 Outros pushes (fechamento, aviso da base, bloqueio por ausência, reconferência) disparam **na hora** no request da API — não precisam de cron.
 
@@ -308,6 +309,15 @@ Outros pushes (fechamento, aviso da base, bloqueio por ausência, reconferência
 - `POST /api/internal/notificar-coletas-pendentes`
 - Header: `X-Cron-Secret: <CRON_PUSH_SECRET ou CRON_REFRESH_SECRET>`
 - Fora da janela das 19h às 23h de São Paulo, o endpoint responde sem enviar alertas.
+
+**Entrada sem saída**
+
+- `POST /api/internal/notificar-entrada-sem-saida`
+- Header: `X-Cron-Secret: <CRON_PUSH_SECRET ou CRON_REFRESH_SECRET>`
+- Só owners com `entrada_obrigatoria_habilitada`; conta pacotes `NA_BASE` do dia (BRT).
+- Se count = 0, não envia. Dedupe por staff/sub_base/tipo/slot de 5 min (`push_envio_log`).
+- Resposta típica: `{ "status": "ok", "notificacoes": N, "sub_bases_com_pendencia": M, "data": "YYYY-MM-DD", ... }`
+- **Sem janela fixa no código** — horário e intervalo ficam no Cron Job do Render.
 
 ### Onde configurar no Render
 
@@ -354,6 +364,19 @@ curl -sf -X POST \
   "https://track-saidas-api.onrender.com/api/internal/notificar-coletas-pendentes"
 ```
 
+**4) Entrada sem saída** — exemplo a cada 30 min a partir das 18h BRT (UTC-3 → 21:00 UTC):
+
+- Schedule sugerido: `*/30 21-23 * * *` e `0-30 0-2 * * *` (ou um único job com o intervalo desejado)
+- Command:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_PUSH_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/notificar-entrada-sem-saida"
+```
+
+Ajuste o schedule no Render conforme a operação (início e intervalo). O endpoint só notifica se ainda houver pacotes na base.
+
 ### Smoke test manual
 
 ```bash
@@ -362,6 +385,7 @@ export BASE_URL="https://track-saidas-api.onrender.com"
 
 curl -sf -X POST -H "X-Cron-Secret: $SECRET" "$BASE_URL/api/internal/flush-push-digests"
 curl -sf -X POST -H "X-Cron-Secret: $SECRET" "$BASE_URL/api/internal/notificar-atraso-d1"
+curl -sf -X POST -H "X-Cron-Secret: $SECRET" "$BASE_URL/api/internal/notificar-entrada-sem-saida"
 ```
 
 Esperado: HTTP 200 e JSON com `status=ok`. HTTP 401 = secret errado; 500 com “não configurado” = variável ausente no ambiente do processo que atendeu o request.

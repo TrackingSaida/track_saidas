@@ -38,11 +38,14 @@ from dashboard_admin_cobranca import (
     valor_owner,
 )
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
+from entrada_na_base_utils import (
+    detalhe_ainda_na_base_por_dia,
+    listar_ainda_na_base,
+)
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
-STATUS_NA_BASE = "NA_BASE"
 
 # Status considerados válidos (saiu/em rota/entregue/ausente — alinhado ao app mobile)
 # Incluir "saiu_para_entrega" pois o app mobile grava SAIU_PARA_ENTREGA
@@ -1200,28 +1203,12 @@ def get_dashboard_saidas(
                     evolucao_map[dia_key]["entradas"] += 1
 
         total_entradas = ent_shopee + ent_ml + ent_avulso
-        rows_na_base = db.scalars(
-            select(Saida).where(
-                Saida.sub_base == sub_base,
-                Saida.codigo.isnot(None),
-                or_(
-                    Saida.status == STATUS_NA_BASE,
-                    func.lower(Saida.status) == "na_base",
-                    func.lower(Saida.status) == "na base",
-                ),
-            )
-        ).all()
+        # Filtra NA_BASE pelo período (Saida.data), alinhado a entradas/saídas do card
+        rows_na_base = listar_ainda_na_base(db, sub_base, data_inicio, data_fim)
         ainda_na_base = len(rows_na_base)
-        # Detalhe por data operacional (Saida.data) — alinhado à tela de registros
-        na_base_por_dia: Dict[str, int] = {}
-        for s in rows_na_base:
-            dia = s.data.isoformat() if s.data else (s.timestamp.date().isoformat() if s.timestamp else None)
-            if not dia:
-                continue
-            na_base_por_dia[dia] = na_base_por_dia.get(dia, 0) + 1
         ainda_na_base_detalhe = [
             DashboardEntradaNaBaseDiaOut(date=d, qty=q)
-            for d, q in sorted(na_base_por_dia.items(), key=lambda x: x[0], reverse=True)
+            for d, q in detalhe_ainda_na_base_por_dia(rows_na_base)
         ]
         taxa_saida_pct = round((total_saidas / total_entradas) * 100, 1) if total_entradas > 0 else 0.0
         gap_entrada_saida = total_entradas - total_saidas
