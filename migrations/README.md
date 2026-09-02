@@ -180,3 +180,16 @@ psql "$DATABASE_URL" -f migrations/create_push_notifications.sql
 ```
 
 Configuração dos Cron Jobs no Render: ver seção **Notificações push (mobile)** em [`README.md`](../README.md).
+
+## ml_conexoes_unique_user_sub_base.sql
+
+**Obrigatório** após deploy do fix de autenticação ML (invalid_grant + duplicatas).
+
+1. Remove conexões duplicadas do mesmo seller na mesma `sub_base` (mantém a mais recente).
+2. Cria índice único `(user_id_ml, sub_base)`.
+
+```bash
+psql "$DATABASE_URL" -f migrations/ml_conexoes_unique_user_sub_base.sql
+```
+
+Após o deploy, sellers com `invalid_grant` passam a aparecer como **Requer nova autorização** na tela de Autenticação.

@@ -494,6 +494,9 @@ class MercadoLivreToken(Base):
 # ==========================
 class MLConexao(Base):
     __tablename__ = "ml_conexoes"
+    __table_args__ = (
+        UniqueConstraint("user_id_ml", "sub_base", name="uq_ml_conexoes_user_sub_base"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     sub_base = Column(Text, nullable=False, index=True)
