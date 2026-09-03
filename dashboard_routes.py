@@ -40,8 +40,10 @@ from dashboard_admin_cobranca import (
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
 from entrada_na_base_utils import (
     contar_ainda_na_base_por_marketplace,
+    contar_cancelados_apos_entrada_por_marketplace,
     detalhe_ainda_na_base_por_dia,
     listar_ainda_na_base,
+    listar_cancelados_apos_entrada,
 )
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -1010,6 +1012,8 @@ class DashboardEntradaOut(BaseModel):
     ainda_na_base: int
     ainda_na_base_detalhe: List[DashboardEntradaNaBaseDiaOut] = []
     ainda_na_base_por_marketplace: List[DashboardEntradaMarketplaceOut] = []
+    cancelados_apos_entrada: int = 0
+    cancelados_apos_entrada_por_marketplace: List[DashboardEntradaMarketplaceOut] = []
     total_saidas: int
     taxa_saida_pct: float
     gap_entrada_saida: int
@@ -1216,6 +1220,13 @@ def get_dashboard_saidas(
         nb_shopee = nb_counts["shopee"]
         nb_ml = nb_counts["mercado_livre"]
         nb_avulso = nb_counts["avulso"]
+        rows_cancelados = listar_cancelados_apos_entrada(db, sub_base, primeira_entrada.keys())
+        cancelados_apos_entrada = len(rows_cancelados)
+        cancelados_ids = {int(s.id_saida) for s in rows_cancelados}
+        canc_counts = contar_cancelados_apos_entrada_por_marketplace(primeira_entrada, cancelados_ids)
+        canc_shopee = canc_counts["shopee"]
+        canc_ml = canc_counts["mercado_livre"]
+        canc_avulso = canc_counts["avulso"]
         pct_nb_shopee = round(nb_shopee / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
         pct_nb_ml = round(nb_ml / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
         pct_nb_avulso = round(nb_avulso / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
@@ -1224,6 +1235,9 @@ def get_dashboard_saidas(
         pct_e_shopee = round(ent_shopee / total_entradas * 100, 1) if total_entradas > 0 else 0.0
         pct_e_ml = round(ent_ml / total_entradas * 100, 1) if total_entradas > 0 else 0.0
         pct_e_avulso = round(ent_avulso / total_entradas * 100, 1) if total_entradas > 0 else 0.0
+        pct_c_shopee = round(canc_shopee / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
+        pct_c_ml = round(canc_ml / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
+        pct_c_avulso = round(canc_avulso / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
         entrada_out = DashboardEntradaOut(
             total_entradas=total_entradas,
             ainda_na_base=ainda_na_base,
@@ -1232,6 +1246,12 @@ def get_dashboard_saidas(
                 DashboardEntradaMarketplaceOut(nome="Shopee", qty=nb_shopee, pct=pct_nb_shopee),
                 DashboardEntradaMarketplaceOut(nome="Mercado Livre", qty=nb_ml, pct=pct_nb_ml),
                 DashboardEntradaMarketplaceOut(nome="Avulso", qty=nb_avulso, pct=pct_nb_avulso),
+            ],
+            cancelados_apos_entrada=cancelados_apos_entrada,
+            cancelados_apos_entrada_por_marketplace=[
+                DashboardEntradaMarketplaceOut(nome="Shopee", qty=canc_shopee, pct=pct_c_shopee),
+                DashboardEntradaMarketplaceOut(nome="Mercado Livre", qty=canc_ml, pct=pct_c_ml),
+                DashboardEntradaMarketplaceOut(nome="Avulso", qty=canc_avulso, pct=pct_c_avulso),
             ],
             total_saidas=total_saidas,
             taxa_saida_pct=taxa_saida_pct,

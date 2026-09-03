@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from entrada_na_base_pure import (
     classify_servico_na_base,
     contar_ainda_na_base_por_marketplace,
+    contar_cancelados_apos_entrada_por_marketplace,
 )
 
 
@@ -39,3 +40,15 @@ def test_contar_ainda_na_base_por_marketplace_vazio():
         "mercado_livre": 0,
         "avulso": 0,
     }
+
+
+def test_contar_cancelados_apos_entrada_por_marketplace():
+    primeira_entrada = {
+        1: ("Shopee", None),
+        2: ("Mercado Livre", None),
+        3: ("Mercado Livre", None),
+        4: ("Mercado Livre", None),
+        5: ("Avulso", None),
+    }
+    counts = contar_cancelados_apos_entrada_por_marketplace(primeira_entrada, {2, 3, 4})
+    assert counts == {"shopee": 0, "mercado_livre": 3, "avulso": 0}
