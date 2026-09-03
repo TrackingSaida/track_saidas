@@ -7,9 +7,22 @@ from typing import Dict, List, Tuple
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from entrada_na_base_pure import (
+    classify_servico_na_base,
+    contar_ainda_na_base_por_marketplace,
+)
 from models import Saida
 
 STATUS_NA_BASE = "NA_BASE"
+
+__all__ = [
+    "STATUS_NA_BASE",
+    "listar_ainda_na_base",
+    "contar_ainda_na_base",
+    "detalhe_ainda_na_base_por_dia",
+    "classify_servico_na_base",
+    "contar_ainda_na_base_por_marketplace",
+]
 
 
 def _conds_status_na_base():
