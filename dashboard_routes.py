@@ -39,6 +39,7 @@ from dashboard_admin_cobranca import (
 )
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
 from entrada_na_base_utils import (
+    contar_ainda_na_base_por_marketplace,
     detalhe_ainda_na_base_por_dia,
     listar_ainda_na_base,
 )
@@ -1008,6 +1009,7 @@ class DashboardEntradaOut(BaseModel):
     total_entradas: int
     ainda_na_base: int
     ainda_na_base_detalhe: List[DashboardEntradaNaBaseDiaOut] = []
+    ainda_na_base_por_marketplace: List[DashboardEntradaMarketplaceOut] = []
     total_saidas: int
     taxa_saida_pct: float
     gap_entrada_saida: int
@@ -1210,6 +1212,13 @@ def get_dashboard_saidas(
             DashboardEntradaNaBaseDiaOut(date=d, qty=q)
             for d, q in detalhe_ainda_na_base_por_dia(rows_na_base)
         ]
+        nb_counts = contar_ainda_na_base_por_marketplace(rows_na_base)
+        nb_shopee = nb_counts["shopee"]
+        nb_ml = nb_counts["mercado_livre"]
+        nb_avulso = nb_counts["avulso"]
+        pct_nb_shopee = round(nb_shopee / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
+        pct_nb_ml = round(nb_ml / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
+        pct_nb_avulso = round(nb_avulso / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
         taxa_saida_pct = round((total_saidas / total_entradas) * 100, 1) if total_entradas > 0 else 0.0
         gap_entrada_saida = total_entradas - total_saidas
         pct_e_shopee = round(ent_shopee / total_entradas * 100, 1) if total_entradas > 0 else 0.0
@@ -1219,6 +1228,11 @@ def get_dashboard_saidas(
             total_entradas=total_entradas,
             ainda_na_base=ainda_na_base,
             ainda_na_base_detalhe=ainda_na_base_detalhe,
+            ainda_na_base_por_marketplace=[
+                DashboardEntradaMarketplaceOut(nome="Shopee", qty=nb_shopee, pct=pct_nb_shopee),
+                DashboardEntradaMarketplaceOut(nome="Mercado Livre", qty=nb_ml, pct=pct_nb_ml),
+                DashboardEntradaMarketplaceOut(nome="Avulso", qty=nb_avulso, pct=pct_nb_avulso),
+            ],
             total_saidas=total_saidas,
             taxa_saida_pct=taxa_saida_pct,
             gap_entrada_saida=gap_entrada_saida,
