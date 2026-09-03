@@ -1756,6 +1756,7 @@ def _montar_item_listar_saida(
     return {
         "id_saida": row.id_saida,
         "timestamp": row.timestamp,
+        "data": row.data.isoformat() if getattr(row, "data", None) else None,
         "data_hora_acao": (op_ctx.ultimo_evento_ts if op_ctx else None) or row.timestamp,
         "acao": (op_ctx.acao_label if op_ctx else None) or "Sem ação",
         "executado_por": (op_ctx.executado_por if op_ctx else None) or "—",

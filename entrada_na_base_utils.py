@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from entrada_na_base_pure import (
     classify_servico_na_base,
     contar_ainda_na_base_por_marketplace,
+    contar_cancelados_apos_entrada_por_marketplace,
 )
 from models import Saida
 
@@ -22,7 +23,13 @@ __all__ = [
     "detalhe_ainda_na_base_por_dia",
     "classify_servico_na_base",
     "contar_ainda_na_base_por_marketplace",
+    "listar_cancelados_apos_entrada",
+    "contar_cancelados_apos_entrada_por_marketplace",
 ]
+
+
+def _conds_status_cancelado():
+    return func.lower(Saida.status).in_(("cancelado", "cancelada"))
 
 
 def _conds_status_na_base():
@@ -48,6 +55,27 @@ def listar_ainda_na_base(
                 Saida.data >= data_inicio,
                 Saida.data <= data_fim,
                 _conds_status_na_base(),
+            )
+        ).all()
+    )
+
+
+def listar_cancelados_apos_entrada(
+    db: Session,
+    sub_base: str,
+    ids_entrada_periodo: Iterable[int],
+) -> List[Saida]:
+    """Pacotes com entrada no período e status cancelado (explica parte do gap entradas−saídas)."""
+    ids = [int(i) for i in ids_entrada_periodo]
+    if not ids:
+        return []
+    return list(
+        db.scalars(
+            select(Saida).where(
+                Saida.sub_base == sub_base,
+                Saida.id_saida.in_(ids),
+                Saida.codigo.isnot(None),
+                _conds_status_cancelado(),
             )
         ).all()
     )
