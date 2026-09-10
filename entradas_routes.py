@@ -16,6 +16,12 @@ from codigo_normalizer import canonicalize_servico, is_qr_like_scan_payload, nor
 from db import get_db
 from leitura_manual_auth import ensure_manual_code_entry_allowed
 from models import Owner, Saida, SaidaHistorico, User
+from qr_payload_utils import (
+    apply_qr_payload_if_needed,
+    needs_qr_update,
+    qr_flags_for_response,
+    should_store_qr_payload_raw,
+)
 from saidas_routes import (
     STATUS_NA_BASE,
     _gerar_codigo_avulso,
@@ -96,10 +102,20 @@ def _bounds_dia_operacional(data_ref: date) -> tuple[datetime, datetime]:
     return start.replace(tzinfo=None), end.replace(tzinfo=None)
 
 
-def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
-    if not qr_raw or not str(qr_raw).strip():
-        return False
-    return (servico or "").strip().lower() in ("ml", "mercado_livre", "mercado livre")
+def _entrada_ok_payload(row: Saida, *, ja_existia: bool, promovido_coleta: bool = False, qr_result: Optional[dict] = None) -> dict:
+    out = {
+        "ok": True,
+        "ja_existia": ja_existia,
+        "id_saida": row.id_saida,
+        "codigo": row.codigo,
+        "servico": row.servico,
+        "status": row.status,
+    }
+    if promovido_coleta:
+        out["promovido_coleta"] = True
+    if qr_result:
+        out.update(qr_flags_for_response(qr_result))
+    return out
 
 
 @router.get("/resumo-dia", response_model=EntradaResumoDiaOut)
@@ -173,7 +189,7 @@ def ler_entrada(
 
     servico_val = canonicalize_servico(servico)
     qr_payload_raw = payload.qr_payload_raw or qr_from_norm
-    store_qr = _should_store_qr_payload_raw(servico_val, qr_payload_raw)
+    store_qr = should_store_qr_payload_raw(servico_val, qr_payload_raw)
 
     existente = db.scalar(
         select(Saida).where(Saida.sub_base == sub_base, Saida.codigo == codigo)
@@ -199,15 +215,10 @@ def ler_entrada(
                     user_id=getattr(current_user, "id", None),
                 )
             )
+            # Flags (alerta se ML sem JSON completo); payload já gravado no INSERT quando válido.
+            qr_result = apply_qr_payload_if_needed(row, None, servico_val)
             db.commit()
-            return {
-                "ok": True,
-                "ja_existia": False,
-                "id_saida": row.id_saida,
-                "codigo": row.codigo,
-                "servico": row.servico,
-                "status": row.status,
-            }
+            return _entrada_ok_payload(row, ja_existia=False, qr_result=qr_result)
         except Exception as e:
             db.rollback()
             raise HTTPException(500, f"Erro ao registrar entrada: {e}")
@@ -215,6 +226,15 @@ def ler_entrada(
     status_norm = normalizar_status_saida(existente.status)
 
     if status_norm == STATUS_NA_BASE:
+        if needs_qr_update(existente, qr_payload_raw, servico_val):
+            try:
+                qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico_val)
+                db.commit()
+                return _entrada_ok_payload(existente, ja_existia=True, qr_result=qr_result)
+            except Exception:
+                db.rollback()
+                raise HTTPException(500, "Erro ao atualizar QR da entrada.")
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico_val)
         return JSONResponse(
             status_code=409,
             content={
@@ -222,12 +242,14 @@ def ler_entrada(
                 "message": "Este pacote já teve entrada na base.",
                 "id_saida": existente.id_saida,
                 "status": existente.status,
+                **qr_flags_for_response(qr_result),
             },
         )
 
     if status_norm == "coletado":
         status_anterior = existente.status
         existente.status = STATUS_NA_BASE
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico_val)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
@@ -239,15 +261,12 @@ def ler_entrada(
         )
         try:
             db.commit()
-            return {
-                "ok": True,
-                "ja_existia": True,
-                "promovido_coleta": True,
-                "id_saida": existente.id_saida,
-                "codigo": existente.codigo,
-                "servico": existente.servico,
-                "status": existente.status,
-            }
+            return _entrada_ok_payload(
+                existente,
+                ja_existia=True,
+                promovido_coleta=True,
+                qr_result=qr_result,
+            )
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar entrada.")

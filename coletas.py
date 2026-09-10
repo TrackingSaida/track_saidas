@@ -122,10 +122,14 @@ class TotaisColetaBase(BaseModel):
 
 
 class LoteResponse(BaseModel):
-    coleta: ColetaOut
+    coleta: Optional[ColetaOut] = None
     resumo: ResumoLote
     saidas_criadas: List[SaidaCriadaLote] = Field(default_factory=list)
     totais: Optional[TotaisColetaBase] = None
+    qr_atualizado: bool = False
+    qr_alerta: bool = False
+    qr_alerta_mensagem: Optional[str] = None
+    codigos_qr_atualizados: List[str] = Field(default_factory=list)
 
 
 class ColetaAvulsoSaidaOut(BaseModel):
@@ -173,19 +177,10 @@ def _servico_label_for_saida(s: Literal["shopee", "mercado_livre", "avulso"]) ->
 
 
 def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
-    """Armazena qr_payload_raw somente para Mercado Livre com formato válido."""
-    if not qr_raw or not qr_raw.strip():
-        return False
-    s = (servico or "").strip().lower()
-    if "mercado" not in s and "ml" not in s and "flex" not in s:
-        return False
-    raw = qr_raw.strip()
-    if raw.startswith("{") and ("sender_id" in raw or "SENDER_ID" in raw or "hash_code" in raw):
-        return True
-    if re.search(r"4[5-9]\d{9}", raw):
-        return True
-    return False
+    """Compat: delega ao helper compartilhado."""
+    from qr_payload_utils import should_store_qr_payload_raw
 
+    return should_store_qr_payload_raw(servico, qr_raw)
 
 def _sub_base_from_token_or_422(user: User) -> str:
     """
@@ -347,21 +342,97 @@ def registrar_coleta_em_lote(
         seen.add(c)
         norm_codes.append(c)
 
-    # 5) Checagem de duplicidade no banco em 1 consulta (IN)
-    #    Mesmo com front ajustado, isso protege integridade e evita N SELECTs.
-    existing_codes = set(
+    # 5) Checagem de duplicidade / upgrade de QR no banco
+    from qr_payload_utils import (
+        MSG_QR_ALERTA_ML,
+        apply_qr_payload_if_needed,
+        needs_qr_update,
+        should_store_qr_payload_raw,
+    )
+
+    existing_rows = list(
         db.scalars(
-            select(Saida.codigo).where(
+            select(Saida).where(
                 Saida.sub_base == sub_base,
-                Saida.codigo.in_(norm_codes)
+                Saida.codigo.in_(norm_codes),
             )
         ).all()
     )
-    if existing_codes:
-        # Para manter compatibilidade com o comportamento antigo (falha no primeiro),
-        # escolhemos um determinístico.
-        dup = sorted(existing_codes)[0]
-        raise HTTPException(409, f"Código '{dup}' já coletado.")
+    existing_by_codigo = {str(s.codigo): s for s in existing_rows}
+
+    items_by_codigo = {}
+    for it in payload.itens:
+        items_by_codigo[(it.codigo or "").strip()] = it
+
+    codigos_qr_atualizados: List[str] = []
+    qr_alerta_lote = False
+
+    # Upgrades de QR em códigos já existentes (sem nova cobrança/coleta)
+    for codigo_existente, saida_existente in existing_by_codigo.items():
+        item = items_by_codigo.get(codigo_existente)
+        if item is None:
+            continue
+        qr_raw = getattr(item, "qr_payload_raw", None)
+        serv_label = _servico_label_for_saida(_normalize_servico(item.servico))
+        if needs_qr_update(saida_existente, qr_raw, serv_label):
+            apply_qr_payload_if_needed(saida_existente, qr_raw, serv_label)
+            codigos_qr_atualizados.append(codigo_existente)
+        else:
+            qr_flags = apply_qr_payload_if_needed(saida_existente, qr_raw, serv_label)
+            if qr_flags.get("alerta"):
+                qr_alerta_lote = True
+
+    # Códigos que ainda seriam "duplicados" (existem e não precisavam de upgrade)
+    truly_dup = sorted(
+        c
+        for c in existing_by_codigo.keys()
+        if c not in codigos_qr_atualizados
+    )
+
+    # Apenas upgrades (nenhum código novo no lote)
+    novos_itens = [it for it in payload.itens if (it.codigo or "").strip() not in existing_by_codigo]
+
+    if truly_dup and not novos_itens and not codigos_qr_atualizados:
+        # Compatível com comportamento antigo
+        raise HTTPException(409, f"Código '{truly_dup[0]}' já coletado.")
+
+    if truly_dup and novos_itens:
+        # Lote misto com duplicata real: mantém falha explícita
+        raise HTTPException(409, f"Código '{truly_dup[0]}' já coletado.")
+
+    if not novos_itens and codigos_qr_atualizados:
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(500, f"Falha ao atualizar QR da coleta: {e}")
+        totais = obter_totais_por_nome_base(
+            db,
+            sub_base=sub_base,
+            base_nome=payload.base,
+            data_operacao=date.today(),
+        )
+        return LoteResponse(
+            coleta=None,
+            resumo=ResumoLote(
+                inseridos=0,
+                duplicados=0,
+                codigos_duplicados=[],
+                contagem={"shopee": 0, "mercado_livre": 0, "avulso": 0},
+                precos={
+                    "shopee": _fmt_money(p_shopee),
+                    "ml": _fmt_money(p_ml),
+                    "avulso": _fmt_money(p_avulso),
+                },
+                total=_fmt_money(Decimal("0.00")),
+            ),
+            saidas_criadas=[],
+            totais=TotaisColetaBase(**totais),
+            qr_atualizado=True,
+            qr_alerta=qr_alerta_lote,
+            qr_alerta_mensagem=MSG_QR_ALERTA_ML if qr_alerta_lote else None,
+            codigos_qr_atualizados=codigos_qr_atualizados,
+        )
 
     created = 0
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
@@ -380,12 +451,12 @@ def registrar_coleta_em_lote(
         db.add(coleta)
         db.flush()
 
-        # 6) Inserção em loop, sem SELECTs dentro
-        for item in payload.itens:
+        # 6) Inserção em loop, sem SELECTs dentro (somente códigos novos)
+        for item in novos_itens:
             serv_key = _normalize_servico(item.servico)
             codigo = item.codigo.strip()
             qr_raw = getattr(item, "qr_payload_raw", None)
-            store_qr = _should_store_qr_payload_raw(_servico_label_for_saida(serv_key), qr_raw)
+            store_qr = should_store_qr_payload_raw(_servico_label_for_saida(serv_key), qr_raw)
 
             saida = Saida(
                 sub_base=sub_base,
@@ -402,6 +473,9 @@ def registrar_coleta_em_lote(
             )
             db.add(saida)
             db.flush()
+            qr_flags = apply_qr_payload_if_needed(saida, None, saida.servico)
+            if qr_flags.get("alerta"):
+                qr_alerta_lote = True
             db.add(
                 SaidaHistorico(
                     id_saida=saida.id_saida,
@@ -473,6 +547,10 @@ def registrar_coleta_em_lote(
         ),
         saidas_criadas=saidas_criadas,
         totais=TotaisColetaBase(**totais),
+        qr_atualizado=bool(codigos_qr_atualizados),
+        qr_alerta=qr_alerta_lote,
+        qr_alerta_mensagem=MSG_QR_ALERTA_ML if qr_alerta_lote else None,
+        codigos_qr_atualizados=codigos_qr_atualizados,
     )
 
 
@@ -512,6 +590,9 @@ def lancar_avulso_coleta(
         db=db,
         current_user=current_user,
     )
+
+    if lote.coleta is None:
+        raise HTTPException(500, "Falha ao registrar avulso na coleta.")
 
     ids_por_codigo = {item.codigo: item.id_saida for item in lote.saidas_criadas}
     saidas = [

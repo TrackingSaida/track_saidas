@@ -68,6 +68,13 @@ from saidas_routes import (
     _status_esta_finalizado,
     _status_finalizado_detail,
 )
+from qr_payload_utils import (
+    apply_qr_payload_if_needed,
+    has_usable_qr_etiqueta,
+    needs_qr_update,
+    qr_flags_for_response,
+    should_store_qr_payload_raw,
+)
 from ausencia_bloqueio_service import raise_if_bloqueado_ausencias, snapshot_bloqueio_ausencias
 from leitura_manual_auth import ensure_manual_code_entry_allowed
 from upload_storage_utils import extract_foto_keys, parse_foto_items
@@ -674,6 +681,7 @@ def _saida_to_item(
         "possui_endereco": _possui_endereco(detail),
         "tentativa": (detail.tentativa if detail and getattr(detail, "tentativa", None) is not None else None) or 1,
         "tem_comprovante": tem_comprovante,
+        "tem_qr_etiqueta": has_usable_qr_etiqueta(getattr(s, "qr_payload_raw", None)),
         "ausencias_total": ausencias_total,
         "bloqueado_ausencias": bloqueado_ausencias,
         "tipo_recebedor": (detail.tipo_recebedor or "").strip() or None if detail else None,
@@ -890,9 +898,14 @@ def _ctx_data_operacional_saida(db: Session, saida: Saida) -> date:
 
 
 def _scan_needs_qr_update(saida: Saida, qr_payload_raw: Optional[str], servico: Optional[str]) -> bool:
-    if not qr_payload_raw or not _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-        return False
-    return not (saida.qr_payload_raw or "").strip()
+    return needs_qr_update(saida, qr_payload_raw, servico)
+
+
+def _scan_response_com_qr(base: dict, qr_result: Optional[dict] = None) -> dict:
+    out = dict(base)
+    if qr_result:
+        out.update(qr_flags_for_response(qr_result))
+    return out
 
 
 def _scan_item_leve(
@@ -3735,7 +3748,7 @@ def scan_codigo(
         motoboy = db.get(Motoboy, motoboy_id) if motoboy_id else None
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
-        qr_raw = qr_payload_raw.strip() if (qr_payload_raw and _should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
+        qr_raw = qr_payload_raw.strip() if (qr_payload_raw and should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
         try:
             nova = Saida(
                 sub_base=sub_base,
@@ -3750,6 +3763,7 @@ def scan_codigo(
             )
             db.add(nova)
             db.flush()
+            qr_result = apply_qr_payload_if_needed(nova, None, servico_val)
             _garantir_cobranca_owner_saida(db, nova, owner_valor)
             db.add(
                 SaidaHistorico(
@@ -3761,7 +3775,10 @@ def scan_codigo(
             )
             db.commit()
             # flush já preencheu id_saida; evita refresh + SELECTs de campos.
-            return {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova)}
+            return _scan_response_com_qr(
+                {"ok": True, "conflito": False, "ja_existia": False, "entrega": _scan_item_leve(nova)},
+                qr_result,
+            )
         except Exception as e:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Erro ao registrar leitura: {e}")
@@ -3871,24 +3888,30 @@ def scan_codigo(
     # - outro motoboy titular: conflito 409 para confirmar assumir
     if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         if motoboy_id is None:
-            if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
-                return {
+            qr_result = apply_qr_payload_if_needed(saida, qr_payload_raw, servico)
+            if not qr_result.get("updated"):
+                return _scan_response_com_qr(
+                    {
+                        "ok": True,
+                        "conflito": False,
+                        "ja_existia": True,
+                        "entrega": _scan_item_leve(saida),
+                    },
+                    qr_result,
+                )
+            saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
+            qr_result = apply_qr_payload_if_needed(saida, qr_payload_raw, servico)
+            _garantir_cobranca_owner_saida(db, saida, owner_valor)
+            db.commit()
+            return _scan_response_com_qr(
+                {
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
                     "entrega": _scan_item_leve(saida),
-                }
-            saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
-            if _scan_needs_qr_update(saida, qr_payload_raw, servico):
-                saida.qr_payload_raw = qr_payload_raw.strip()
-            _garantir_cobranca_owner_saida(db, saida, owner_valor)
-            db.commit()
-            return {
-                "ok": True,
-                "conflito": False,
-                "ja_existia": True,
-                "entrega": _scan_item_leve(saida),
-            }
+                },
+                qr_result,
+            )
         if saida.motoboy_id == motoboy_id:
             data_operacional = _ctx_data_operacional_saida(db, saida)
             hoje = _hoje_operacional()
@@ -3919,25 +3942,31 @@ def scan_codigo(
                         "conflito": False,
                     },
                 )
-            # Mesmo motoboy + mesmo dia: se nada a gravar, responde sem lock/commit/log
-            if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
-                return {
+            # Mesmo motoboy + mesmo dia: completa QR se faltar; senão responde sem lock
+            qr_result = apply_qr_payload_if_needed(saida, qr_payload_raw, servico)
+            if not qr_result.get("updated"):
+                return _scan_response_com_qr(
+                    {
+                        "ok": True,
+                        "conflito": False,
+                        "ja_existia": True,
+                        "entrega": _scan_item_leve(saida),
+                    },
+                    qr_result,
+                )
+            saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
+            qr_result = apply_qr_payload_if_needed(saida, qr_payload_raw, servico)
+            _garantir_cobranca_owner_saida(db, saida, owner_valor)
+            db.commit()
+            return _scan_response_com_qr(
+                {
                     "ok": True,
                     "conflito": False,
                     "ja_existia": True,
                     "entrega": _scan_item_leve(saida),
-                }
-            saida = _lock_saida_para_scan(db, saida.id_saida, sub_base)
-            if _scan_needs_qr_update(saida, qr_payload_raw, servico):
-                saida.qr_payload_raw = qr_payload_raw.strip()
-            _garantir_cobranca_owner_saida(db, saida, owner_valor)
-            db.commit()
-            return {
-                "ok": True,
-                "conflito": False,
-                "ja_existia": True,
-                "entrega": _scan_item_leve(saida),
-            }
+                },
+                qr_result,
+            )
         if saida.motoboy_id is not None:
             id_saida_lock = saida.id_saida
             saida = _lock_saida_para_scan(db, id_saida_lock, sub_base)
@@ -3974,23 +4003,19 @@ def scan_codigo(
                     },
                 )
             if saida.motoboy_id == motoboy_id:
-                if not _scan_needs_qr_update(saida, qr_payload_raw, servico):
-                    return {
+                qr_result = apply_qr_payload_if_needed(saida, qr_payload_raw, servico)
+                if qr_result.get("updated"):
+                    _garantir_cobranca_owner_saida(db, saida, owner_valor)
+                    db.commit()
+                return _scan_response_com_qr(
+                    {
                         "ok": True,
                         "conflito": False,
                         "ja_existia": True,
                         "entrega": _scan_item_leve(saida),
-                    }
-                if _scan_needs_qr_update(saida, qr_payload_raw, servico):
-                    saida.qr_payload_raw = qr_payload_raw.strip()
-                _garantir_cobranca_owner_saida(db, saida, owner_valor)
-                db.commit()
-                return {
-                    "ok": True,
-                    "conflito": False,
-                    "ja_existia": True,
-                    "entrega": _scan_item_leve(saida),
-                }
+                    },
+                    qr_result,
+                )
             # sem titular após o lock: segue para reatribuição sem conflito
         # sem titular (motoboy_id nulo): segue para reatribuição sem conflito
 
@@ -4047,9 +4072,7 @@ def scan_codigo(
                 "id_saida": saida.id_saida,
             },
         )
-    if qr_payload_raw and _should_store_qr_payload_raw(servico or "", qr_payload_raw):
-        if not saida.qr_payload_raw or not saida.qr_payload_raw.strip():
-            saida.qr_payload_raw = qr_payload_raw.strip()
+    qr_result_scan = apply_qr_payload_if_needed(saida, qr_payload_raw, servico)
     motoboy_id_anterior = saida.motoboy_id
     status_anterior = status_norm
     detail_resp: Optional[SaidaDetail] = None
@@ -4098,12 +4121,15 @@ def scan_codigo(
             or status_anterior != status_scan
         )
     )
-    return {
-        "ok": True,
-        "conflito": False,
-        "ja_existia": not houve_atribuicao_ou_progresso,
-        "entrega": _scan_item_leve(saida, detail_resp),
-    }
+    return _scan_response_com_qr(
+        {
+            "ok": True,
+            "conflito": False,
+            "ja_existia": not houve_atribuicao_ou_progresso,
+            "entrega": _scan_item_leve(saida, detail_resp),
+        },
+        qr_result_scan,
+    )
 
 
 @router.post("/entrega/{id_saida}/confirmar-reativacao-encerrado")
