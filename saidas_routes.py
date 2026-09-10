@@ -55,6 +55,7 @@ from pedido_campos_obrigatorios_service import (
 )
 from log_leitura_service import registrar_log_leitura_critico
 from leitura_manual_auth import ensure_manual_code_entry_allowed
+from qr_payload_utils import apply_qr_payload_if_needed, qr_flags_for_response, should_store_qr_payload_raw
 from ausencia_bloqueio_service import (
     EVENTO_LIBERACAO,
     raise_if_bloqueado_ausencias,
@@ -164,6 +165,9 @@ class SaidaOut(BaseModel):
     status: Optional[str]
     base: Optional[str] = None
     is_grande: bool = False
+    qr_atualizado: Optional[bool] = None
+    qr_alerta: Optional[bool] = None
+    qr_alerta_mensagem: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -641,20 +645,15 @@ def _check_delete_window_or_409(ts: datetime):
 
 
 def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
-    """Armazena qr_payload_raw somente para Mercado Livre com formato válido."""
-    if not qr_raw or not qr_raw.strip():
-        return False
-    s = servico.strip().lower()
-    if "mercado" not in s and "ml" not in s and "flex" not in s:
-        return False
-    raw = qr_raw.strip()
-    # JSON com id, sender_id, hash_code
-    if raw.startswith("{") and ("sender_id" in raw or "SENDER_ID" in raw or "hash_code" in raw):
-        return True
-    # Formato antigo com dígitos ML (4[5-9]...)
-    if re.search(r"4[5-9]\d{9}", raw):
-        return True
-    return False
+    """Compat: delega ao helper compartilhado (Mercado Livre / etiqueta)."""
+    return should_store_qr_payload_raw(servico, qr_raw)
+
+
+def _saida_out_com_qr(row: Saida, qr_result: Optional[dict] = None) -> dict:
+    data = SaidaOut.model_validate(row).model_dump(mode="json")
+    if qr_result:
+        data.update(qr_flags_for_response(qr_result))
+    return data
 
 
 def _normalizar_label_avulso(label: Optional[str]) -> str:
@@ -990,6 +989,7 @@ def ler_saida(
                     valor=owner_valor,
                 )
             )
+            qr_result = apply_qr_payload_if_needed(row, None, servico)
             db.commit()
             db.refresh(row)
             _enqueue_atribuicao_push_externa(
@@ -1001,7 +1001,7 @@ def ler_saida(
             )
             return JSONResponse(
                 status_code=201,
-                content=SaidaOut.model_validate(row).model_dump(mode="json"),
+                content=_saida_out_com_qr(row, qr_result),
             )
         except HTTPException:
             db.rollback()
@@ -1030,6 +1030,7 @@ def ler_saida(
                 detail.id_entregador = entregador_id
             elif motoboy_id is not None:
                 detail.id_entregador = motoboy_id
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
@@ -1049,7 +1050,7 @@ def ler_saida(
                 motoboy_id=motoboy_id,
                 codigo=existente.codigo,
             )
-            return SaidaOut.model_validate(existente)
+            return _saida_out_com_qr(existente, qr_result)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
@@ -1070,6 +1071,7 @@ def ler_saida(
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
@@ -1089,7 +1091,7 @@ def ler_saida(
                 motoboy_id=motoboy_id,
                 codigo=existente.codigo,
             )
-            return SaidaOut.model_validate(existente)
+            return _saida_out_com_qr(existente, qr_result)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
@@ -1101,6 +1103,7 @@ def ler_saida(
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
@@ -1120,7 +1123,7 @@ def ler_saida(
                 motoboy_id=motoboy_id,
                 codigo=existente.codigo,
             )
-            return SaidaOut.model_validate(existente)
+            return _saida_out_com_qr(existente, qr_result)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
@@ -1197,6 +1200,14 @@ def ler_saida(
                         "message": "Pedido já lido em data anterior para o mesmo motoboy.",
                     },
                 )
+            qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+            if qr_result.get("updated"):
+                try:
+                    db.commit()
+                    db.refresh(existente)
+                except Exception:
+                    db.rollback()
+                    raise HTTPException(500, "Erro ao atualizar QR da saída.")
             registrar_log_leitura_critico(
                 sub_base=sub_base,
                 username=username,
@@ -1210,7 +1221,7 @@ def ler_saida(
                 origem_app="web",
                 endpoint="/saidas/ler",
             )
-            return SaidaOut.model_validate(existente)
+            return _saida_out_com_qr(existente, qr_result)
         # outro entregador → 409 para front acionar PATCH de troca.
         # Sem retry: front trata com Swal + PATCH, evita latência de retry em fluxo normal.
         registrar_log_leitura_critico(
@@ -1319,6 +1330,7 @@ def ler_saida(
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
@@ -1334,13 +1346,21 @@ def ler_saida(
         try:
             db.commit()
             db.refresh(existente)
-            return SaidaOut.model_validate(existente)
+            return _saida_out_com_qr(existente, qr_result)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao reativar saída encerrada.")
 
-    # status cancelado ou outro: retornar como está (idempotente) ou 422 conforme regra de negócio
-    return SaidaOut.model_validate(existente)
+    # status cancelado ou outro: tenta completar QR; retorna como está
+    qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+    if qr_result.get("updated"):
+        try:
+            db.commit()
+            db.refresh(existente)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar QR da saída.")
+    return _saida_out_com_qr(existente, qr_result)
 
 
 @router.post("/confirmar-nova-saida-mesmo-entregador")

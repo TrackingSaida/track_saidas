@@ -363,7 +363,37 @@ def gerar_etiqueta(
     if not codigo:
         raise HTTPException(400, "Código obrigatório.")
 
-    sub_base = getattr(current_user, "sub_base", None)
+    sub_base = (getattr(current_user, "sub_base", None) or "").strip()
+    if not sub_base:
+        raise HTTPException(403, "Sub-base não definida.")
+
+    role = int(getattr(current_user, "role", 0) or 0)
+    saida_autorizada: Optional[Saida] = None
+
+    if payload.id_saida is not None:
+        saida_autorizada = db.get(Saida, payload.id_saida)
+        if (
+            saida_autorizada is None
+            or (saida_autorizada.sub_base or "").strip() != sub_base
+        ):
+            raise HTTPException(404, "Pedido não encontrado.")
+        if role == 4:
+            motoboy_id = getattr(current_user, "motoboy_id", None)
+            if motoboy_id is None or saida_autorizada.motoboy_id != motoboy_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Sem permissão para gerar etiqueta deste pedido.",
+                )
+        elif role not in (0, 1, 2, 3):
+            raise HTTPException(403, "Sem permissão para gerar etiqueta.")
+    elif role == 4:
+        raise HTTPException(
+            status_code=422,
+            detail="Informe id_saida para gerar etiqueta no perfil motoboy.",
+        )
+    elif role not in (0, 1, 2, 3):
+        raise HTTPException(403, "Sem permissão para gerar etiqueta.")
+
     qr_content = _resolve_qr_content(
         codigo=codigo,
         id_saida=payload.id_saida,
