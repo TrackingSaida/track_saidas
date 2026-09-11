@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import Coleta, Entregador, BasePreco, User, Saida, Owner, BaseFechamento
-from models import OwnerCobrancaItem, SaidaHistorico
+from models import OwnerCobrancaItem, SaidaHistorico, SaidaDetail, Motoboy
 from leitura_manual_auth import ensure_lancar_avulso_allowed
 from saidas_routes import _gerar_codigo_avulso, _normalizar_label_avulso
 from coleta_operacional_service import (
@@ -56,6 +56,11 @@ class ColetaLancarAvulsoIn(BaseModel):
     base: str = Field(min_length=1)
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
+    # Foto(s) opcionais; obrigatórias só se o usuário (motoboy) exigir e não for root/admin.
+    foto_object_key: Optional[str] = Field(default=None, max_length=500)
+    foto_object_keys: Optional[List[str]] = None
+    photo_id: Optional[str] = Field(default=None, max_length=80)
+    photo_ids: Optional[List[Optional[str]]] = None
 
 
 class ResumoLote(BaseModel):
@@ -561,13 +566,16 @@ def lancar_avulso_coleta(
     current_user: User = Depends(get_current_user),
 ):
     """Cria pacotes avulsos já coletados e vinculados à mesma coleta."""
+    from saidas_routes import _PENDING_AVULSO_KEY_RE
+    from upload_storage_utils import MAX_FOTOS_POR_EVENTO_TENTATIVA, build_foto_item, serialize_foto_items
+
     sub_base = _sub_base_from_token_or_422(current_user)
     role_raw = getattr(current_user, "role", None)
     try:
         role = int(role_raw) if role_raw is not None else -1
     except (TypeError, ValueError):
         role = -1
-    if role not in (0, 1, 2, 3):
+    if role not in (0, 1, 2, 3, 4):
         raise HTTPException(status_code=403, detail="Acesso restrito à operação.")
     if bool(getattr(current_user, "ignorar_coleta", False)):
         raise HTTPException(status_code=403, detail="Fluxo de coletas desativado para este owner.")
@@ -576,6 +584,52 @@ def lancar_avulso_coleta(
     base = payload.base.strip()
     if not base:
         raise HTTPException(status_code=422, detail="Informe a base para registrar a coleta.")
+
+    # Obrigação por usuário (motoboy); root/admin nunca exigem.
+    avulso_exige_foto = False
+    if role == 4 and role not in (0, 1):
+        motoboy_id = getattr(current_user, "motoboy_id", None)
+        motoboy = db.get(Motoboy, int(motoboy_id)) if motoboy_id else None
+        avulso_exige_foto = bool(motoboy and getattr(motoboy, "avulso_exige_foto", False))
+    if role in (0, 1):
+        avulso_exige_foto = False
+
+    foto_keys: List[str] = []
+    for k in list(payload.foto_object_keys or []):
+        kk = (k or "").strip()
+        if kk and kk not in foto_keys:
+            foto_keys.append(kk)
+    single_key = (payload.foto_object_key or "").strip() or None
+    if single_key and single_key not in foto_keys:
+        foto_keys.insert(0, single_key)
+    foto_keys = foto_keys[:MAX_FOTOS_POR_EVENTO_TENTATIVA]
+
+    for kk in foto_keys:
+        if not _PENDING_AVULSO_KEY_RE.match(kk):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "FOTO_KEY_INVALIDA",
+                    "message": "Foto inválida para lançamento avulso. Tire a foto novamente.",
+                },
+            )
+
+    photo_ids_list: List[Optional[str]] = []
+    raw_ids = list(payload.photo_ids or [])
+    if payload.photo_id and not raw_ids:
+        raw_ids = [payload.photo_id]
+    for i, _k in enumerate(foto_keys):
+        pid = (raw_ids[i] if i < len(raw_ids) else None) or None
+        photo_ids_list.append((str(pid).strip() or None) if pid is not None else None)
+
+    if avulso_exige_foto and not foto_keys:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "FOTO_OBRIGATORIA",
+                "message": "Este usuário exige foto ao lançar avulso.",
+            },
+        )
 
     label_norm = _normalizar_label_avulso(payload.identificacao)
     codigos = [
@@ -593,6 +647,34 @@ def lancar_avulso_coleta(
 
     if lote.coleta is None:
         raise HTTPException(500, "Falha ao registrar avulso na coleta.")
+
+    if foto_keys:
+        foto_payload = serialize_foto_items(
+            [
+                build_foto_item(
+                    key=key,
+                    evento="lancar_avulso",
+                    tentativa=1,
+                    photo_id=photo_ids_list[i] if i < len(photo_ids_list) else None,
+                )
+                for i, key in enumerate(foto_keys)
+            ]
+        )
+        try:
+            for item in lote.saidas_criadas:
+                db.add(
+                    SaidaDetail(
+                        id_saida=item.id_saida,
+                        id_entregador=int(getattr(current_user, "motoboy_id", None) or 0),
+                        status="coletado",
+                        tentativa=1,
+                        foto_url=foto_payload,
+                    )
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Avulso criado, mas falhou ao vincular a foto.")
 
     ids_por_codigo = {item.codigo: item.id_saida for item in lote.saidas_criadas}
     saidas = [

@@ -1537,6 +1537,9 @@ def _lancar_avulso_impl(
     avulso_exige_foto = bool(
         motoboy_row is not None and getattr(motoboy_row, "avulso_exige_foto", False)
     )
+    # Root/admin: foto sempre opcional, mesmo se o motoboy exigir.
+    if role in (0, 1):
+        avulso_exige_foto = False
     from upload_storage_utils import MAX_FOTOS_POR_EVENTO_TENTATIVA
 
     foto_keys: List[str] = []
