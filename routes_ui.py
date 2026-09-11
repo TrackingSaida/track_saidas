@@ -105,6 +105,7 @@ MENU_DEFS = [
         "items": [
             {"label": "Bases",        "href": "tracking-base.html",       "roles": [0, 1], "coleta_only": True},
             {"label": "Usuários",     "href": "tracking-usuarios.html",   "roles": [0, 1]},
+            {"label": "Aniversariantes", "href": "tracking-aniversariantes.html", "roles": [0, 1]},
             {"label": "Preços de Entrega", "href": "tracking-valores-entrega.html", "roles": [0, 1]},
             {"label": "Autenticação", "href": "tracking-autenticacao.html", "roles": [0, 1], "base_only": True, "base_only_roles": [1]},
         ]

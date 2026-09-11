@@ -39,6 +39,7 @@ class User(Base):
     # dados adicionais
     nome = Column(Text, nullable=True)
     sobrenome = Column(Text, nullable=True)
+    data_nascimento = Column(Date, nullable=True)
 
     # status geral do usuário
     status = Column(Boolean, nullable=False, server_default=text("true"))

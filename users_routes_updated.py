@@ -62,6 +62,7 @@ class UserCreate(BaseModel):
 
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
+    data_nascimento: Optional[date] = None
 
     # admin=1, operador=2, coletador=3 (legado), motoboy=4
     role: int = Field(default=2)
@@ -97,6 +98,7 @@ class UserOut(BaseModel):
     sub_base: Optional[str] = None
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
+    data_nascimento: Optional[date] = None
     role: Optional[int] = None
     coletador: Optional[bool] = None
     motoboy: Optional[MotoboyOut] = None
@@ -116,6 +118,7 @@ class AdminUserUpdate(BaseModel):
     username: Optional[str] = None
     contato: Optional[str] = None
     email: Optional[EmailStr] = None
+    data_nascimento: Optional[date] = None
     status: Optional[bool] = None
     role: Optional[int] = None  # 1, 2, 3 ou 4
 
@@ -173,6 +176,15 @@ class PasswordChangePayload(BaseModel):
 # ============================================================
 # Helpers
 # ============================================================
+
+
+def _validate_data_nascimento(value: Optional[date]) -> Optional[date]:
+    """Normaliza e valida data de nascimento (opcional). Rejeita data futura."""
+    if value is None:
+        return None
+    if value > date.today():
+        raise HTTPException(422, "Data de nascimento não pode ser futura.")
+    return value
 
 
 def _db_user_from_token(db: Session, token_user: User) -> User:
@@ -393,6 +405,7 @@ def _user_to_out(user: User) -> UserOut:
             "sub_base": user.sub_base,
             "nome": normalize_person_name(user.nome),
             "sobrenome": normalize_person_name(user.sobrenome),
+            "data_nascimento": getattr(user, "data_nascimento", None),
             "role": getattr(user, "role", 2),
             "coletador": getattr(user, "coletador", False),
             "motoboy": None,
@@ -419,6 +432,7 @@ def _user_to_out(user: User) -> UserOut:
             sub_base=getattr(user, "sub_base", None),
             nome=normalize_person_name(getattr(user, "nome", None)),
             sobrenome=normalize_person_name(getattr(user, "sobrenome", None)),
+            data_nascimento=getattr(user, "data_nascimento", None),
             role=getattr(user, "role", 2),
             coletador=getattr(user, "coletador", False),
             motoboy=None,
@@ -514,6 +528,7 @@ def create_user(
 
     # --- MAPEAR ROLE → COLETADOR (legado) ---
     coletador = (body.role == 3)
+    data_nascimento_val = _validate_data_nascimento(body.data_nascimento)
 
     try:
         new_user = User(
@@ -523,6 +538,7 @@ def create_user(
             contato=contato_val,
             nome=normalize_person_name(body.nome),
             sobrenome=normalize_person_name(body.sobrenome),
+            data_nascimento=data_nascimento_val,
             status=True,
             role=body.role,
             coletador=coletador,
@@ -769,11 +785,94 @@ def list_users(
                 sub_base=getattr(u, "sub_base", None),
                 nome=getattr(u, "nome", None),
                 sobrenome=getattr(u, "sobrenome", None),
+                data_nascimento=getattr(u, "data_nascimento", None),
                 role=getattr(u, "role", 2),
                 coletador=getattr(u, "coletador", False),
                 motoboy=None,
             ))
     return out
+
+
+# ============================================================
+# ANIVERSARIANTES — mesma sub_base, ativos com data_nascimento
+# ============================================================
+
+class AniversarianteItem(BaseModel):
+    id: int
+    nome: Optional[str] = None
+    sobrenome: Optional[str] = None
+    username: Optional[str] = None
+    data_nascimento: date
+    dia: int
+    mes: int
+
+
+class AniversariantesOut(BaseModel):
+    ano_referencia: int
+    mes: Optional[int] = None
+    meses: dict[str, list[AniversarianteItem]]
+
+
+@router.get("/aniversariantes", response_model=AniversariantesOut)
+def list_aniversariantes(
+    mes: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Lista aniversariantes ativos da sub_base. mes=1..12 filtra; omitido/all = ano todo."""
+    if getattr(current_user, "role", None) not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+    sub_base = _resolve_user_sub_base(db, current_user)
+    if not sub_base or not str(sub_base).strip():
+        raise HTTPException(403, "Usuário sem sub_base definida. Faça login novamente.")
+
+    mes_filtro: Optional[int] = None
+    if mes is not None and str(mes).strip() and str(mes).strip().lower() != "all":
+        try:
+            mes_filtro = int(str(mes).strip())
+        except ValueError:
+            raise HTTPException(422, "Mês inválido. Use 1 a 12 ou all.")
+        if mes_filtro < 1 or mes_filtro > 12:
+            raise HTTPException(422, "Mês inválido. Use 1 a 12 ou all.")
+
+    stmt = (
+        select(User)
+        .where(
+            User.sub_base == sub_base,
+            User.status.is_(True),
+            User.data_nascimento.is_not(None),
+        )
+    )
+    if mes_filtro is not None:
+        stmt = stmt.where(func.extract("month", User.data_nascimento) == mes_filtro)
+
+    users = db.scalars(stmt).all()
+
+    meses: dict[str, list[AniversarianteItem]] = {str(i): [] for i in range(1, 13)}
+    for u in users:
+        dn = getattr(u, "data_nascimento", None)
+        if not dn:
+            continue
+        item = AniversarianteItem(
+            id=int(u.id),
+            nome=normalize_person_name(u.nome),
+            sobrenome=normalize_person_name(u.sobrenome),
+            username=(u.username or "").strip() or None,
+            data_nascimento=dn,
+            dia=int(dn.day),
+            mes=int(dn.month),
+        )
+        meses[str(item.mes)].append(item)
+
+    for key in meses:
+        meses[key].sort(key=lambda x: (x.dia, (x.nome or "").casefold(), (x.sobrenome or "").casefold()))
+
+    return AniversariantesOut(
+        ano_referencia=date.today().year,
+        mes=mes_filtro,
+        meses=meses,
+    )
 
 
 # ============================================================
@@ -830,7 +929,7 @@ def admin_update_user(
         user.coletador = (updates["role"] == 3)
 
     # Campos User
-    user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role"}
+    user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role", "data_nascimento"}
 
     # Validação/normalização de username por perfil
     if "username" in updates:
@@ -860,6 +959,8 @@ def admin_update_user(
         updates["nome"] = normalize_person_name(updates.get("nome"))
     if "sobrenome" in updates:
         updates["sobrenome"] = normalize_person_name(updates.get("sobrenome"))
+    if "data_nascimento" in updates:
+        updates["data_nascimento"] = _validate_data_nascimento(updates.get("data_nascimento"))
 
     for field, value in updates.items():
         if field in user_fields:
