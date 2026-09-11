@@ -6,7 +6,7 @@ import hashlib
 import logging
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from decimal import Decimal
 
 from fastapi import (
@@ -157,6 +157,16 @@ class MotoboySelectSubBase(BaseModel):
     )
     password: str
     sub_base: str = Field(min_length=1)
+
+
+class RootSelectSubBase(BaseModel):
+    identifier: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("identifier", "email", "username", "contato"),
+    )
+    password: str
+    sub_base: str = Field(min_length=1)
+    remember: bool = False
 
 
 class UserResponse(BaseModel):
@@ -338,11 +348,13 @@ def _tipo_owner_from_owner(owner: Owner) -> str:
     return "base" if v == "base" else "subbase"
 
 
-def _claims(user: User, owner: Owner) -> Dict[str, Any]:
+def _claims(user: User, owner: Owner, sub_base: Optional[str] = None) -> Dict[str, Any]:
     """
     Tudo que o backend precisa no caminho crítico
     fica resolvido aqui, no login.
+    sub_base opcional: usado no login root com seleção de tenant.
     """
+    resolved_sub_base = (sub_base or getattr(owner, "sub_base", None) or user.sub_base or "").strip() or None
     return {
         "sub": _subject(user),
         "uid": user.id,
@@ -350,7 +362,7 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
         "email": user.email,
         "contato": user.contato,
         "role": user.role,
-        "sub_base": user.sub_base,
+        "sub_base": resolved_sub_base,
         "ignorar_coleta": bool(owner.ignorar_coleta),
         "owner_ativo": bool(owner.ativo),
         "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
@@ -364,6 +376,87 @@ def _claims(user: User, owner: Owner) -> Dict[str, Any]:
         "conferencia_saida_habilitada": bool(
             getattr(owner, "conferencia_saida_habilitada", False)
         ),
+    }
+
+
+def _list_active_owner_sub_bases(db: Session) -> List[str]:
+    """Lista sub_bases de Owners ativos (login root)."""
+    rows = run_db_query_with_retry(
+        db,
+        lambda: db.scalars(
+            select(Owner.sub_base).where(
+                Owner.ativo.is_(True),
+                Owner.sub_base.is_not(None),
+            )
+        ).all(),
+    )
+    sub_bases = sorted({(s or "").strip() for s in rows if (s or "").strip()})
+    return sub_bases
+
+
+def _root_needs_sub_base_response(db: Session, user: User) -> Dict[str, Any]:
+    sub_bases = _list_active_owner_sub_bases(db)
+    if not sub_bases:
+        raise HTTPException(403, "Nenhuma sub_base ativa disponível.")
+    return {
+        "needs_sub_base_selection": True,
+        "sub_bases": sub_bases,
+        "must_change_password": _must_change_password_from_user(user),
+    }
+
+
+def _staff_expires(remember: bool) -> timedelta:
+    return (
+        timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
+        if remember
+        else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+
+def _set_access_cookie(response: Response, token: str, expires: timedelta) -> None:
+    response.set_cookie(
+        key=ACCESS_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="None" if COOKIE_SECURE else "Lax",
+        max_age=int(expires.total_seconds()),
+        path="/",
+        domain=COOKIE_DOMAIN,
+    )
+
+
+def _issue_staff_auth(
+    user: User,
+    owner: Owner,
+    expires: timedelta,
+    *,
+    sub_base: Optional[str] = None,
+    response: Optional[Response] = None,
+) -> Dict[str, Any]:
+    resolved_sub_base = (sub_base or getattr(owner, "sub_base", None) or user.sub_base or "").strip()
+    token = create_access_token(_claims(user, owner, resolved_sub_base), expires)
+    must_change = _must_change_password_from_user(user)
+    if response is not None:
+        _set_access_cookie(response, token, expires)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "must_change_password": must_change,
+        "expires_in": int(expires.total_seconds()),
+        "ok": True,
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+            "contato": user.contato,
+            "role": user.role,
+            "sub_base": resolved_sub_base,
+            "ignorar_coleta": owner.ignorar_coleta,
+            "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
+            "tipo_owner": _tipo_owner_from_owner(owner),
+            "must_change_password": must_change,
+        },
     }
 
 
@@ -516,39 +609,35 @@ async def get_current_user(
 # ======================================================
 # ROTAS
 # ======================================================
-@router.post("/token", response_model=Token)
+@router.post("/token")
 async def login_for_access_token(
     user_credentials: UserLogin,
     db: Session = Depends(get_db),
 ):
     """
-    Login staff (admin/operador) para API/mobile.
+    Login staff (admin/operador/root) para API/mobile.
     Com remember=true (app mobile / “lembrar”), emite access longo como o cookie web.
     Sem remember, mantém TTL curto (ACCESS_TOKEN_EXPIRE_MINUTES).
+    Root (role=0): retorna needs_sub_base_selection + lista de bases (sem token).
     """
     user = authenticate_user(db, user_credentials.identifier, user_credentials.password)
     if not user:
         raise HTTPException(401, "Login ou senha incorretos")
 
+    if user.role == 0:
+        return _root_needs_sub_base_response(db, user)
+
     if not user.sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida")
 
     owner = _owner_for_sub_base(db, user.sub_base)
-
-    expires = (
-        timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
-        if user_credentials.remember
-        else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    token = create_access_token(_claims(user, owner), expires)
-
-    must_change = _must_change_password_from_user(user)
-
+    expires = _staff_expires(user_credentials.remember)
+    issued = _issue_staff_auth(user, owner, expires)
     return {
-        "access_token": token,
+        "access_token": issued["access_token"],
         "token_type": "bearer",
-        "must_change_password": must_change,
-        "expires_in": int(expires.total_seconds()),
+        "must_change_password": issued["must_change_password"],
+        "expires_in": issued["expires_in"],
     }
 
 
@@ -562,46 +651,70 @@ async def login_set_cookie(
     if not user:
         raise HTTPException(401, "Login ou senha incorretos")
 
+    if user.role == 0:
+        return _root_needs_sub_base_response(db, user)
+
     if not user.sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida")
 
     owner = _owner_for_sub_base(db, user.sub_base)
-
-    expires = (
-        timedelta(days=REMEMBER_ME_EXPIRE_DAYS)
-        if user_credentials.remember
-        else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-
-    token = create_access_token(_claims(user, owner), expires)
-
-    must_change = _must_change_password_from_user(user)
-
-    response.set_cookie(
-        key=ACCESS_COOKIE_NAME,
-        value=token,
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite="None" if COOKIE_SECURE else "Lax",
-        max_age=int(expires.total_seconds()),
-        path="/",
-        domain=COOKIE_DOMAIN,
-    )
-
+    expires = _staff_expires(user_credentials.remember)
+    issued = _issue_staff_auth(user, owner, expires, response=response)
     return {
         "ok": True,
-        "user": {
-            "id": user.id,
-            "email": user.email,
-            "username": user.username,
-            "contato": user.contato,
-            "role": user.role,
-            "sub_base": user.sub_base,
-            "ignorar_coleta": owner.ignorar_coleta,
-            "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
-            "tipo_owner": _tipo_owner_from_owner(owner),
-            "must_change_password": must_change,
-        },
+        "user": issued["user"],
+    }
+
+
+@router.post("/root-select-subbase")
+async def root_select_subbase(
+    body: RootSelectSubBase,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """
+    Após /login ou /token com needs_sub_base_selection (role=0),
+    envia identifier + password + sub_base para obter sessão na base escolhida.
+    Retorna access_token (mobile) e seta cookie HttpOnly (web).
+    """
+    meta = _auth_attempt_meta(body.identifier)
+    selected_sub_base = body.sub_base.strip()
+    logger.info(
+        "root_select_subbase_attempt attempt_id=%s identifier_mask=%s identifier_hash=%s sub_base=%s",
+        meta["attempt_id"], meta["identifier_mask"], meta["identifier_hash"], selected_sub_base,
+    )
+
+    user = authenticate_user(db, body.identifier, body.password)
+    if not user:
+        logger.warning(
+            "root_select_subbase_failed attempt_id=%s reason=invalid_credentials",
+            meta["attempt_id"],
+        )
+        raise HTTPException(401, "Login ou senha incorretos")
+
+    if user.role != 0:
+        logger.info(
+            "root_select_subbase_failed attempt_id=%s reason=non_root_role user_id=%s role=%s",
+            meta["attempt_id"], user.id, user.role,
+        )
+        raise HTTPException(403, "Acesso restrito a root.")
+
+    owner = _owner_for_sub_base(db, selected_sub_base)
+    expires = _staff_expires(body.remember)
+    issued = _issue_staff_auth(
+        user, owner, expires, sub_base=selected_sub_base, response=response,
+    )
+    logger.info(
+        "root_select_subbase_success attempt_id=%s user_id=%s sub_base=%s",
+        meta["attempt_id"], user.id, selected_sub_base,
+    )
+    return {
+        "access_token": issued["access_token"],
+        "token_type": "bearer",
+        "must_change_password": issued["must_change_password"],
+        "expires_in": issued["expires_in"],
+        "ok": True,
+        "user": issued["user"],
     }
 
 

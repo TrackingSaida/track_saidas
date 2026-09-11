@@ -27,6 +27,21 @@ router = APIRouter(prefix="/users", tags=["Users"])
 logger = logging.getLogger("routes.users")
 
 
+def _caller_is_root(current_user: User) -> bool:
+    return getattr(current_user, "role", None) == 0
+
+
+def _deny_non_root_managing_root(current_user: User, target_role: Optional[int]) -> None:
+    """Admin (role=1) não pode gerenciar usuários root (role=0)."""
+    if target_role == 0 and not _caller_is_root(current_user):
+        raise HTTPException(403, "Não é permitido gerenciar usuário root.")
+
+
+def _deny_non_root_assigning_root(current_user: User, new_role: Optional[int]) -> None:
+    if new_role == 0 and not _caller_is_root(current_user):
+        raise HTTPException(403, "Não é permitido criar ou promover usuário root.")
+
+
 # ============================================================
 # Schemas
 # ============================================================
@@ -438,6 +453,8 @@ def create_user(
 ):
     """Cria usuário herdando sub_base e setando coletador baseado no role. Role 4 = Motoboy."""
 
+    _deny_non_root_assigning_root(current_user, body.role)
+
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(400, "Usuário atual não possui sub_base.")
@@ -747,9 +764,11 @@ def list_users(
     sub_base = _resolve_user_sub_base(db, current_user)
     if not sub_base or not str(sub_base).strip():
         raise HTTPException(403, "Usuário sem sub_base definida. Faça login novamente.")
-    users = db.scalars(
-        select(User).options(joinedload(User.motoboy)).where(User.sub_base == sub_base)
-    ).all()
+    q = select(User).options(joinedload(User.motoboy)).where(User.sub_base == sub_base)
+    # Admin não vê usuários root na listagem
+    if getattr(current_user, "role", None) == 1:
+        q = q.where(User.role != 0)
+    users = db.scalars(q).all()
     out = []
     for u in users:
         try:
@@ -795,6 +814,8 @@ def get_user(
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
 
+    _deny_non_root_managing_root(current_user, getattr(user, "role", None))
+
     return _user_to_out(user)
 
 
@@ -821,11 +842,14 @@ def admin_update_user(
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
 
+    _deny_non_root_managing_root(current_user, getattr(user, "role", None))
+
     owner = db.scalar(select(Owner).where(Owner.sub_base == current_user.sub_base))
     updates = payload.model_dump(exclude_unset=True)
 
     # ROLE → define COLETADOR (legado)
     if "role" in updates:
+        _deny_non_root_assigning_root(current_user, updates["role"])
         user.role = updates["role"]
         user.coletador = (updates["role"] == 3)
 
@@ -993,6 +1017,8 @@ def admin_reset_password(
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
 
+    _deny_non_root_managing_root(current_user, getattr(user, "role", None))
+
     user.password_hash = get_password_hash(DEFAULT_PASSWORD)
     user.must_change_password = True
     db.commit()
@@ -1021,6 +1047,8 @@ def delete_user(
 
     if user.sub_base != current_user.sub_base:
         raise HTTPException(403, "Acesso negado.")
+
+    _deny_non_root_managing_root(current_user, getattr(user, "role", None))
 
     # Limpa espelho legado (entregador + exceção de preço) antes do hard delete.
     try:
