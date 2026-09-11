@@ -42,6 +42,8 @@ EVENTOS_UI_ULTIMA_ACAO = {
     "entrada_base",
     "saida_conferida",
     "saida_reconferida",
+    "criado_coleta",
+    "coleta",
 }
 
 ROTULOS_ACAO = {
@@ -73,6 +75,8 @@ ROTULOS_ACAO = {
     "entrada_base": "Entrada na base",
     "saida_conferida": "Saída conferida",
     "saida_reconferida": "Saída reconferida",
+    "criado_coleta": "Pacote coletado",
+    "coleta": "Pacote coletado",
 }
 
 
