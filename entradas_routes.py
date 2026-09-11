@@ -15,7 +15,7 @@ from auth import get_current_user
 from codigo_normalizer import canonicalize_servico, is_qr_like_scan_payload, normalize_codigo
 from db import get_db
 from leitura_manual_auth import ensure_manual_code_entry_allowed
-from models import Owner, Saida, SaidaHistorico, User
+from models import Owner, Saida, SaidaDetail, SaidaHistorico, User
 from qr_payload_utils import (
     apply_qr_payload_if_needed,
     needs_qr_update,
@@ -44,6 +44,11 @@ class EntradaLerIn(BaseModel):
 class EntradaLancarAvulsoIn(BaseModel):
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
+    # Foto opcional (root/admin nunca obrigatória; staff operação sem flag de motoboy).
+    foto_object_key: Optional[str] = Field(default=None, max_length=500)
+    foto_object_keys: Optional[List[str]] = None
+    photo_id: Optional[str] = Field(default=None, max_length=80)
+    photo_ids: Optional[List[Optional[str]]] = None
 
 
 class EntradaLancarAvulsoOut(BaseModel):
@@ -298,11 +303,64 @@ def lancar_avulso_entrada(
             detail={"code": "QUANTIDADE_INVALIDA", "message": "Quantidade mínima é 1."},
         )
 
+    from saidas_routes import _PENDING_AVULSO_KEY_RE
+    from upload_storage_utils import MAX_FOTOS_POR_EVENTO_TENTATIVA, build_foto_item, serialize_foto_items
+
+    role = int(getattr(current_user, "role", 0) or 0)
+    # Entrada é staff; root/admin nunca exigem. Sem motoboy no fluxo → foto opcional.
+    avulso_exige_foto = False
+    if role in (0, 1):
+        avulso_exige_foto = False
+
+    foto_keys: List[str] = []
+    for k in list(payload.foto_object_keys or []):
+        kk = (k or "").strip()
+        if kk and kk not in foto_keys:
+            foto_keys.append(kk)
+    single_key = (payload.foto_object_key or "").strip() or None
+    if single_key and single_key not in foto_keys:
+        foto_keys.insert(0, single_key)
+    foto_keys = foto_keys[:MAX_FOTOS_POR_EVENTO_TENTATIVA]
+    for kk in foto_keys:
+        if not _PENDING_AVULSO_KEY_RE.match(kk):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "FOTO_KEY_INVALIDA",
+                    "message": "Foto inválida para lançamento avulso. Tire a foto novamente.",
+                },
+            )
+    photo_ids_list: List[Optional[str]] = []
+    raw_ids = list(payload.photo_ids or [])
+    if payload.photo_id and not raw_ids:
+        raw_ids = [payload.photo_id]
+    for i, _k in enumerate(foto_keys):
+        pid = (raw_ids[i] if i < len(raw_ids) else None) or None
+        photo_ids_list.append((str(pid).strip() or None) if pid is not None else None)
+    if avulso_exige_foto and not foto_keys:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "FOTO_OBRIGATORIA", "message": "É necessário enviar foto ao lançar avulso."},
+        )
+
     label_norm = _normalizar_label_avulso(payload.identificacao)
     servico = canonicalize_servico("Avulso")
     codigos: List[str] = []
     saidas_criadas: List[dict] = []
     user_id = getattr(current_user, "id", None)
+    foto_payload = None
+    if foto_keys:
+        foto_payload = serialize_foto_items(
+            [
+                build_foto_item(
+                    key=key,
+                    evento="lancar_avulso",
+                    tentativa=1,
+                    photo_id=photo_ids_list[i] if i < len(photo_ids_list) else None,
+                )
+                for i, key in enumerate(foto_keys)
+            ]
+        )
 
     try:
         for _ in range(quantidade):
@@ -325,6 +383,16 @@ def lancar_avulso_entrada(
                     user_id=user_id,
                 )
             )
+            if foto_payload:
+                db.add(
+                    SaidaDetail(
+                        id_saida=row.id_saida,
+                        id_entregador=0,
+                        status=STATUS_NA_BASE,
+                        tentativa=1,
+                        foto_url=foto_payload,
+                    )
+                )
             codigos.append(codigo)
             saidas_criadas.append(
                 {
