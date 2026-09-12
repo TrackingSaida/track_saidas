@@ -253,9 +253,15 @@ def _issue_motoboy_auth_response(
     owner: Owner,
     sub_base: str,
 ) -> Dict[str, Any]:
+    # Espelha a base da sessão no cadastro — refresh e consultas de banco ficam alinhados
+    selected = (sub_base or "").strip()
+    if selected and (user.sub_base or "").strip() != selected:
+        user.sub_base = selected
+        db.add(user)
+
     access_delta = _motoboy_access_expires()
     access_token = create_access_token(
-        _claims_motoboy(user, motoboy, owner, sub_base),
+        _claims_motoboy(user, motoboy, owner, selected),
         access_delta,
     )
     revoke_motoboy_refresh_tokens_for_user(db, int(user.id), commit=False)
@@ -274,6 +280,40 @@ def _issue_motoboy_auth_response(
         "expires_in": int(access_delta.total_seconds()),
         "must_change_password": _must_change_password_from_user(user),
     }
+
+
+def _resolve_motoboy_session_sub_base(
+    db: Session,
+    *,
+    user: User,
+    motoboy: Motoboy,
+) -> str:
+    """
+    Resolve sub_base de sessão do motoboy apenas entre vínculos ativos.
+    Nunca usa users.sub_base se ela não estiver em MotoboySubBase.
+    """
+    sub_bases_rows = run_db_query_with_retry(
+        db,
+        lambda: db.scalars(
+            select(MotoboySubBase.sub_base).where(
+                MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+                MotoboySubBase.ativo.is_(True),
+            )
+        ).all(),
+    )
+    sub_bases = sorted({(s or "").strip() for s in sub_bases_rows if (s or "").strip()})
+    if not sub_bases:
+        raise HTTPException(status_code=403, detail="Motoboy sem sub_base ativa vinculada.")
+
+    preferred = (user.sub_base or "").strip()
+    if preferred and preferred in sub_bases:
+        return preferred
+    if len(sub_bases) == 1:
+        return sub_bases[0]
+    raise HTTPException(
+        status_code=403,
+        detail="Selecione a base novamente. Sessão com múltiplas bases ativas.",
+    )
 
 
 def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, Any]:
@@ -295,20 +335,7 @@ def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, 
     if not user or not motoboy or user.role != 4:
         raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
 
-    sub_bases_rows = run_db_query_with_retry(
-        db,
-        lambda: db.scalars(
-            select(MotoboySubBase.sub_base).where(
-                MotoboySubBase.motoboy_id == motoboy.id_motoboy,
-                MotoboySubBase.ativo.is_(True),
-            )
-        ).all(),
-    )
-    sub_bases = [s for s in sub_bases_rows if s]
-    sub_base = user.sub_base or (sub_bases[0] if len(sub_bases) == 1 else None)
-    if not sub_base:
-        raise HTTPException(status_code=403, detail="Motoboy sem sub_base ativa vinculada.")
-
+    sub_base = _resolve_motoboy_session_sub_base(db, user=user, motoboy=motoboy)
     owner = _owner_for_sub_base(db, sub_base)
 
     row.revoked_at = datetime.utcnow()
