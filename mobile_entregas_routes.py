@@ -169,6 +169,7 @@ class EntregaListItem(BaseModel):
     possui_endereco: bool = False
     tentativa: Optional[int] = None  # 1 = primeira; >= 2 exibe "Xª tentativa"
     tem_comprovante: bool = False
+    tem_qr_etiqueta: bool = False  # qr_payload_raw utilizável para etiqueta ML
     ausencias_total: int = 0
     bloqueado_ausencias: bool = False
     tipo_recebedor: Optional[str] = None
