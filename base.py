@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, BasePreco, BaseSellerDados  # classe do models.py com __tablename__ = "base"
+from models import User, BasePreco, BaseSellerDados, MotoboySubBase  # classe do models.py com __tablename__ = "base"
 
 router = APIRouter(prefix="/base", tags=["Base"])
 
@@ -76,12 +76,56 @@ class BaseUpdate(BaseModel):
 # Helper
 # =========================
 def _resolve_user_sub_base(db: Session, current_user: User) -> str:
-    # Preferir claim da sessão (JWT) — crítico para root com sub_base selecionada no login
+    # Preferir claim da sessão (JWT) — crítico para root com sub_base selecionada no login.
+    # Motoboy (role=4): só aceita claim se estiver vinculada em MotoboySubBase (anti cross-tenant).
     token_sub_base = (getattr(current_user, "sub_base", None) or "").strip()
-    if token_sub_base:
+    role = getattr(current_user, "role", None)
+    try:
+        role_int = int(role) if role is not None and role != "" else None
+    except (TypeError, ValueError):
+        role_int = None
+
+    if token_sub_base and role_int == 4:
+        motoboy_id = getattr(current_user, "motoboy_id", None)
+        if motoboy_id is not None:
+            vinculado = db.scalar(
+                select(MotoboySubBase.id).where(
+                    MotoboySubBase.motoboy_id == int(motoboy_id),
+                    MotoboySubBase.sub_base == token_sub_base,
+                    MotoboySubBase.ativo.is_(True),
+                )
+            )
+            if vinculado:
+                return token_sub_base
+        # Claim inválida/fora do vínculo: não vazar outro tenant — cai no fallback seguro
+    elif token_sub_base:
         return token_sub_base
 
     user_id = getattr(current_user, "id", None)
+    if role_int == 4 and user_id is not None:
+        # Fallback motoboy: só vínculos ativos (nunca users.sub_base stale de outro tenant)
+        from models import Motoboy
+
+        motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == int(user_id)))
+        if motoboy:
+            rows = db.scalars(
+                select(MotoboySubBase.sub_base).where(
+                    MotoboySubBase.motoboy_id == motoboy.id_motoboy,
+                    MotoboySubBase.ativo.is_(True),
+                )
+            ).all()
+            sub_bases = sorted({(s or "").strip() for s in rows if (s or "").strip()})
+            preferred = (getattr(current_user, "sub_base", None) or "").strip()
+            if preferred and preferred in sub_bases:
+                return preferred
+            u = db.get(User, user_id)
+            db_pref = (getattr(u, "sub_base", None) or "").strip() if u else ""
+            if db_pref and db_pref in sub_bases:
+                return db_pref
+            if len(sub_bases) == 1:
+                return sub_bases[0]
+        raise HTTPException(status_code=401, detail="Usuário sem 'sub_base' válida vinculada.")
+
     if user_id is not None:
         u = db.get(User, user_id)
         if u and getattr(u, "sub_base", None):
