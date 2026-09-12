@@ -76,6 +76,11 @@ class BaseUpdate(BaseModel):
 # Helper
 # =========================
 def _resolve_user_sub_base(db: Session, current_user: User) -> str:
+    # Preferir claim da sessão (JWT) — crítico para root com sub_base selecionada no login
+    token_sub_base = (getattr(current_user, "sub_base", None) or "").strip()
+    if token_sub_base:
+        return token_sub_base
+
     user_id = getattr(current_user, "id", None)
     if user_id is not None:
         u = db.get(User, user_id)

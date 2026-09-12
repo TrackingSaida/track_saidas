@@ -700,6 +700,14 @@ async def root_select_subbase(
         raise HTTPException(403, "Acesso restrito a root.")
 
     owner = _owner_for_sub_base(db, selected_sub_base)
+
+    # Persistir a base escolhida no cadastro do root para consultas que leem do banco
+    if (user.sub_base or "").strip() != selected_sub_base:
+        user.sub_base = selected_sub_base
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
     expires = _staff_expires(body.remember)
     issued = _issue_staff_auth(
         user, owner, expires, sub_base=selected_sub_base, response=response,
@@ -953,8 +961,13 @@ async def read_users_me(
 
     nome_val, sobrenome_val = _nome_exibicao(current_user)
     # tipo_owner vivo do Owner (não só do JWT) — sessão mobile longa pode ficar desatualizada
+    # Preferir sub_base da sessão (JWT), essencial para root com base selecionada no login
     tipo_owner = getattr(current_user, "tipo_owner", None) or "subbase"
-    sub_base = (getattr(db_user, "sub_base", None) or getattr(current_user, "sub_base", None) or "").strip()
+    sub_base = (
+        getattr(current_user, "sub_base", None)
+        or getattr(db_user, "sub_base", None)
+        or ""
+    ).strip()
     if sub_base:
         owner = run_db_query_with_retry(
             db,
@@ -970,7 +983,7 @@ async def read_users_me(
         sobrenome=sobrenome_val,
         contato=current_user.contato,
         role=current_user.role,
-        sub_base=current_user.sub_base,
+        sub_base=sub_base or current_user.sub_base,
         ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
         modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
         tipo_owner=tipo_owner,
