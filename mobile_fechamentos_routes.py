@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
+from auth import get_current_user, ensure_motoboy_session
 from db import get_db
 from fechamento_pdf_service import (
     build_fechamento_code,
@@ -40,6 +40,13 @@ def _pdf_mobile_enabled() -> bool:
         "true",
         "yes",
     )
+
+
+def get_current_motoboy_fechamento(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    return ensure_motoboy_session(db, user)
 
 
 def _require_motoboy(user: User) -> tuple[int, str]:
@@ -156,7 +163,7 @@ def _to_out(
 @router.get("", response_model=List[FechamentoMobileOut])
 def listar_fechamentos(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_motoboy_fechamento),
 ):
     motoboy_id, sub_base = _require_motoboy(current_user)
     rows = db.scalars(
@@ -176,7 +183,7 @@ def listar_fechamentos(
 def detalhe_fechamento(
     id_fechamento: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_motoboy_fechamento),
 ):
     motoboy_id, sub_base = _require_motoboy(current_user)
     fech = db.get(EntregadorFechamento, id_fechamento)
@@ -216,7 +223,7 @@ def detalhe_fechamento(
 def baixar_pdf_fechamento(
     id_fechamento: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_motoboy_fechamento),
 ):
     if not _pdf_mobile_enabled():
         raise HTTPException(403, "Download de PDF temporariamente indisponível.")

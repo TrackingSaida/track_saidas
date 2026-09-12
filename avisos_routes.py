@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
+from auth import get_current_user, ensure_motoboy_session
 from db import get_db
 from models import AvisoBase, AvisoDestinatario, MotoboySubBase, User
 from push_notification_service import send_to_motoboy
@@ -54,6 +54,14 @@ def _require_motoboy(user: User) -> int:
     if _role(user) != 4 or not getattr(user, "motoboy_id", None):
         raise HTTPException(403, "Acesso restrito a motoboy.")
     return int(user.motoboy_id)
+
+
+def get_current_motoboy_avisos(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """Hidrata motoboy_id/sub_base — JWT staff legado (role=4 sem motoboy_id) deixa de quebrar avisos."""
+    return ensure_motoboy_session(db, user)
 
 
 class AvisoCreateIn(BaseModel):
@@ -235,7 +243,7 @@ mobile_router = APIRouter(prefix="/mobile/avisos", tags=["Mobile Avisos"])
 @mobile_router.get("", response_model=List[AvisoMotoboyOut])
 def listar_avisos_motoboy(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_motoboy_avisos),
 ):
     motoboy_id = _require_motoboy(current_user)
     sub_base = _require_sub_base(current_user)
@@ -267,7 +275,7 @@ def listar_avisos_motoboy(
 @mobile_router.get("/urgentes-pendentes", response_model=List[AvisoMotoboyOut])
 def listar_urgentes_pendentes(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_motoboy_avisos),
 ):
     motoboy_id = _require_motoboy(current_user)
     sub_base = _require_sub_base(current_user)
@@ -301,7 +309,7 @@ def listar_urgentes_pendentes(
 def obter_aviso_motoboy(
     aviso_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_motoboy_avisos),
 ):
     motoboy_id = _require_motoboy(current_user)
     sub_base = _require_sub_base(current_user)
@@ -334,7 +342,7 @@ def obter_aviso_motoboy(
 def marcar_aviso_lido(
     aviso_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_motoboy_avisos),
 ):
     motoboy_id = _require_motoboy(current_user)
     sub_base = _require_sub_base(current_user)
