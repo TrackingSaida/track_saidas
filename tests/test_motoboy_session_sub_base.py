@@ -45,7 +45,27 @@ def test_resolve_keeps_preferred_when_linked(monkeypatch):
     assert _resolve_motoboy_session_sub_base(db, user=user, motoboy=motoboy) == "WS"
 
 
-def test_resolve_raises_when_no_links(monkeypatch):
+def test_resolve_allows_preferred_when_no_links(monkeypatch):
+    """Sem MotoboySubBase ativo, mantém claim da sessão (legado)."""
+    import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "run_db_query_with_retry", lambda _db, fn: fn())
+    db = MagicMock()
+    result = MagicMock()
+    result.all.return_value = []
+    db.scalars.return_value = result
+
+    assert (
+        _resolve_motoboy_session_sub_base(
+            db,
+            user=SimpleNamespace(sub_base="RUB_TEST1"),
+            motoboy=SimpleNamespace(id_motoboy=10),
+        )
+        == "RUB_TEST1"
+    )
+
+
+def test_resolve_raises_when_no_links_and_no_preferred(monkeypatch):
     import auth as auth_mod
 
     monkeypatch.setattr(auth_mod, "run_db_query_with_retry", lambda _db, fn: fn())
@@ -57,7 +77,7 @@ def test_resolve_raises_when_no_links(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         _resolve_motoboy_session_sub_base(
             db,
-            user=SimpleNamespace(sub_base="WS"),
+            user=SimpleNamespace(sub_base=""),
             motoboy=SimpleNamespace(id_motoboy=10),
         )
     assert exc.value.status_code == 403

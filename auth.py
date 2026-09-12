@@ -302,10 +302,13 @@ def _resolve_motoboy_session_sub_base(
         ).all(),
     )
     sub_bases = sorted({(s or "").strip() for s in sub_bases_rows if (s or "").strip()})
+    preferred = (user.sub_base or "").strip()
     if not sub_bases:
+        # Legado / dado incompleto: permite claim da sessão se existir
+        if preferred:
+            return preferred
         raise HTTPException(status_code=403, detail="Motoboy sem sub_base ativa vinculada.")
 
-    preferred = (user.sub_base or "").strip()
     if preferred and preferred in sub_bases:
         return preferred
     if len(sub_bases) == 1:
@@ -314,6 +317,63 @@ def _resolve_motoboy_session_sub_base(
         status_code=403,
         detail="Selecione a base novamente. Sessão com múltiplas bases ativas.",
     )
+
+
+def ensure_motoboy_session(db: Session, user: User) -> User:
+    """
+    Garante identidade de motoboy na request:
+    - role 4
+    - motoboy_id (hidrata do banco se o JWT veio sem o claim — ex.: fallback /auth/token)
+    - sub_base alinhada a MotoboySubBase quando possível
+    """
+    try:
+        role = int(user.role) if getattr(user, "role", None) is not None and user.role != "" else None
+    except (TypeError, ValueError):
+        role = None
+    if role != 4:
+        raise HTTPException(status_code=403, detail="Acesso restrito a motoboys.")
+
+    motoboy: Optional[Motoboy] = None
+    raw_mid = getattr(user, "motoboy_id", None)
+    if raw_mid is not None and raw_mid != "":
+        try:
+            mid = int(raw_mid)
+            motoboy = run_db_query_with_retry(db, lambda: db.get(Motoboy, mid))
+        except (TypeError, ValueError):
+            motoboy = None
+
+    if motoboy is None and getattr(user, "id", None) is not None:
+        try:
+            uid = int(user.id)
+        except (TypeError, ValueError):
+            uid = None
+        if uid is not None:
+            motoboy = run_db_query_with_retry(
+                db,
+                lambda: db.scalar(select(Motoboy).where(Motoboy.user_id == uid)),
+            )
+
+    if motoboy is None:
+        raise HTTPException(status_code=403, detail="Token inválido para motoboy.")
+
+    user.motoboy_id = int(motoboy.id_motoboy)
+    token_sub_base = (getattr(user, "sub_base", None) or "").strip()
+    try:
+        user.sub_base = _resolve_motoboy_session_sub_base(db, user=user, motoboy=motoboy)
+    except HTTPException as exc:
+        # Evita lockout total (ex.: multi-base com preferred stale): mantém claim se houver
+        if token_sub_base and exc.status_code == 403:
+            logger.warning(
+                "motoboy_sub_base_resolve_fallback user_id=%s motoboy_id=%s token_sub_base=%s detail=%s",
+                getattr(user, "id", None),
+                user.motoboy_id,
+                token_sub_base,
+                exc.detail,
+            )
+            user.sub_base = token_sub_base
+        else:
+            raise
+    return user
 
 
 def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, Any]:
@@ -662,6 +722,13 @@ async def login_for_access_token(
     if user.role == 0:
         return _root_needs_sub_base_response(db, user)
 
+    # Motoboy não pode receber JWT staff (sem motoboy_id) — quebra /mobile/*
+    if int(user.role or 0) == 4:
+        raise HTTPException(
+            403,
+            "Conta de entregador: use o login de motoboy.",
+        )
+
     if not user.sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida")
 
@@ -688,6 +755,12 @@ async def login_set_cookie(
 
     if user.role == 0:
         return _root_needs_sub_base_response(db, user)
+
+    if int(user.role or 0) == 4:
+        raise HTTPException(
+            403,
+            "Conta de entregador: use o login de motoboy.",
+        )
 
     if not user.sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida")
