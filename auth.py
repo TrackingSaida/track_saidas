@@ -624,8 +624,16 @@ async def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
+    try:
+        role_int = int(payload.get("role")) if payload.get("role") is not None and payload.get("role") != "" else None
+    except (TypeError, ValueError):
+        role_int = None
+
     if not payload.get("owner_ativo", False):
-        raise HTTPException(status_code=403, detail="Operação bloqueada")
+        # Motoboy: owner_ativo no JWT pode ser de sub_base stale (ex.: WS).
+        # A validação real do Owner ocorre após resolver MotoboySubBase.
+        if role_int != 4:
+            raise HTTPException(status_code=403, detail="Operação bloqueada")
 
     # policy disponível para as rotas
     request.state.ignorar_coleta = payload.get("ignorar_coleta", False)
