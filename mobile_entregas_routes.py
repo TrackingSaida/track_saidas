@@ -29,7 +29,11 @@ from saida_historico_service import (
 )
 from db import get_db
 from db_utils import db_rollback_safe, run_db_query_with_retry
-from auth import get_current_user
+from auth import (
+    get_current_user,
+    _owner_for_sub_base,
+    _resolve_motoboy_session_sub_base,
+)
 from active_route_sync import (
     get_active_route_delivery_ids,
     refresh_active_route_if_stale,
@@ -118,21 +122,42 @@ def _hoje_operacional() -> date:
 # ============================================================
 # Dep: usuário deve ser motoboy (role=4, motoboy_id no token)
 # ============================================================
-def get_current_motoboy(user: User = Depends(get_current_user)) -> User:
-    if getattr(user, "role", 0) != 4:
-        raise HTTPException(status_code=403, detail="Acesso restrito a motoboys.")
-    if not getattr(user, "motoboy_id", None):
+def _apply_motoboy_session_sub_base(db: Session, user: User) -> User:
+    """
+    Corrige user.sub_base da sessão para um vínculo ativo em MotoboySubBase.
+    Impede JWT stale (ex.: WS) de filtrar entregas/pendentes de outro tenant.
+    """
+    motoboy_id = getattr(user, "motoboy_id", None)
+    if not motoboy_id:
         raise HTTPException(status_code=403, detail="Token inválido para motoboy.")
+    motoboy = run_db_query_with_retry(db, lambda: db.get(Motoboy, int(motoboy_id)))
+    if not motoboy:
+        raise HTTPException(status_code=403, detail="Perfil de motoboy não encontrado.")
+    sub_base = _resolve_motoboy_session_sub_base(db, user=user, motoboy=motoboy)
+    _owner_for_sub_base(db, sub_base)  # valida Owner ativo da base resolvida
+    user.sub_base = sub_base
     return user
 
 
-def get_current_mobile_scan_user(user: User = Depends(get_current_user)) -> User:
+def get_current_motoboy(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    if getattr(user, "role", 0) != 4:
+        raise HTTPException(status_code=403, detail="Acesso restrito a motoboys.")
+    return _apply_motoboy_session_sub_base(db, user)
+
+
+def get_current_mobile_scan_user(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
     """Permite scan no mobile para motoboy e staff (admin/operação)."""
     role = int(getattr(user, "role", 0) or 0)
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(status_code=403, detail="Perfil sem acesso ao scan mobile.")
-    if role == 4 and not getattr(user, "motoboy_id", None):
-        raise HTTPException(status_code=403, detail="Token inválido para motoboy.")
+    if role == 4:
+        return _apply_motoboy_session_sub_base(db, user)
     return user
 
 
