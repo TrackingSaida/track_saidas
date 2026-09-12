@@ -48,15 +48,8 @@ def should_store_qr_payload_raw(servico: Optional[str], qr_raw: Optional[str]) -
 
 
 def has_usable_qr_etiqueta(qr_raw: Optional[str]) -> bool:
-    """True se há payload utilizável na geração de etiqueta ML."""
-    if not qr_raw or not str(qr_raw).strip():
-        return False
-    raw = str(qr_raw).strip()
-    if is_ml_qr_completo(raw):
-        return True
-    if re.search(r"4[5-9]\d{9}", raw):
-        return True
-    return False
+    """True se há payload gravado; alinha com POST /etiquetas/gerar (usa qualquer raw)."""
+    return bool(qr_raw and str(qr_raw).strip())
 
 
 def needs_qr_update(

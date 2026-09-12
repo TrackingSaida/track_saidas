@@ -71,4 +71,6 @@ def test_apply_atualiza_e_alerta():
 def test_has_usable():
     assert has_usable_qr_etiqueta(JSON_COMPLETO) is True
     assert has_usable_qr_etiqueta(DIGITOS) is True
+    assert has_usable_qr_etiqueta('{"id":"47818181365"}') is True
     assert has_usable_qr_etiqueta(None) is False
+    assert has_usable_qr_etiqueta("   ") is False
