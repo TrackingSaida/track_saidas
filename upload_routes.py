@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 _BASE_DIR = Path(__file__).resolve().parent
 _DEFAULT_LOGO_PATH = _BASE_DIR / "assets" / "logo-comprovante.png"
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -659,6 +659,105 @@ def upload_presign(
         "upload_url": upload_url,
         "object_key": object_key,
         "headers": {"Content-Type": body.content_type or "image/jpeg"},
+    }
+
+
+# ---------- POST /upload/avulso-file ----------
+# Proxy para o web: evita PUT direto no B2 (CORS → "Failed to fetch" no browser).
+
+_MAX_AVULSO_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB
+_ALLOWED_AVULSO_CONTENT_TYPES = frozenset({
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+})
+
+
+@router.post("/avulso-file")
+async def upload_avulso_file(
+    file: UploadFile = File(...),
+    photo_id: Optional[str] = Form(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Recebe a imagem do avulso e grava no B2 (pending). Uso preferencial do web."""
+    del db  # auth/tenant já validados pelo current_user
+    sub_base = getattr(current_user, "sub_base", None)
+    if not sub_base:
+        raise HTTPException(status_code=401, detail="Usuário inválido.")
+
+    filename = (file.filename or "avulso.jpg").strip() or "avulso.jpg"
+    content_type = (file.content_type or "").strip().lower() or "image/jpeg"
+    if content_type not in _ALLOWED_AVULSO_CONTENT_TYPES:
+        # Alguns browsers mandam application/octet-stream; aceita e trata como jpeg.
+        if content_type not in ("application/octet-stream", ""):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "FOTO_TIPO_INVALIDO",
+                    "message": "Envie uma imagem JPG, PNG, GIF ou WEBP.",
+                },
+            )
+        content_type = "image/jpeg"
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "FOTO_VAZIA", "message": "Arquivo de imagem vazio."},
+        )
+    if len(raw) > _MAX_AVULSO_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "FOTO_MUITO_GRANDE",
+                "message": "Imagem muito grande. Use um arquivo de até 8 MB.",
+            },
+        )
+
+    ext = "jpg"
+    if "." in filename:
+        cand = filename.rsplit(".", 1)[-1].lower()
+        if cand in ("jpg", "jpeg", "png", "gif", "webp"):
+            ext = cand
+    object_key = f"saida/pending/lancar_avulso/{uuid.uuid4().hex}.{ext}"
+    pid = (photo_id or "").strip() or None
+
+    client = _get_s3_client()
+    try:
+        client.put_object(
+            Bucket=B2_BUCKET_NAME,
+            Key=object_key,
+            Body=raw,
+            ContentType=content_type,
+        )
+    except Exception as e:
+        logger.exception(
+            "upload_avulso_file_failed user_id=%s key=%s",
+            getattr(current_user, "id", None),
+            object_key,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "STORAGE_TEMPORARY_ERROR",
+                "message": "Falha temporária ao enviar a foto. Tente novamente.",
+            },
+        ) from e
+
+    logger.info(
+        "upload avulso-file: photo_id=%s object_key=%s user_id=%s bytes=%s",
+        pid,
+        object_key,
+        getattr(current_user, "id", None),
+        len(raw),
+    )
+    return {
+        "object_key": object_key,
+        "foto_object_key": object_key,
+        "photo_id": pid,
     }
 
 
