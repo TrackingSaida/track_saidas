@@ -946,11 +946,21 @@ def admin_update_user(
     owner = db.scalar(select(Owner).where(Owner.sub_base == current_user.sub_base))
     updates = payload.model_dump(exclude_unset=True)
 
+    previous_role = getattr(user, "role", None)
+
     # ROLE → define COLETADOR (legado)
     if "role" in updates:
         _deny_non_root_assigning_root(current_user, updates["role"])
         user.role = updates["role"]
         user.coletador = (updates["role"] == 3)
+        # Troca de perfil: invalida refresh de motoboy (JWT staff antigo cai no get_current_user).
+        if updates["role"] != previous_role:
+            try:
+                revoke_motoboy_refresh_tokens_for_user(db, int(user.id), commit=False)
+            except Exception:
+                logger.exception(
+                    "Falha ao revogar refresh tokens ao mudar role user_id=%s", user.id
+                )
 
     # Campos User
     user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role", "data_nascimento"}

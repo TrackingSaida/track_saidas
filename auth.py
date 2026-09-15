@@ -637,38 +637,95 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
 # ======================================================
 # DB helpers (somente para login)
 # ======================================================
-def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
+SESSION_INVALID_DETAIL = "Sessão inválida. Faça login novamente."
+
+
+def _coerce_role_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_users_by_identifier(db: Session, identifier: str) -> List[User]:
+    """Todos os usuários que batem email/username/contato (pode haver 1 por sub_base)."""
     identifier = (identifier or "").strip()
     if not identifier:
-        return None
+        return []
 
     stmt = select(User).where(
         or_(
             User.email == identifier,
             User.username == identifier,
-            User.contato == identifier
+            User.contato == identifier,
         )
     )
-    return run_db_query_with_retry(db, lambda: db.scalars(stmt).first())
+    rows = run_db_query_with_retry(db, lambda: db.scalars(stmt).all())
+    return list(rows or [])
+
+
+def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
+    """Retorna o usuário só se o identificador for inequívoco (1 match)."""
+    users = get_users_by_identifier(db, identifier)
+    if len(users) == 1:
+        return users[0]
+    return None
 
 
 def authenticate_user(db: Session, identifier: str, password: str) -> Optional[User]:
-    user = get_user_by_identifier(db, identifier)
-    if not user:
-        return None
-    if not bool(getattr(user, "status", True)):
-        return None
-    if not verify_password(password, user.password_hash):
-        return None
-    return user
+    """
+    Autentica por identifier + senha.
+    Se o mesmo identifier existir em várias sub_bases, só aceita quando
+    exatamente um candidato ativo bate a senha (evita .first() cego).
+    """
+    matched: List[User] = []
+    for user in get_users_by_identifier(db, identifier):
+        if not bool(getattr(user, "status", True)):
+            continue
+        hashed = getattr(user, "password_hash", None)
+        if not hashed:
+            continue
+        if verify_password(password, hashed):
+            matched.append(user)
+    if len(matched) == 1:
+        return matched[0]
+    return None
+
+
+def _ensure_staff_jwt_matches_db(db: Session, *, uid: Any, jwt_role: int) -> None:
+    """
+    Sessão staff (JWT role 0–3): confere role/status vivos no banco.
+    Token antigo de operador após promoção a motoboy (role=4) → 401.
+    """
+    try:
+        user_id = int(uid) if uid is not None and uid != "" else None
+    except (TypeError, ValueError):
+        user_id = None
+    if user_id is None:
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+
+    db_user = run_db_query_with_retry(db, lambda: db.get(User, user_id))
+    if not db_user:
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+    if not bool(getattr(db_user, "status", True)):
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+
+    live_role = _coerce_role_int(getattr(db_user, "role", None))
+    if live_role == 4:
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+    if live_role != jwt_role:
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
 
 
 # ======================================================
-# Usuário logado — FAST PATH (SEM BANCO)
+# Usuário logado — JWT; staff revalida role no banco
 # ======================================================
 async def get_current_user(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: Session = Depends(get_db),
 ) -> User:
 
     token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
@@ -684,16 +741,17 @@ async def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
-    try:
-        role_int = int(payload.get("role")) if payload.get("role") is not None and payload.get("role") != "" else None
-    except (TypeError, ValueError):
-        role_int = None
+    role_int = _coerce_role_int(payload.get("role"))
 
     if not payload.get("owner_ativo", False):
         # Motoboy: owner_ativo no JWT pode ser de sub_base stale (ex.: WS).
         # A validação real do Owner ocorre após resolver MotoboySubBase.
         if role_int != 4:
             raise HTTPException(status_code=403, detail="Operação bloqueada")
+
+    # Staff: 1 SELECT por uid — invalida JWT antigo se o cadastro virou motoboy.
+    if role_int in (0, 1, 2, 3):
+        _ensure_staff_jwt_matches_db(db, uid=payload.get("uid"), jwt_role=role_int)
 
     # policy disponível para as rotas
     request.state.ignorar_coleta = payload.get("ignorar_coleta", False)
@@ -1067,6 +1125,15 @@ async def read_users_me(
     if not db_user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
 
+    if not bool(getattr(db_user, "status", True)):
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+
+    live_role = _coerce_role_int(getattr(db_user, "role", None))
+    jwt_role = _coerce_role_int(getattr(current_user, "role", None))
+    # Role vivo diverge do JWT (ex.: staff antigo após virar motoboy) → novo login.
+    if live_role != jwt_role:
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+
     nome_val, sobrenome_val = _nome_exibicao(current_user)
     # tipo_owner vivo do Owner (não só do JWT) — sessão mobile longa pode ficar desatualizada
     # Preferir sub_base da sessão (JWT), essencial para root com base selecionada no login
@@ -1090,7 +1157,7 @@ async def read_users_me(
         nome=nome_val,
         sobrenome=sobrenome_val,
         contato=current_user.contato,
-        role=current_user.role,
+        role=live_role,
         sub_base=sub_base or current_user.sub_base,
         ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
         modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
