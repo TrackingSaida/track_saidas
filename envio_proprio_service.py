@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from auth import _coerce_role_int
 from etiqueta_identidade_service import resolver_nome_exibicao, resolver_slogan
 from etiqueta_pdf_service import gerar_etiqueta
 from models import BasePreco, BaseSellerDados, EnvioProprio, Owner, Saida, SaidaDetail, SaidaHistorico, User
@@ -97,7 +98,7 @@ def criar_envio_proprio(
     sub_base = (getattr(current_user, "sub_base", None) or "").strip()
     if not sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida.")
-    role = int(getattr(current_user, "role", -1) or -1)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2):
         raise HTTPException(403, "Sem permissão para criar envio próprio.")
 
