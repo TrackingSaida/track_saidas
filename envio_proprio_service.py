@@ -98,7 +98,7 @@ def criar_envio_proprio(
     if not sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida.")
     role = int(getattr(current_user, "role", -1) or -1)
-    if role not in (0, 1):
+    if role not in (0, 1, 2):
         raise HTTPException(403, "Sem permissão para criar envio próprio.")
 
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
