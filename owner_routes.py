@@ -222,16 +222,37 @@ def _upload_owner_logo(owner: Owner, content: bytes, ext: str, content_type: str
 
     client = get_s3_client_optional()
     if client is None:
-        raise HTTPException(503, "Upload não configurado (B2 credentials ausentes).")
+        raise HTTPException(
+            503,
+            "Upload de logo indisponível: armazenamento (B2) não configurado neste ambiente.",
+        )
 
     old_key = (getattr(owner, "logo_object_key", None) or "").strip()
     object_key = f"owner/{owner.id_owner}/logo/{uuid.uuid4().hex}.{ext}"
-    client.put_object(
-        Bucket=B2_BUCKET_NAME,
-        Key=object_key,
-        Body=content,
-        ContentType=content_type,
-    )
+    try:
+        client.put_object(
+            Bucket=B2_BUCKET_NAME,
+            Key=object_key,
+            Body=content,
+            ContentType=content_type,
+        )
+    except Exception as exc:
+        err = str(exc or "").strip()
+        low = err.lower()
+        if "credential" in low or "accessdenied" in low or "invalidaccesskey" in low or "signature" in low:
+            raise HTTPException(
+                503,
+                "Upload de logo falhou: credenciais do armazenamento inválidas ou sem permissão.",
+            ) from exc
+        if "nosuchbucket" in low or ("bucket" in low and "exist" in low):
+            raise HTTPException(
+                503,
+                "Upload de logo falhou: bucket de armazenamento não encontrado.",
+            ) from exc
+        raise HTTPException(
+            502,
+            "Não foi possível enviar a logo ao armazenamento. Tente novamente em instantes.",
+        ) from exc
     owner.logo_object_key = object_key
     owner.logo_filename = (filename or f"logo.{ext}")[:200]
     owner.logo_content_type = content_type
@@ -256,13 +277,22 @@ def _presign_logo(owner: Owner) -> LogoPresignGetOut:
         return LogoPresignGetOut(download_url=None, expires_in=60, tem_logo=False)
     client = get_s3_client_optional()
     if client is None:
-        raise HTTPException(503, "Upload não configurado (B2 credentials ausentes).")
+        raise HTTPException(
+            503,
+            "Pré-visualização indisponível: armazenamento (B2) não configurado neste ambiente.",
+        )
     expires_in = 60
-    url = client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": B2_BUCKET_NAME, "Key": key},
-        ExpiresIn=expires_in,
-    )
+    try:
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": B2_BUCKET_NAME, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            "Não foi possível gerar o link de pré-visualização da logo.",
+        ) from exc
     return LogoPresignGetOut(download_url=url, expires_in=expires_in, tem_logo=True)
 
 

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from etiqueta_identidade_service import (
+    LOGO_ORIGEM_ROTEVO,
     fit_logo_image,
     resolver_logo_etiqueta,
     resolver_nome_exibicao,
@@ -261,7 +262,7 @@ def gerar_pdf_envio_proprio(
 
     nome = (nome_exibicao_override or resolver_nome_exibicao(owner)).strip()
     slogan = (slogan_override if slogan_override is not None else resolver_slogan(owner)).strip()
-    logo_bytes, _origem = resolver_logo_etiqueta(owner)
+    logo_bytes, logo_origem = resolver_logo_etiqueta(owner)
 
     # Borda externa
     c.setStrokeColor(line)
@@ -271,17 +272,23 @@ def gerar_pdf_envio_proprio(
     y = altura - margin - 2 * mm
 
     # ---- Header ----
-    header_h = 18 * mm
-    logo_box_w, logo_box_h = 14 * mm, 14 * mm
+    # Faixa larga: logos landscape (ex. ROTEVO 800x220) precisam de espaço horizontal.
+    header_h = 22 * mm
+    logo_max_w, logo_max_h = 48 * mm, 18 * mm
+    draw_w = draw_h = 0
     if logo_bytes:
-        fitted = fit_logo_image(logo_bytes, max_width=280, max_height=280)
+        fitted = fit_logo_image(logo_bytes, max_width=960, max_height=360)
         if fitted is not None:
             logo_buf = io.BytesIO()
             fitted.save(logo_buf, format="PNG")
             logo_buf.seek(0)
-            aspect = fitted.width / max(1, fitted.height)
-            draw_h = logo_box_h
-            draw_w = min(logo_box_w, draw_h * aspect)
+            aspect = fitted.width / max(1.0, float(fitted.height))
+            if (logo_max_w / logo_max_h) > aspect:
+                draw_h = logo_max_h
+                draw_w = draw_h * aspect
+            else:
+                draw_w = logo_max_w
+                draw_h = draw_w / aspect
             c.drawImage(
                 ImageReader(logo_buf),
                 margin,
@@ -297,20 +304,31 @@ def gerar_pdf_envio_proprio(
     else:
         text_x = margin
 
-    c.setFillColor(dark)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(text_x, y - 6 * mm, _clip(nome.upper(), 28))
+    # Evita "ROTEVO" + logo ROTEVO duplicados no fallback.
+    show_name = True
+    if logo_origem == LOGO_ORIGEM_ROTEVO and nome.strip().upper() in {"ROTEVO", "ROTEVO TECNOLOGIA"}:
+        show_name = False
+
+    name_y = y - (draw_h / 2.0 if draw_h else 6 * mm) - 1.5 * mm
+    if show_name:
+        c.setFillColor(dark)
+        c.setFont("Helvetica-Bold", 11)
+        max_chars = 18 if draw_w > 28 * mm else 28
+        c.drawString(text_x, name_y, _clip(nome.upper(), max_chars))
     if slogan:
         c.setFont("Helvetica", 6)
         c.setFillColor(gray)
-        # slogan à direita do header
         sw = c.stringWidth(_clip(slogan, 36), "Helvetica", 6)
-        c.drawRightString(largura - margin, y - 6 * mm, _clip(slogan, 36))
-        # linha vertical sutil
+        c.drawRightString(largura - margin, name_y, _clip(slogan, 36))
         c.setStrokeColor(line)
-        c.line(largura - margin - sw - 3 * mm, y - 2 * mm, largura - margin - sw - 3 * mm, y - 10 * mm)
+        c.line(
+            largura - margin - sw - 3 * mm,
+            name_y - 2 * mm,
+            largura - margin - sw - 3 * mm,
+            name_y + 6 * mm,
+        )
 
-    y -= header_h
+    y -= max(header_h, draw_h + 2 * mm)
     c.setStrokeColor(line)
     c.line(margin, y, largura - margin, y)
     y -= 4 * mm
