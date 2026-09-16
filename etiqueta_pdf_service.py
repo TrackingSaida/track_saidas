@@ -346,7 +346,7 @@ def gerar_pdf_envio_proprio(
     y -= 5 * mm
     c.setFillColor(gray)
     c.setFont("Helvetica", 6)
-    c.drawString(margin, y, "ESCANEIE O QR CODE PARA ACOMPANHAR")
+    c.drawString(margin, y, "QR CODE DE IDENTIFICAÇÃO DO ENVIO")
 
     qr = qrcode.QRCode(
         version=1,

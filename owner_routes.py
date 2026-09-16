@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from typing import Optional, List
 
@@ -13,6 +14,8 @@ from auth import _coerce_role_int, get_current_user
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
 from etiqueta_identidade_service import resolver_nome_exibicao
 from upload_storage_utils import B2_BUCKET_NAME, get_s3_client_optional, purge_b2_keys
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/owner", tags=["Owner"])
 MODOS_OPERACAO = {"codigo", "coleta_manual", "ambos"}
@@ -228,7 +231,9 @@ def _upload_owner_logo(owner: Owner, content: bytes, ext: str, content_type: str
         )
 
     old_key = (getattr(owner, "logo_object_key", None) or "").strip()
-    object_key = f"owner/{owner.id_owner}/logo/{uuid.uuid4().hex}.{ext}"
+    # Prefixo saida/ — a Application Key do B2 em homol/prod costuma estar restrita a saida/
+    # (mesmo padrão de fotos e PDF de fechamento). Prefixo owner/ gera AccessDenied/not entitled.
+    object_key = f"saida/owner/{owner.id_owner}/logo/{uuid.uuid4().hex}.{ext}"
     try:
         client.put_object(
             Bucket=B2_BUCKET_NAME,
@@ -237,12 +242,36 @@ def _upload_owner_logo(owner: Owner, content: bytes, ext: str, content_type: str
             ContentType=content_type,
         )
     except Exception as exc:
-        err = str(exc or "").strip()
+        err_code = ""
+        try:
+            err_code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+        except Exception:
+            err_code = ""
+        err = f"{err_code} {exc}".strip()
         low = err.lower()
-        if "credential" in low or "accessdenied" in low or "invalidaccesskey" in low or "signature" in low:
+        logger.exception(
+            "owner_logo_upload_failed id_owner=%s bucket=%s key=%s err=%s",
+            getattr(owner, "id_owner", None),
+            B2_BUCKET_NAME,
+            object_key,
+            type(exc).__name__,
+        )
+        if any(
+            token in low
+            for token in (
+                "credential",
+                "accessdenied",
+                "invalidaccesskey",
+                "signature",
+                "not entitled",
+                "unauthorized",
+                "forbidden",
+            )
+        ):
             raise HTTPException(
                 503,
-                "Upload de logo falhou: credenciais do armazenamento inválidas ou sem permissão.",
+                "Upload de logo falhou: a chave do armazenamento não tem permissão de escrita "
+                "no prefixo saida/owner/. Verifique a Application Key do B2.",
             ) from exc
         if "nosuchbucket" in low or ("bucket" in low and "exist" in low):
             raise HTTPException(

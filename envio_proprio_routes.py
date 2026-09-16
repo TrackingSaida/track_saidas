@@ -142,6 +142,57 @@ def criar_envio(
     )
 
 
+@router.get("/envios-proprios/reimpressao/{codigo}")
+def reimprimir_envio_por_codigo(
+    codigo: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Reimprime a etiqueta comercial de um envio próprio (RTE…).
+    Exige que a sub_base atual tenha a Saida correspondente (tenant-safe).
+    Declarado antes de /{id_envio} para não colidir com path param inteiro.
+    """
+    from models import Saida
+    from envio_proprio_service import get_envio_by_codigo_global, is_codigo_rte
+
+    _assert_operacao_etiqueta(current_user)
+    sub_base = _resolve_user_sub_base(db, current_user)
+    cod = (codigo or "").strip().upper()
+    if not is_codigo_rte(cod):
+        raise HTTPException(422, "Informe um código de envio próprio (RTE…).")
+
+    saida = db.scalar(
+        select(Saida)
+        .where(Saida.sub_base == sub_base, Saida.codigo == cod)
+        .limit(1)
+    )
+    if not saida:
+        raise HTTPException(404, "Pedido não encontrado nesta base.")
+
+    envio = get_envio_by_codigo_global(db, cod)
+    if not envio:
+        raise HTTPException(404, "Envio próprio não encontrado para este código.")
+
+    try:
+        pdf = pdf_from_envio(db, envio)
+    except Exception as e:
+        logger.exception("erro_reimpressao_envio codigo=%s", cod)
+        raise HTTPException(500, "Falha ao gerar PDF da etiqueta.") from e
+
+    filename = f"etq-envio-{envio.codigo}.pdf"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Envio-Id": str(envio.id_envio),
+            "X-Codigo": envio.codigo,
+            "X-Id-Saida": str(saida.id_saida),
+        },
+    )
+
+
 @router.get("/envios-proprios/{id_envio}")
 def get_envio(
     id_envio: int,
