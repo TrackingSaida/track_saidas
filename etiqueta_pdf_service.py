@@ -272,17 +272,20 @@ def gerar_pdf_envio_proprio(
     y = altura - margin - 2 * mm
 
     # ---- Header ----
-    # Faixa larga: logos landscape (ex. ROTEVO 800x220) precisam de espaço horizontal.
-    header_h = 22 * mm
-    logo_max_w, logo_max_h = 48 * mm, 18 * mm
+    # Logo à esquerda; nome + slogan empilhados à direita (evita sobreposição).
+    header_h = 20 * mm
+    logo_max_w, logo_max_h = 28 * mm, 16 * mm
     draw_w = draw_h = 0
     if logo_bytes:
-        fitted = fit_logo_image(logo_bytes, max_width=960, max_height=360)
+        fitted = fit_logo_image(logo_bytes, max_width=720, max_height=400)
         if fitted is not None:
             logo_buf = io.BytesIO()
             fitted.save(logo_buf, format="PNG")
             logo_buf.seek(0)
             aspect = fitted.width / max(1.0, float(fitted.height))
+            # Logos quadradas/altas não podem dominar a faixa — reserva espaço para o texto.
+            if aspect < 1.35:
+                logo_max_w = 18 * mm
             if (logo_max_w / logo_max_h) > aspect:
                 draw_h = logo_max_h
                 draw_w = draw_h * aspect
@@ -298,7 +301,7 @@ def gerar_pdf_envio_proprio(
                 mask="auto",
                 preserveAspectRatio=True,
             )
-            text_x = margin + draw_w + 2.5 * mm
+            text_x = margin + draw_w + 3 * mm
         else:
             text_x = margin
     else:
@@ -309,26 +312,37 @@ def gerar_pdf_envio_proprio(
     if logo_origem == LOGO_ORIGEM_ROTEVO and nome.strip().upper() in {"ROTEVO", "ROTEVO TECNOLOGIA"}:
         show_name = False
 
-    name_y = y - (draw_h / 2.0 if draw_h else 6 * mm) - 1.5 * mm
-    if show_name:
-        c.setFillColor(dark)
-        c.setFont("Helvetica-Bold", 11)
-        max_chars = 18 if draw_w > 28 * mm else 28
-        c.drawString(text_x, name_y, _clip(nome.upper(), max_chars))
-    if slogan:
-        c.setFont("Helvetica", 6)
-        c.setFillColor(gray)
-        sw = c.stringWidth(_clip(slogan, 36), "Helvetica", 6)
-        c.drawRightString(largura - margin, name_y, _clip(slogan, 36))
-        c.setStrokeColor(line)
-        c.line(
-            largura - margin - sw - 3 * mm,
-            name_y - 2 * mm,
-            largura - margin - sw - 3 * mm,
-            name_y + 6 * mm,
-        )
+    text_right = largura - margin
+    text_width = max(10 * mm, text_right - text_x)
+    name_font_size = 11
+    slogan_font_size = 6
 
-    y -= max(header_h, draw_h + 2 * mm)
+    # Empilha nome (acima) e slogan (abaixo), alinhados à esquerda do bloco de texto.
+    if show_name and slogan:
+        name_y = y - 6 * mm
+        slogan_y = y - 11 * mm
+    elif show_name:
+        name_y = y - (draw_h / 2.0 if draw_h else 6 * mm) - 1.5 * mm
+        slogan_y = None
+    elif slogan:
+        name_y = None
+        slogan_y = y - (draw_h / 2.0 if draw_h else 6 * mm) - 1.0 * mm
+    else:
+        name_y = slogan_y = None
+
+    if show_name and name_y is not None:
+        c.setFillColor(dark)
+        c.setFont("Helvetica-Bold", name_font_size)
+        max_chars = max(12, int(text_width / (name_font_size * 0.52)))
+        c.drawString(text_x, name_y, _clip(nome.upper(), max_chars))
+
+    if slogan and slogan_y is not None:
+        c.setFillColor(gray)
+        c.setFont("Helvetica", slogan_font_size)
+        max_chars_slogan = max(16, int(text_width / (slogan_font_size * 0.48)))
+        c.drawString(text_x, slogan_y, _clip(slogan, max_chars_slogan))
+
+    y -= max(header_h, draw_h + 3 * mm)
     c.setStrokeColor(line)
     c.line(margin, y, largura - margin, y)
     y -= 4 * mm
@@ -450,8 +464,8 @@ def gerar_pdf_envio_proprio(
     c.setFillColor(white)
     c.setFont("Helvetica-Bold", 8)
     c.drawCentredString(largura / 2, 2 * mm + footer_h - 5 * mm, "OBRIGADO PELA SUA CONFIANÇA!")
-    c.setFont("Helvetica", 6)
-    c.drawCentredString(largura / 2, 2 * mm + 2.5 * mm, "www.rotevo.com.br")
+    c.setFont("Helvetica", 7)
+    c.drawCentredString(largura / 2, 2 * mm + 2.5 * mm, "BY: ROTEVO")
 
     c.save()
     buf.seek(0)
