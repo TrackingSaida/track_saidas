@@ -25,6 +25,7 @@ _DDD_VALIDOS = frozenset(
 )
 
 _AVULSO_CODIGO_RE = re.compile(r"^AVULSO(-[A-Z0-9-]+)?$")
+_RTE_CODIGO_RE = re.compile(r"^RTE[0-9]{11,}$")
 
 
 def _to_ascii_digits(s: str) -> str:
@@ -77,6 +78,11 @@ def _normalize_shopee_codigo(raw: str, all_digits: str) -> Optional[str]:
 def _is_codigo_avulso_gerado(raw: str) -> bool:
     """Código avulso gerado pelo sistema (ex.: AVULSO-9JULHO-000019 ou AVULSO-000019)."""
     return bool(_AVULSO_CODIGO_RE.match(_to_ascii_digits(str(raw or "")).upper().strip()))
+
+
+def _is_codigo_rte(raw: str) -> bool:
+    """Código de envio próprio ROTEVO (ex.: RTE25082600001)."""
+    return bool(_RTE_CODIGO_RE.match(_to_ascii_digits(str(raw or "")).upper().strip()))
 
 
 def _extract_ml_codigo(value: str) -> Optional[str]:
@@ -159,6 +165,8 @@ def is_qr_like_scan_payload(raw_input: str) -> bool:
         return True
     if _is_codigo_avulso_gerado(raw_input_str):
         return True
+    if _is_codigo_rte(raw_input_str):
+        return True
     return False
 
 
@@ -176,6 +184,9 @@ def _classify_codigo_text(codigo_raw: str, strict_qr: bool = False) -> tuple[Opt
         return ml_codigo, "Mercado Livre"
 
     if _is_codigo_avulso_gerado(raw):
+        return raw.strip().upper(), "Avulso"
+
+    if _is_codigo_rte(raw):
         return raw.strip().upper(), "Avulso"
 
     if strict_qr:
@@ -254,6 +265,9 @@ def normalize_codigo(raw_input: str, strict_qr: bool = False) -> tuple[Optional[
 
     # AVULSO-* gerado pelo sistema
     if _is_codigo_avulso_gerado(raw):
+        return raw.strip().upper(), "Avulso", None
+
+    if _is_codigo_rte(raw):
         return raw.strip().upper(), "Avulso", None
 
     if strict_qr:

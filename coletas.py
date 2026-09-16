@@ -391,14 +391,27 @@ def registrar_coleta_em_lote(
                 qr_alerta_lote = True
 
     # Códigos que ainda seriam "duplicados" (existem e não precisavam de upgrade)
+    # ETIQUETADO (envio próprio local) deve ser adotado na coleta, não tratado como duplicata.
+    etiquetados_adotar: List[Saida] = []
+    for c, s in existing_by_codigo.items():
+        st = (s.status or "").strip().upper()
+        if st == "ETIQUETADO" and c not in codigos_qr_atualizados:
+            etiquetados_adotar.append(s)
+
+    etiquetado_codigos = {str(s.codigo) for s in etiquetados_adotar}
     truly_dup = sorted(
         c
         for c in existing_by_codigo.keys()
-        if c not in codigos_qr_atualizados
+        if c not in codigos_qr_atualizados and c not in etiquetado_codigos
     )
 
     # Apenas upgrades (nenhum código novo no lote)
-    novos_itens = [it for it in payload.itens if (it.codigo or "").strip() not in existing_by_codigo]
+    novos_itens = [
+        it
+        for it in payload.itens
+        if (it.codigo or "").strip() not in existing_by_codigo
+        or (it.codigo or "").strip() in etiquetado_codigos
+    ]
 
     if truly_dup and not novos_itens and not codigos_qr_atualizados:
         # Compatível com comportamento antigo
@@ -460,11 +473,77 @@ def registrar_coleta_em_lote(
         db.flush()
 
         # 6) Inserção em loop, sem SELECTs dentro (somente códigos novos)
+        from envio_proprio_service import admitir_envio_proprio_no_tenant, is_codigo_rte
+
         for item in novos_itens:
             serv_key = _normalize_servico(item.servico)
             codigo = item.codigo.strip()
             qr_raw = getattr(item, "qr_payload_raw", None)
             store_qr = should_store_qr_payload_raw(_servico_label_for_saida(serv_key), qr_raw)
+
+            # Adota ETIQUETADO local (mesmo tenant gerador)
+            saida_existente = existing_by_codigo.get(codigo)
+            if saida_existente is not None and (saida_existente.status or "").strip().upper() == "ETIQUETADO":
+                saida_existente.status = "coletado"
+                saida_existente.base = payload.base
+                saida_existente.id_coleta = coleta.id_coleta
+                saida_existente.entregador = entregador_nome
+                saida_existente.entregador_id = entregador_id
+                if getattr(item, "is_grande", False):
+                    saida_existente.is_grande = True
+                db.add(
+                    SaidaHistorico(
+                        id_saida=saida_existente.id_saida,
+                        evento="criado_coleta",
+                        status_anterior="ETIQUETADO",
+                        status_novo="coletado",
+                        user_id=getattr(current_user, "id", None),
+                    )
+                )
+                db.add(
+                    OwnerCobrancaItem(
+                        sub_base=sub_base,
+                        id_coleta=coleta.id_coleta,
+                        id_saida=saida_existente.id_saida,
+                        valor=valor_cobranca_owner,
+                    )
+                )
+                count[serv_key] += 1
+                created += 1
+                saidas_criadas.append(SaidaCriadaLote(codigo=codigo, id_saida=saida_existente.id_saida))
+                continue
+
+            # RTE de outro Owner / snapshot global → materializa Saida Avulso local
+            if is_codigo_rte(codigo) and codigo not in existing_by_codigo:
+                admitida = admitir_envio_proprio_no_tenant(
+                    db,
+                    sub_base=sub_base,
+                    codigo=codigo,
+                    status_inicial="coletado",
+                    username=getattr(current_user, "username", None),
+                    base=payload.base,
+                    user_id=getattr(current_user, "id", None),
+                    evento_historico="criado_coleta",
+                )
+                if admitida is not None:
+                    admitida.id_coleta = coleta.id_coleta
+                    admitida.entregador = entregador_nome
+                    admitida.entregador_id = entregador_id
+                    admitida.base = payload.base
+                    if getattr(item, "is_grande", False):
+                        admitida.is_grande = True
+                    db.add(
+                        OwnerCobrancaItem(
+                            sub_base=sub_base,
+                            id_coleta=coleta.id_coleta,
+                            id_saida=admitida.id_saida,
+                            valor=valor_cobranca_owner,
+                        )
+                    )
+                    count["avulso"] += 1
+                    created += 1
+                    saidas_criadas.append(SaidaCriadaLote(codigo=codigo, id_saida=admitida.id_saida))
+                    continue
 
             saida = Saida(
                 sub_base=sub_base,

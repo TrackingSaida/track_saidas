@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 STATUS_NA_BASE = "NA_BASE"
 STATUS_COLETADO = "coletado"
+STATUS_ETIQUETADO = "ETIQUETADO"
 
 
 def _norm(status: Optional[str]) -> str:
@@ -28,6 +29,8 @@ def avaliar_prerequisito_saida(
     - coleta off, entrada on → exige Entrada (NA_BASE) ou já em rota/saída
     - ambas on → Coleta OU Entrada (coletado OU NA_BASE)
     - ambas off → sem pré-requisito deste tipo
+
+    ETIQUETADO (envio próprio só com etiqueta) NÃO libera saída.
     """
     if ja_em_rota_ou_saida:
         return None
@@ -38,12 +41,16 @@ def avaliar_prerequisito_saida(
         return None
 
     st = _norm(status_norm)
-    ok_coleta = saida_existe and st == STATUS_COLETADO
-    # Existir após coleta (já na base) também “veio da coleta”, mas para OR
-    # NA_BASE já cobre o lado entrada; coletado cobre o lado coleta.
-    ok_entrada = saida_existe and st == STATUS_NA_BASE
+    # Etiqueta gerada ainda não passou por coleta/entrada operacional
+    if saida_existe and st.upper() == STATUS_ETIQUETADO:
+        saida_existe_operacional = False
+    else:
+        saida_existe_operacional = saida_existe
 
-    if not saida_existe:
+    ok_coleta = saida_existe_operacional and st == STATUS_COLETADO
+    ok_entrada = saida_existe_operacional and st == STATUS_NA_BASE
+
+    if not saida_existe_operacional:
         if permitir_registrar_nao_coletado and coleta_on and not entrada_on:
             return None
         if coleta_on and entrada_on:
@@ -63,11 +70,10 @@ def avaliar_prerequisito_saida(
             "message": "Código não coletado.",
         }
 
-    # Pacote existe
+    # Pacote existe operacionalmente
     if coleta_on and entrada_on:
         if ok_coleta or ok_entrada:
             return None
-        # Existe mas ainda não está apto (ex. status estranho) — exige um dos dois
         return {
             "code": "PRE_REQUISITO_SAIDA",
             "message": "Pacote precisa de Coleta ou Entrada antes da saída.",
@@ -81,5 +87,5 @@ def avaliar_prerequisito_saida(
             "message": "Este pacote ainda não teve entrada na base.",
         }
 
-    # só coleta: existência do registro basta (fluxo legado)
+    # só coleta: existência do registro basta (fluxo legado) — ETIQUETADO já tratado acima
     return None

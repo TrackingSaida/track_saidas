@@ -339,6 +339,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return "não coletado"
     if lower in ("na_base", "na base"):
         return STATUS_NA_BASE
+    if lower in ("etiquetado",):
+        return "ETIQUETADO"
     # Novos status motoboy (aceitar em maiúsculas ou lowercase)
     if lower in ("saiu_para_entrega", "saiu para entrega"):
         return STATUS_SAIU_PARA_ENTREGA
@@ -948,6 +950,60 @@ def ler_saida(
     )
 
     if existente is None:
+        from envio_proprio_service import admitir_envio_proprio_no_tenant, get_envio_by_codigo_global, is_codigo_rte
+
+        # RTE: se políticas exigem coleta/entrada, não materializa na saída — só informa pré-requisito.
+        if is_codigo_rte(codigo) and get_envio_by_codigo_global(db, codigo) is not None:
+            if coleta_habilitada or entrada_habilitada:
+                gate = avaliar_prerequisito_saida(
+                    coleta_habilitada=coleta_habilitada,
+                    entrada_habilitada=entrada_habilitada,
+                    saida_existe=False,
+                    status_norm="ETIQUETADO",
+                    permitir_registrar_nao_coletado=False,
+                )
+                if gate:
+                    return JSONResponse(status_code=422, content=gate)
+            # Modo saída direta: materializa localmente e segue
+            admitida = admitir_envio_proprio_no_tenant(
+                db,
+                sub_base=sub_base,
+                codigo=codigo,
+                status_inicial=STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu",
+                username=username,
+                user_id=getattr(current_user, "id", None),
+                evento_historico="lido",
+            )
+            if admitida is not None:
+                admitida.entregador = entregador_nome
+                admitida.entregador_id = entregador_id
+                admitida.motoboy_id = motoboy_id
+                db.add(
+                    OwnerCobrancaItem(
+                        sub_base=sub_base,
+                        id_coleta=None,
+                        id_saida=admitida.id_saida,
+                        valor=owner_valor,
+                    )
+                )
+                try:
+                    db.commit()
+                    db.refresh(admitida)
+                except Exception as e:
+                    db.rollback()
+                    raise HTTPException(500, f"Erro ao registrar saída: {e}")
+                _enqueue_atribuicao_push_externa(
+                    db,
+                    current_user=current_user,
+                    sub_base=sub_base,
+                    motoboy_id=motoboy_id,
+                    codigo=codigo,
+                )
+                return JSONResponse(
+                    status_code=201,
+                    content=_saida_out_com_qr(admitida, None),
+                )
+
         permitir_soft = bool(payload.registrar_nao_coletado) and not bloquear_saida_sem_coleta
         gate = avaliar_prerequisito_saida(
             coleta_habilitada=coleta_habilitada,
@@ -1015,6 +1071,55 @@ def ler_saida(
 
     # Existe: decidir por status e entregador
     status_norm = normalizar_status_saida(existente.status)
+
+    if status_norm == "ETIQUETADO":
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=True,
+            status_norm=status_norm,
+        )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
+        # Sem pré-requisito: promove etiqueta → saiu
+        status_anterior = existente.status
+        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.entregador_id = entregador_id
+        existente.entregador = entregador_nome
+        if motoboy_id is not None:
+            existente.motoboy_id = motoboy_id
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="lido",
+                status_anterior=status_anterior,
+                status_novo=existente.status,
+                user_id=getattr(current_user, "id", None),
+            )
+        )
+        db.add(
+            OwnerCobrancaItem(
+                sub_base=sub_base,
+                id_coleta=None,
+                id_saida=existente.id_saida,
+                valor=owner_valor,
+            )
+        )
+        try:
+            db.commit()
+            db.refresh(existente)
+            _enqueue_atribuicao_push_externa(
+                db,
+                current_user=current_user,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                codigo=existente.codigo,
+            )
+            return _saida_out_com_qr(existente, qr_result)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "aguardando_coleta":
         # Leitura em coleta: aguardando_coleta → coletado
