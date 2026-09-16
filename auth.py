@@ -708,6 +708,7 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
 # DB helpers (somente para login)
 # ======================================================
 def get_users_by_identifier(db: Session, identifier: str) -> List[User]:
+    """Todos os usuários que batem email/username/contato (pode haver 1 por sub_base)."""
     identifier = (identifier or "").strip()
     if not identifier:
         return []
@@ -723,6 +724,7 @@ def get_users_by_identifier(db: Session, identifier: str) -> List[User]:
 
 
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
+    """Retorna o usuário só se o identificador for inequívoco (1 match)."""
     users = get_users_by_identifier(db, identifier)
     if len(users) == 1:
         return users[0]
@@ -730,6 +732,11 @@ def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
 
 
 def authenticate_user(db: Session, identifier: str, password: str) -> Optional[User]:
+    """
+    Autentica por identifier + senha.
+    Se o mesmo identifier existir em várias sub_bases, só aceita quando
+    exatamente um candidato ativo bate a senha (evita .first() cego).
+    """
     matched: List[User] = []
     for user in get_users_by_identifier(db, identifier):
         if not bool(getattr(user, "status", True)):
@@ -745,17 +752,23 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
 
 
 def _ensure_staff_jwt_matches_db(db: Session, *, uid: Any, jwt_role: int) -> None:
+    """
+    Sessão staff (JWT role 0–3): confere role/status vivos no banco.
+    Token antigo de operador após promoção a motoboy (role=4) → 401.
+    """
     try:
         user_id = int(uid) if uid is not None and uid != "" else None
     except (TypeError, ValueError):
         user_id = None
     if user_id is None:
         raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+
     db_user = run_db_query_with_retry(db, lambda: db.get(User, user_id))
     if not db_user:
         raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
     if not bool(getattr(db_user, "status", True)):
         raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+
     live_role = _coerce_role_int(getattr(db_user, "role", None))
     if live_role == 4:
         raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
@@ -865,6 +878,7 @@ async def get_current_user(
         if role_int != 4:
             raise HTTPException(status_code=403, detail="Operação bloqueada")
 
+    # Staff: 1 SELECT por uid — invalida JWT antigo se o cadastro virou motoboy.
     if role_int in (0, 1, 2, 3):
         _ensure_staff_jwt_matches_db(db, uid=payload.get("uid"), jwt_role=role_int)
 
@@ -1254,6 +1268,7 @@ async def read_users_me(
 
     live_role = _coerce_role_int(getattr(db_user, "role", None))
     jwt_role = _coerce_role_int(getattr(current_user, "role", None))
+    # Role vivo diverge do JWT (ex.: staff antigo após virar motoboy) → novo login.
     if live_role != jwt_role:
         raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
 

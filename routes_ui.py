@@ -119,6 +119,7 @@ MENU_DEFS = [
             {"label": "Políticas gerais", "href": "tracking-politicas-gerais.html", "roles": [0, 1]},
             {"label": "Campos Obrigatórios", "href": "tracking-campos-obrigatorios-servico.html", "roles": [0, 1]},
             {"label": "Campos do Avulso", "href": "tracking-campos-avulso.html", "roles": [0, 1]},
+            {"label": "Guia do usuário", "href": "tracking-guia-usuario.html", "roles": [0, 1]},
         ]
     },
 ]
