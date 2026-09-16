@@ -54,6 +54,59 @@ def test_parse_optimize_ok():
     assert result.distancia_total_m == 1234
 
 
+def test_parse_omitted_shipment_index_zero():
+    """REST proto3 omite shipmentIndex=0; isso não é visita inválida."""
+    labels = [shipment_label(10), shipment_label(20)]
+    data = {
+        "routes": [
+            {
+                "visits": [
+                    {"shipmentIndex": 1, "shipmentLabel": labels[1]},
+                    {"shipmentLabel": labels[0]},
+                ],
+                "routePolyline": {"points": "encodedpoly"},
+            }
+        ],
+        "skippedShipments": [],
+    }
+    result = parse_optimize_tours_response(data, expected_labels=labels)
+    assert result.ordem == [20, 10]
+
+
+def test_parse_only_first_shipment_omits_index():
+    labels = [shipment_label(7)]
+    data = {
+        "routes": [
+            {
+                "visits": [{"shipmentLabel": labels[0]}],
+                "routePolyline": {"points": "p"},
+            }
+        ],
+        "skippedShipments": [],
+    }
+    result = parse_optimize_tours_response(data, expected_labels=labels)
+    assert result.ordem == [7]
+
+
+def test_parse_out_of_range_shipment_index_raises():
+    labels = [shipment_label(1)]
+    with pytest.raises(RoutingError) as ei:
+        parse_optimize_tours_response(
+            {
+                "routes": [
+                    {
+                        "visits": [{"shipmentIndex": 9, "shipmentLabel": labels[0]}],
+                        "routePolyline": {"points": "p"},
+                    }
+                ],
+                "skippedShipments": [],
+            },
+            expected_labels=labels,
+        )
+    assert ei.value.code == "ROUTING_VISIT_MISMATCH"
+    assert "shipmentIndex inválido" in ei.value.message
+
+
 def test_parse_skipped_raises():
     labels = [shipment_label(1)]
     with pytest.raises(RoutingError) as ei:

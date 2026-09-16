@@ -220,6 +220,21 @@ def _extract_metrics(route: Dict[str, Any]) -> Tuple[Optional[int], Optional[int
     return dist, dur
 
 
+def _shipment_index_from_visit(visit: Dict[str, Any]) -> Optional[int]:
+    """Índice 0-based do shipment.
+
+    A Route Optimization REST omite campos proto3 com valor default.
+    `shipmentIndex=0` chega como campo ausente, não como inválido.
+    """
+    raw = visit.get("shipmentIndex")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_optimize_tours_response(
     data: Dict[str, Any],
     *,
@@ -254,17 +269,17 @@ def parse_optimize_tours_response(
     ordered_labels: List[str] = []
     seen = set()
     for visit in visits:
-        idx = visit.get("shipmentIndex")
-        if idx is None or int(idx) not in label_by_index:
+        idx = _shipment_index_from_visit(visit)
+        if idx is None or idx not in label_by_index:
             raise RoutingError(
                 "ROUTING_VISIT_MISMATCH",
                 "Visita Google com shipmentIndex inválido.",
                 http_status=422,
             )
-        label = visit.get("shipmentLabel") or label_by_index[int(idx)]
+        label = visit.get("shipmentLabel") or label_by_index[idx]
         sid = parse_shipment_label(label)
         if sid is None:
-            sid = parse_shipment_label(label_by_index[int(idx)])
+            sid = parse_shipment_label(label_by_index[idx])
         if sid is None:
             raise RoutingError(
                 "ROUTING_VISIT_MISMATCH",
