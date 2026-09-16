@@ -9,9 +9,9 @@ def test_todos_soma_entregue_mais_cancelado():
     assert valor_extrato_por_filtro(Decimal("40.00"), Decimal("8.00"), "todos") == Decimal("48.00")
 
 
-def test_entregue_subtrai_cancelados():
-    # 10 x R$ 4,00 - 2 x R$ 4,00 = R$ 32,00
-    assert valor_extrato_por_filtro(Decimal("40.00"), Decimal("8.00"), "grupo_entregue") == Decimal("32.00")
+def test_grupo_entregue_nao_desconta_cancelados_de_novo():
+    # valor_feitos já exclui cancelados (10 x R$ 4,00); cancelados são só informativos.
+    assert valor_extrato_por_filtro(Decimal("40.00"), Decimal("8.00"), "grupo_entregue") == Decimal("40.00")
 
 
 def test_cancelados_so_valor_cancelado():
@@ -23,10 +23,11 @@ def test_sem_cancelados_entregue_igual_bruto():
     assert valor_extrato_por_filtro(Decimal("40.00"), Decimal("0.00"), "todos") == Decimal("40.00")
 
 
-def test_modo_desconhecido_usa_entregue_menos_cancelado():
-    assert valor_extrato_por_filtro(Decimal("40.00"), Decimal("8.00"), "") == Decimal("32.00")
+def test_modo_desconhecido_usa_somente_feitos():
+    assert valor_extrato_por_filtro(Decimal("40.00"), Decimal("8.00"), "") == Decimal("40.00")
 
 
-def test_mais_cancelados_que_entregues_fica_negativo_no_filtro_entregue():
-    assert valor_extrato_por_filtro(Decimal("4.00"), Decimal("8.00"), "grupo_entregue") == Decimal("-4.00")
+def test_mais_cancelados_que_entregues_nao_fica_negativo_no_filtro_entregue():
+    # 1 feito + 2 cancelados: total a receber = só o feito (sem multa).
+    assert valor_extrato_por_filtro(Decimal("4.00"), Decimal("8.00"), "grupo_entregue") == Decimal("4.00")
     assert valor_extrato_por_filtro(Decimal("4.00"), Decimal("8.00"), "todos") == Decimal("12.00")

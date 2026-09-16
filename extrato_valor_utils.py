@@ -16,7 +16,7 @@ def valor_extrato_por_filtro(
     """Aplica a regra de total conforme o filtro de status.
 
     - todos: entregues + cancelados
-    - grupo_entregue: entregues - cancelados
+    - grupo_entregue: só entregues (cancelados já estão fora; sem multa)
     - cancelados: só cancelados
     """
     feitos = Decimal(valor_feitos or 0)
@@ -27,5 +27,6 @@ def valor_extrato_por_filtro(
     elif key == MODO_CANCELADOS:
         total = cancelados
     else:
-        total = feitos - cancelados
+        # Cancelados já não entram em valor_feitos; não descontar de novo.
+        total = feitos
     return total.quantize(Decimal("0.01"))
