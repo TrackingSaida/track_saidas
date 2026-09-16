@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,28 +22,107 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/etiquetas", tags=["Etiquetas"])
 
+_UF_RE = re.compile(r"^[A-Za-z]{2}$")
+_CEP_RE = re.compile(r"^\d{8}$")
+_PHONE_RE = re.compile(r"^\d{10,11}$")
+
+
+def _digits(value: Optional[str], max_len: int) -> Optional[str]:
+    if value is None:
+        return None
+    digits = re.sub(r"\D+", "", str(value))
+    if not digits:
+        return None
+    return digits[:max_len]
+
+
+def _clean_text(value: Optional[str], max_len: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:max_len]
+
 
 class EnderecoIn(BaseModel):
-    nome: Optional[str] = None
-    telefone: Optional[str] = None
-    cep: Optional[str] = None
-    rua: Optional[str] = None
-    numero: Optional[str] = None
-    complemento: Optional[str] = None
-    bairro: Optional[str] = None
-    cidade: Optional[str] = None
-    uf: Optional[str] = None
+    nome: Optional[str] = Field(default=None, max_length=120)
+    telefone: Optional[str] = Field(default=None, max_length=20)
+    cep: Optional[str] = Field(default=None, max_length=9)
+    rua: Optional[str] = Field(default=None, max_length=180)
+    numero: Optional[str] = Field(default=None, max_length=20)
+    complemento: Optional[str] = Field(default=None, max_length=80)
+    bairro: Optional[str] = Field(default=None, max_length=80)
+    cidade: Optional[str] = Field(default=None, max_length=80)
+    uf: Optional[str] = Field(default=None, max_length=2)
+
+    @field_validator("nome", "rua", "numero", "complemento", "bairro", "cidade", mode="before")
+    @classmethod
+    def _trim_text(cls, v):
+        if v is None:
+            return None
+        text = str(v).strip()
+        return text or None
+
+    @field_validator("telefone", mode="before")
+    @classmethod
+    def _norm_telefone(cls, v):
+        return _digits(v, 11)
+
+    @field_validator("cep", mode="before")
+    @classmethod
+    def _norm_cep(cls, v):
+        return _digits(v, 8)
+
+    @field_validator("uf", mode="before")
+    @classmethod
+    def _norm_uf(cls, v):
+        if v is None:
+            return None
+        uf = re.sub(r"[^A-Za-z]", "", str(v)).upper()[:2]
+        return uf or None
+
+    @model_validator(mode="after")
+    def _validate_formats(self):
+        if self.telefone is not None and not _PHONE_RE.match(self.telefone):
+            raise ValueError("Telefone inválido. Use DDD + número (10 ou 11 dígitos).")
+        if self.cep is not None and not _CEP_RE.match(self.cep):
+            raise ValueError("CEP inválido. Use 8 dígitos.")
+        if self.uf is not None and not _UF_RE.match(self.uf):
+            raise ValueError("UF inválida. Use 2 letras (ex.: SP).")
+        return self
 
 
 class EnvioProprioCreateIn(BaseModel):
     origem_remetente: str = Field(description="seller | manual")
     id_base: Optional[int] = None
-    remetente_telefone: Optional[str] = None
+    remetente_telefone: Optional[str] = Field(default=None, max_length=20)
     remetente: Optional[EnderecoIn] = None
     destinatario: EnderecoIn
-    peso_kg: Optional[float] = None
-    dimensoes: Optional[str] = None
-    observacao: Optional[str] = None
+    peso_kg: Optional[float] = Field(default=None, ge=0, le=9999)
+    dimensoes: Optional[str] = Field(default=None, max_length=40)
+    observacao: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("remetente_telefone", mode="before")
+    @classmethod
+    def _norm_rem_tel(cls, v):
+        return _digits(v, 11)
+
+    @field_validator("dimensoes", mode="before")
+    @classmethod
+    def _trim_dimensoes(cls, v):
+        return _clean_text(v, 40)
+
+    @field_validator("observacao", mode="before")
+    @classmethod
+    def _trim_obs(cls, v):
+        return _clean_text(v, 500)
+
+    @model_validator(mode="after")
+    def _validate_rem_tel(self):
+        if self.remetente_telefone is not None and not _PHONE_RE.match(self.remetente_telefone):
+            raise ValueError("Telefone do remetente inválido. Use DDD + número (10 ou 11 dígitos).")
+        return self
 
 
 class RemetenteOut(BaseModel):
