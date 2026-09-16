@@ -116,7 +116,7 @@ app.add_middleware(
         "Cache-Control", "Pragma",
     ],
     max_age=86400,                           # cache do preflight
-    expose_headers=["X-Backend-Process-Time", "Content-Disposition"],
+    expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale"],
 )
 
 # ──────────────────────────────────────────────────────────────────
@@ -138,12 +138,16 @@ from shopee_routes import router as shopee_router
 from logs import router as logs_router
 from contabilidade_routes import router as contabilidade_router
 from etiquetas_routes import router as etiquetas_router
+from envio_proprio_routes import router as envio_proprio_router
 from dashboard_routes import router as dashboard_router
 from mobile_entregas_routes import router as mobile_entregas_router
 from upload_routes import router as upload_router
 from acompanhamento_routes import router as acompanhamento_router
 from cep_routes import router as cep_router
 from config_campos_obrigatorios_routes import router as config_campos_obrigatorios_router
+from politicas_routes import router as politicas_router
+from avulso_campos_routes import router_config as avulso_campos_config_router
+from avulso_campos_routes import router_avulsos as avulsos_router
 from entradas_routes import router as entradas_router
 from conferencia_saida_routes import router as conferencia_saida_router
 from mobile_push_routes import router as mobile_push_router
@@ -153,6 +157,7 @@ from mobile_fechamentos_routes import router as mobile_fechamentos_router
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
+app.include_router(envio_proprio_router, prefix=API_PREFIX)
 app.include_router(contabilidade_router, prefix=API_PREFIX)
 app.include_router(dashboard_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
@@ -182,6 +187,9 @@ app.include_router(signup_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
 app.include_router(config_campos_obrigatorios_router, prefix=API_PREFIX)
+app.include_router(politicas_router, prefix=API_PREFIX)
+app.include_router(avulso_campos_config_router, prefix=API_PREFIX)
+app.include_router(avulsos_router, prefix=API_PREFIX)
 
 
 def _cors_headers_for_request(request: Request):

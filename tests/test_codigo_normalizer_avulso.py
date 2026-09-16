@@ -88,3 +88,12 @@ def test_is_qr_like_shopee_digits():
 
 def test_is_qr_like_rejeita_truncado():
     assert is_qr_like_scan_payload("26561280188") is False
+
+
+def test_rte_envio_proprio_como_avulso():
+    codigo = "RTE25082600001"
+    assert is_qr_like_scan_payload(codigo) is True
+    c, servico, qr_raw = normalize_codigo(codigo, strict_qr=True)
+    assert c == codigo
+    assert servico == "Avulso"
+    assert qr_raw is None

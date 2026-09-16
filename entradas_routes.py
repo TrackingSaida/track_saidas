@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -44,6 +44,7 @@ class EntradaLerIn(BaseModel):
 class EntradaLancarAvulsoIn(BaseModel):
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
+    campos: Optional[Dict[str, Any]] = None
     # Foto opcional (root/admin nunca obrigatória; staff operação sem flag de motoboy).
     foto_object_key: Optional[str] = Field(default=None, max_length=500)
     foto_object_keys: Optional[List[str]] = None
@@ -56,6 +57,8 @@ class EntradaLancarAvulsoOut(BaseModel):
     codigos: List[str]
     saidas: List[dict]
     mensagem: str
+    lote_id: Optional[int] = None
+    labels: List[str] = Field(default_factory=list)
 
 
 class EntradaResumoDiaOut(BaseModel):
@@ -202,6 +205,23 @@ def ler_entrada(
 
     if existente is None:
         try:
+            from envio_proprio_service import admitir_envio_proprio_no_tenant, is_codigo_rte
+
+            if is_codigo_rte(codigo):
+                admitida = admitir_envio_proprio_no_tenant(
+                    db,
+                    sub_base=sub_base,
+                    codigo=codigo,
+                    status_inicial=STATUS_NA_BASE,
+                    username=current_user.username,
+                    user_id=getattr(current_user, "id", None),
+                    evento_historico="entrada_base",
+                )
+                if admitida is not None:
+                    qr_result = apply_qr_payload_if_needed(admitida, None, admitida.servico or servico_val)
+                    db.commit()
+                    return _entrada_ok_payload(admitida, ja_existia=False, qr_result=qr_result)
+
             row = Saida(
                 sub_base=sub_base,
                 username=current_user.username,
@@ -229,6 +249,26 @@ def ler_entrada(
             raise HTTPException(500, f"Erro ao registrar entrada: {e}")
 
     status_norm = normalizar_status_saida(existente.status)
+
+    if status_norm == "ETIQUETADO":
+        status_anterior = existente.status
+        existente.status = STATUS_NA_BASE
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico_val)
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="entrada_base",
+                status_anterior=status_anterior,
+                status_novo=STATUS_NA_BASE,
+                user_id=getattr(current_user, "id", None),
+            )
+        )
+        try:
+            db.commit()
+            return _entrada_ok_payload(existente, ja_existia=True, qr_result=qr_result)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar entrada.")
 
     if status_norm == STATUS_NA_BASE:
         if needs_qr_update(existente, qr_payload_raw, servico_val):
@@ -344,6 +384,28 @@ def lancar_avulso_entrada(
         )
 
     label_norm = _normalizar_label_avulso(payload.identificacao)
+    from avulso_campos_service import (
+        build_label_amigavel,
+        create_lote,
+        persist_valores_para_saidas,
+        resolve_campos_ativos,
+        validate_campos_payload,
+    )
+
+    campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto="ENTRADA_AVULSO")
+    valores_norm = validate_campos_payload(
+        campos_cfg,
+        payload.campos,
+        identificacao_legado=payload.identificacao,
+    )
+    lote_row = create_lote(
+        db,
+        sub_base=sub_base,
+        origem="entrada",
+        quantidade=int(payload.quantidade),
+        criado_por=getattr(current_user, "id", None),
+    )
+
     servico = canonicalize_servico("Avulso")
     codigos: List[str] = []
     saidas_criadas: List[dict] = []
@@ -372,6 +434,7 @@ def lancar_avulso_entrada(
                 servico=servico,
                 status=STATUS_NA_BASE,
                 base=(payload.identificacao or "").strip() or None,
+                avulso_lote_id=int(lote_row.id),
             )
             db.add(row)
             db.flush()
@@ -402,12 +465,27 @@ def lancar_avulso_entrada(
                     "status": STATUS_NA_BASE,
                 }
             )
+        persist_valores_para_saidas(
+            db,
+            id_saidas=[s["id_saida"] for s in saidas_criadas],
+            campos_cfg=campos_cfg,
+            valores_norm=valores_norm,
+        )
         db.commit()
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erro ao lançar avulso de entrada: {e}")
 
     qtd = len(codigos)
+    labels = [
+        build_label_amigavel(
+            codigo,
+            base_legado=payload.identificacao,
+            campos_cfg=campos_cfg,
+            valores=valores_norm,
+        )
+        for codigo in codigos
+    ]
     msg = (
         "1 avulso registrado na entrada."
         if qtd == 1
@@ -418,4 +496,6 @@ def lancar_avulso_entrada(
         codigos=codigos,
         saidas=saidas_criadas,
         mensagem=msg,
+        lote_id=int(lote_row.id),
+        labels=labels,
     )
