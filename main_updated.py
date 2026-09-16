@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
+from http_error_public import CLIENT_SAFE_500, public_error_body
+
 logger = logging.getLogger("main")
 
 # ──────────────────────────────────────────────────────────────────
@@ -105,7 +107,11 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
             if origin:
                 headers["Access-Control-Allow-Origin"] = origin
                 headers["Access-Control-Allow-Credentials"] = "true"
-            return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=headers)
+            return JSONResponse(
+                status_code=500,
+                content={"detail": CLIENT_SAFE_500},
+                headers=headers,
+            )
 
         end = time.perf_counter()
         response.headers["X-Backend-Process-Time"] = f"{(end - start) * 1000:.3f}"
@@ -224,30 +230,24 @@ def _cors_headers_for_request(request: Request):
 
 @app.exception_handler(FastAPIHTTPException)
 async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
-    """Garante CORS e preserva detail estruturado (ex.: mensagem/pode_ajudar)."""
-    detail = exc.detail
-    # Dict/list devem ir intactos para o cliente montar UI (ex.: "Deseja ajudar?").
-    # Strings simples continuam em {"detail": "..."}.
-    if isinstance(detail, (dict, list)):
-        body = {"detail": detail}
-    else:
-        body = {"detail": str(detail) if detail else "Erro"}
+    """Garante CORS e preserva detail de negócio; 500 técnico não vai ao cliente."""
+    body = public_error_body(exc.status_code, exc.detail)
     headers = dict(_cors_headers_for_request(request))
     return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Garante que respostas de erro (500) incluam headers CORS para o browser não bloquear."""
+    """Garante CORS em 500 e nunca devolve SQL/stack ao browser."""
     status = 500
-    detail = str(exc) or "Erro interno do servidor"
+    detail_for_log = str(exc) or "Erro interno do servidor"
     try:
         if hasattr(exc, "status_code"):
             status = getattr(exc, "status_code", 500)
         if hasattr(exc, "detail"):
             d = getattr(exc, "detail", None)
             if d is not None:
-                detail = d if isinstance(d, str) else str(d.get("message", d.get("detail", d)))
+                detail_for_log = d if isinstance(d, str) else str(d.get("message", d.get("detail", d)))
     except Exception:
         pass
     logger.exception(
@@ -255,11 +255,11 @@ async def global_exception_handler(request: Request, exc: Exception):
         request.method,
         request.url.path,
         status,
-        detail,
+        detail_for_log,
     )
-    body = {"detail": detail}
+    body = public_error_body(status, detail_for_log, unhandled=True)
     headers = dict(_cors_headers_for_request(request))
-    return JSONResponse(status_code=status, content=body, headers=headers)
+    return JSONResponse(status_code=status if isinstance(status, int) else 500, content=body, headers=headers)
 
 
 # ──────────────────────────────────────────────────────────────────
