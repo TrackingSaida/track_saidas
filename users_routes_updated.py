@@ -15,7 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from db import get_db
 from name_normalizer import normalize_person_name
-from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD, revoke_motoboy_refresh_tokens_for_user
+from auth import get_current_user, get_password_hash, verify_password, DEFAULT_PASSWORD, revoke_motoboy_refresh_tokens_for_user, bump_motoboy_claims_version
 from entregador_legado_sync import (
     limpar_legado_entregador_ao_excluir_usuario,
     sincronizar_legado_entregador_com_status_usuario,
@@ -61,9 +61,9 @@ class MotoboyOut(BaseModel):
     pode_ler_coleta: bool = False
     pode_realizar_coleta: bool = False
     pode_ler_saida: bool = True
-    pode_digitar_codigo_manual: bool = True
+    pode_digitar_codigo_manual: bool = False
     pode_lancar_avulso: bool = True
-    avulso_exige_foto: bool = False
+    avulso_exige_foto: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -125,6 +125,7 @@ class UserOut(BaseModel):
 
 class UserFull(UserOut):
     ignorar_coleta: Optional[bool] = None  # para desabilitar checkbox no frontend
+    bloquear_saida_sem_coleta: Optional[bool] = None
 
 
 class AdminUserUpdate(BaseModel):
@@ -571,20 +572,29 @@ def create_user(
             new_user.email = _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or _placeholder_email(new_user.id, sub_base)
 
         if body.role == 4:
-            pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else False
+            # Defaults oficiais do Owner (Políticas gerais); body sobrescreve se enviado
+            def_coleta = bool(getattr(owner, "default_pode_realizar_coleta", False))
+            def_saida = bool(getattr(owner, "default_pode_ler_saida", True))
+            def_digitar = bool(getattr(owner, "default_pode_digitar_codigo_manual", False))
+            def_avulso = bool(getattr(owner, "default_pode_lancar_avulso", True))
+            def_foto = bool(getattr(owner, "default_avulso_exige_foto", True))
+
+            pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else def_coleta
             pode_realizar_coleta = (
                 body.pode_realizar_coleta
                 if body.pode_realizar_coleta is not None
-                else pode_ler_coleta
+                else (pode_ler_coleta if body.pode_ler_coleta is not None else def_coleta)
             )
-            pode_ler_saida = body.pode_ler_saida if body.pode_ler_saida is not None else True
+            pode_ler_saida = body.pode_ler_saida if body.pode_ler_saida is not None else def_saida
             pode_digitar_codigo_manual = (
-                body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else True
+                body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else def_digitar
             )
             pode_lancar_avulso = (
-                body.pode_lancar_avulso if body.pode_lancar_avulso is not None else True
+                body.pode_lancar_avulso if body.pode_lancar_avulso is not None else def_avulso
             )
-            avulso_exige_foto = bool(body.avulso_exige_foto) if body.avulso_exige_foto is not None else False
+            avulso_exige_foto = (
+                bool(body.avulso_exige_foto) if body.avulso_exige_foto is not None else def_foto
+            )
             if not pode_lancar_avulso:
                 avulso_exige_foto = False
             if owner.ignorar_coleta:
@@ -612,6 +622,7 @@ def create_user(
                 pode_digitar_codigo_manual=pode_digitar_codigo_manual,
                 pode_lancar_avulso=pode_lancar_avulso,
                 avulso_exige_foto=avulso_exige_foto,
+                claims_version=0,
             )
             db.add(motoboy)
             db.flush()
@@ -661,6 +672,7 @@ def read_current_user(
         owner = db.scalar(select(Owner).where(Owner.sub_base == user.sub_base))
         if owner:
             full.ignorar_coleta = bool(owner.ignorar_coleta)
+            full.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
     return full
 
 
@@ -753,6 +765,7 @@ def motoboys_permissoes_lote(
             m.avulso_exige_foto = bool(body.avulso_exige_foto) and bool(m.pode_lancar_avulso)
             changed = True
         if changed:
+            m.claims_version = int(getattr(m, "claims_version", 0) or 0) + 1
             atualizados += 1
 
     db.commit()
@@ -946,11 +959,20 @@ def admin_update_user(
     owner = db.scalar(select(Owner).where(Owner.sub_base == current_user.sub_base))
     updates = payload.model_dump(exclude_unset=True)
 
+    previous_role = getattr(user, "role", None)
+
     # ROLE → define COLETADOR (legado)
     if "role" in updates:
         _deny_non_root_assigning_root(current_user, updates["role"])
         user.role = updates["role"]
         user.coletador = (updates["role"] == 3)
+        if updates["role"] != previous_role:
+            try:
+                revoke_motoboy_refresh_tokens_for_user(db, int(user.id), commit=False)
+            except Exception:
+                logger.exception(
+                    "Falha ao revogar refresh tokens ao mudar role user_id=%s", user.id
+                )
 
     # Campos User
     user_fields = {"nome", "sobrenome", "username", "contato", "email", "status", "role", "data_nascimento"}
@@ -1031,6 +1053,12 @@ def admin_update_user(
                 user.motoboy.pode_realizar_coleta = bool(user.motoboy.pode_ler_coleta)
             if not bool(getattr(user.motoboy, "pode_lancar_avulso", True)):
                 user.motoboy.avulso_exige_foto = False
+            perm_keys = {
+                "pode_ler_coleta", "pode_realizar_coleta", "pode_ler_saida",
+                "pode_digitar_codigo_manual", "pode_lancar_avulso", "avulso_exige_foto",
+            }
+            if perm_keys & set(updates.keys()):
+                bump_motoboy_claims_version(db, user.motoboy, commit=False)
         else:
             # Criar Motoboy ao mudar role para 4
             obrigatorios = ["documento", "rua", "numero", "bairro", "cidade", "cep"]
@@ -1218,6 +1246,7 @@ def update_current_user(
         owner = db.scalar(select(Owner).where(Owner.sub_base == db_user.sub_base))
         if owner:
             full.ignorar_coleta = bool(owner.ignorar_coleta)
+            full.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
     return full
 
 

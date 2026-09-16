@@ -22,6 +22,7 @@ from db import get_db
 from db_utils import run_db_query_with_retry
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, Owner, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from saida_prerequisito import avaliar_prerequisito_saida
 from entrega_audit_log import audit_entrega, norm_client_action_id
 from saida_operacional_utils import (
     carregar_contexto_operacional,
@@ -221,6 +222,8 @@ class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
 class LancarAvulsoIn(BaseModel):
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
+    campos: Optional[Dict[str, Any]] = None
+    motivo_excepcional: Optional[str] = Field(default=None, max_length=500)
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
@@ -237,6 +240,9 @@ class LancarAvulsoOut(BaseModel):
     saidas: List[dict]
     mensagem: str
     avulso_exige_foto: bool = False
+    lote_id: Optional[int] = None
+    labels: List[str] = Field(default_factory=list)
+    criado_excepcional: bool = False
 
 
 class SaidaDetailOut(BaseModel):
@@ -877,11 +883,14 @@ def ler_saida(
     if not sub_base or not username:
         raise HTTPException(401, "Usuário inválido.")
 
-    if not entrada_obrigatoria:
-        owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-        entrada_obrigatoria = bool(
-            owner_row and getattr(owner_row, "entrada_obrigatoria_habilitada", False)
-        )
+    owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    bloquear_saida_sem_coleta = False
+    if owner_row is not None:
+        ignorar_coleta = bool(owner_row.ignorar_coleta)
+        entrada_obrigatoria = bool(getattr(owner_row, "entrada_obrigatoria_habilitada", False))
+        bloquear_saida_sem_coleta = bool(getattr(owner_row, "bloquear_saida_sem_coleta", False))
+    coleta_habilitada = not ignorar_coleta
+    entrada_habilitada = entrada_obrigatoria
 
     origem_leitura = ensure_manual_code_entry_allowed(
         db,
@@ -939,23 +948,17 @@ def ler_saida(
     )
 
     if existente is None:
-        if entrada_obrigatoria:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "code": "ENTRADA_OBRIGATORIA",
-                    "message": "Este pacote ainda não teve entrada na base.",
-                },
-            )
-        # Não existe: ignorar_coleta ou registrar_nao_coletado → INSERT; senão 422 (erro de negócio, sem retry)
-        if not ignorar_coleta and not payload.registrar_nao_coletado:
-            # JSONResponse direto para preservar código de erro sem passar pelo handler global.
-            return JSONResponse(
-                status_code=422,
-                content={"code": "NAO_COLETADO", "message": "Código não coletado."},
-            )
-        # status: "saiu" quando ignorar_coleta; "não coletado" quando usuário confirmou registrar mesmo assim
-        status_inicial = "não coletado" if payload.registrar_nao_coletado else (
+        permitir_soft = bool(payload.registrar_nao_coletado) and not bloquear_saida_sem_coleta
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=False,
+            permitir_registrar_nao_coletado=permitir_soft,
+        )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
+        # status: "saiu" quando sem coleta; "não coletado" quando usuário confirmou registrar mesmo assim
+        status_inicial = "não coletado" if permitir_soft else (
             STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
         )
         store_qr = _should_store_qr_payload_raw(servico, qr_payload_raw)
@@ -1056,14 +1059,14 @@ def ler_saida(
             raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "coletado":
-        if entrada_obrigatoria:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "code": "ENTRADA_OBRIGATORIA",
-                    "message": "Este pacote ainda não teve entrada na base.",
-                },
-            )
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=True,
+            status_norm=status_norm,
+        )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
         status_anterior = existente.status
         existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
@@ -1128,14 +1131,16 @@ def ler_saida(
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
 
-    if entrada_obrigatoria and not _status_ja_em_rota_ou_saida(status_norm):
-        return JSONResponse(
-            status_code=422,
-            content={
-                "code": "ENTRADA_OBRIGATORIA",
-                "message": "Este pacote ainda não teve entrada na base.",
-            },
+    if not _status_ja_em_rota_ou_saida(status_norm):
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=True,
+            status_norm=status_norm,
+            ja_em_rota_ou_saida=False,
         )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
 
     if _status_ja_em_rota_ou_saida(status_norm):
         # mesmo entregador/motoboy → 200 idempotente (sem 409)
@@ -1587,11 +1592,49 @@ def _lancar_avulso_impl(
             detail={"code": "QUANTIDADE_INVALIDA", "message": "Quantidade mínima é 1."},
         )
 
+    from avulso_campos_service import (
+        build_label_amigavel,
+        create_lote,
+        owner_exige_selecao_avulso,
+        persist_valores_para_saidas,
+        resolve_campos_ativos,
+        validate_campos_payload,
+    )
+
+    motivo = (payload.motivo_excepcional or "").strip()
+    exige_selecao = owner_exige_selecao_avulso(db, sub_base)
+    if exige_selecao and not motivo:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "AVULSO_SELECAO_OBRIGATORIA",
+                "message": "Com Coleta ou Entrada ativos, selecione um avulso pendente. Para cadastrar fora do fluxo, informe o motivo.",
+            },
+        )
+
+    contexto = "SAIDA_AVULSO"
+    campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto=contexto)
+    valores_norm = validate_campos_payload(
+        campos_cfg,
+        payload.campos,
+        identificacao_legado=payload.identificacao,
+    )
+    origem_lote = "saida_excecao" if motivo else "saida"
+    lote_row = create_lote(
+        db,
+        sub_base=sub_base,
+        origem=origem_lote,
+        quantidade=quantidade,
+        criado_por=getattr(current_user, "id", None),
+        motivo_excepcional=motivo or None,
+    )
+
     label_norm = _normalizar_label_avulso(payload.identificacao)
     codigos: List[str] = []
     saidas_criadas: List[dict] = []
     status_inicial = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
     servico = canonicalize_servico("Avulso")
+    excepcional = bool(motivo)
 
     try:
         for _ in range(quantidade):
@@ -1606,19 +1649,23 @@ def _lancar_avulso_impl(
                 servico=servico,
                 status=status_inicial,
                 base=(payload.identificacao or "").strip() or None,
+                avulso_lote_id=int(lote_row.id),
+                avulso_criado_excepcional=excepcional,
             )
             db.add(row)
             db.flush()
             db.add(
                 SaidaHistorico(
                     id_saida=row.id_saida,
-                    evento="lancar_avulso",
+                    evento="avulso_criado_excepcional_saida" if excepcional else "lancar_avulso",
                     status_novo=status_inicial,
                     user_id=getattr(current_user, "id", None),
                     payload=json.dumps(
                         {
                             "identificacao": (payload.identificacao or "").strip() or None,
                             "codigo": codigo,
+                            "motivo_excepcional": motivo or None,
+                            "campos": valores_norm,
                         },
                         ensure_ascii=False,
                     ),
@@ -1664,6 +1711,12 @@ def _lancar_avulso_impl(
                     "status": status_inicial,
                 }
             )
+        persist_valores_para_saidas(
+            db,
+            id_saidas=[s["id_saida"] for s in saidas_criadas],
+            campos_cfg=campos_cfg,
+            valores_norm=valores_norm,
+        )
         db.commit()
     except HTTPException:
         db.rollback()
@@ -1690,6 +1743,15 @@ def _lancar_avulso_impl(
                 codigo=None,
             )
 
+    labels = [
+        build_label_amigavel(
+            codigo,
+            base_legado=payload.identificacao,
+            campos_cfg=campos_cfg,
+            valores=valores_norm,
+        )
+        for codigo in codigos
+    ]
     qtd = len(codigos)
     msg = "1 avulso lançado com sucesso." if qtd == 1 else f"{qtd} avulsos lançados com sucesso."
     return {
@@ -1698,6 +1760,9 @@ def _lancar_avulso_impl(
         "saidas": saidas_criadas,
         "mensagem": msg,
         "avulso_exige_foto": avulso_exige_foto,
+        "lote_id": int(lote_row.id),
+        "labels": labels,
+        "criado_excepcional": excepcional,
     }
 
 

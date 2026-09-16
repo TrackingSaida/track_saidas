@@ -5,7 +5,7 @@ import re
 import time
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, List, Literal, Dict, Tuple
+from typing import Optional, List, Literal, Dict, Tuple, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -56,6 +56,7 @@ class ColetaLancarAvulsoIn(BaseModel):
     base: str = Field(min_length=1)
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
+    campos: Optional[Dict[str, Any]] = None
     # Foto(s) opcionais; obrigatórias só se o usuário (motoboy) exigir e não for root/admin.
     foto_object_key: Optional[str] = Field(default=None, max_length=500)
     foto_object_keys: Optional[List[str]] = None
@@ -151,6 +152,8 @@ class ColetaLancarAvulsoOut(BaseModel):
     coleta: ColetaOut
     mensagem: str
     totais: Optional[TotaisColetaBase] = None
+    lote_id: Optional[int] = None
+    labels: List[str] = Field(default_factory=list)
 
 
 # ============================================================
@@ -632,10 +635,32 @@ def lancar_avulso_coleta(
         )
 
     label_norm = _normalizar_label_avulso(payload.identificacao)
+    from avulso_campos_service import (
+        build_label_amigavel,
+        create_lote,
+        persist_valores_para_saidas,
+        resolve_campos_ativos,
+        validate_campos_payload,
+    )
+
+    campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto="COLETA_AVULSO")
+    valores_norm = validate_campos_payload(
+        campos_cfg,
+        payload.campos,
+        identificacao_legado=payload.identificacao,
+    )
+
     codigos = [
         _gerar_codigo_avulso(db, label_norm)
         for _ in range(int(payload.quantidade))
     ]
+    lote_row = create_lote(
+        db,
+        sub_base=sub_base,
+        origem="coleta",
+        quantidade=len(codigos),
+        criado_por=getattr(current_user, "id", None),
+    )
     lote = registrar_coleta_em_lote(
         ColetaLoteIn(
             base=base,
@@ -647,6 +672,26 @@ def lancar_avulso_coleta(
 
     if lote.coleta is None:
         raise HTTPException(500, "Falha ao registrar avulso na coleta.")
+
+    id_saidas = [int(item.id_saida) for item in lote.saidas_criadas]
+    try:
+        for item in lote.saidas_criadas:
+            saida = db.get(Saida, item.id_saida)
+            if saida:
+                saida.avulso_lote_id = int(lote_row.id)
+                if payload.identificacao and not saida.base:
+                    saida.base = (payload.identificacao or "").strip() or saida.base
+                db.add(saida)
+        persist_valores_para_saidas(
+            db,
+            id_saidas=id_saidas,
+            campos_cfg=campos_cfg,
+            valores_norm=valores_norm,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        # saidas já criadas; não falha o fluxo principal
 
     if foto_keys:
         foto_payload = serialize_foto_items(
@@ -677,6 +722,15 @@ def lancar_avulso_coleta(
             raise HTTPException(500, "Avulso criado, mas falhou ao vincular a foto.")
 
     ids_por_codigo = {item.codigo: item.id_saida for item in lote.saidas_criadas}
+    labels = [
+        build_label_amigavel(
+            codigo,
+            base_legado=payload.identificacao,
+            campos_cfg=campos_cfg,
+            valores=valores_norm,
+        )
+        for codigo in codigos
+    ]
     saidas = [
         ColetaAvulsoSaidaOut(
             id_saida=ids_por_codigo[codigo],
@@ -699,6 +753,8 @@ def lancar_avulso_coleta(
         coleta=lote.coleta,
         mensagem=mensagem,
         totais=lote.totais,
+        lote_id=int(lote_row.id),
+        labels=labels,
     )
 
 

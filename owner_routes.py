@@ -53,6 +53,7 @@ class OwnerUpdate(BaseModel):
     devolucao_sub_base_habilitada: Optional[bool] = None
     entrada_obrigatoria_habilitada: Optional[bool] = None
     conferencia_saida_habilitada: Optional[bool] = None
+    bloquear_saida_sem_coleta: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -73,6 +74,7 @@ class OwnerOut(BaseModel):
     devolucao_sub_base_habilitada: bool = False
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
+    bloquear_saida_sem_coleta: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -232,6 +234,9 @@ def update_owner(
 
     if body.conferencia_saida_habilitada is not None:
         owner.conferencia_saida_habilitada = bool(body.conferencia_saida_habilitada)
+
+    if body.bloquear_saida_sem_coleta is not None:
+        owner.bloquear_saida_sem_coleta = bool(body.bloquear_saida_sem_coleta)
 
     db.commit()
     db.refresh(owner)

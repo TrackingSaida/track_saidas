@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -44,6 +44,7 @@ class EntradaLerIn(BaseModel):
 class EntradaLancarAvulsoIn(BaseModel):
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
+    campos: Optional[Dict[str, Any]] = None
     # Foto opcional (root/admin nunca obrigatória; staff operação sem flag de motoboy).
     foto_object_key: Optional[str] = Field(default=None, max_length=500)
     foto_object_keys: Optional[List[str]] = None
@@ -56,6 +57,8 @@ class EntradaLancarAvulsoOut(BaseModel):
     codigos: List[str]
     saidas: List[dict]
     mensagem: str
+    lote_id: Optional[int] = None
+    labels: List[str] = Field(default_factory=list)
 
 
 class EntradaResumoDiaOut(BaseModel):
@@ -344,6 +347,28 @@ def lancar_avulso_entrada(
         )
 
     label_norm = _normalizar_label_avulso(payload.identificacao)
+    from avulso_campos_service import (
+        build_label_amigavel,
+        create_lote,
+        persist_valores_para_saidas,
+        resolve_campos_ativos,
+        validate_campos_payload,
+    )
+
+    campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto="ENTRADA_AVULSO")
+    valores_norm = validate_campos_payload(
+        campos_cfg,
+        payload.campos,
+        identificacao_legado=payload.identificacao,
+    )
+    lote_row = create_lote(
+        db,
+        sub_base=sub_base,
+        origem="entrada",
+        quantidade=int(payload.quantidade),
+        criado_por=getattr(current_user, "id", None),
+    )
+
     servico = canonicalize_servico("Avulso")
     codigos: List[str] = []
     saidas_criadas: List[dict] = []
@@ -372,6 +397,7 @@ def lancar_avulso_entrada(
                 servico=servico,
                 status=STATUS_NA_BASE,
                 base=(payload.identificacao or "").strip() or None,
+                avulso_lote_id=int(lote_row.id),
             )
             db.add(row)
             db.flush()
@@ -402,12 +428,27 @@ def lancar_avulso_entrada(
                     "status": STATUS_NA_BASE,
                 }
             )
+        persist_valores_para_saidas(
+            db,
+            id_saidas=[s["id_saida"] for s in saidas_criadas],
+            campos_cfg=campos_cfg,
+            valores_norm=valores_norm,
+        )
         db.commit()
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erro ao lançar avulso de entrada: {e}")
 
     qtd = len(codigos)
+    labels = [
+        build_label_amigavel(
+            codigo,
+            base_legado=payload.identificacao,
+            campos_cfg=campos_cfg,
+            valores=valores_norm,
+        )
+        for codigo in codigos
+    ]
     msg = (
         "1 avulso registrado na entrada."
         if qtd == 1
@@ -418,4 +459,6 @@ def lancar_avulso_entrada(
         codigos=codigos,
         saidas=saidas_criadas,
         mensagem=msg,
+        lote_id=int(lote_row.id),
+        labels=labels,
     )

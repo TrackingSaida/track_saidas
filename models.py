@@ -97,6 +97,14 @@ class Owner(Base):
     entrada_obrigatoria_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
     # Conferência de saída após Começar Entrega
     conferencia_saida_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
+    # Com coleta ativa: true = impede saída sem coleta; false = avisa e permite registrar
+    bloquear_saida_sem_coleta = Column(Boolean, nullable=False, server_default=text("false"))
+    # Defaults Motoboy (Políticas gerais) — novos cadastros
+    default_pode_realizar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
+    default_pode_ler_saida = Column(Boolean, nullable=False, server_default=text("true"))
+    default_pode_digitar_codigo_manual = Column(Boolean, nullable=False, server_default=text("false"))
+    default_pode_lancar_avulso = Column(Boolean, nullable=False, server_default=text("true"))
+    default_avulso_exige_foto = Column(Boolean, nullable=False, server_default=text("true"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -165,6 +173,7 @@ class Motoboy(Base):
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
     pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
     avulso_exige_foto = Column(Boolean, default=False, nullable=False)
+    claims_version = Column(Integer, nullable=False, server_default=text("0"))
 
     user = relationship("User", back_populates="motoboy")
     sub_bases = relationship("MotoboySubBase", back_populates="motoboy", cascade="all, delete-orphan")
@@ -375,6 +384,8 @@ class Saida(Base):
     ml_shipment_id = Column(BigInteger, nullable=True, index=True)  # vínculo envio ML (evita duplicata no auto-fill)
     ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
     is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande) — única fonte da sinalização
+    avulso_lote_id = Column(BigInteger, nullable=True, index=True)
+    avulso_criado_excepcional = Column(Boolean, nullable=False, server_default=text("false"))
 
     coleta = relationship("Coleta", back_populates="saidas")
 
@@ -782,6 +793,75 @@ class PedidoCamposObrigatoriosConfig(Base):
 
 
 # ==========================
+# Tabela: avulso_lote
+# ==========================
+class AvulsoLote(Base):
+    __tablename__ = "avulso_lote"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    origem = Column(Text, nullable=False)  # coleta | entrada | saida_excecao | saida
+    quantidade = Column(Integer, nullable=False, server_default=text("1"))
+    criado_por = Column(BigInteger, nullable=True)
+    motivo_excepcional = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<AvulsoLote id={self.id} sub_base={self.sub_base!r} origem={self.origem!r}>"
+
+
+# ==========================
+# Tabela: avulso_campo_config
+# ==========================
+class AvulsoCampoConfig(Base):
+    __tablename__ = "avulso_campo_config"
+    __table_args__ = (
+        UniqueConstraint("sub_base", "contexto", "chave", name="uq_avulso_campo_config_sub_ctx_chave"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    contexto = Column(Text, nullable=False, server_default=text("'TODOS_AVULSO'"))
+    chave = Column(Text, nullable=False)
+    label = Column(Text, nullable=False)
+    tipo = Column(Text, nullable=False, server_default=text("'texto'"))
+    obrigatorio = Column(Boolean, nullable=False, server_default=text("false"))
+    usar_na_identificacao = Column(Boolean, nullable=False, server_default=text("false"))
+    exibir_na_selecao = Column(Boolean, nullable=False, server_default=text("true"))
+    ordem = Column(Integer, nullable=False, server_default=text("0"))
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    opcoes_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"<AvulsoCampoConfig id={self.id} sub_base={self.sub_base!r} "
+            f"chave={self.chave!r} contexto={self.contexto!r}>"
+        )
+
+
+# ==========================
+# Tabela: avulso_campo_valor
+# ==========================
+class AvulsoCampoValor(Base):
+    __tablename__ = "avulso_campo_valor"
+    __table_args__ = (
+        UniqueConstraint("id_saida", "campo_config_id", name="uq_avulso_campo_valor_saida_campo"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_saida = Column(BigInteger, nullable=False, index=True)
+    campo_config_id = Column(BigInteger, ForeignKey("avulso_campo_config.id", ondelete="CASCADE"), nullable=False)
+    valor_texto = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return f"<AvulsoCampoValor id={self.id} id_saida={self.id_saida} campo={self.campo_config_id}>"
+
+
+# ==========================
 # Tabela: saida_historico
 # ==========================
 class SaidaHistorico(Base):
@@ -954,6 +1034,7 @@ class MotoboyRefreshToken(Base):
     token_hash = Column(String(64), nullable=False, unique=True)
     expires_at = Column(DateTime(timezone=False), nullable=False)
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    last_activity_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
     revoked_at = Column(DateTime(timezone=False), nullable=True)
 
     def __repr__(self) -> str:
