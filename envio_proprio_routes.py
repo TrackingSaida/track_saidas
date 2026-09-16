@@ -59,10 +59,10 @@ class RemetenteOut(BaseModel):
     uf: Optional[str] = None
 
 
-def _assert_admin(current_user: User) -> None:
+def _assert_operacao_etiqueta(current_user: User) -> None:
     role = int(getattr(current_user, "role", -1) or -1)
-    if role not in (0, 1):
-        raise HTTPException(403, "Acesso restrito a administradores.")
+    if role not in (0, 1, 2):
+        raise HTTPException(403, "Acesso restrito a administradores e operadores.")
 
 
 @router.get("/remetentes", response_model=List[RemetenteOut])
@@ -71,7 +71,7 @@ def listar_remetentes(
     current_user: User = Depends(get_current_user),
 ):
     """Sellers da sub_base autenticada com endereço estruturado (tenant-safe)."""
-    _assert_admin(current_user)
+    _assert_operacao_etiqueta(current_user)
     sub_base = _resolve_user_sub_base(db, current_user)
     bases = list(
         db.scalars(
@@ -148,7 +148,7 @@ def get_envio(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _assert_admin(current_user)
+    _assert_operacao_etiqueta(current_user)
     sub_base = _resolve_user_sub_base(db, current_user)
     envio = db.get(EnvioProprio, id_envio)
     if not envio or (envio.sub_base or "").strip() != sub_base:
@@ -193,7 +193,7 @@ def get_envio_pdf(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _assert_admin(current_user)
+    _assert_operacao_etiqueta(current_user)
     sub_base = _resolve_user_sub_base(db, current_user)
     envio = db.get(EnvioProprio, id_envio)
     if not envio or (envio.sub_base or "").strip() != sub_base:
