@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from db import get_db
-from auth import get_current_user
+from auth import _coerce_role_int, get_current_user
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
 from etiqueta_identidade_service import resolver_nome_exibicao
 from upload_storage_utils import B2_BUCKET_NAME, get_s3_client_optional, purge_b2_keys
@@ -137,7 +137,7 @@ def _owner_to_out(owner: Owner) -> OwnerOut:
 
 
 def _assert_role_01(current_user: User) -> None:
-    role = int(getattr(current_user, "role", -1) or -1)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1):
         raise HTTPException(403, "Acesso restrito a administradores.")
 
@@ -647,7 +647,7 @@ def get_identidade_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if int(getattr(current_user, "role", -1) or -1) != 0:
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
     owner = db.get(Owner, id_owner)
     if not owner:
@@ -662,7 +662,7 @@ def patch_identidade_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if int(getattr(current_user, "role", -1) or -1) != 0:
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
     owner = db.get(Owner, id_owner)
     if not owner:
@@ -683,7 +683,7 @@ async def upload_logo_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if int(getattr(current_user, "role", -1) or -1) != 0:
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
     owner = db.get(Owner, id_owner)
     if not owner:
@@ -701,7 +701,7 @@ def delete_logo_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if int(getattr(current_user, "role", -1) or -1) != 0:
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
     owner = db.get(Owner, id_owner)
     if not owner:
@@ -718,7 +718,7 @@ def presign_logo_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if int(getattr(current_user, "role", -1) or -1) != 0:
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
     owner = db.get(Owner, id_owner)
     if not owner:

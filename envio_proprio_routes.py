@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
+from auth import _coerce_role_int, get_current_user
 from db import get_db
 from envio_proprio_service import criar_envio_proprio, pdf_from_envio
 from models import BasePreco, BaseSellerDados, EnvioProprio, User
@@ -60,7 +60,7 @@ class RemetenteOut(BaseModel):
 
 
 def _assert_operacao_etiqueta(current_user: User) -> None:
-    role = int(getattr(current_user, "role", -1) or -1)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2):
         raise HTTPException(403, "Acesso restrito a administradores e operadores.")
 

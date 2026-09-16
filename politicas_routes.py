@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from auth import bump_motoboys_claims_version_for_sub_base, get_current_user
+from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from db import get_db
 from models import Motoboy, Owner, User
 
@@ -63,7 +63,7 @@ class PoliticasPatch(BaseModel):
 
 
 def _assert_admin(current_user: User) -> None:
-    role = int(getattr(current_user, "role", -1) or -1)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1):
         raise HTTPException(403, "Acesso restrito a administradores.")
 
