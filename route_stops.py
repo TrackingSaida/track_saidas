@@ -38,22 +38,33 @@ def normalize_cidade(text: str) -> str:
     return normalize_street(text)
 
 
+def normalize_bairro(text: str) -> str:
+    return normalize_street(text)
+
+
 def build_stop_key(detail: Any, id_saida: int) -> str:
-    """Espelha prioridades mobile: CEP+num → rua+num+cidade → coord → id."""
+    """Espelha o mobile: rua+número+bairro → CEP+número → coord → id.
+
+    Bairros diferentes são paradas diferentes. Depois que o motoboy iguala o
+    endereço (incluindo o bairro), as entregas passam a ter a mesma chave.
+    """
     cep = normalize_cep(getattr(detail, "dest_cep", None) or "")
     numero = normalize_numero(
         getattr(detail, "dest_numero", None) or "",
         getattr(detail, "dest_rua", None) or "",
     )
     rua = normalize_street(getattr(detail, "dest_rua", None) or "")
+    bairro = normalize_bairro(getattr(detail, "dest_bairro", None) or "")
     cidade = normalize_cidade(getattr(detail, "dest_cidade", None) or "")
 
-    if cep and numero:
-        return f"cep|{cep}|{numero}"
+    if rua and numero and bairro:
+        return f"loc|{rua}|{numero}|{bairro}|{cidade}"
     if rua and numero and cidade:
         return f"loc|{rua}|{numero}|{cidade}"
     if rua and numero:
         return f"loc|{rua}|{numero}|"
+    if cep and numero:
+        return f"cep|{cep}|{numero}"
 
     lat = getattr(detail, "latitude", None)
     lon = getattr(detail, "longitude", None)
@@ -104,7 +115,7 @@ def build_route_stops(
     delivery_ids: Sequence[int],
     details_map: Dict[int, Any],
 ) -> List[RouteStop]:
-    """Agrupa entregas consecutivas na ordem de entrada por stop_key."""
+    """Agrupa entregas pela mesma stop_key, independente da posição na lista."""
     groups: List[RouteStop] = []
     key_to_index: Dict[str, int] = {}
 
