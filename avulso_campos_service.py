@@ -45,22 +45,8 @@ TIPOS_META = [
     {
         "id": "texto",
         "label": "Texto",
-        "hint": "Texto livre (pedido, observação, referência).",
-        "placeholder": "Ex.: Pedido 99821",
-        "input_mode": "text",
-    },
-    {
-        "id": "primeiro_nome",
-        "label": "Primeiro nome",
-        "hint": "Somente letras. Ex.: Maria.",
+        "hint": "Texto livre (nome, bairro, complemento, observação).",
         "placeholder": "Ex.: Maria",
-        "input_mode": "text",
-    },
-    {
-        "id": "segundo_nome",
-        "label": "Segundo nome",
-        "hint": "Sobrenome, somente letras. Ex.: Silva.",
-        "placeholder": "Ex.: Silva",
         "input_mode": "text",
     },
     {
@@ -95,13 +81,14 @@ TIPOS_META = [
     {
         "id": "foto",
         "label": "Foto",
-        "hint": "Referência de imagem. A foto de comprovante do avulso é um campo separado.",
+        "hint": "Imagem de referência no lançamento do avulso.",
         "placeholder": "",
         "input_mode": "text",
     },
 ]
+TIPOS_LEGADOS = {"primeiro_nome", "segundo_nome"}
 CONTEXTOS_AVULSO = {c["id"] for c in CONTEXTOS_META}
-TIPOS_CAMPO = {t["id"] for t in TIPOS_META}
+TIPOS_CAMPO = {t["id"] for t in TIPOS_META} | TIPOS_LEGADOS
 ORIGENS_LOTE = {"coleta", "entrada", "saida", "saida_excecao"}
 ORIGEM_LABELS = {
     "coleta": "Coleta",
@@ -125,6 +112,8 @@ def contexto_meta(contexto: str) -> Dict[str, Any]:
 
 def tipo_meta(tipo: str) -> Dict[str, Any]:
     key = (tipo or "").strip().lower()
+    if key in TIPOS_LEGADOS:
+        key = "texto"
     for item in TIPOS_META:
         if item["id"] == key:
             return item

@@ -33,7 +33,7 @@ from models import AvulsoCampoConfig, AvulsoLote, Saida, User
 
 router_config = APIRouter(
     prefix="/configuracoes/campos-avulso",
-    tags=["Configuração - Campos Avulso"],
+    tags=["Configuração - Dados do avulso"],
 )
 router_avulsos = APIRouter(prefix="/avulsos", tags=["Avulsos"])
 
@@ -199,7 +199,7 @@ def create_campo_avulso(
         )
     )
     if existing:
-        raise HTTPException(409, "Já existe um campo com esta chave neste contexto.")
+        raise HTTPException(409, "Já existe um campo com este nome neste fluxo.")
     opcoes = [str(x).strip() for x in (body.opcoes or []) if str(x).strip()]
     if tipo == "lista" and not opcoes:
         raise HTTPException(422, "Tipo lista exige opções.")

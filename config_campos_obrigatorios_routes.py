@@ -20,7 +20,7 @@ from pedido_campos_obrigatorios_service import (
     normalize_campos_obrigatorios,
 )
 
-router = APIRouter(prefix="/configuracoes/campos-obrigatorios-pedido", tags=["Configuração - Campos Obrigatórios"])
+router = APIRouter(prefix="/configuracoes/campos-obrigatorios-pedido", tags=["Configuração - Comprovante da entrega"])
 SERVICOS_DISPONIVEIS = ["Shopee", "Mercado Livre", "Avulso"]
 
 
