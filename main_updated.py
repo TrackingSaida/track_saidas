@@ -16,25 +16,44 @@ logger = logging.getLogger("main")
 # Config
 API_PREFIX = os.getenv("API_PREFIX", "/api")
 
+# Origens que o frontend web usa. Sempre mescladas, mesmo se ALLOWED_ORIGINS
+# vier por ENV (ex.: serviço de homol clonado com origens só de produção).
+REQUIRED_FRONTEND_ORIGINS = [
+    "https://tracking-saidas.com.br",
+    "https://www.tracking-saidas.com.br",
+    "https://track-saidas-html.onrender.com",
+    "https://rotevo-web-homol.onrender.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+
+def _merge_allowed_origins(origins):
+    merged = []
+    for origin in list(origins) + REQUIRED_FRONTEND_ORIGINS:
+        if origin and origin not in merged:
+            merged.append(origin)
+    return merged
+
+
 # ALLOWED_ORIGINS pode vir por ENV (lista separada por vírgula) ou usar a default abaixo
 _env_origins = os.getenv("ALLOWED_ORIGINS")
 if _env_origins:
-    ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
-    # Garantir localhost:3000 para desenvolvimento/testes mesmo quando ENV está definida
-    for origin in ("http://localhost:3000", "http://127.0.0.1:3000"):
-        if origin not in ALLOWED_ORIGINS:
-            ALLOWED_ORIGINS.append(origin)
+    ALLOWED_ORIGINS = _merge_allowed_origins(
+        [o.strip() for o in _env_origins.split(",") if o.strip()]
+    )
 else:
-    ALLOWED_ORIGINS = [
+    ALLOWED_ORIGINS = _merge_allowed_origins([
         "https://admirable-sprinkles-d10196.netlify.app",
         "https://tracking-saidas.com.br",
         "https://www.tracking-saidas.com.br",
         "https://track-saidas-html.onrender.com",
+        "https://rotevo-web-homol.onrender.com",
         "http://localhost:5500", "http://127.0.0.1:5500",
         "http://localhost:8000", "http://127.0.0.1:8000",
         "http://localhost:3000", "http://172.30.33.97:3000",
         "http://account.sandbox.test-stable.shopee.com",
-    ]
+    ])
 
 # ──────────────────────────────────────────────────────────────────
 # App
@@ -144,6 +163,7 @@ from shopee_routes import router as shopee_router
 from logs import router as logs_router
 from contabilidade_routes import router as contabilidade_router
 from etiquetas_routes import router as etiquetas_router
+from envio_proprio_routes import router as envio_proprio_router
 from dashboard_routes import router as dashboard_router
 from mobile_entregas_routes import router as mobile_entregas_router
 from upload_routes import router as upload_router
@@ -162,6 +182,7 @@ from mobile_fechamentos_routes import router as mobile_fechamentos_router
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
+app.include_router(envio_proprio_router, prefix=API_PREFIX)
 app.include_router(contabilidade_router, prefix=API_PREFIX)
 app.include_router(dashboard_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)

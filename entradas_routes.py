@@ -205,6 +205,23 @@ def ler_entrada(
 
     if existente is None:
         try:
+            from envio_proprio_service import admitir_envio_proprio_no_tenant, is_codigo_rte
+
+            if is_codigo_rte(codigo):
+                admitida = admitir_envio_proprio_no_tenant(
+                    db,
+                    sub_base=sub_base,
+                    codigo=codigo,
+                    status_inicial=STATUS_NA_BASE,
+                    username=current_user.username,
+                    user_id=getattr(current_user, "id", None),
+                    evento_historico="entrada_base",
+                )
+                if admitida is not None:
+                    qr_result = apply_qr_payload_if_needed(admitida, None, admitida.servico or servico_val)
+                    db.commit()
+                    return _entrada_ok_payload(admitida, ja_existia=False, qr_result=qr_result)
+
             row = Saida(
                 sub_base=sub_base,
                 username=current_user.username,
@@ -232,6 +249,26 @@ def ler_entrada(
             raise HTTPException(500, f"Erro ao registrar entrada: {e}")
 
     status_norm = normalizar_status_saida(existente.status)
+
+    if status_norm == "ETIQUETADO":
+        status_anterior = existente.status
+        existente.status = STATUS_NA_BASE
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico_val)
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="entrada_base",
+                status_anterior=status_anterior,
+                status_novo=STATUS_NA_BASE,
+                user_id=getattr(current_user, "id", None),
+            )
+        )
+        try:
+            db.commit()
+            return _entrada_ok_payload(existente, ja_existia=True, qr_result=qr_result)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar entrada.")
 
     if status_norm == STATUS_NA_BASE:
         if needs_qr_update(existente, qr_payload_raw, servico_val):

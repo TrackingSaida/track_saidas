@@ -105,6 +105,12 @@ class Owner(Base):
     default_pode_digitar_codigo_manual = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_lancar_avulso = Column(Boolean, nullable=False, server_default=text("true"))
     default_avulso_exige_foto = Column(Boolean, nullable=False, server_default=text("true"))
+    # Identidade visual das etiquetas de envio próprio
+    logo_object_key = Column(Text, nullable=True)
+    logo_filename = Column(Text, nullable=True)
+    logo_content_type = Column(Text, nullable=True)
+    logo_updated_at = Column(DateTime(timezone=False), nullable=True)
+    slogan = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -1287,3 +1293,56 @@ class AvisoDestinatario(Base):
     lido_em = Column(DateTime(timezone=False), nullable=True)
 
     aviso = relationship("AvisoBase", back_populates="destinatarios")
+
+
+# ==========================
+# Tabela: envio_proprio (snapshot de etiqueta)
+# ==========================
+class EnvioProprio(Base):
+    __tablename__ = "envio_proprio"
+    __table_args__ = (
+        UniqueConstraint("codigo", name="uq_envio_proprio_codigo"),
+        UniqueConstraint("id_saida", name="uq_envio_proprio_id_saida"),
+    )
+
+    id_envio = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="SET NULL"), nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
+    codigo = Column(Text, nullable=False)
+    origem_remetente = Column(Text, nullable=False)  # seller | manual
+    id_base = Column(BigInteger, nullable=True)
+
+    remetente_nome = Column(Text, nullable=False)
+    remetente_telefone = Column(Text, nullable=True)
+    remetente_cep = Column(Text, nullable=False)
+    remetente_rua = Column(Text, nullable=False)
+    remetente_numero = Column(Text, nullable=False)
+    remetente_complemento = Column(Text, nullable=True)
+    remetente_bairro = Column(Text, nullable=False)
+    remetente_cidade = Column(Text, nullable=False)
+    remetente_uf = Column(Text, nullable=False)
+
+    dest_nome = Column(Text, nullable=False)
+    dest_telefone = Column(Text, nullable=True)
+    dest_cep = Column(Text, nullable=False)
+    dest_rua = Column(Text, nullable=False)
+    dest_numero = Column(Text, nullable=False)
+    dest_complemento = Column(Text, nullable=True)
+    dest_bairro = Column(Text, nullable=False)
+    dest_cidade = Column(Text, nullable=False)
+    dest_uf = Column(Text, nullable=False)
+
+    peso_kg = Column(Numeric(10, 3), nullable=True)
+    dimensoes = Column(Text, nullable=True)
+    observacao = Column(Text, nullable=True)
+
+    owner_nome_exibicao = Column(Text, nullable=True)
+    owner_slogan = Column(Text, nullable=True)
+    logo_object_key_used = Column(Text, nullable=True)
+
+    criado_por_user_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<EnvioProprio id_envio={self.id_envio} codigo={self.codigo!r} sub_base={self.sub_base!r}>"

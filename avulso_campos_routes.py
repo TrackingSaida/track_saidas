@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
+from auth import _coerce_role_int, get_current_user
 from avulso_campos_service import (
     CONTEXTOS_META,
     TIPOS_META,
@@ -96,7 +96,7 @@ class AvulsoDetalheOut(AvulsoPendenteOut):
 
 
 def _assert_admin(current_user: User) -> None:
-    role = int(getattr(current_user, "role", 0) or 0)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1):
         raise HTTPException(403, "Acesso restrito a administradores.")
 
@@ -169,7 +169,7 @@ def schema_campos_avulso(
     current_user: User = Depends(get_current_user),
 ):
     """Schema ativo para formulários operacionais (roles operação)."""
-    role = int(getattr(current_user, "role", -1) or -1)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = _sub_base(current_user)
@@ -302,7 +302,7 @@ def get_avulsos_pendentes(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    role = int(getattr(current_user, "role", -1) or -1)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = _sub_base(current_user)
@@ -352,7 +352,7 @@ def get_avulso_detalhe(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    role = int(getattr(current_user, "role", -1) or -1)
+    role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = _sub_base(current_user)

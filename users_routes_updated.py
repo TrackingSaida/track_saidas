@@ -966,6 +966,7 @@ def admin_update_user(
         _deny_non_root_assigning_root(current_user, updates["role"])
         user.role = updates["role"]
         user.coletador = (updates["role"] == 3)
+        # Troca de perfil: invalida refresh de motoboy (JWT staff antigo cai no get_current_user).
         if updates["role"] != previous_role:
             try:
                 revoke_motoboy_refresh_tokens_for_user(db, int(user.id), commit=False)
