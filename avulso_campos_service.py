@@ -4,21 +4,104 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
-from models import AvulsoCampoConfig, AvulsoCampoValor, AvulsoLote, Owner, Saida
+from models import AvulsoCampoConfig, AvulsoCampoValor, AvulsoLote, Motoboy, Owner, Saida
 
-CONTEXTOS_AVULSO = {
-    "COLETA_AVULSO",
-    "ENTRADA_AVULSO",
-    "SAIDA_AVULSO",
-    "TODOS_AVULSO",
-}
-TIPOS_CAMPO = {"texto", "telefone", "numero", "foto", "lista"}
+CONTEXTOS_META = [
+    {
+        "id": "TODOS_AVULSO",
+        "label": "Todos os fluxos",
+        "badges": ["Coleta", "Entrada", "Saída"],
+        "hint": "O campo aparece na Coleta, na Entrada e na Saída.",
+    },
+    {
+        "id": "COLETA_AVULSO",
+        "label": "Coleta",
+        "badges": ["Coleta"],
+        "hint": "O campo aparece somente ao lançar avulso na Coleta.",
+    },
+    {
+        "id": "ENTRADA_AVULSO",
+        "label": "Entrada",
+        "badges": ["Entrada"],
+        "hint": "O campo aparece somente ao lançar avulso na Entrada.",
+    },
+    {
+        "id": "SAIDA_AVULSO",
+        "label": "Saída",
+        "badges": ["Saída"],
+        "hint": "O campo aparece somente ao lançar ou selecionar avulso na Saída.",
+    },
+]
+TIPOS_META = [
+    {
+        "id": "texto",
+        "label": "Texto",
+        "hint": "Texto livre (pedido, observação, referência).",
+        "placeholder": "Ex.: Pedido 99821",
+        "input_mode": "text",
+    },
+    {
+        "id": "primeiro_nome",
+        "label": "Primeiro nome",
+        "hint": "Somente letras. Ex.: Maria.",
+        "placeholder": "Ex.: Maria",
+        "input_mode": "text",
+    },
+    {
+        "id": "segundo_nome",
+        "label": "Segundo nome",
+        "hint": "Sobrenome, somente letras. Ex.: Silva.",
+        "placeholder": "Ex.: Silva",
+        "input_mode": "text",
+    },
+    {
+        "id": "cep",
+        "label": "CEP",
+        "hint": "CEP brasileiro com 8 dígitos. Ex.: 01310-100.",
+        "placeholder": "00000-000",
+        "input_mode": "numeric",
+        "mascara": "00000-000",
+    },
+    {
+        "id": "telefone",
+        "label": "Telefone",
+        "hint": "Telefone com DDD. Ex.: (11) 98888-7777.",
+        "placeholder": "(11) 98888-7777",
+        "input_mode": "tel",
+    },
+    {
+        "id": "numero",
+        "label": "Número",
+        "hint": "Valor numérico. Use vírgula ou ponto decimal se precisar.",
+        "placeholder": "Ex.: 12",
+        "input_mode": "decimal",
+    },
+    {
+        "id": "lista",
+        "label": "Lista",
+        "hint": "O operador escolhe uma das opções cadastradas.",
+        "placeholder": "Selecione",
+        "input_mode": "text",
+    },
+    {
+        "id": "foto",
+        "label": "Foto",
+        "hint": "Referência de imagem. A foto de comprovante do avulso é um campo separado.",
+        "placeholder": "",
+        "input_mode": "text",
+    },
+]
+CONTEXTOS_AVULSO = {c["id"] for c in CONTEXTOS_META}
+TIPOS_CAMPO = {t["id"] for t in TIPOS_META}
 ORIGENS_LOTE = {"coleta", "entrada", "saida", "saida_excecao"}
 ORIGEM_LABELS = {
     "coleta": "Coleta",
@@ -28,6 +111,121 @@ ORIGEM_LABELS = {
 }
 
 STATUS_PENDENTE_SAIDA = {"coletado", "NA_BASE", "na_base"}
+STATUS_HOJE_EXCLUIR = {"entregue", "cancelado", "devolvido", "devolvida"}
+_RE_NOME = re.compile(r"^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' -]{0,79}$")
+
+
+def contexto_meta(contexto: str) -> Dict[str, Any]:
+    ctx = (contexto or "").strip().upper()
+    for item in CONTEXTOS_META:
+        if item["id"] == ctx:
+            return item
+    return {"id": ctx, "label": ctx, "badges": [ctx], "hint": ""}
+
+
+def tipo_meta(tipo: str) -> Dict[str, Any]:
+    key = (tipo or "").strip().lower()
+    for item in TIPOS_META:
+        if item["id"] == key:
+            return item
+    return {
+        "id": key,
+        "label": (tipo or "Texto").capitalize(),
+        "hint": "",
+        "placeholder": "",
+        "input_mode": "text",
+    }
+
+
+def hoje_operacional() -> date:
+    try:
+        return datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    except Exception:
+        return date.today()
+
+
+def status_avulso_label(status: Optional[str]) -> str:
+    raw = (status or "").strip()
+    key = raw.lower()
+    mapping = {
+        "coletado": "Coletado",
+        "na_base": "Na base",
+        "saiu": "Saiu para entrega",
+        "saiu_para_entrega": "Saiu para entrega",
+        "em_rota": "Em rota",
+        "entregue": "Entregue",
+        "nao coletado": "Não coletado",
+        "não coletado": "Não coletado",
+        "ausente": "Ausente",
+        "devolvido": "Devolvido",
+    }
+    if key in mapping:
+        return mapping[key]
+    if raw:
+        return raw.replace("_", " ").strip().capitalize()
+    return "Sem status"
+
+
+def motoboy_nome_saida(db: Session, row: Saida) -> Optional[str]:
+    texto = (getattr(row, "entregador", None) or "").strip()
+    if texto:
+        return texto
+    motoboy_id = getattr(row, "motoboy_id", None)
+    if not motoboy_id:
+        return None
+    mb = db.get(Motoboy, int(motoboy_id))
+    if not mb:
+        return None
+    user = getattr(mb, "user", None)
+    if user:
+        nome = " ".join(p for p in [(user.nome or "").strip(), (user.sobrenome or "").strip()] if p)
+        return nome or (user.username or None)
+    return None
+
+
+def _somente_digitos(text: str) -> str:
+    return re.sub(r"\D", "", text or "")
+
+
+def format_valor_tipo(tipo: str, text: str, label: str) -> str:
+    tipo_n = (tipo or "texto").strip().lower()
+    value = (text or "").strip()
+    if tipo_n == "cep":
+        digits = _somente_digitos(value)
+        if len(digits) != 8:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Campo '{label}' deve ser um CEP com 8 dígitos. Ex.: 01310-100",
+            )
+        return f"{digits[:5]}-{digits[5:]}"
+    if tipo_n == "telefone":
+        digits = _somente_digitos(value)
+        if digits.startswith("55") and len(digits) in (12, 13):
+            digits = digits[2:]
+        if len(digits) == 11:
+            return f"({digits[:2]}) {digits[2:7]}-{digits[7:]}"
+        if len(digits) == 10:
+            return f"({digits[:2]}) {digits[2:6]}-{digits[6:]}"
+        raise HTTPException(
+            status_code=422,
+            detail=f"Campo '{label}' deve ser um telefone com DDD. Ex.: (11) 98888-7777",
+        )
+    if tipo_n in ("primeiro_nome", "segundo_nome"):
+        cleaned = re.sub(r"\s+", " ", value)
+        if not _RE_NOME.match(cleaned):
+            exemplo = "Maria" if tipo_n == "primeiro_nome" else "Silva"
+            raise HTTPException(
+                status_code=422,
+                detail=f"Campo '{label}' aceita somente letras. Ex.: {exemplo}",
+            )
+        return cleaned.title()
+    if tipo_n == "numero":
+        try:
+            float(value.replace(",", "."))
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Campo '{label}' deve ser numérico.")
+        return value
+    return value[:2000]
 
 
 def _slug_chave(raw: str) -> str:
@@ -121,11 +319,7 @@ def validate_campos_payload(
             continue
         if not text:
             continue
-        if cfg.tipo == "numero":
-            try:
-                float(text.replace(",", "."))
-            except ValueError:
-                raise HTTPException(status_code=422, detail=f"Campo '{cfg.label}' deve ser numérico.")
+        text = format_valor_tipo(cfg.tipo, text, cfg.label or cfg.chave)
         if cfg.tipo == "lista":
             opcoes = parse_opcoes_json(cfg.opcoes_json)
             if opcoes and text not in opcoes:
@@ -257,41 +451,224 @@ def owner_exige_selecao_avulso(db: Session, sub_base: str) -> bool:
     return coleta_on or entrada_on
 
 
-def list_pendentes(
-    db: Session,
-    *,
-    sub_base: str,
-    q: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> Tuple[List[Saida], int]:
-    from sqlalchemy import func
+@dataclass
+class ListagemAvulsos:
+    rows: List[Saida]
+    total: int
+    modo: str
+    ambiguo: bool = False
+    mensagem: Optional[str] = None
 
-    limit = max(1, min(int(limit or 50), 100))
-    offset = max(0, int(offset or 0))
-    filters = [
+
+def _filtro_avulso(sub_base: str):
+    return [
         Saida.sub_base == sub_base,
         or_(
             Saida.servico.ilike("%avulso%"),
             Saida.codigo.ilike("AVULSO-%"),
         ),
-        Saida.status.in_(["coletado", "NA_BASE", "na_base"]),
     ]
-    term = (q or "").strip()
+
+
+def _variantes_busca(tipo: Optional[str], valor: str) -> List[str]:
+    raw = (valor or "").strip()
+    if not raw:
+        return []
+    out = [raw]
+    if (tipo or "") in ("cep", "telefone"):
+        digits = _somente_digitos(raw)
+        if digits and digits not in out:
+            out.append(digits)
+        if tipo == "cep" and len(digits) == 8:
+            formatted = f"{digits[:5]}-{digits[5:]}"
+            if formatted not in out:
+                out.append(formatted)
+    return out
+
+
+def _ids_por_identificadores(
+    db: Session,
+    *,
+    sub_base: str,
+    identificadores: Dict[str, str],
+) -> Optional[select]:
+    matching = None
+    for chave, valor in identificadores.items():
+        cfg = db.scalar(
+            select(AvulsoCampoConfig)
+            .where(
+                AvulsoCampoConfig.sub_base == sub_base,
+                AvulsoCampoConfig.chave == chave,
+            )
+            .order_by(AvulsoCampoConfig.id.desc())
+        )
+        tipo = cfg.tipo if cfg else None
+        variants = _variantes_busca(tipo, valor)
+        if not variants:
+            continue
+        conds = [AvulsoCampoValor.valor_texto.ilike(f"%{v}%") for v in variants]
+        subset = (
+            select(AvulsoCampoValor.id_saida)
+            .join(AvulsoCampoConfig, AvulsoCampoValor.campo_config_id == AvulsoCampoConfig.id)
+            .where(
+                AvulsoCampoConfig.sub_base == sub_base,
+                AvulsoCampoConfig.chave == chave,
+                or_(*conds),
+            )
+        )
+        matching = subset if matching is None else matching.intersect(subset)
+    return matching
+
+
+def _filtros_hoje(sub_base: str) -> List:
+    hoje = hoje_operacional()
+    return [
+        *_filtro_avulso(sub_base),
+        Saida.data == hoje,
+        or_(
+            AvulsoLote.origem.in_(["coleta", "entrada"]),
+            and_(
+                AvulsoLote.id.is_(None),
+                Saida.status.in_(["coletado", "NA_BASE", "na_base"]),
+            ),
+        ),
+        or_(
+            Saida.status.is_(None),
+            func.lower(func.coalesce(Saida.status, "")).notin_(list(STATUS_HOJE_EXCLUIR)),
+        ),
+    ]
+
+
+def _aplicar_busca_contem(
+    filters: List,
+    *,
+    sub_base: str,
+    term: str,
+    ids: Dict[str, str],
+    db: Session,
+) -> Optional[List]:
+    out = list(filters)
+    if ids:
+        matching = _ids_por_identificadores(db, sub_base=sub_base, identificadores=ids)
+        if matching is None:
+            return None
+        out.append(Saida.id_saida.in_(matching))
     if term:
         like = f"%{term}%"
         ids_from_eav = select(AvulsoCampoValor.id_saida).where(AvulsoCampoValor.valor_texto.ilike(like))
-        filters.append(
+        out.append(
             or_(
                 Saida.codigo.ilike(like),
                 Saida.base.ilike(like),
                 Saida.id_saida.in_(ids_from_eav),
             )
         )
-    total = int(db.scalar(select(func.count()).select_from(Saida).where(*filters)) or 0)
+    return out
+
+
+def _contar_e_listar(db: Session, filters: List, *, joined_lote: bool, limit: int, offset: int) -> tuple:
+    stmt = select(Saida)
+    if joined_lote:
+        stmt = stmt.outerjoin(AvulsoLote, AvulsoLote.id == Saida.avulso_lote_id)
+    stmt = stmt.where(*filters)
+    total = int(
+        db.scalar(
+            select(func.count()).select_from(
+                stmt.with_only_columns(Saida.id_saida).order_by(None).subquery()
+            )
+        )
+        or 0
+    )
     rows = list(
-        db.scalars(
-            select(Saida).where(*filters).order_by(Saida.id_saida.desc()).offset(offset).limit(limit)
-        ).all()
+        db.scalars(stmt.order_by(Saida.id_saida.desc()).offset(offset).limit(limit)).all()
     )
     return rows, total
+
+
+def list_pendentes(
+    db: Session,
+    *,
+    sub_base: str,
+    q: Optional[str] = None,
+    identificadores: Optional[Dict[str, str]] = None,
+    todos_do_dia: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> ListagemAvulsos:
+    limit = max(1, min(int(limit or 50), 100))
+    offset = max(0, int(offset or 0))
+    ids = {
+        str(k).strip(): str(v).strip()
+        for k, v in (identificadores or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    term = (q or "").strip()
+    busca = bool(ids or term)
+
+    if not busca and not todos_do_dia:
+        return ListagemAvulsos(
+            rows=[],
+            total=0,
+            modo="idle",
+            mensagem="Digite para buscar os avulsos de hoje.",
+        )
+
+    if busca:
+        filtros_hoje = _aplicar_busca_contem(
+            _filtros_hoje(sub_base),
+            sub_base=sub_base,
+            term=term,
+            ids=ids,
+            db=db,
+        )
+        if filtros_hoje is None:
+            return ListagemAvulsos(
+                rows=[],
+                total=0,
+                modo="busca",
+                mensagem="Nenhum avulso de hoje com esses dados.",
+            )
+        rows, total = _contar_e_listar(
+            db, filtros_hoje, joined_lote=True, limit=limit, offset=offset
+        )
+        if total > 0:
+            return ListagemAvulsos(rows=rows, total=total, modo="busca")
+
+        filtros_outros = _aplicar_busca_contem(
+            _filtro_avulso(sub_base),
+            sub_base=sub_base,
+            term=term,
+            ids=ids,
+            db=db,
+        )
+        if filtros_outros is None:
+            return ListagemAvulsos(
+                rows=[],
+                total=0,
+                modo="busca",
+                mensagem="Nenhum avulso encontrado com esses dados.",
+            )
+        outros_rows, outros_total = _contar_e_listar(
+            db, filtros_outros, joined_lote=False, limit=2, offset=0
+        )
+        if outros_total == 0:
+            return ListagemAvulsos(
+                rows=[],
+                total=0,
+                modo="busca",
+                mensagem="Nenhum avulso encontrado com esses dados.",
+            )
+        if outros_total > 1:
+            return ListagemAvulsos(
+                rows=[],
+                total=outros_total,
+                modo="busca",
+                ambiguo=True,
+                mensagem="Nada encontrado hoje. Em outros dias há vários avulsos com esses dados. Refine a busca ou leia a etiqueta.",
+            )
+        return ListagemAvulsos(rows=outros_rows[:1], total=1, modo="busca")
+
+    rows, total = _contar_e_listar(
+        db, _filtros_hoje(sub_base), joined_lote=True, limit=limit, offset=offset
+    )
+    return ListagemAvulsos(rows=rows, total=total, modo="hoje")
