@@ -224,11 +224,24 @@ def test_origem_amigavel():
 
 
 def test_tipos_novos_e_labels():
-    from avulso_campos_service import format_valor_tipo, normalize_tipo_campo, status_avulso_label, tipo_meta, contexto_meta
+    from avulso_campos_service import (
+        TIPOS_META,
+        format_valor_tipo,
+        normalize_tipo_campo,
+        status_avulso_label,
+        tipo_meta,
+        contexto_meta,
+    )
 
+    ids = {t["id"] for t in TIPOS_META}
+    assert "primeiro_nome" not in ids
+    assert "segundo_nome" not in ids
+    assert "foto" in ids
+    assert "texto" in ids
     assert normalize_tipo_campo("CEP") == "cep"
     assert normalize_tipo_campo("primeiro_nome") == "primeiro_nome"
     assert tipo_meta("cep")["label"] == "CEP"
+    assert tipo_meta("primeiro_nome")["label"] == "Texto"
     assert contexto_meta("COLETA_AVULSO")["label"] == "Coleta"
     assert "Coleta" in contexto_meta("TODOS_AVULSO")["badges"]
     assert format_valor_tipo("cep", "01310100", "CEP") == "01310-100"
