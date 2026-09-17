@@ -221,3 +221,23 @@ def test_origem_amigavel():
     assert origem_amigavel("entrada") == "Entrada"
     assert origem_amigavel(None, excepcional=True) == "Cadastro excepcional na saída"
     assert origem_amigavel("saida_excecao") == "Cadastro excepcional na saída"
+
+
+def test_tipos_novos_e_labels():
+    from avulso_campos_service import format_valor_tipo, normalize_tipo_campo, status_avulso_label, tipo_meta, contexto_meta
+
+    assert normalize_tipo_campo("CEP") == "cep"
+    assert normalize_tipo_campo("primeiro_nome") == "primeiro_nome"
+    assert tipo_meta("cep")["label"] == "CEP"
+    assert contexto_meta("COLETA_AVULSO")["label"] == "Coleta"
+    assert "Coleta" in contexto_meta("TODOS_AVULSO")["badges"]
+    assert format_valor_tipo("cep", "01310100", "CEP") == "01310-100"
+    assert format_valor_tipo("primeiro_nome", "maria", "Primeiro nome") == "Maria"
+    assert format_valor_tipo("segundo_nome", "silva", "Segundo nome") == "Silva"
+    assert format_valor_tipo("telefone", "11988887777", "Telefone") == "(11) 98888-7777"
+    assert status_avulso_label("NA_BASE") == "Na base"
+    assert status_avulso_label("coletado") == "Coletado"
+    with pytest.raises(HTTPException):
+        format_valor_tipo("cep", "123", "CEP")
+    with pytest.raises(HTTPException):
+        format_valor_tipo("primeiro_nome", "Maria2", "Primeiro nome")

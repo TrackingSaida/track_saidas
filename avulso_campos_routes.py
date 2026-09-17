@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -12,15 +12,19 @@ from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, get_current_user
 from avulso_campos_service import (
-    CONTEXTOS_AVULSO,
-    TIPOS_CAMPO,
+    CONTEXTOS_META,
+    TIPOS_META,
     build_label_amigavel,
+    contexto_meta,
     list_pendentes,
+    motoboy_nome_saida,
     normalize_contexto_avulso,
     normalize_tipo_campo,
     origem_amigavel,
     parse_opcoes_json,
     resolve_campos_ativos,
+    status_avulso_label,
+    tipo_meta,
     valores_por_saida,
     _slug_chave,
 )
@@ -51,9 +55,15 @@ class CampoAvulsoOut(BaseModel):
     id: int
     sub_base: str
     contexto: str
+    contexto_label: str
+    contexto_badges: List[str] = Field(default_factory=list)
     chave: str
     label: str
     tipo: str
+    tipo_label: str
+    tipo_hint: str = ""
+    placeholder: str = ""
+    input_mode: str = "text"
     obrigatorio: bool
     usar_na_identificacao: bool
     exibir_na_selecao: bool
@@ -68,16 +78,18 @@ class AvulsoPendenteOut(BaseModel):
     id_saida: int
     codigo: Optional[str] = None
     status: Optional[str] = None
+    status_label: str = ""
     base: Optional[str] = None
     label: str
     campos: Dict[str, str] = Field(default_factory=dict)
     avulso_lote_id: Optional[int] = None
     avulso_criado_excepcional: bool = False
+    motoboy_id: Optional[int] = None
+    motoboy_nome: Optional[str] = None
 
 
 class AvulsoDetalheOut(AvulsoPendenteOut):
     servico: Optional[str] = None
-    motoboy_id: Optional[int] = None
     timestamp: Optional[datetime] = None
     origem: Optional[str] = None
     origem_label: Optional[str] = None
@@ -97,13 +109,21 @@ def _sub_base(current_user: User) -> str:
 
 
 def _row_to_out(row: AvulsoCampoConfig) -> CampoAvulsoOut:
+    ctx = contexto_meta(row.contexto)
+    tipo = tipo_meta(row.tipo)
     return CampoAvulsoOut(
         id=int(row.id),
         sub_base=row.sub_base,
         contexto=row.contexto,
+        contexto_label=str(ctx.get("label") or row.contexto),
+        contexto_badges=list(ctx.get("badges") or []),
         chave=row.chave,
         label=row.label,
         tipo=row.tipo,
+        tipo_label=str(tipo.get("label") or row.tipo),
+        tipo_hint=str(tipo.get("hint") or ""),
+        placeholder=str(tipo.get("placeholder") or ""),
+        input_mode=str(tipo.get("input_mode") or "text"),
         obrigatorio=bool(row.obrigatorio),
         usar_na_identificacao=bool(row.usar_na_identificacao),
         exibir_na_selecao=bool(row.exibir_na_selecao),
@@ -121,8 +141,8 @@ def meta_campos_avulso(
 ):
     _assert_admin(current_user)
     return {
-        "contextos": sorted(CONTEXTOS_AVULSO),
-        "tipos": sorted(TIPOS_CAMPO),
+        "contextos": CONTEXTOS_META,
+        "tipos": TIPOS_META,
     }
 
 
@@ -251,10 +271,12 @@ def delete_campo_avulso(
 
 def _saida_to_pendente(db: Session, row: Saida, campos_cfg) -> AvulsoPendenteOut:
     vals = valores_por_saida(db, int(row.id_saida))
+    motoboy_nome = motoboy_nome_saida(db, row)
     return AvulsoPendenteOut(
         id_saida=int(row.id_saida),
         codigo=row.codigo,
         status=row.status,
+        status_label=status_avulso_label(row.status),
         base=row.base,
         label=build_label_amigavel(
             row.codigo,
@@ -265,12 +287,16 @@ def _saida_to_pendente(db: Session, row: Saida, campos_cfg) -> AvulsoPendenteOut
         campos=vals,
         avulso_lote_id=int(row.avulso_lote_id) if getattr(row, "avulso_lote_id", None) else None,
         avulso_criado_excepcional=bool(getattr(row, "avulso_criado_excepcional", False)),
+        motoboy_id=int(row.motoboy_id) if getattr(row, "motoboy_id", None) else None,
+        motoboy_nome=motoboy_nome,
     )
 
 
 @router_avulsos.get("/pendentes")
 def get_avulsos_pendentes(
     q: Optional[str] = Query(None),
+    identificadores: Optional[str] = Query(None, description="JSON {chave: valor} para busca contém"),
+    todos_do_dia: bool = Query(False, description="Lista todos os avulsos de coleta/entrada de hoje"),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -280,11 +306,43 @@ def get_avulsos_pendentes(
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = _sub_base(current_user)
-    rows, total = list_pendentes(db, sub_base=sub_base, q=q, limit=limit, offset=offset)
+    ids_map: Dict[str, str] = {}
+    if identificadores and str(identificadores).strip():
+        try:
+            parsed = json.loads(identificadores)
+            if isinstance(parsed, dict):
+                ids_map = {str(k): str(v) for k, v in parsed.items() if str(v).strip()}
+        except Exception:
+            raise HTTPException(422, "identificadores inválidos.")
+    listing = list_pendentes(
+        db,
+        sub_base=sub_base,
+        q=q,
+        identificadores=ids_map,
+        todos_do_dia=bool(todos_do_dia),
+        limit=limit,
+        offset=offset,
+    )
     campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto="SAIDA_AVULSO")
+    campos_busca = [
+        {
+            "chave": c.chave,
+            "label": c.label,
+            "tipo": c.tipo,
+            "tipo_label": tipo_meta(c.tipo).get("label"),
+            "placeholder": tipo_meta(c.tipo).get("placeholder") or c.label,
+            "input_mode": tipo_meta(c.tipo).get("input_mode") or "text",
+        }
+        for c in campos_cfg
+        if c.usar_na_identificacao or c.exibir_na_selecao
+    ]
     return {
-        "total": total,
-        "items": [_saida_to_pendente(db, r, campos_cfg) for r in rows],
+        "total": listing.total,
+        "modo": listing.modo,
+        "ambiguo": listing.ambiguo,
+        "mensagem": listing.mensagem,
+        "campos_busca": campos_busca,
+        "items": [_saida_to_pendente(db, r, campos_cfg) for r in listing.rows],
     }
 
 
@@ -312,7 +370,6 @@ def get_avulso_detalhe(
     return AvulsoDetalheOut(
         **base.model_dump(),
         servico=row.servico,
-        motoboy_id=row.motoboy_id,
         timestamp=row.timestamp,
         origem=origem or ("saida_excecao" if excepcional else None),
         origem_label=origem_amigavel(origem, excepcional=excepcional),
