@@ -2786,6 +2786,28 @@ def liberar_nova_tentativa(
         bloqueio["ausencias_total"],
         getattr(current_user, "id", None),
     )
+    if obj.motoboy_id:
+        try:
+            from push_notification_service import send_to_motoboy
+
+            codigo = (getattr(obj, "codigo", None) or "").strip() or str(obj.id_saida)
+            send_to_motoboy(
+                db,
+                motoboy_id=int(obj.motoboy_id),
+                sub_base=sub_base,
+                tipo="liberacao_ausencia",
+                title="Nova tentativa liberada",
+                body=f"Pacote {codigo}: a base liberou uma nova tentativa de entrega.",
+                data={"id_saida": obj.id_saida, "codigo": codigo},
+                chave_dedupe=f"liberacao:{obj.id_saida}:{bloqueio['ausencias_total']}",
+            )
+            db.commit()
+        except Exception:
+            logger.exception(
+                "push_liberacao_ausencia_failed id_saida=%s motoboy_id=%s",
+                obj.id_saida,
+                obj.motoboy_id,
+            )
     return {
         "ok": True,
         "id_saida": obj.id_saida,

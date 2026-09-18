@@ -3069,10 +3069,11 @@ def finalizar_lote(
             if status_novo == STATUS_AUSENTE:
                 try:
                     from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
-                    from push_notification_service import send_to_motoboy
+                    from push_notification_service import send_to_motoboy, send_to_staff_sub_base
 
                     bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
                     if bloqueado and total >= 3:
+                        codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
                         send_to_motoboy(
                             db,
                             motoboy_id=int(user.motoboy_id),
@@ -3080,8 +3081,17 @@ def finalizar_lote(
                             tipo="bloqueio_ausencia",
                             title="Pacote bloqueado",
                             body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
-                            data={"id_saida": id_saida},
+                            data={"id_saida": id_saida, "codigo": codigo},
                             chave_dedupe=str(id_saida),
+                        )
+                        send_to_staff_sub_base(
+                            db,
+                            sub_base=user.sub_base,
+                            tipo="bloqueio_ausencia",
+                            title="Pacote bloqueado por ausência",
+                            body=f"Pacote {codigo} bloqueado por limite de ausências.",
+                            data={"id_saida": id_saida, "codigo": codigo},
+                            chave_dedupe=f"staff:{id_saida}",
                         )
                         db.commit()
                 except Exception:
@@ -3399,10 +3409,11 @@ def marcar_ausente(
     db.refresh(s)
     try:
         from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
-        from push_notification_service import send_to_motoboy
+        from push_notification_service import send_to_motoboy, send_to_staff_sub_base
 
         bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
         if bloqueado and total >= 3:
+            codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
             send_to_motoboy(
                 db,
                 motoboy_id=int(user.motoboy_id),
@@ -3410,8 +3421,17 @@ def marcar_ausente(
                 tipo="bloqueio_ausencia",
                 title="Pacote bloqueado",
                 body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
-                data={"id_saida": id_saida},
+                data={"id_saida": id_saida, "codigo": codigo},
                 chave_dedupe=str(id_saida),
+            )
+            send_to_staff_sub_base(
+                db,
+                sub_base=user.sub_base,
+                tipo="bloqueio_ausencia",
+                title="Pacote bloqueado por ausência",
+                body=f"Pacote {codigo} bloqueado por limite de ausências.",
+                data={"id_saida": id_saida, "codigo": codigo},
+                chave_dedupe=f"staff:{id_saida}",
             )
             db.commit()
     except Exception:
