@@ -277,7 +277,35 @@ Push remoto para motoboy e staff (Expo Push API). Depende de tokens registrados 
 | Coletas pendentes | `POST /api/internal/notificar-coletas-pendentes` | Alerta o staff, de hora em hora entre 19h e 23h BRT, sobre bases programadas sem lançamento |
 | Entrada sem saída | `POST /api/internal/notificar-entrada-sem-saida` | Alerta staff (roles 0/1/2) quando há pacotes do dia ainda na base; janela/intervalo só no Cron Render |
 
-Outros pushes (fechamento, aviso da base, bloqueio por ausência, reconferência) disparam **na hora** no request da API — não precisam de cron.
+Outros pushes (fechamento, aviso da base, bloqueio por ausência, liberação de nova tentativa, reconferência) disparam **na hora** no request da API — não precisam de cron.
+
+### Avisos da Base (admin)
+
+Endpoints sob `/api/avisos` (JWT admin/operação, escopo `sub_base`):
+
+| Método | Endpoint | Comportamento |
+|--------|----------|---------------|
+| `POST` | `/api/avisos` | Cria aviso, grava destinos e dispara push Expo aos motoboys ativos |
+| `GET` | `/api/avisos` | Lista histórico da `sub_base` (inclui `mensagem`) |
+| `GET` | `/api/avisos/{id}` | Detalhe do aviso (mensagem, prioridade, `motoboy_ids`, contagem) |
+| `PATCH` | `/api/avisos/{id}` | Edita título/mensagem/prioridade **sem** reenviar push |
+| `POST` | `/api/avisos/{id}/reenviar` | Cria **novo** aviso com o texto já salvo; push só para motoboys ainda ativos do original |
+
+Regras:
+
+- Mensagem: texto puro, `max_length` 1000; URLs `http`/`https` são permitidas como texto (clientes fazem autolink). HTML livre não é interpretado no backend.
+- Editar (`PATCH`) atualiza o registro da base e **não** notifica de novo.
+- Reenviar cria linha nova no histórico; rate limit de criação (20/h) permanece.
+- Motoboys inativos no momento do reenvio ficam de fora.
+
+### Pushes imediatos extras (ausência)
+
+| Tipo (`tipo`) | Destinatário | Quando |
+|---------------|--------------|--------|
+| `bloqueio_ausencia` | Motoboy **e** staff da `sub_base` | Pacote atinge limite de ausências e fica bloqueado |
+| `liberacao_ausencia` | Motoboy do pacote | Operação libera nova tentativa (`ALWAYS_SEND`, não depende de preferência) |
+
+Falha no Expo é só logada: o fluxo de ausência/liberação **não** falha por causa do push. Staff sem app Expo não vê o alerta até existir caixa web (fora deste escopo).
 
 ### Pré-requisitos
 
