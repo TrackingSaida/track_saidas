@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, get_current_user
 from db import get_db
-from envio_proprio_service import criar_envio_proprio, pdf_from_envio
+from envio_proprio_service import criar_envio_proprio, pdf_from_envio, require_owner_tipo_base
 from models import BasePreco, BaseSellerDados, EnvioProprio, User
 from base import _resolve_user_sub_base
 
@@ -152,6 +152,7 @@ def listar_remetentes(
 ):
     """Sellers da sub_base autenticada com endereço estruturado (tenant-safe)."""
     _assert_operacao_etiqueta(current_user)
+    require_owner_tipo_base(db, current_user)
     sub_base = _resolve_user_sub_base(db, current_user)
     bases = list(
         db.scalars(
@@ -202,6 +203,8 @@ def criar_envio(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    _assert_operacao_etiqueta(current_user)
+    require_owner_tipo_base(db, current_user)
     payload: Dict[str, Any] = body.model_dump()
     if body.remetente:
         payload["remetente"] = body.remetente.model_dump()
@@ -237,6 +240,7 @@ def reimprimir_envio_por_codigo(
     from envio_proprio_service import get_envio_by_codigo_global, is_codigo_rte
 
     _assert_operacao_etiqueta(current_user)
+    require_owner_tipo_base(db, current_user)
     sub_base = _resolve_user_sub_base(db, current_user)
     cod = (codigo or "").strip().upper()
     if not is_codigo_rte(cod):
@@ -280,6 +284,7 @@ def get_envio(
     current_user: User = Depends(get_current_user),
 ):
     _assert_operacao_etiqueta(current_user)
+    require_owner_tipo_base(db, current_user)
     sub_base = _resolve_user_sub_base(db, current_user)
     envio = db.get(EnvioProprio, id_envio)
     if not envio or (envio.sub_base or "").strip() != sub_base:
@@ -325,6 +330,7 @@ def get_envio_pdf(
     current_user: User = Depends(get_current_user),
 ):
     _assert_operacao_etiqueta(current_user)
+    require_owner_tipo_base(db, current_user)
     sub_base = _resolve_user_sub_base(db, current_user)
     envio = db.get(EnvioProprio, id_envio)
     if not envio or (envio.sub_base or "").strip() != sub_base:

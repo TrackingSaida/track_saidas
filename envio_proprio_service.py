@@ -17,6 +17,8 @@ from etiqueta_identidade_service import resolver_nome_exibicao, resolver_slogan
 from etiqueta_pdf_service import gerar_etiqueta
 from models import BasePreco, BaseSellerDados, EnvioProprio, Owner, Saida, SaidaDetail, SaidaHistorico, User
 
+MSG_SOMENTE_OWNER_BASE = "Disponível apenas para Owner tipo Base."
+
 logger = logging.getLogger(__name__)
 OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -26,6 +28,20 @@ RTE_CODIGO_RE = re.compile(r"^RTE[0-9]{11,}$")
 
 def is_codigo_rte(codigo: Optional[str]) -> bool:
     return bool(RTE_CODIGO_RE.match((codigo or "").strip().upper()))
+
+
+def require_owner_tipo_base(db: Session, current_user: User) -> Owner:
+    """Envio próprio / Gerar Etiqueta só para Owner tipo Base."""
+    sub_base = (getattr(current_user, "sub_base", None) or "").strip()
+    if not sub_base:
+        raise HTTPException(403, "Usuário sem sub_base definida.")
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+    tipo = (getattr(owner, "tipo_owner", None) or "").strip().lower()
+    if tipo != "base":
+        raise HTTPException(403, MSG_SOMENTE_OWNER_BASE)
+    return owner
 
 
 def _hoje_operacional() -> datetime:
@@ -95,16 +111,12 @@ def criar_envio_proprio(
     current_user: User,
     payload: Dict[str, Any],
 ) -> Tuple[EnvioProprio, Saida, bytes]:
-    sub_base = (getattr(current_user, "sub_base", None) or "").strip()
-    if not sub_base:
-        raise HTTPException(403, "Usuário sem sub_base definida.")
     role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2):
         raise HTTPException(403, "Sem permissão para criar envio próprio.")
 
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    if not owner:
-        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+    owner = require_owner_tipo_base(db, current_user)
+    sub_base = (getattr(owner, "sub_base", None) or "").strip()
 
     origem = (payload.get("origem_remetente") or "").strip().lower()
     if origem not in ("seller", "manual"):

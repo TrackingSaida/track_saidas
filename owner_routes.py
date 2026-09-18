@@ -335,11 +335,13 @@ def create_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    email = body.email or current_user.email
+    email = (body.email or getattr(current_user, "email", None) or "").strip() or None
     username = body.username or current_user.username
 
     if not body.sub_base:
         raise HTTPException(422, "sub_base é obrigatória.")
+    if not email:
+        raise HTTPException(422, "E-mail é obrigatório no cadastro do Owner.")
 
     exists = db.scalar(select(Owner).where(Owner.sub_base == body.sub_base))
     if exists:

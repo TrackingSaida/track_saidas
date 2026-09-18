@@ -195,3 +195,40 @@ def test_pdf_envio_proprio_nao_explode_sem_logo():
     assert isinstance(pdf, (bytes, bytearray))
     assert pdf[:4] == b"%PDF"
     assert len(pdf) > 500
+
+
+def test_require_owner_tipo_base_rejeita_subbase():
+    from fastapi import HTTPException
+    from envio_proprio_service import MSG_SOMENTE_OWNER_BASE, require_owner_tipo_base
+
+    db = MagicMock()
+    db.scalar.return_value = SimpleNamespace(sub_base="sb", tipo_owner="subbase")
+    user = SimpleNamespace(sub_base="sb", role=1)
+    try:
+        require_owner_tipo_base(db, user)
+        raise AssertionError("esperava 403")
+    except HTTPException as e:
+        assert e.status_code == 403
+        assert e.detail == MSG_SOMENTE_OWNER_BASE
+
+
+def test_require_owner_tipo_base_aceita_base():
+    from envio_proprio_service import require_owner_tipo_base
+
+    db = MagicMock()
+    owner = SimpleNamespace(sub_base="sb", tipo_owner="base")
+    db.scalar.return_value = owner
+    user = SimpleNamespace(sub_base="sb", role=0)
+    assert require_owner_tipo_base(db, user) is owner
+
+
+def test_require_owner_tipo_base_sem_sub_base():
+    from fastapi import HTTPException
+    from envio_proprio_service import require_owner_tipo_base
+
+    db = MagicMock()
+    try:
+        require_owner_tipo_base(db, SimpleNamespace(sub_base="", role=1))
+        raise AssertionError("esperava 403")
+    except HTTPException as e:
+        assert e.status_code == 403
