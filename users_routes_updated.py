@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from datetime import date
 from typing import Optional, List, Any
 import re
@@ -105,7 +104,7 @@ class UserCreate(BaseModel):
 
 class UserOut(BaseModel):
     id: int
-    email: EmailStr
+    email: Optional[EmailStr] = None
     username: str
     contato: str
 
@@ -133,7 +132,7 @@ class AdminUserUpdate(BaseModel):
     sobrenome: Optional[str] = None
     username: Optional[str] = None
     contato: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     data_nascimento: Optional[date] = None
     status: Optional[bool] = None
     role: Optional[int] = None  # 1, 2, 3 ou 4
@@ -177,7 +176,7 @@ class UserUpdatePayload(BaseModel):
     nome: Optional[str] = None
     sobrenome: Optional[str] = None
     contato: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -192,6 +191,30 @@ class PasswordChangePayload(BaseModel):
 # ============================================================
 # Helpers
 # ============================================================
+
+
+def _normalize_optional_email(raw: Optional[str]) -> Optional[str]:
+    """"" / whitespace → NULL. Valida formato só quando informado."""
+    email = (raw or "").strip() or None
+    if not email:
+        return None
+    if "@" not in email or "." not in email.split("@", 1)[-1]:
+        raise HTTPException(422, "E-mail inválido.")
+    return email
+
+
+def _assert_email_unique(
+    db: Session,
+    email: Optional[str],
+    exclude_user_id: Optional[int] = None,
+) -> None:
+    if not email:
+        return
+    stmt = select(User.id).where(User.email == email)
+    if exclude_user_id is not None:
+        stmt = stmt.where(User.id != exclude_user_id)
+    if db.scalar(stmt.limit(1)) is not None:
+        raise HTTPException(409, "Email já existe.")
 
 
 def _validate_data_nascimento(value: Optional[date]) -> Optional[date]:
@@ -400,9 +423,9 @@ def _user_to_out(user: User) -> UserOut:
         nome = getattr(user, "nome", None)
         sobrenome = getattr(user, "sobrenome", None)
 
-        email_val = (user.email or "").strip()
-        if not _is_email_safe_for_display(email_val):
-            email_val = _placeholder_email_from_nome_sobrenome(nome, sobrenome, sub_base) or _placeholder_email(user_id, sub_base)
+        email_val = (user.email or "").strip() or None
+        if email_val and not _is_email_safe_for_display(email_val):
+            email_val = None
 
         username_val = (user.username or "").strip()
         if not username_val or username_val.startswith("sem_username"):
@@ -441,7 +464,7 @@ def _user_to_out(user: User) -> UserOut:
         sobrenome = getattr(user, "sobrenome", None)
         return UserOut(
             id=user_id,
-            email=_placeholder_email_from_nome_sobrenome(nome, sobrenome, sub_base) or _placeholder_email(user_id, sub_base),
+            email=None,
             username=_placeholder_username_from_nome(nome, sub_base) or "—",
             contato="—",
             status=getattr(user, "status", True),
@@ -481,19 +504,13 @@ def create_user(
     if not owner.ativo:
         raise HTTPException(403, "Owner desta sub_base está inativo.")
 
-    _ts = str(int(time.time() * 1000))
-
-    # Para role != 4 (não-motoboy): username e e-mail obrigatórios; senha opcional (usa padrão quando vazia)
+    # Staff (role != 4): username obrigatório; e-mail opcional. Motoboy: e-mail vazio → NULL.
     if body.role != 4:
         u = (body.username or "").strip()
-        e = (body.email or "").strip()
+        e = _normalize_optional_email(body.email)
         p = (body.password or "").strip()
         if not u:
             raise HTTPException(422, "Username é obrigatório para este perfil.")
-        if not e:
-            raise HTTPException(422, "E-mail é obrigatório para este perfil.")
-        if "@" not in e or "." not in e.split("@", 1)[-1]:
-            raise HTTPException(422, "E-mail inválido.")
         if p and len(p) < 4:
             raise HTTPException(422, "Senha deve ter no mínimo 4 caracteres para este perfil.")
         username_val = u
@@ -503,13 +520,12 @@ def create_user(
         else:
             password_hash_val = get_password_hash(DEFAULT_PASSWORD)
     else:
-        # Role 4 (motoboy): placeholders permitidos
         username_manual = (body.username or "").strip()
         if username_manual:
             username_val = username_manual
         else:
             username_val = _generate_unique_username_for_sub_base(db, sub_base, body.nome, body.sobrenome)
-        email_val = (body.email or "").strip() or _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or f"sem-email-{_ts}@{_sub_base_domain(sub_base)}.com"
+        email_val = _normalize_optional_email(body.email)
         if (body.password or "").strip():
             password_hash_val = get_password_hash((body.password or "").strip())
         else:
@@ -517,11 +533,7 @@ def create_user(
 
     username_val = (username_val or "").strip()
 
-    # Emails e usernames únicos
-    email_raw = (body.email or "").strip()
-    if email_raw:
-        if db.scalar(select(User).where(User.email == email_raw)):
-            raise HTTPException(409, "Email já existe.")
+    _assert_email_unique(db, email_val)
 
     # Username único POR sub_base (permite mesmo username em sub_bases diferentes)
     username_check = (username_val or "").strip()
@@ -566,10 +578,6 @@ def create_user(
 
         db.add(new_user)
         db.flush()
-
-        # Se email era placeholder, gravar formato definitivo (nome-sobrenome@subbase.com ou fallback)
-        if not (body.email or "").strip():
-            new_user.email = _placeholder_email_from_nome_sobrenome(body.nome, body.sobrenome, sub_base) or _placeholder_email(new_user.id, sub_base)
 
         if body.role == 4:
             # Defaults oficiais do Owner (Políticas gerais); body sobrescreve se enviado
@@ -810,7 +818,7 @@ def list_users(
             sobrenome = getattr(u, "sobrenome", None)
             out.append(UserOut(
                 id=uid,
-                email=_placeholder_email_from_nome_sobrenome(nome, sobrenome, sub_base) or _placeholder_email(uid, sub_base),
+                email=None,
                 username=_placeholder_username_from_nome(nome) or "—",
                 contato="—",
                 status=getattr(u, "status", True),
@@ -1008,6 +1016,11 @@ def admin_update_user(
         updates["sobrenome"] = normalize_person_name(updates.get("sobrenome"))
     if "data_nascimento" in updates:
         updates["data_nascimento"] = _validate_data_nascimento(updates.get("data_nascimento"))
+
+    if "email" in updates:
+        email_val = _normalize_optional_email(updates.get("email"))
+        _assert_email_unique(db, email_val, exclude_user_id=user.id)
+        updates["email"] = email_val
 
     for field, value in updates.items():
         if field in user_fields:
@@ -1229,15 +1242,10 @@ def update_current_user(
             raise HTTPException(409, "Contato já em uso.")
         db_user.contato = contato
 
-    if payload.email is not None:
-        email = payload.email.strip()
-        if not email:
-            raise HTTPException(400, "Email não pode ser vazio.")
-
-        exists = db.query(User).filter(User.email == email, User.id != db_user.id).first()
-        if exists:
-            raise HTTPException(409, "Email já em uso.")
-        db_user.email = email
+    if "email" in payload.model_fields_set:
+        email_val = _normalize_optional_email(payload.email)
+        _assert_email_unique(db, email_val, exclude_user_id=db_user.id)
+        db_user.email = email_val
 
     db.commit()
     db.refresh(db_user)

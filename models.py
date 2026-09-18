@@ -31,7 +31,7 @@ class User(Base):
     id = Column(BigInteger, primary_key=True)
 
     # credenciais/identificação
-    email = Column(Text, nullable=False)            # e-mail do usuário
+    email = Column(Text, nullable=True)             # e-mail opcional; login por username/contato
     password_hash = Column(Text, nullable=False)    # SENHA HASH (única senha usada no sistema)
     username = Column(Text, nullable=False)         # pode ser o mesmo do "username_entregador"
     contato = Column(Text, nullable=False)          # telefone/celular
