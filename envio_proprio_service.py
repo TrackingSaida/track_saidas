@@ -31,7 +31,7 @@ def is_codigo_rte(codigo: Optional[str]) -> bool:
 
 
 def require_owner_tipo_base(db: Session, current_user: User) -> Owner:
-    """Envio próprio / Gerar Etiqueta só para Owner tipo Base."""
+    """Envio próprio só para Owner tipo Base. Gerar etiqueta de código existente não usa este gate."""
     sub_base = (getattr(current_user, "sub_base", None) or "").strip()
     if not sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida.")

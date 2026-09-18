@@ -70,8 +70,6 @@ MENU_DEFS = [
                 "href": "tracking-etiquetas.html",
                 "roles": [0, 1, 2, 3],
                 "group": "etiquetas",
-                "base_only": True,
-                "base_only_roles": [1, 2, 3],
             },
         ]
     },
