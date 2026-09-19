@@ -222,7 +222,12 @@ def _send_aviso_pushes(
                 tipo=tipo,
                 title=title,
                 body=body,
-                data={"aviso_id": aviso.id, "prioridade": aviso.prioridade},
+                data={
+                    "aviso_id": str(aviso.id),
+                    "prioridade": aviso.prioridade,
+                    "titulo": aviso.titulo or "",
+                    "mensagem": aviso.mensagem or "",
+                },
             )
         except Exception:
             pass
