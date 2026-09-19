@@ -14,6 +14,7 @@ from auth import _coerce_role_int, get_current_user
 from avulso_campos_service import (
     CONTEXTOS_META,
     TIPOS_META,
+    TIPOS_RETIRADOS,
     build_label_amigavel,
     contexto_meta,
     list_pendentes,
@@ -190,6 +191,8 @@ def create_campo_avulso(
     sub_base = _sub_base(current_user)
     ctx = normalize_contexto_avulso(body.contexto)
     tipo = normalize_tipo_campo(body.tipo)
+    if tipo in TIPOS_RETIRADOS:
+        raise HTTPException(422, "A foto do avulso fica na política do motoboy, não como tipo de campo.")
     chave = _slug_chave(body.chave or body.label)
     existing = db.scalar(
         select(AvulsoCampoConfig).where(
@@ -236,7 +239,10 @@ def update_campo_avulso(
         raise HTTPException(404, "Campo não encontrado.")
     row.contexto = normalize_contexto_avulso(body.contexto)
     row.label = body.label.strip()
-    row.tipo = normalize_tipo_campo(body.tipo)
+    tipo = normalize_tipo_campo(body.tipo)
+    if tipo in TIPOS_RETIRADOS and str(row.tipo or "").strip().lower() != tipo:
+        raise HTTPException(422, "A foto do avulso fica na política do motoboy, não como tipo de campo.")
+    row.tipo = tipo
     if body.chave:
         row.chave = _slug_chave(body.chave)
     row.obrigatorio = bool(body.obrigatorio)

@@ -78,17 +78,12 @@ TIPOS_META = [
         "placeholder": "Selecione",
         "input_mode": "text",
     },
-    {
-        "id": "foto",
-        "label": "Foto",
-        "hint": "Imagem de referência no lançamento do avulso.",
-        "placeholder": "",
-        "input_mode": "text",
-    },
 ]
 TIPOS_LEGADOS = {"primeiro_nome", "segundo_nome"}
+# Foto do avulso fica na política do motoboy, não como tipo de campo.
+TIPOS_RETIRADOS = {"foto"}
 CONTEXTOS_AVULSO = {c["id"] for c in CONTEXTOS_META}
-TIPOS_CAMPO = {t["id"] for t in TIPOS_META} | TIPOS_LEGADOS
+TIPOS_CAMPO = {t["id"] for t in TIPOS_META} | TIPOS_LEGADOS | TIPOS_RETIRADOS
 ORIGENS_LOTE = {"coleta", "entrada", "saida", "saida_excecao"}
 ORIGEM_LABELS = {
     "coleta": "Coleta",
@@ -278,7 +273,7 @@ def resolve_campos_ativos(
             continue
         by_chave[row.chave] = row
     ordered = sorted(by_chave.values(), key=lambda r: (int(r.ordem or 0), int(r.id or 0)))
-    return ordered
+    return [r for r in ordered if str(r.tipo or "").strip().lower() not in TIPOS_RETIRADOS]
 
 
 def validate_campos_payload(
