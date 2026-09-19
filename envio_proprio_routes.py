@@ -9,13 +9,19 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, get_current_user
 from db import get_db
-from envio_proprio_service import criar_envio_proprio, pdf_from_envio, require_owner_tipo_base
-from models import BasePreco, BaseSellerDados, EnvioProprio, User
+from envio_proprio_service import (
+    cancelar_envio_proprio,
+    criar_envio_proprio,
+    pdf_from_envio,
+    require_owner_tipo_base,
+    status_etiqueta_amigavel,
+)
+from models import BasePreco, BaseSellerDados, EnvioProprio, Saida, User
 from base import _resolve_user_sub_base
 
 logger = logging.getLogger(__name__)
@@ -197,6 +203,91 @@ def listar_remetentes(
     return out
 
 
+class EnvioProprioListItemOut(BaseModel):
+    id_envio: int
+    codigo: str
+    id_saida: Optional[int] = None
+    id_base: Optional[int] = None
+    origem_emissao: Optional[str] = None
+    dest_nome: Optional[str] = None
+    dest_cep: Optional[str] = None
+    dest_cidade: Optional[str] = None
+    status: Optional[str] = None
+    status_label: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@router.get("/envios-proprios")
+def listar_envios_proprios(
+    page: int = 1,
+    per_page: int = 20,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _assert_operacao_etiqueta(current_user)
+    require_owner_tipo_base(db, current_user)
+    sub_base = _resolve_user_sub_base(db, current_user)
+    page = max(1, int(page or 1))
+    per_page = min(100, max(1, int(per_page or 20)))
+    q = (
+        select(EnvioProprio)
+        .where(EnvioProprio.sub_base == sub_base)
+        .order_by(EnvioProprio.created_at.desc())
+    )
+    total = int(
+        db.scalar(
+            select(func.count(EnvioProprio.id_envio)).where(EnvioProprio.sub_base == sub_base)
+        )
+        or 0
+    )
+    rows = list(db.scalars(q.offset((page - 1) * per_page).limit(per_page)).all())
+    saida_ids = [int(r.id_saida) for r in rows if r.id_saida]
+    saidas = {}
+    if saida_ids:
+        for s in db.scalars(select(Saida).where(Saida.id_saida.in_(saida_ids))).all():
+            saidas[int(s.id_saida)] = s
+    items = []
+    for envio in rows:
+        saida = saidas.get(int(envio.id_saida)) if envio.id_saida else None
+        st = getattr(saida, "status", None) if saida else None
+        items.append(
+            EnvioProprioListItemOut(
+                id_envio=int(envio.id_envio),
+                codigo=envio.codigo,
+                id_saida=envio.id_saida,
+                id_base=envio.id_base,
+                origem_emissao=getattr(envio, "origem_emissao", None),
+                dest_nome=envio.dest_nome,
+                dest_cep=envio.dest_cep,
+                dest_cidade=envio.dest_cidade,
+                status=st,
+                status_label=status_etiqueta_amigavel(st),
+                created_at=envio.created_at.isoformat() if envio.created_at else None,
+            )
+        )
+    return {"total": total, "page": page, "per_page": per_page, "items": items}
+
+
+@router.post("/envios-proprios/{id_envio}/cancelar")
+def cancelar_envio_staff(
+    id_envio: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _assert_operacao_etiqueta(current_user)
+    require_owner_tipo_base(db, current_user)
+    sub_base = _resolve_user_sub_base(db, current_user)
+    envio = db.get(EnvioProprio, id_envio)
+    if not envio or (envio.sub_base or "").strip() != sub_base:
+        raise HTTPException(404, "Envio não encontrado.")
+    cancelar_envio_proprio(
+        db,
+        envio,
+        cancelado_por=getattr(current_user, "username", None) or str(current_user.id),
+    )
+    return {"ok": True, "id_envio": id_envio, "status_label": "Cancelada"}
+
+
 @router.post("/envios-proprios")
 def criar_envio(
     body: EnvioProprioCreateIn,
@@ -211,17 +302,25 @@ def criar_envio(
     if body.destinatario:
         payload["destinatario"] = body.destinatario.model_dump()
 
-    envio, saida, pdf = criar_envio_proprio(db, current_user=current_user, payload=payload)
+    envio, saida, pdf, cobertura_aviso = criar_envio_proprio(
+        db, current_user=current_user, payload=payload, origem_emissao="staff"
+    )
     filename = f"etq-envio-{envio.codigo}.pdf"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Envio-Id": str(envio.id_envio),
+        "X-Codigo": envio.codigo,
+        "X-Id-Saida": str(saida.id_saida),
+    }
+    if cobertura_aviso:
+        headers["X-Cobertura-Aviso"] = cobertura_aviso
+        headers["Access-Control-Expose-Headers"] = (
+            "X-Envio-Id, X-Codigo, X-Id-Saida, X-Cobertura-Aviso, Content-Disposition"
+        )
     return Response(
         content=pdf,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Envio-Id": str(envio.id_envio),
-            "X-Codigo": envio.codigo,
-            "X-Id-Saida": str(saida.id_saida),
-        },
+        headers=headers,
     )
 
 

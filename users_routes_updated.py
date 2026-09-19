@@ -36,9 +36,27 @@ def _deny_non_root_managing_root(current_user: User, target_role: Optional[int])
         raise HTTPException(403, "Não é permitido gerenciar usuário root.")
 
 
+ALLOWED_ASSIGNABLE_ROLES = (1, 2, 3, 4)
+
+
 def _deny_non_root_assigning_root(current_user: User, new_role: Optional[int]) -> None:
     if new_role == 0 and not _caller_is_root(current_user):
         raise HTTPException(403, "Não é permitido criar ou promover usuário root.")
+
+
+def _require_admin_caller(current_user: User) -> None:
+    if getattr(current_user, "role", None) not in (0, 1):
+        raise HTTPException(403, "Acesso negado.")
+
+
+def _require_assignable_role(role: Optional[int]) -> int:
+    try:
+        role_int = int(role) if role is not None else 2
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Perfil inválido.")
+    if role_int not in ALLOWED_ASSIGNABLE_ROLES:
+        raise HTTPException(422, "Perfil inválido.")
+    return role_int
 
 
 # ============================================================
@@ -491,6 +509,8 @@ def create_user(
 ):
     """Cria usuário herdando sub_base e setando coletador baseado no role. Role 4 = Motoboy."""
 
+    _require_admin_caller(current_user)
+    body.role = _require_assignable_role(body.role)
     _deny_non_root_assigning_root(current_user, body.role)
 
     sub_base = current_user.sub_base
@@ -971,6 +991,7 @@ def admin_update_user(
 
     # ROLE → define COLETADOR (legado)
     if "role" in updates:
+        updates["role"] = _require_assignable_role(updates["role"])
         _deny_non_root_assigning_root(current_user, updates["role"])
         user.role = updates["role"]
         user.coletador = (updates["role"] == 3)

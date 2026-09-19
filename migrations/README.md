@@ -1,5 +1,13 @@
 # Migrações
 
+## portal_seller_etiquetas.sql
+
+Obrigatória para o Portal do Seller (PRD-001): área de cobertura, auditoria de envio próprio, limites e `seller_portal_access`.
+
+```bash
+psql "$DATABASE_URL" -f migrations/portal_seller_etiquetas.sql
+```
+
 ## coleta_flexivel.sql
 
 Obrigatória antes do deploy da coleta flexível. Adiciona agenda por base, calendário de

@@ -3,19 +3,20 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int
 from etiqueta_identidade_service import resolver_contato, resolver_nome_exibicao, resolver_slogan
 from etiqueta_pdf_service import gerar_etiqueta
 from models import BasePreco, BaseSellerDados, EnvioProprio, Owner, Saida, SaidaDetail, SaidaHistorico, User
+from cobertura_cep_service import avaliar_cobertura
 
 MSG_SOMENTE_OWNER_BASE = "Disponível apenas para Owner tipo Base."
 
@@ -23,7 +24,9 @@ logger = logging.getLogger(__name__)
 OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
 
 STATUS_ETIQUETADO = "ETIQUETADO"
+STATUS_CANCELADO = "cancelado"
 RTE_CODIGO_RE = re.compile(r"^RTE[0-9]{11,}$")
+MSG_CEP_FORA_COBERTURA = "CEP fora da área de atendimento."
 
 
 def is_codigo_rte(codigo: Optional[str]) -> bool:
@@ -108,18 +111,47 @@ def _party_dict_from_envio(envio: EnvioProprio, kind: str) -> Dict[str, Any]:
 def criar_envio_proprio(
     db: Session,
     *,
-    current_user: User,
+    current_user: Optional[User] = None,
     payload: Dict[str, Any],
-) -> Tuple[EnvioProprio, Saida, bytes]:
-    role = _coerce_role_int(getattr(current_user, "role", None))
-    if role not in (0, 1, 2):
-        raise HTTPException(403, "Sem permissão para criar envio próprio.")
+    origem_emissao: str = "staff",
+    force_id_base: Optional[int] = None,
+    sub_base_override: Optional[str] = None,
+    criado_por_user_id: Optional[int] = None,
+) -> Tuple[EnvioProprio, Saida, bytes, Optional[str]]:
+    origem_emissao = (origem_emissao or "staff").strip().lower()
+    if origem_emissao not in ("staff", "portal"):
+        origem_emissao = "staff"
 
-    owner = require_owner_tipo_base(db, current_user)
-    sub_base = (getattr(owner, "sub_base", None) or "").strip()
+    if origem_emissao == "staff":
+        if current_user is None:
+            raise HTTPException(401, "Não autenticado")
+        role = _coerce_role_int(getattr(current_user, "role", None))
+        if role not in (0, 1, 2):
+            raise HTTPException(403, "Sem permissão para criar envio próprio.")
+        owner = require_owner_tipo_base(db, current_user)
+        sub_base = (getattr(owner, "sub_base", None) or "").strip()
+        username = getattr(current_user, "username", None)
+        user_id = getattr(current_user, "id", None)
+    else:
+        sub_base = (sub_base_override or "").strip()
+        if not sub_base:
+            raise HTTPException(403, "Usuário sem sub_base definida.")
+        owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        if not owner:
+            raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+        tipo = (getattr(owner, "tipo_owner", None) or "").strip().lower()
+        if tipo != "base":
+            raise HTTPException(403, MSG_SOMENTE_OWNER_BASE)
+        username = None
+        user_id = criado_por_user_id
 
     origem = (payload.get("origem_remetente") or "").strip().lower()
-    if origem not in ("seller", "manual"):
+    if origem_emissao == "portal":
+        origem = "seller"
+        if force_id_base is None:
+            raise HTTPException(422, "id_base é obrigatório.")
+        payload["id_base"] = int(force_id_base)
+    elif origem not in ("seller", "manual"):
         raise HTTPException(422, "origem_remetente deve ser 'seller' ou 'manual'.")
 
     id_base = payload.get("id_base")
@@ -183,6 +215,16 @@ def criar_envio_proprio(
         "complemento": (dest_in.get("complemento") or "").strip() or None,
     }
 
+    coberto, _prefixos = avaliar_cobertura(db, sub_base, destinatario.get("cep"))
+    cobertura_aviso: Optional[str] = None
+    if not coberto:
+        if origem_emissao == "portal":
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "CEP_FORA_COBERTURA", "message": MSG_CEP_FORA_COBERTURA},
+            )
+        cobertura_aviso = MSG_CEP_FORA_COBERTURA
+
     peso_kg = payload.get("peso_kg")
     if peso_kg is not None:
         try:
@@ -199,7 +241,7 @@ def criar_envio_proprio(
 
     saida = Saida(
         sub_base=sub_base,
-        username=getattr(current_user, "username", None),
+        username=username,
         base=(remetente.get("nome") or "").strip() or None,
         codigo=codigo,
         servico="Avulso",
@@ -243,7 +285,8 @@ def criar_envio_proprio(
         owner_nome_exibicao=nome_exib,
         owner_slogan=slogan or None,
         logo_object_key_used=logo_key,
-        criado_por_user_id=getattr(current_user, "id", None),
+        criado_por_user_id=user_id,
+        origem_emissao=origem_emissao,
     )
     db.add(envio)
 
@@ -269,7 +312,7 @@ def criar_envio_proprio(
             id_saida=saida.id_saida,
             evento="etiqueta_gerada",
             status_novo=STATUS_ETIQUETADO,
-            user_id=getattr(current_user, "id", None),
+            user_id=user_id,
         )
     )
     db.flush()
@@ -293,7 +336,7 @@ def criar_envio_proprio(
     db.commit()
     db.refresh(envio)
     db.refresh(saida)
-    return envio, saida, pdf
+    return envio, saida, pdf, cobertura_aviso
 
 
 def pdf_from_envio(db: Session, envio: EnvioProprio) -> bytes:
@@ -394,3 +437,125 @@ def admitir_envio_proprio_no_tenant(
         )
     )
     return saida
+
+
+def status_etiqueta_amigavel(status: Optional[str]) -> str:
+    st = (status or "").strip().lower()
+    if st == "etiquetado":
+        return "Aguardando coleta"
+    if st == "cancelado":
+        return "Cancelada"
+    if st in ("coletado", "saiu", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega", "em_rota"):
+        return "Coletado"
+    if st == "entregue":
+        return "Entregue"
+    if not st:
+        return "Aguardando coleta"
+    return "Coletado"
+
+
+def cancelar_envio_proprio(
+    db: Session,
+    envio: EnvioProprio,
+    *,
+    cancelado_por: str,
+    saida: Optional[Saida] = None,
+) -> EnvioProprio:
+    if saida is None and envio.id_saida:
+        saida = db.get(Saida, envio.id_saida)
+    st = (getattr(saida, "status", None) or "").strip().upper() if saida else ""
+    if saida is None or st != STATUS_ETIQUETADO:
+        raise HTTPException(409, "Só é possível cancelar etiqueta ainda aguardando coleta.")
+    agora = datetime.utcnow()
+    saida.status = STATUS_CANCELADO
+    envio.cancelado_at = agora
+    envio.cancelado_por = (cancelado_por or "")[:120] or None
+    db.add(
+        SaidaHistorico(
+            id_saida=saida.id_saida,
+            evento="etiqueta_cancelada",
+            status_anterior=STATUS_ETIQUETADO,
+            status_novo=STATUS_CANCELADO,
+        )
+    )
+    db.commit()
+    db.refresh(envio)
+    return envio
+
+
+def limite_diario_para_seller(db: Session, sub_base: str, id_base: int) -> int:
+    owner = db.scalar(select(Owner).where(Owner.sub_base == (sub_base or "").strip()))
+    default = int(getattr(owner, "etiqueta_limite_diario_default", None) or 50)
+    base = db.get(BasePreco, int(id_base)) if id_base else None
+    if base is not None and getattr(base, "etiqueta_limite_diario", None) is not None:
+        try:
+            return max(0, int(base.etiqueta_limite_diario))
+        except (TypeError, ValueError):
+            return default
+    return max(0, default)
+
+
+def contar_emissoes_hoje(db: Session, id_base: int) -> int:
+    hoje = datetime.now(OPERACAO_TZ).date()
+    inicio = datetime(hoje.year, hoje.month, hoje.day)
+    return int(
+        db.scalar(
+            select(func.count(EnvioProprio.id_envio)).where(
+                EnvioProprio.id_base == int(id_base),
+                EnvioProprio.created_at >= inicio,
+                EnvioProprio.cancelado_at.is_(None),
+            )
+        )
+        or 0
+    )
+
+
+def assert_limite_diario(db: Session, sub_base: str, id_base: int) -> None:
+    limite = limite_diario_para_seller(db, sub_base, id_base)
+    usados = contar_emissoes_hoje(db, id_base)
+    if usados >= limite:
+        raise HTTPException(
+            409,
+            f"Limite diário de {limite} etiquetas atingido para hoje.",
+        )
+
+
+def expirar_etiquetas_etiquetado(db: Session, *, max_rows: int = 500) -> Dict[str, Any]:
+    owners = list(db.scalars(select(Owner).where(Owner.sub_base.is_not(None))).all())
+    total = 0
+    for owner in owners:
+        dias = int(getattr(owner, "etiqueta_expiracao_dias", None) or 30)
+        if dias < 1:
+            dias = 30
+        corte = datetime.utcnow() - timedelta(days=dias)
+        sub = (owner.sub_base or "").strip()
+        envios = list(
+            db.scalars(
+                select(EnvioProprio)
+                .where(
+                    EnvioProprio.sub_base == sub,
+                    EnvioProprio.cancelado_at.is_(None),
+                    EnvioProprio.created_at < corte,
+                )
+                .limit(max_rows)
+            ).all()
+        )
+        for envio in envios:
+            saida = db.get(Saida, envio.id_saida) if envio.id_saida else None
+            st = (getattr(saida, "status", None) or "").strip().upper() if saida else ""
+            if saida is None or st != STATUS_ETIQUETADO:
+                continue
+            saida.status = STATUS_CANCELADO
+            envio.cancelado_at = datetime.utcnow()
+            envio.cancelado_por = "expiracao"
+            db.add(
+                SaidaHistorico(
+                    id_saida=saida.id_saida,
+                    evento="etiqueta_expirada",
+                    status_anterior=STATUS_ETIQUETADO,
+                    status_novo=STATUS_CANCELADO,
+                )
+            )
+            total += 1
+    db.commit()
+    return {"expirados": total}
