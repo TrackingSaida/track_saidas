@@ -236,8 +236,11 @@ def test_tipos_novos_e_labels():
     ids = {t["id"] for t in TIPOS_META}
     assert "primeiro_nome" not in ids
     assert "segundo_nome" not in ids
-    assert "foto" in ids
+    assert "foto" not in ids
     assert "texto" in ids
+    assert "lista" in ids
+    assert normalize_tipo_campo("foto") == "foto"
+    assert tipo_meta("foto")["label"] == "Foto"
     assert normalize_tipo_campo("CEP") == "cep"
     assert normalize_tipo_campo("primeiro_nome") == "primeiro_nome"
     assert tipo_meta("cep")["label"] == "CEP"
