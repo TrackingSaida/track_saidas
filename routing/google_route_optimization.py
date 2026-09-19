@@ -15,6 +15,7 @@ from routing.config import (
     get_google_timeout_s,
 )
 from routing.hashes import parse_shipment_label, shipment_label
+from routing.polyline_codec import decode_polyline
 from routing.types import (
     GeometryResult,
     OptimizeRouteResult,
@@ -499,3 +500,102 @@ def refresh_geometry_google(
     body = build_refresh_details_body(points_in_order, start=start, end=end)
     data = _call_optimize_tours_rest(body)
     return parse_refresh_response(data)
+
+
+# ~13 km: pega tour do veículo (Rodoanel etc.) sem recusar desvio urbano típico.
+_POLYLINE_BBOX_EXCESS_DEG = 0.12
+
+
+def polyline_exceeds_stops_bbox(
+    encoded: str,
+    points: Sequence[RoutePoint],
+    *,
+    excess_deg: float = _POLYLINE_BBOX_EXCESS_DEG,
+) -> bool:
+    """True se a polyline sair muito da bbox das paradas (provável perna start/end)."""
+    coords = decode_polyline(encoded)
+    if not coords or not points:
+        return False
+    stop_lats = [float(p[1]) for p in points]
+    stop_lons = [float(p[2]) for p in points]
+    min_lat = min(stop_lats) - excess_deg
+    max_lat = max(stop_lats) + excess_deg
+    min_lon = min(stop_lons) - excess_deg
+    max_lon = max(stop_lons) + excess_deg
+    poly_lats = [c[0] for c in coords]
+    poly_lons = [c[1] for c in coords]
+    return (
+        min(poly_lats) < min_lat
+        or max(poly_lats) > max_lat
+        or min(poly_lons) < min_lon
+        or max(poly_lons) > max_lon
+    )
+
+
+def resolve_map_polyline_after_optimize(
+    points_in_visit_order: List[RoutePoint],
+    *,
+    had_vehicle_endpoints: bool,
+    optimize_polyline: Optional[str],
+    optimize_dist_m: Optional[int] = None,
+    optimize_dur_s: Optional[int] = None,
+    refresh_fn=None,
+) -> GeometryResult:
+    """Geometria persistida no mapa: só paradas 1→N.
+
+    `optimizeTours` com start/end devolve o tour do veículo (GPS→paradas→casa).
+    Esse blob não deve ir para o mapa; após a ordem, dá refresh sem endpoints.
+    """
+    refresh = refresh_fn or refresh_geometry_google
+    if not had_vehicle_endpoints:
+        if optimize_polyline:
+            return GeometryResult(
+                polyline_encoded=optimize_polyline,
+                distancia_total_m=optimize_dist_m,
+                duracao_total_s=optimize_dur_s,
+                geometry_provider="google",
+                ok=True,
+            )
+        return GeometryResult(
+            polyline_encoded=None,
+            distancia_total_m=None,
+            duracao_total_s=None,
+            geometry_provider="google",
+            ok=False,
+            error_code="ROUTING_NO_POLYLINE",
+        )
+
+    try:
+        geom = refresh(points_in_visit_order)
+    except RoutingError as err:
+        logger.warning("refresh stop-to-stop após optimize falhou: %s", err.code)
+        return GeometryResult(
+            polyline_encoded=None,
+            distancia_total_m=None,
+            duracao_total_s=None,
+            geometry_provider="google",
+            ok=False,
+            error_code=err.code,
+        )
+
+    if not geom.ok or not geom.polyline_encoded:
+        return GeometryResult(
+            polyline_encoded=None,
+            distancia_total_m=None,
+            duracao_total_s=None,
+            geometry_provider="google",
+            ok=False,
+            error_code=geom.error_code or "ROUTING_NO_POLYLINE",
+        )
+
+    if polyline_exceeds_stops_bbox(geom.polyline_encoded, points_in_visit_order):
+        logger.warning("polyline Google expandiu bbox das paradas; descartada")
+        return GeometryResult(
+            polyline_encoded=None,
+            distancia_total_m=None,
+            duracao_total_s=None,
+            geometry_provider="google",
+            ok=False,
+            error_code="ROUTING_POLYLINE_BBOX",
+        )
+    return geom

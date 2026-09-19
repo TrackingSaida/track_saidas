@@ -1818,10 +1818,37 @@ def rotas_otimizar(
     ordem_final = ordem_expandida + sem_coordenadas
 
     poly = result.polyline_encoded
+    dist_m = result.distancia_total_m
+    dur_s = result.duracao_total_s
     geom_provider = "google" if poly and result.optimization_mode == "google" else None
+    discard_vehicle_polyline = False
     # Soft / osrm sem polyline no backend: geometry fica missing/stale; mobile legado usa OSRM Route
     if result.optimization_mode == "osrm":
         geom_provider = None
+    elif result.optimization_mode == "google" and geom_provider_flag == "google":
+        from routing.google_route_optimization import resolve_map_polyline_after_optimize
+
+        id_to_point = {p[0]: p for p in com_coord}
+        ordered_points = [id_to_point[sid] for sid in ordem_otimizada if sid in id_to_point]
+        had_vehicle_endpoints = start is not None or end is not None
+        map_geom = resolve_map_polyline_after_optimize(
+            ordered_points,
+            had_vehicle_endpoints=had_vehicle_endpoints,
+            optimize_polyline=poly,
+            optimize_dist_m=dist_m,
+            optimize_dur_s=dur_s,
+        )
+        if map_geom.ok and map_geom.polyline_encoded:
+            poly = map_geom.polyline_encoded
+            geom_provider = "google"
+            if map_geom.distancia_total_m is not None:
+                dist_m = map_geom.distancia_total_m
+            if map_geom.duracao_total_s is not None:
+                dur_s = map_geom.duracao_total_s
+        elif had_vehicle_endpoints:
+            poly = None
+            geom_provider = "google"
+            discard_vehicle_polyline = True
 
     rota = _upsert_rota_preparando(
         db,
@@ -1831,11 +1858,18 @@ def rotas_otimizar(
         ordem=ordem_final,
         optimization_mode=result.optimization_mode,
         optimization_input_hash=input_hash,
-        distancia_total_m=result.distancia_total_m,
-        duracao_total_s=result.duracao_total_s,
+        distancia_total_m=dist_m,
+        duracao_total_s=dur_s,
         polyline_encoded=poly,
         geometry_provider=geom_provider,
     )
+    if discard_vehicle_polyline:
+        rota.polyline_encoded = None
+        rota.geometry_provider = "google"
+        rota.geometry_status = "failed"
+        rota.geometry_order_hash = None
+        db.commit()
+        db.refresh(rota)
 
     # Se priority_soft + geometry google: geometria via refresh (endpoint dedicado / pós-POC)
     geom = geometry_payload_for_api(rota)
@@ -1844,8 +1878,8 @@ def rotas_otimizar(
         modo=result.optimization_mode,
         optimization_mode=result.optimization_mode,
         sem_coordenadas=sem_coordenadas,
-        distancia_total_m=result.distancia_total_m,
-        duracao_total_s=result.duracao_total_s,
+        distancia_total_m=dist_m,
+        duracao_total_s=dur_s,
         geometry_provider=geom.get("geometry_provider"),
         geometry_status=geom.get("geometry_status"),
         route_revision=int(getattr(rota, "route_revision", 0) or 0),
