@@ -59,7 +59,7 @@ else:
 # App
 app = FastAPI(
     title="API Saídas",
-    version="1.10.1",
+    version="1.11.0",
     openapi_url=f"{API_PREFIX}/openapi.json",
     docs_url=f"{API_PREFIX}/docs",
     redoc_url=f"{API_PREFIX}/redoc",
