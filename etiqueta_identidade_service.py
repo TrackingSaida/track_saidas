@@ -110,6 +110,18 @@ def resolver_logo_etiqueta(owner: Optional[Owner]) -> Tuple[Optional[bytes], str
     return None, LOGO_ORIGEM_ROTEVO
 
 
+def _trim_transparent(logo: Image.Image) -> Image.Image:
+    """Corta padding transparente para a marca ocupar a caixa da etiqueta."""
+    if logo.mode != "RGBA":
+        logo = logo.convert("RGBA")
+    alpha = logo.getchannel("A")
+    mask = alpha.point(lambda a: 255 if a > 12 else 0)
+    bbox = mask.getbbox()
+    if not bbox:
+        return logo
+    return logo.crop(bbox)
+
+
 def fit_logo_image(
     raw: bytes,
     *,
@@ -120,6 +132,9 @@ def fit_logo_image(
     try:
         with Image.open(BytesIO(raw)) as img:
             logo = img.convert("RGBA")
+        if logo.width <= 0 or logo.height <= 0:
+            return None
+        logo = _trim_transparent(logo)
         if logo.width <= 0 or logo.height <= 0:
             return None
         ratio = min(max_width / float(logo.width), max_height / float(logo.height), 1.0)

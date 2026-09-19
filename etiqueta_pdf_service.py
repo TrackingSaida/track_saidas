@@ -259,16 +259,33 @@ def _wrap_lines(c, text: str, font: str, size: float, max_width: float, max_line
 
 
 def _draw_phone_icon(c, x: float, y: float, size: float, color) -> None:
-    """Ícone compacto de telefone (handset) à esquerda do contato."""
+    """Ícone de telefone (Material), caixa size x size, origem inferior-esquerda."""
     c.saveState()
+    c.translate(x, y)
+    s = size / 24.0
+    c.scale(s, s)
     c.setFillColor(color)
-    c.setStrokeColor(color)
-    c.setLineWidth(max(0.6, size * 0.08))
-    c.setLineCap(1)
-    c.setLineJoin(1)
-    c.translate(x + size * 0.52, y + size * 0.42)
-    c.rotate(40)
-    c.roundRect(-size * 0.18, -size * 0.46, size * 0.36, size * 0.92, size * 0.16, stroke=0, fill=1)
+    p = c.beginPath()
+
+    def pt(px: float, py: float):
+        return px, 24.0 - py
+
+    p.moveTo(*pt(6.62, 10.79))
+    p.curveTo(*pt(8.06, 13.62), *pt(10.38, 15.94), *pt(13.21, 17.38))
+    p.lineTo(*pt(15.41, 15.18))
+    p.curveTo(*pt(15.69, 14.9), *pt(16.08, 14.82), *pt(16.43, 14.93))
+    p.curveTo(*pt(17.55, 15.3), *pt(18.75, 15.5), *pt(20, 15.5))
+    p.curveTo(*pt(20.55, 15.5), *pt(21, 15.95), *pt(21, 16.5))
+    p.lineTo(*pt(21, 20))
+    p.curveTo(*pt(21, 20.55), *pt(20.55, 21), *pt(20, 21))
+    p.curveTo(*pt(10.61, 21), *pt(3, 13.39), *pt(3, 4))
+    p.curveTo(*pt(3, 3.45), *pt(3.45, 3), *pt(4, 3))
+    p.lineTo(*pt(7.5, 3))
+    p.curveTo(*pt(8.05, 3), *pt(8.5, 3.45), *pt(8.5, 4))
+    p.curveTo(*pt(8.5, 5.25), *pt(8.7, 6.45), *pt(9.07, 7.57))
+    p.curveTo(*pt(9.18, 7.92), *pt(9.1, 8.31), *pt(8.82, 8.59))
+    p.close()
+    c.drawPath(p, fill=1, stroke=0)
     c.restoreState()
 
 
@@ -326,21 +343,20 @@ def gerar_pdf_envio_proprio(
     y = altura - margin - 2 * mm
 
     # ---- Header ----
-    # Logo à esquerda; nome + slogan à direita; contato no canto inferior esquerdo, abaixo da logo.
-    header_h = 26 * mm if contato_txt else 20 * mm
+    # Logo à esquerda preenchendo a faixa; nome + slogan à direita; contato abaixo da logo.
+    header_h = 26 * mm if contato_txt else 22 * mm
     header_top = y
-    logo_max_w, logo_max_h = 28 * mm, 16 * mm
+    contact_row = 5.8 * mm if contato_txt else 0
+    logo_max_w = 34 * mm
+    logo_max_h = max(14 * mm, header_h - contact_row - 0.6 * mm)
     draw_w = draw_h = 0
     if logo_bytes:
-        fitted = fit_logo_image(logo_bytes, max_width=720, max_height=400)
+        fitted = fit_logo_image(logo_bytes, max_width=900, max_height=520)
         if fitted is not None:
             logo_buf = io.BytesIO()
             fitted.save(logo_buf, format="PNG")
             logo_buf.seek(0)
             aspect = fitted.width / max(1.0, float(fitted.height))
-            # Logos quadradas/altas não podem dominar a faixa — reserva espaço para o texto.
-            if aspect < 1.35:
-                logo_max_w = 18 * mm
             if (logo_max_w / logo_max_h) > aspect:
                 draw_h = logo_max_h
                 draw_w = draw_h * aspect
@@ -356,7 +372,7 @@ def gerar_pdf_envio_proprio(
                 mask="auto",
                 preserveAspectRatio=True,
             )
-            text_x = margin + draw_w + 3 * mm
+            text_x = margin + draw_w + 2.6 * mm
         else:
             text_x = margin
     else:
@@ -369,19 +385,21 @@ def gerar_pdf_envio_proprio(
 
     text_right = largura - margin
     text_width = max(10 * mm, text_right - text_x)
-    name_font_size = 11
-    slogan_font_size = 6
+    name_font_size = 13
+    slogan_font_size = 8
+    logo_band = draw_h if draw_h else 16 * mm
+    mid = header_top - logo_band / 2.0
 
-    # Empilha nome (acima) e slogan (abaixo), alinhados à esquerda do bloco de texto.
+    # Nome/slogan centralizados na altura real da logo.
     if show_name and slogan:
-        name_y = header_top - 6 * mm
-        slogan_y = header_top - 11 * mm
+        name_y = mid + 2.4 * mm
+        slogan_y = mid - 2.6 * mm
     elif show_name:
-        name_y = header_top - (draw_h / 2.0 if draw_h else 6 * mm) - 1.5 * mm
+        name_y = mid - 1.6 * mm
         slogan_y = None
     elif slogan:
         name_y = None
-        slogan_y = header_top - (draw_h / 2.0 if draw_h else 6 * mm) - 1.0 * mm
+        slogan_y = mid - 1.2 * mm
     else:
         name_y = slogan_y = None
 
@@ -398,12 +416,13 @@ def gerar_pdf_envio_proprio(
         c.drawString(text_x, slogan_y, _clip(slogan, max_chars_slogan))
 
     if contato_txt:
-        icon_size = 3.2 * mm
-        contact_baseline = header_top - header_h + 2.6 * mm
-        _draw_phone_icon(c, margin, contact_baseline - 0.3 * mm, icon_size, dark)
-        c.setFillColor(dark)
-        c.setFont("Helvetica", 7)
-        c.drawString(margin + icon_size + 1.5 * mm, contact_baseline, _clip(contato_txt, 28))
+        icon_size = 4.2 * mm
+        contact_baseline = header_top - header_h + 2.4 * mm
+        contact_color = HexColor("#374151")
+        _draw_phone_icon(c, margin, contact_baseline - 0.6 * mm, icon_size, contact_color)
+        c.setFillColor(contact_color)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(margin + icon_size + 1.4 * mm, contact_baseline, _clip(contato_txt, 24))
 
     y = header_top - header_h
     c.setStrokeColor(line)
@@ -443,17 +462,17 @@ def gerar_pdf_envio_proprio(
 
     obs = (observacao or "").strip()
     if obs:
-        y -= 4.2 * mm
+        y -= 7.2 * mm
         c.setFillColor(gray)
         c.setFont("Helvetica", 6)
         c.drawString(margin, y, "OBSERVAÇÃO")
-        y -= 3.4 * mm
+        y -= 3.8 * mm
         c.setFillColor(dark)
-        c.setFont("Helvetica", 7)
+        c.setFont("Helvetica", 8)
         obs_width = max(20 * mm, qr_x - margin - 2.5 * mm)
-        for obs_line in _wrap_lines(c, obs, "Helvetica", 7, obs_width, max_lines=3):
+        for obs_line in _wrap_lines(c, obs, "Helvetica", 8, obs_width, max_lines=3):
             c.drawString(margin, y, obs_line)
-            y -= 3.2 * mm
+            y -= 3.6 * mm
         y += 1.2 * mm
 
     y = min(y, qr_y) - 3 * mm
