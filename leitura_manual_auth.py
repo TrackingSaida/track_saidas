@@ -8,12 +8,27 @@ from sqlalchemy.orm import Session
 
 from models import Motoboy, User
 
+ORIGENS_LEITURA = ("camera", "manual", "selecao")
+
 
 def normalize_origem_leitura(origem: Optional[str], *, default: str = "camera") -> str:
     value = (origem or default or "camera").strip().lower()
-    if value not in ("camera", "manual"):
+    if value not in ORIGENS_LEITURA:
         return default
     return value
+
+
+def raise_if_selecao_sem_registro(origem: str) -> None:
+    """Seleção na lista só associa pacote existente; nunca cria."""
+    if origem != "selecao":
+        return
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "code": "AVULSO_NAO_ENCONTRADO",
+            "message": "Avulso não encontrado. Selecione um item da lista ou leia a etiqueta.",
+        },
+    )
 
 
 def ensure_manual_code_entry_allowed(

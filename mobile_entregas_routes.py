@@ -80,7 +80,11 @@ from qr_payload_utils import (
     should_store_qr_payload_raw,
 )
 from ausencia_bloqueio_service import raise_if_bloqueado_ausencias, snapshot_bloqueio_ausencias
-from leitura_manual_auth import ensure_manual_code_entry_allowed
+from leitura_manual_auth import (
+    ensure_lancar_avulso_allowed,
+    ensure_manual_code_entry_allowed,
+    raise_if_selecao_sem_registro,
+)
 from upload_storage_utils import extract_foto_keys, parse_foto_items
 from codigo_normalizer import (
     normalize_codigo,
@@ -194,7 +198,7 @@ class EntregaListItem(BaseModel):
 
 class ScanBody(BaseModel):
     codigo: str = Field(min_length=1)
-    origem: str = "camera"  # camera | manual
+    origem: str = "camera"  # camera | manual | selecao
 
 
 class ConfirmarNovaSaidaMesmoEntregadorBody(BaseModel):
@@ -3768,6 +3772,7 @@ def scan_codigo(
 
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
     if not saida:
+        raise_if_selecao_sem_registro(origem)
         gate = avaliar_prerequisito_saida(
             coleta_habilitada=coleta_habilitada,
             entrada_habilitada=entrada_habilitada,
@@ -3778,6 +3783,8 @@ def scan_codigo(
         motoboy = db.get(Motoboy, motoboy_id) if motoboy_id else None
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
+        if servico_val == "Avulso":
+            ensure_lancar_avulso_allowed(db, user)
         qr_raw = qr_payload_raw.strip() if (qr_payload_raw and should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
         try:
             nova = Saida(

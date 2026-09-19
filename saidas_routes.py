@@ -55,7 +55,7 @@ from pedido_campos_obrigatorios_service import (
     raise_if_campos_obrigatorios_faltando,
 )
 from log_leitura_service import registrar_log_leitura_critico
-from leitura_manual_auth import ensure_manual_code_entry_allowed
+from leitura_manual_auth import ensure_manual_code_entry_allowed, raise_if_selecao_sem_registro
 from qr_payload_utils import apply_qr_payload_if_needed, qr_flags_for_response, should_store_qr_payload_raw
 from ausencia_bloqueio_service import (
     EVENTO_LIBERACAO,
@@ -208,7 +208,7 @@ class SaidaLerIn(BaseModel):
     # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
     registrar_nao_coletado: bool = False
     qr_payload_raw: Optional[str] = None  # Payload bruto do QR (ML) para etiqueta reconhecível
-    origem: Optional[str] = "manual"  # camera | manual — motoboy precisa de permissão para manual
+    origem: Optional[str] = "manual"  # camera | manual | selecao — motoboy precisa de permissão para manual
 
 
 class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
@@ -950,6 +950,7 @@ def ler_saida(
     )
 
     if existente is None:
+        raise_if_selecao_sem_registro(origem_leitura)
         from envio_proprio_service import admitir_envio_proprio_no_tenant, get_envio_by_codigo_global, is_codigo_rte
 
         # RTE: se políticas exigem coleta/entrada, não materializa na saída — só informa pré-requisito.
