@@ -22,6 +22,7 @@ from db import get_db
 from db_utils import run_db_query_with_retry
 from auth import get_current_user
 from models import User, Saida, Coleta, Entregador, Owner, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from saida_prerequisito import avaliar_prerequisito_saida
 from entrega_audit_log import audit_entrega, norm_client_action_id
 from saida_operacional_utils import (
     carregar_contexto_operacional,
@@ -221,6 +222,8 @@ class ConfirmarNovaSaidaMesmoEntregadorIn(BaseModel):
 class LancarAvulsoIn(BaseModel):
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
+    campos: Optional[Dict[str, Any]] = None
+    motivo_excepcional: Optional[str] = Field(default=None, max_length=500)
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
@@ -237,6 +240,9 @@ class LancarAvulsoOut(BaseModel):
     saidas: List[dict]
     mensagem: str
     avulso_exige_foto: bool = False
+    lote_id: Optional[int] = None
+    labels: List[str] = Field(default_factory=list)
+    criado_excepcional: bool = False
 
 
 class SaidaDetailOut(BaseModel):
@@ -333,6 +339,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return "não coletado"
     if lower in ("na_base", "na base"):
         return STATUS_NA_BASE
+    if lower in ("etiquetado",):
+        return "ETIQUETADO"
     # Novos status motoboy (aceitar em maiúsculas ou lowercase)
     if lower in ("saiu_para_entrega", "saiu para entrega"):
         return STATUS_SAIU_PARA_ENTREGA
@@ -877,11 +885,14 @@ def ler_saida(
     if not sub_base or not username:
         raise HTTPException(401, "Usuário inválido.")
 
-    if not entrada_obrigatoria:
-        owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-        entrada_obrigatoria = bool(
-            owner_row and getattr(owner_row, "entrada_obrigatoria_habilitada", False)
-        )
+    owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    bloquear_saida_sem_coleta = False
+    if owner_row is not None:
+        ignorar_coleta = bool(owner_row.ignorar_coleta)
+        entrada_obrigatoria = bool(getattr(owner_row, "entrada_obrigatoria_habilitada", False))
+        bloquear_saida_sem_coleta = bool(getattr(owner_row, "bloquear_saida_sem_coleta", False))
+    coleta_habilitada = not ignorar_coleta
+    entrada_habilitada = entrada_obrigatoria
 
     origem_leitura = ensure_manual_code_entry_allowed(
         db,
@@ -939,23 +950,71 @@ def ler_saida(
     )
 
     if existente is None:
-        if entrada_obrigatoria:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "code": "ENTRADA_OBRIGATORIA",
-                    "message": "Este pacote ainda não teve entrada na base.",
-                },
+        from envio_proprio_service import admitir_envio_proprio_no_tenant, get_envio_by_codigo_global, is_codigo_rte
+
+        # RTE: se políticas exigem coleta/entrada, não materializa na saída — só informa pré-requisito.
+        if is_codigo_rte(codigo) and get_envio_by_codigo_global(db, codigo) is not None:
+            if coleta_habilitada or entrada_habilitada:
+                gate = avaliar_prerequisito_saida(
+                    coleta_habilitada=coleta_habilitada,
+                    entrada_habilitada=entrada_habilitada,
+                    saida_existe=False,
+                    status_norm="ETIQUETADO",
+                    permitir_registrar_nao_coletado=False,
+                )
+                if gate:
+                    return JSONResponse(status_code=422, content=gate)
+            # Modo saída direta: materializa localmente e segue
+            admitida = admitir_envio_proprio_no_tenant(
+                db,
+                sub_base=sub_base,
+                codigo=codigo,
+                status_inicial=STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu",
+                username=username,
+                user_id=getattr(current_user, "id", None),
+                evento_historico="lido",
             )
-        # Não existe: ignorar_coleta ou registrar_nao_coletado → INSERT; senão 422 (erro de negócio, sem retry)
-        if not ignorar_coleta and not payload.registrar_nao_coletado:
-            # JSONResponse direto para preservar código de erro sem passar pelo handler global.
-            return JSONResponse(
-                status_code=422,
-                content={"code": "NAO_COLETADO", "message": "Código não coletado."},
-            )
-        # status: "saiu" quando ignorar_coleta; "não coletado" quando usuário confirmou registrar mesmo assim
-        status_inicial = "não coletado" if payload.registrar_nao_coletado else (
+            if admitida is not None:
+                admitida.entregador = entregador_nome
+                admitida.entregador_id = entregador_id
+                admitida.motoboy_id = motoboy_id
+                db.add(
+                    OwnerCobrancaItem(
+                        sub_base=sub_base,
+                        id_coleta=None,
+                        id_saida=admitida.id_saida,
+                        valor=owner_valor,
+                    )
+                )
+                try:
+                    db.commit()
+                    db.refresh(admitida)
+                except Exception as e:
+                    db.rollback()
+                    raise HTTPException(500, f"Erro ao registrar saída: {e}")
+                _enqueue_atribuicao_push_externa(
+                    db,
+                    current_user=current_user,
+                    sub_base=sub_base,
+                    motoboy_id=motoboy_id,
+                    codigo=codigo,
+                )
+                return JSONResponse(
+                    status_code=201,
+                    content=_saida_out_com_qr(admitida, None),
+                )
+
+        permitir_soft = bool(payload.registrar_nao_coletado) and not bloquear_saida_sem_coleta
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=False,
+            permitir_registrar_nao_coletado=permitir_soft,
+        )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
+        # status: "saiu" quando sem coleta; "não coletado" quando usuário confirmou registrar mesmo assim
+        status_inicial = "não coletado" if permitir_soft else (
             STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
         )
         store_qr = _should_store_qr_payload_raw(servico, qr_payload_raw)
@@ -1013,6 +1072,55 @@ def ler_saida(
     # Existe: decidir por status e entregador
     status_norm = normalizar_status_saida(existente.status)
 
+    if status_norm == "ETIQUETADO":
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=True,
+            status_norm=status_norm,
+        )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
+        # Sem pré-requisito: promove etiqueta → saiu
+        status_anterior = existente.status
+        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.entregador_id = entregador_id
+        existente.entregador = entregador_nome
+        if motoboy_id is not None:
+            existente.motoboy_id = motoboy_id
+        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+        db.add(
+            SaidaHistorico(
+                id_saida=existente.id_saida,
+                evento="lido",
+                status_anterior=status_anterior,
+                status_novo=existente.status,
+                user_id=getattr(current_user, "id", None),
+            )
+        )
+        db.add(
+            OwnerCobrancaItem(
+                sub_base=sub_base,
+                id_coleta=None,
+                id_saida=existente.id_saida,
+                valor=owner_valor,
+            )
+        )
+        try:
+            db.commit()
+            db.refresh(existente)
+            _enqueue_atribuicao_push_externa(
+                db,
+                current_user=current_user,
+                sub_base=sub_base,
+                motoboy_id=motoboy_id,
+                codigo=existente.codigo,
+            )
+            return _saida_out_com_qr(existente, qr_result)
+        except Exception:
+            db.rollback()
+            raise HTTPException(500, "Erro ao atualizar saída.")
+
     if status_norm == "aguardando_coleta":
         # Leitura em coleta: aguardando_coleta → coletado
         status_anterior = existente.status
@@ -1056,14 +1164,14 @@ def ler_saida(
             raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "coletado":
-        if entrada_obrigatoria:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "code": "ENTRADA_OBRIGATORIA",
-                    "message": "Este pacote ainda não teve entrada na base.",
-                },
-            )
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=True,
+            status_norm=status_norm,
+        )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
         status_anterior = existente.status
         existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
@@ -1128,14 +1236,16 @@ def ler_saida(
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
 
-    if entrada_obrigatoria and not _status_ja_em_rota_ou_saida(status_norm):
-        return JSONResponse(
-            status_code=422,
-            content={
-                "code": "ENTRADA_OBRIGATORIA",
-                "message": "Este pacote ainda não teve entrada na base.",
-            },
+    if not _status_ja_em_rota_ou_saida(status_norm):
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=True,
+            status_norm=status_norm,
+            ja_em_rota_ou_saida=False,
         )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
 
     if _status_ja_em_rota_ou_saida(status_norm):
         # mesmo entregador/motoboy → 200 idempotente (sem 409)
@@ -1587,11 +1697,49 @@ def _lancar_avulso_impl(
             detail={"code": "QUANTIDADE_INVALIDA", "message": "Quantidade mínima é 1."},
         )
 
+    from avulso_campos_service import (
+        build_label_amigavel,
+        create_lote,
+        owner_exige_selecao_avulso,
+        persist_valores_para_saidas,
+        resolve_campos_ativos,
+        validate_campos_payload,
+    )
+
+    motivo = (payload.motivo_excepcional or "").strip()
+    exige_selecao = owner_exige_selecao_avulso(db, sub_base)
+    if exige_selecao and not motivo:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "AVULSO_SELECAO_OBRIGATORIA",
+                "message": "Com Coleta ou Entrada ativos, selecione um avulso pendente. Para cadastrar fora do fluxo, informe o motivo.",
+            },
+        )
+
+    contexto = "SAIDA_AVULSO"
+    campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto=contexto)
+    valores_norm = validate_campos_payload(
+        campos_cfg,
+        payload.campos,
+        identificacao_legado=payload.identificacao,
+    )
+    origem_lote = "saida_excecao" if motivo else "saida"
+    lote_row = create_lote(
+        db,
+        sub_base=sub_base,
+        origem=origem_lote,
+        quantidade=quantidade,
+        criado_por=getattr(current_user, "id", None),
+        motivo_excepcional=motivo or None,
+    )
+
     label_norm = _normalizar_label_avulso(payload.identificacao)
     codigos: List[str] = []
     saidas_criadas: List[dict] = []
     status_inicial = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
     servico = canonicalize_servico("Avulso")
+    excepcional = bool(motivo)
 
     try:
         for _ in range(quantidade):
@@ -1606,19 +1754,23 @@ def _lancar_avulso_impl(
                 servico=servico,
                 status=status_inicial,
                 base=(payload.identificacao or "").strip() or None,
+                avulso_lote_id=int(lote_row.id),
+                avulso_criado_excepcional=excepcional,
             )
             db.add(row)
             db.flush()
             db.add(
                 SaidaHistorico(
                     id_saida=row.id_saida,
-                    evento="lancar_avulso",
+                    evento="avulso_criado_excepcional_saida" if excepcional else "lancar_avulso",
                     status_novo=status_inicial,
                     user_id=getattr(current_user, "id", None),
                     payload=json.dumps(
                         {
                             "identificacao": (payload.identificacao or "").strip() or None,
                             "codigo": codigo,
+                            "motivo_excepcional": motivo or None,
+                            "campos": valores_norm,
                         },
                         ensure_ascii=False,
                     ),
@@ -1664,6 +1816,12 @@ def _lancar_avulso_impl(
                     "status": status_inicial,
                 }
             )
+        persist_valores_para_saidas(
+            db,
+            id_saidas=[s["id_saida"] for s in saidas_criadas],
+            campos_cfg=campos_cfg,
+            valores_norm=valores_norm,
+        )
         db.commit()
     except HTTPException:
         db.rollback()
@@ -1690,6 +1848,15 @@ def _lancar_avulso_impl(
                 codigo=None,
             )
 
+    labels = [
+        build_label_amigavel(
+            codigo,
+            base_legado=payload.identificacao,
+            campos_cfg=campos_cfg,
+            valores=valores_norm,
+        )
+        for codigo in codigos
+    ]
     qtd = len(codigos)
     msg = "1 avulso lançado com sucesso." if qtd == 1 else f"{qtd} avulsos lançados com sucesso."
     return {
@@ -1698,6 +1865,9 @@ def _lancar_avulso_impl(
         "saidas": saidas_criadas,
         "mensagem": msg,
         "avulso_exige_foto": avulso_exige_foto,
+        "lote_id": int(lote_row.id),
+        "labels": labels,
+        "criado_excepcional": excepcional,
     }
 
 
@@ -2616,6 +2786,28 @@ def liberar_nova_tentativa(
         bloqueio["ausencias_total"],
         getattr(current_user, "id", None),
     )
+    if obj.motoboy_id:
+        try:
+            from push_notification_service import send_to_motoboy
+
+            codigo = (getattr(obj, "codigo", None) or "").strip() or str(obj.id_saida)
+            send_to_motoboy(
+                db,
+                motoboy_id=int(obj.motoboy_id),
+                sub_base=sub_base,
+                tipo="liberacao_ausencia",
+                title="Nova tentativa liberada",
+                body=f"Pacote {codigo}: a base liberou uma nova tentativa de entrega.",
+                data={"id_saida": obj.id_saida, "codigo": codigo},
+                chave_dedupe=f"liberacao:{obj.id_saida}:{bloqueio['ausencias_total']}",
+            )
+            db.commit()
+        except Exception:
+            logger.exception(
+                "push_liberacao_ausencia_failed id_saida=%s motoboy_id=%s",
+                obj.id_saida,
+                obj.motoboy_id,
+            )
     return {
         "ok": True,
         "id_saida": obj.id_saida,

@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from db import get_db
-from auth import get_current_user
+from auth import _coerce_role_int, get_current_user
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
+from etiqueta_identidade_service import resolver_nome_exibicao
+from upload_storage_utils import B2_BUCKET_NAME, get_s3_client_optional, purge_b2_keys
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/owner", tags=["Owner"])
 MODOS_OPERACAO = {"codigo", "coleta_manual", "ambos"}
@@ -53,6 +58,7 @@ class OwnerUpdate(BaseModel):
     devolucao_sub_base_habilitada: Optional[bool] = None
     entrada_obrigatoria_habilitada: Optional[bool] = None
     conferencia_saida_habilitada: Optional[bool] = None
+    bloquear_saida_sem_coleta: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -63,6 +69,8 @@ class OwnerOut(BaseModel):
     username: Optional[str]
     valor: Optional[float]
     nome_fantasia: Optional[str] = None
+    slogan: Optional[str] = None
+    tem_logo: bool = False
     sub_base: Optional[str]
     contato: Optional[str]
     ativo: bool
@@ -73,8 +81,33 @@ class OwnerOut(BaseModel):
     devolucao_sub_base_habilitada: bool = False
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
+    bloquear_saida_sem_coleta: bool = False
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class OwnerIdentidadeOut(BaseModel):
+    id_owner: int
+    sub_base: Optional[str] = None
+    nome_exibicao: str
+    nome_fantasia: Optional[str] = None
+    slogan: Optional[str] = None
+    contato: Optional[str] = None
+    tem_logo: bool = False
+    logo_filename: Optional[str] = None
+    logo_updated_at: Optional[datetime] = None
+
+
+class OwnerIdentidadePatch(BaseModel):
+    nome_fantasia: Optional[str] = None
+    slogan: Optional[str] = None
+    contato: Optional[str] = None
+
+
+class LogoPresignGetOut(BaseModel):
+    download_url: Optional[str] = None
+    expires_in: int = 60
+    tem_logo: bool = False
 
 
 # ============================================================
@@ -83,6 +116,226 @@ class OwnerOut(BaseModel):
 
 def _get_owner_by_sub_base(db: Session, sub_base: str) -> Optional[Owner]:
     return db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+
+
+def _owner_to_out(owner: Owner) -> OwnerOut:
+    return OwnerOut(
+        id_owner=owner.id_owner,
+        email=owner.email,
+        username=owner.username,
+        valor=float(owner.valor or 0) if owner.valor is not None else None,
+        nome_fantasia=getattr(owner, "nome_fantasia", None),
+        slogan=getattr(owner, "slogan", None),
+        tem_logo=bool((getattr(owner, "logo_object_key", None) or "").strip()),
+        sub_base=owner.sub_base,
+        contato=owner.contato,
+        ativo=bool(owner.ativo),
+        ignorar_coleta=bool(owner.ignorar_coleta),
+        teste=bool(owner.teste),
+        modo_operacao=owner.modo_operacao,
+        tipo_owner=getattr(owner, "tipo_owner", None),
+        devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
+        entrada_obrigatoria_habilitada=bool(getattr(owner, "entrada_obrigatoria_habilitada", False)),
+        conferencia_saida_habilitada=bool(getattr(owner, "conferencia_saida_habilitada", False)),
+        bloquear_saida_sem_coleta=bool(getattr(owner, "bloquear_saida_sem_coleta", False)),
+    )
+
+
+def _assert_role_01(current_user: User) -> None:
+    role = _coerce_role_int(getattr(current_user, "role", None))
+    if role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a administradores.")
+
+
+def _owner_for_me(db: Session, current_user: User) -> Owner:
+    sub_base = (getattr(current_user, "sub_base", None) or "").strip()
+    if not sub_base:
+        raise HTTPException(403, "Usuário sem sub_base definida.")
+    owner = _get_owner_by_sub_base(db, sub_base)
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado para esta sub_base.")
+    return owner
+
+
+def _normalize_contato_identidade(value: Optional[str]) -> Optional[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    digits = "".join(c for c in raw if c.isdigit())
+    if len(digits) not in (10, 11):
+        raise HTTPException(422, "Contato inválido. Use DDD + número (10 ou 11 dígitos).")
+    return digits
+
+
+def _identidade_out(owner: Owner) -> OwnerIdentidadeOut:
+    return OwnerIdentidadeOut(
+        id_owner=owner.id_owner,
+        sub_base=owner.sub_base,
+        nome_exibicao=resolver_nome_exibicao(owner),
+        nome_fantasia=getattr(owner, "nome_fantasia", None),
+        slogan=getattr(owner, "slogan", None),
+        contato=getattr(owner, "contato", None),
+        tem_logo=bool((getattr(owner, "logo_object_key", None) or "").strip()),
+        logo_filename=getattr(owner, "logo_filename", None),
+        logo_updated_at=getattr(owner, "logo_updated_at", None),
+    )
+
+
+_LOGO_EXTS = {"png", "jpg", "jpeg", "webp"}
+_LOGO_MIMES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+}
+_LOGO_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _validate_and_read_logo(file: UploadFile) -> tuple[bytes, str, str]:
+    """Retorna (content, ext, content_type)."""
+    filename = (file.filename or "logo.png").strip()
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    content_type = (file.content_type or "").strip().lower()
+    if ext not in _LOGO_EXTS and content_type not in _LOGO_MIMES:
+        raise HTTPException(422, "Formato inválido. Use PNG, JPG ou WEBP.")
+    if content_type in _LOGO_MIMES:
+        ext = _LOGO_MIMES[content_type]
+    elif ext == "jpeg":
+        ext = "jpg"
+    if ext not in _LOGO_EXTS:
+        raise HTTPException(422, "Formato inválido. Use PNG, JPG ou WEBP.")
+
+    content = file.file.read()
+    if not content:
+        raise HTTPException(422, "Arquivo vazio.")
+    if len(content) > _LOGO_MAX_BYTES:
+        raise HTTPException(422, "Logo deve ter no máximo 5 MB.")
+
+    from io import BytesIO
+    from PIL import Image
+
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+        with Image.open(BytesIO(content)) as img2:
+            img2.load()
+            if img2.width <= 0 or img2.height <= 0:
+                raise ValueError("dimensões inválidas")
+    except Exception:
+        raise HTTPException(422, "Arquivo não é uma imagem válida.")
+
+    mime = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }.get(ext, "image/png")
+    return content, ext, mime
+
+
+def _upload_owner_logo(owner: Owner, content: bytes, ext: str, content_type: str, filename: str) -> None:
+    import uuid
+
+    client = get_s3_client_optional()
+    if client is None:
+        raise HTTPException(
+            503,
+            "Upload de logo indisponível: armazenamento (B2) não configurado neste ambiente.",
+        )
+
+    old_key = (getattr(owner, "logo_object_key", None) or "").strip()
+    # Prefixo saida/ — a Application Key do B2 em homol/prod costuma estar restrita a saida/
+    # (mesmo padrão de fotos e PDF de fechamento). Prefixo owner/ gera AccessDenied/not entitled.
+    object_key = f"saida/owner/{owner.id_owner}/logo/{uuid.uuid4().hex}.{ext}"
+    try:
+        client.put_object(
+            Bucket=B2_BUCKET_NAME,
+            Key=object_key,
+            Body=content,
+            ContentType=content_type,
+        )
+    except Exception as exc:
+        err_code = ""
+        try:
+            err_code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+        except Exception:
+            err_code = ""
+        err = f"{err_code} {exc}".strip()
+        low = err.lower()
+        logger.exception(
+            "owner_logo_upload_failed id_owner=%s bucket=%s key=%s err=%s",
+            getattr(owner, "id_owner", None),
+            B2_BUCKET_NAME,
+            object_key,
+            type(exc).__name__,
+        )
+        if any(
+            token in low
+            for token in (
+                "credential",
+                "accessdenied",
+                "invalidaccesskey",
+                "signature",
+                "not entitled",
+                "unauthorized",
+                "forbidden",
+            )
+        ):
+            raise HTTPException(
+                503,
+                "Upload de logo falhou: a chave do armazenamento não tem permissão de escrita "
+                "no prefixo saida/owner/. Verifique a Application Key do B2.",
+            ) from exc
+        if "nosuchbucket" in low or ("bucket" in low and "exist" in low):
+            raise HTTPException(
+                503,
+                "Upload de logo falhou: bucket de armazenamento não encontrado.",
+            ) from exc
+        raise HTTPException(
+            502,
+            "Não foi possível enviar a logo ao armazenamento. Tente novamente em instantes.",
+        ) from exc
+    owner.logo_object_key = object_key
+    owner.logo_filename = (filename or f"logo.{ext}")[:200]
+    owner.logo_content_type = content_type
+    owner.logo_updated_at = datetime.utcnow()
+    if old_key and old_key != object_key:
+        purge_b2_keys([old_key])
+
+
+def _delete_owner_logo(owner: Owner) -> None:
+    old_key = (getattr(owner, "logo_object_key", None) or "").strip()
+    owner.logo_object_key = None
+    owner.logo_filename = None
+    owner.logo_content_type = None
+    owner.logo_updated_at = None
+    if old_key:
+        purge_b2_keys([old_key])
+
+
+def _presign_logo(owner: Owner) -> LogoPresignGetOut:
+    key = (getattr(owner, "logo_object_key", None) or "").strip()
+    if not key:
+        return LogoPresignGetOut(download_url=None, expires_in=60, tem_logo=False)
+    client = get_s3_client_optional()
+    if client is None:
+        raise HTTPException(
+            503,
+            "Pré-visualização indisponível: armazenamento (B2) não configurado neste ambiente.",
+        )
+    expires_in = 60
+    try:
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": B2_BUCKET_NAME, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            "Não foi possível gerar o link de pré-visualização da logo.",
+        ) from exc
+    return LogoPresignGetOut(download_url=url, expires_in=expires_in, tem_logo=True)
 
 
 # ============================================================
@@ -95,11 +348,13 @@ def create_owner(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    email = body.email or current_user.email
+    email = (body.email or getattr(current_user, "email", None) or "").strip() or None
     username = body.username or current_user.username
 
     if not body.sub_base:
         raise HTTPException(422, "sub_base é obrigatória.")
+    if not email:
+        raise HTTPException(422, "E-mail é obrigatório no cadastro do Owner.")
 
     exists = db.scalar(select(Owner).where(Owner.sub_base == body.sub_base))
     if exists:
@@ -149,8 +404,7 @@ def get_owner_for_current_user(
     if not owner:
         raise HTTPException(404, "Owner não encontrado para esta sub_base.")
 
-    return owner
-
+    return _owner_to_out(owner)
 
 # ============================================================
 # LISTAR TODOS (ADMIN)
@@ -164,8 +418,7 @@ def list_owners(
     if current_user.role != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
 
-    return db.scalars(select(Owner)).all()
-
+    return [_owner_to_out(o) for o in db.scalars(select(Owner)).all()]
 
 # ============================================================
 # UPDATE (PATCH ÚNICO)
@@ -233,15 +486,17 @@ def update_owner(
     if body.conferencia_saida_habilitada is not None:
         owner.conferencia_saida_habilitada = bool(body.conferencia_saida_habilitada)
 
+    if body.bloquear_saida_sem_coleta is not None:
+        owner.bloquear_saida_sem_coleta = bool(body.bloquear_saida_sem_coleta)
+
     db.commit()
     db.refresh(owner)
-    return owner
+    return _owner_to_out(owner)
 
 
 # ============================================================
 # DADOS DO SELLER (CNPJ/ENDEREÇO) POR OWNER
 # ============================================================
-
 
 class SellerDadosBase(BaseModel):
     cnpj: Optional[str] = None
@@ -391,3 +646,159 @@ def desativar_owner(id_owner: int, db: Session = Depends(get_db), current_user: 
     owner.ativo = False
     db.commit()
     return {"ok": True}
+
+
+# ============================================================
+# IDENTIDADE VISUAL (logo + nome + slogan)
+# ============================================================
+
+@router.get("/me/identidade", response_model=OwnerIdentidadeOut)
+def get_identidade_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _assert_role_01(current_user)
+    return _identidade_out(_owner_for_me(db, current_user))
+
+
+@router.patch("/me/identidade", response_model=OwnerIdentidadeOut)
+def patch_identidade_me(
+    body: OwnerIdentidadePatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _assert_role_01(current_user)
+    owner = _owner_for_me(db, current_user)
+    if body.nome_fantasia is not None:
+        owner.nome_fantasia = (body.nome_fantasia or "").strip() or None
+    if body.slogan is not None:
+        owner.slogan = (body.slogan or "").strip() or None
+    if body.contato is not None:
+        owner.contato = _normalize_contato_identidade(body.contato)
+    db.commit()
+    db.refresh(owner)
+    return _identidade_out(owner)
+
+
+@router.post("/me/logo", response_model=OwnerIdentidadeOut)
+async def upload_logo_me(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _assert_role_01(current_user)
+    owner = _owner_for_me(db, current_user)
+    content, ext, content_type = _validate_and_read_logo(file)
+    _upload_owner_logo(owner, content, ext, content_type, file.filename or f"logo.{ext}")
+    db.commit()
+    db.refresh(owner)
+    return _identidade_out(owner)
+
+
+@router.delete("/me/logo", response_model=OwnerIdentidadeOut)
+def delete_logo_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _assert_role_01(current_user)
+    owner = _owner_for_me(db, current_user)
+    _delete_owner_logo(owner)
+    db.commit()
+    db.refresh(owner)
+    return _identidade_out(owner)
+
+
+@router.post("/me/logo/presign-get", response_model=LogoPresignGetOut)
+def presign_logo_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _assert_role_01(current_user)
+    return _presign_logo(_owner_for_me(db, current_user))
+
+
+@router.get("/{id_owner}/identidade", response_model=OwnerIdentidadeOut)
+def get_identidade_owner(
+    id_owner: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
+        raise HTTPException(403, "Acesso restrito ao administrador.")
+    owner = db.get(Owner, id_owner)
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado.")
+    return _identidade_out(owner)
+
+
+@router.patch("/{id_owner}/identidade", response_model=OwnerIdentidadeOut)
+def patch_identidade_owner(
+    id_owner: int,
+    body: OwnerIdentidadePatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
+        raise HTTPException(403, "Acesso restrito ao administrador.")
+    owner = db.get(Owner, id_owner)
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado.")
+    if body.nome_fantasia is not None:
+        owner.nome_fantasia = (body.nome_fantasia or "").strip() or None
+    if body.slogan is not None:
+        owner.slogan = (body.slogan or "").strip() or None
+    if body.contato is not None:
+        owner.contato = _normalize_contato_identidade(body.contato)
+    db.commit()
+    db.refresh(owner)
+    return _identidade_out(owner)
+
+
+@router.post("/{id_owner}/logo", response_model=OwnerIdentidadeOut)
+async def upload_logo_owner(
+    id_owner: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
+        raise HTTPException(403, "Acesso restrito ao administrador.")
+    owner = db.get(Owner, id_owner)
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado.")
+    content, ext, content_type = _validate_and_read_logo(file)
+    _upload_owner_logo(owner, content, ext, content_type, file.filename or f"logo.{ext}")
+    db.commit()
+    db.refresh(owner)
+    return _identidade_out(owner)
+
+
+@router.delete("/{id_owner}/logo", response_model=OwnerIdentidadeOut)
+def delete_logo_owner(
+    id_owner: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
+        raise HTTPException(403, "Acesso restrito ao administrador.")
+    owner = db.get(Owner, id_owner)
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado.")
+    _delete_owner_logo(owner)
+    db.commit()
+    db.refresh(owner)
+    return _identidade_out(owner)
+
+
+@router.post("/{id_owner}/logo/presign-get", response_model=LogoPresignGetOut)
+def presign_logo_owner(
+    id_owner: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if _coerce_role_int(getattr(current_user, "role", None)) != 0:
+        raise HTTPException(403, "Acesso restrito ao administrador.")
+    owner = db.get(Owner, id_owner)
+    if not owner:
+        raise HTTPException(404, "Owner não encontrado.")
+    return _presign_logo(owner)

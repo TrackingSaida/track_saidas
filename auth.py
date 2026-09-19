@@ -48,8 +48,16 @@ ALGORITHM = "HS256"
 
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
 REMEMBER_ME_EXPIRE_DAYS = int(os.getenv("REMEMBER_ME_EXPIRE_DAYS", "200"))
-MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS", "30"))
-MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS", "90"))
+# Access curto + refresh silencioso (sessão deslizante). Preferir HOURS; DAYS legado.
+MOTOBOY_ACCESS_TOKEN_EXPIRE_HOURS = int(os.getenv("MOTOBOY_ACCESS_TOKEN_EXPIRE_HOURS", "2"))
+MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS", "0"))
+MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS", "60"))
+MOTOBOY_IDLE_TIMEOUT_DAYS = int(os.getenv("MOTOBOY_IDLE_TIMEOUT_DAYS", "7"))
+MOTOBOY_REFRESH_ABSOLUTE_DAYS = int(os.getenv("MOTOBOY_REFRESH_ABSOLUTE_DAYS", "60"))
+
+CLAIMS_STALE_HEADER = "X-Claims-Stale"
+SESSION_INVALID_DETAIL = "Sessão inválida. Faça login novamente."
+SESSION_IDLE_DETAIL = "Sessão expirada por inatividade. Faça login novamente."
 
 # Cookies
 ACCESS_COOKIE_NAME = os.getenv("ACCESS_COOKIE_NAME", "access_token")
@@ -184,6 +192,7 @@ class UserResponse(BaseModel):
     must_change_password: Optional[bool] = None
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
+    bloquear_saida_sem_coleta: bool = False
 
 
 # ======================================================
@@ -196,11 +205,42 @@ def create_access_token(data: dict, expires_delta: timedelta) -> str:
 
 
 def _motoboy_access_expires() -> timedelta:
-    return timedelta(days=MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS)
+    if MOTOBOY_ACCESS_TOKEN_EXPIRE_HOURS > 0:
+        return timedelta(hours=MOTOBOY_ACCESS_TOKEN_EXPIRE_HOURS)
+    days = MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS if MOTOBOY_ACCESS_TOKEN_EXPIRE_DAYS > 0 else 1
+    return timedelta(days=days)
 
 
 def _motoboy_refresh_expires() -> timedelta:
-    return timedelta(days=MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS)
+    return timedelta(days=max(1, MOTOBOY_REFRESH_TOKEN_EXPIRE_DAYS))
+
+
+def _coerce_role_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def bump_motoboy_claims_version(db: Session, motoboy: Motoboy, *, commit: bool = False) -> int:
+    current = int(getattr(motoboy, "claims_version", 0) or 0)
+    motoboy.claims_version = current + 1
+    db.add(motoboy)
+    if commit:
+        run_db_query_with_retry(db, db.commit)
+    return int(motoboy.claims_version)
+
+
+def bump_motoboys_claims_version_for_sub_base(db: Session, sub_base: str) -> int:
+    rows = list(
+        db.scalars(select(Motoboy).where(Motoboy.sub_base == (sub_base or "").strip())).all()
+    )
+    for m in rows:
+        m.claims_version = int(getattr(m, "claims_version", 0) or 0) + 1
+        db.add(m)
+    return len(rows)
 
 
 def _hash_refresh_token(raw: str) -> str:
@@ -235,13 +275,15 @@ def _store_motoboy_refresh_token(
     motoboy_id: int,
     plain_token: str,
 ) -> None:
-    expires_at = datetime.utcnow() + _motoboy_refresh_expires()
+    now = datetime.utcnow()
+    expires_at = now + _motoboy_refresh_expires()
     db.add(
         MotoboyRefreshToken(
             user_id=user_id,
             motoboy_id=motoboy_id,
             token_hash=_hash_refresh_token(plain_token),
             expires_at=expires_at,
+            last_activity_at=now,
         )
     )
 
@@ -387,18 +429,38 @@ def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, 
             )
         ),
     )
-    if not row or row.expires_at < datetime.utcnow():
+    now = datetime.utcnow()
+    if not row or row.expires_at < now:
         raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
+
+    # Teto absoluto desde a criação do refresh
+    absolute_limit = timedelta(days=max(1, MOTOBOY_REFRESH_ABSOLUTE_DAYS))
+    created = getattr(row, "created_at", None) or now
+    if created + absolute_limit < now:
+        row.revoked_at = now
+        run_db_query_with_retry(db, db.commit)
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
+
+    # Idle: sem uso por N dias
+    idle_limit = timedelta(days=max(1, MOTOBOY_IDLE_TIMEOUT_DAYS))
+    last_act = getattr(row, "last_activity_at", None) or created
+    if last_act + idle_limit < now:
+        row.revoked_at = now
+        run_db_query_with_retry(db, db.commit)
+        raise HTTPException(status_code=401, detail=SESSION_IDLE_DETAIL)
 
     user = run_db_query_with_retry(db, lambda: db.get(User, row.user_id))
     motoboy = run_db_query_with_retry(db, lambda: db.get(Motoboy, row.motoboy_id))
     if not user or not motoboy or user.role != 4:
         raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
+    if not bool(getattr(user, "status", True)):
+        raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
 
     sub_base = _resolve_motoboy_session_sub_base(db, user=user, motoboy=motoboy)
     owner = _owner_for_sub_base(db, sub_base)
 
-    row.revoked_at = datetime.utcnow()
+    row.revoked_at = now
+    # Sliding: atividade registrada na rotação do refresh
     response = _issue_motoboy_auth_response(db, user, motoboy, owner, sub_base)
     return response
 
@@ -462,6 +524,9 @@ def _claims(user: User, owner: Owner, sub_base: Optional[str] = None) -> Dict[st
         ),
         "conferencia_saida_habilitada": bool(
             getattr(owner, "conferencia_saida_habilitada", False)
+        ),
+        "bloquear_saida_sem_coleta": bool(
+            getattr(owner, "bloquear_saida_sem_coleta", False)
         ),
     }
 
@@ -587,7 +652,11 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "conferencia_saida_habilitada": bool(
             getattr(owner, "conferencia_saida_habilitada", False)
         ),
+        "bloquear_saida_sem_coleta": bool(
+            getattr(owner, "bloquear_saida_sem_coleta", False)
+        ),
         "sub_base_nome": (owner.sub_base or sub_base or "").strip() or sub_base,
+        "claims_version": int(getattr(motoboy, "claims_version", 0) or 0),
     }
 
 
@@ -622,6 +691,7 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.devolucao_sub_base_habilitada = bool(payload.get("devolucao_sub_base_habilitada", False))
     u.entrada_obrigatoria_habilitada = bool(payload.get("entrada_obrigatoria_habilitada", False))
     u.conferencia_saida_habilitada = bool(payload.get("conferencia_saida_habilitada", False))
+    u.bloquear_saida_sem_coleta = bool(payload.get("bloquear_saida_sem_coleta", False))
     u.sub_base_nome = (payload.get("sub_base_nome") or payload.get("sub_base") or "").strip() or None
     u.pode_ler_saida = bool(payload.get("pode_ler_saida", True))
     u.pode_digitar_codigo_manual = bool(payload.get("pode_digitar_codigo_manual", True))
@@ -637,24 +707,11 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
 # ======================================================
 # DB helpers (somente para login)
 # ======================================================
-SESSION_INVALID_DETAIL = "Sessão inválida. Faça login novamente."
-
-
-def _coerce_role_int(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def get_users_by_identifier(db: Session, identifier: str) -> List[User]:
     """Todos os usuários que batem email/username/contato (pode haver 1 por sub_base)."""
     identifier = (identifier or "").strip()
     if not identifier:
         return []
-
     stmt = select(User).where(
         or_(
             User.email == identifier,
@@ -719,11 +776,85 @@ def _ensure_staff_jwt_matches_db(db: Session, *, uid: Any, jwt_role: int) -> Non
         raise HTTPException(status_code=401, detail=SESSION_INVALID_DETAIL)
 
 
+def _hydrate_motoboy_permissions_from_db(
+    db: Session,
+    user: User,
+    *,
+    response: Optional[Response] = None,
+    jwt_claims_version: Any = None,
+) -> User:
+    """Sobrescreve flags do JWT com valores vivos (Motoboy + Owner)."""
+    uid = getattr(user, "id", None)
+    if uid is None:
+        return user
+    try:
+        uid_int = int(uid)
+    except (TypeError, ValueError):
+        return user
+
+    motoboy = run_db_query_with_retry(
+        db,
+        lambda: db.scalar(select(Motoboy).where(Motoboy.user_id == uid_int)),
+    )
+    if not motoboy:
+        return user
+
+    sub_base = (getattr(user, "sub_base", None) or getattr(motoboy, "sub_base", None) or "").strip()
+    owner = None
+    if sub_base:
+        owner = run_db_query_with_retry(
+            db,
+            lambda: db.scalar(select(Owner).where(Owner.sub_base == sub_base)),
+        )
+
+    pode_realizar = bool(getattr(motoboy, "pode_realizar_coleta", getattr(motoboy, "pode_ler_coleta", False)))
+    modo = "codigo"
+    ignorar = False
+    if owner is not None:
+        ignorar = bool(owner.ignorar_coleta)
+        modo = (getattr(owner, "modo_operacao", None) or "codigo").strip().lower()
+        user.ignorar_coleta = ignorar
+        user.modo_operacao = modo
+        user.tipo_owner = _tipo_owner_from_owner(owner)
+        user.owner_valor = Decimal(str(owner.valor or 0))
+        user.devolucao_sub_base_habilitada = bool(getattr(owner, "devolucao_sub_base_habilitada", False))
+        user.entrada_obrigatoria_habilitada = bool(getattr(owner, "entrada_obrigatoria_habilitada", False))
+        user.conferencia_saida_habilitada = bool(getattr(owner, "conferencia_saida_habilitada", False))
+        user.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
+        user.owner_ativo = bool(owner.ativo)
+        user.sub_base_nome = (owner.sub_base or sub_base).strip() or sub_base
+
+    pode_ler_coleta = pode_realizar and modo in ("codigo", "ambos")
+    if ignorar:
+        pode_ler_coleta = False
+        pode_realizar = False
+
+    user.motoboy_id = int(motoboy.id_motoboy)
+    user.pode_realizar_coleta = pode_realizar
+    user.pode_ler_coleta = bool(pode_ler_coleta)
+    user.pode_ler_saida = bool(getattr(motoboy, "pode_ler_saida", True))
+    user.pode_digitar_codigo_manual = bool(getattr(motoboy, "pode_digitar_codigo_manual", False))
+    user.pode_lancar_avulso = bool(getattr(motoboy, "pode_lancar_avulso", True))
+    user.avulso_exige_foto = bool(getattr(motoboy, "avulso_exige_foto", True))
+    live_version = int(getattr(motoboy, "claims_version", 0) or 0)
+    user.claims_version = live_version
+
+    try:
+        jwt_ver = int(jwt_claims_version) if jwt_claims_version is not None and jwt_claims_version != "" else None
+    except (TypeError, ValueError):
+        jwt_ver = None
+    if response is not None and jwt_ver is not None and jwt_ver != live_version:
+        response.headers[CLAIMS_STALE_HEADER] = "1"
+
+    return user
+
+
 # ======================================================
-# Usuário logado — JWT; staff revalida role no banco
+# Usuário logado — JWT; staff revalida role; motoboy hidrata flags
 # ======================================================
 async def get_current_user(
     request: Request,
+    response: Response,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: Session = Depends(get_db),
 ) -> User:
@@ -744,8 +875,6 @@ async def get_current_user(
     role_int = _coerce_role_int(payload.get("role"))
 
     if not payload.get("owner_ativo", False):
-        # Motoboy: owner_ativo no JWT pode ser de sub_base stale (ex.: WS).
-        # A validação real do Owner ocorre após resolver MotoboySubBase.
         if role_int != 4:
             raise HTTPException(status_code=403, detail="Operação bloqueada")
 
@@ -753,10 +882,19 @@ async def get_current_user(
     if role_int in (0, 1, 2, 3):
         _ensure_staff_jwt_matches_db(db, uid=payload.get("uid"), jwt_role=role_int)
 
-    # policy disponível para as rotas
     request.state.ignorar_coleta = payload.get("ignorar_coleta", False)
+    user = _user_from_claims(payload)
 
-    return _user_from_claims(payload)
+    if role_int == 4:
+        user = _hydrate_motoboy_permissions_from_db(
+            db,
+            user,
+            response=response,
+            jwt_claims_version=payload.get("claims_version"),
+        )
+        request.state.ignorar_coleta = bool(getattr(user, "ignorar_coleta", False))
+
+    return user
 
 
 # ======================================================
@@ -1138,6 +1276,11 @@ async def read_users_me(
     # tipo_owner vivo do Owner (não só do JWT) — sessão mobile longa pode ficar desatualizada
     # Preferir sub_base da sessão (JWT), essencial para root com base selecionada no login
     tipo_owner = getattr(current_user, "tipo_owner", None) or "subbase"
+    ignorar_coleta = bool(getattr(request.state, "ignorar_coleta", False))
+    modo_operacao = getattr(current_user, "modo_operacao", None) or "codigo"
+    entrada_obrigatoria = bool(getattr(current_user, "entrada_obrigatoria_habilitada", False))
+    conferencia = bool(getattr(current_user, "conferencia_saida_habilitada", False))
+    bloquear_saida_sem_coleta = bool(getattr(current_user, "bloquear_saida_sem_coleta", False))
     sub_base = (
         getattr(current_user, "sub_base", None)
         or getattr(db_user, "sub_base", None)
@@ -1150,6 +1293,11 @@ async def read_users_me(
         )
         if owner is not None:
             tipo_owner = _tipo_owner_from_owner(owner)
+            ignorar_coleta = bool(owner.ignorar_coleta)
+            modo_operacao = (getattr(owner, "modo_operacao", None) or "codigo")
+            entrada_obrigatoria = bool(getattr(owner, "entrada_obrigatoria_habilitada", False))
+            conferencia = bool(getattr(owner, "conferencia_saida_habilitada", False))
+            bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
@@ -1159,16 +1307,13 @@ async def read_users_me(
         contato=current_user.contato,
         role=live_role,
         sub_base=sub_base or current_user.sub_base,
-        ignorar_coleta=bool(getattr(request.state, "ignorar_coleta", False)),
-        modo_operacao=getattr(current_user, "modo_operacao", None) or "codigo",
+        ignorar_coleta=ignorar_coleta,
+        modo_operacao=modo_operacao,
         tipo_owner=tipo_owner,
         must_change_password=bool(getattr(db_user, "must_change_password", False)),
-        entrada_obrigatoria_habilitada=bool(
-            getattr(current_user, "entrada_obrigatoria_habilitada", False)
-        ),
-        conferencia_saida_habilitada=bool(
-            getattr(current_user, "conferencia_saida_habilitada", False)
-        ),
+        entrada_obrigatoria_habilitada=entrada_obrigatoria,
+        conferencia_saida_habilitada=conferencia,
+        bloquear_saida_sem_coleta=bloquear_saida_sem_coleta,
     )
 
 

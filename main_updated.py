@@ -8,31 +8,52 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
+from http_error_public import CLIENT_SAFE_500, public_error_body
+
 logger = logging.getLogger("main")
 
 # ──────────────────────────────────────────────────────────────────
 # Config
 API_PREFIX = os.getenv("API_PREFIX", "/api")
 
+# Origens que o frontend web usa. Sempre mescladas, mesmo se ALLOWED_ORIGINS
+# vier por ENV (ex.: serviço de homol clonado com origens só de produção).
+REQUIRED_FRONTEND_ORIGINS = [
+    "https://tracking-saidas.com.br",
+    "https://www.tracking-saidas.com.br",
+    "https://track-saidas-html.onrender.com",
+    "https://rotevo-web-homol.onrender.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+
+def _merge_allowed_origins(origins):
+    merged = []
+    for origin in list(origins) + REQUIRED_FRONTEND_ORIGINS:
+        if origin and origin not in merged:
+            merged.append(origin)
+    return merged
+
+
 # ALLOWED_ORIGINS pode vir por ENV (lista separada por vírgula) ou usar a default abaixo
 _env_origins = os.getenv("ALLOWED_ORIGINS")
 if _env_origins:
-    ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
-    # Garantir localhost:3000 para desenvolvimento/testes mesmo quando ENV está definida
-    for origin in ("http://localhost:3000", "http://127.0.0.1:3000"):
-        if origin not in ALLOWED_ORIGINS:
-            ALLOWED_ORIGINS.append(origin)
+    ALLOWED_ORIGINS = _merge_allowed_origins(
+        [o.strip() for o in _env_origins.split(",") if o.strip()]
+    )
 else:
-    ALLOWED_ORIGINS = [
+    ALLOWED_ORIGINS = _merge_allowed_origins([
         "https://admirable-sprinkles-d10196.netlify.app",
         "https://tracking-saidas.com.br",
         "https://www.tracking-saidas.com.br",
         "https://track-saidas-html.onrender.com",
+        "https://rotevo-web-homol.onrender.com",
         "http://localhost:5500", "http://127.0.0.1:5500",
         "http://localhost:8000", "http://127.0.0.1:8000",
         "http://localhost:3000", "http://172.30.33.97:3000",
         "http://account.sandbox.test-stable.shopee.com",
-    ]
+    ])
 
 # ──────────────────────────────────────────────────────────────────
 # App
@@ -86,7 +107,11 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
             if origin:
                 headers["Access-Control-Allow-Origin"] = origin
                 headers["Access-Control-Allow-Credentials"] = "true"
-            return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=headers)
+            return JSONResponse(
+                status_code=500,
+                content={"detail": CLIENT_SAFE_500},
+                headers=headers,
+            )
 
         end = time.perf_counter()
         response.headers["X-Backend-Process-Time"] = f"{(end - start) * 1000:.3f}"
@@ -116,7 +141,7 @@ app.add_middleware(
         "Cache-Control", "Pragma",
     ],
     max_age=86400,                           # cache do preflight
-    expose_headers=["X-Backend-Process-Time", "Content-Disposition"],
+    expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale"],
 )
 
 # ──────────────────────────────────────────────────────────────────
@@ -138,12 +163,16 @@ from shopee_routes import router as shopee_router
 from logs import router as logs_router
 from contabilidade_routes import router as contabilidade_router
 from etiquetas_routes import router as etiquetas_router
+from envio_proprio_routes import router as envio_proprio_router
 from dashboard_routes import router as dashboard_router
 from mobile_entregas_routes import router as mobile_entregas_router
 from upload_routes import router as upload_router
 from acompanhamento_routes import router as acompanhamento_router
 from cep_routes import router as cep_router
 from config_campos_obrigatorios_routes import router as config_campos_obrigatorios_router
+from politicas_routes import router as politicas_router
+from avulso_campos_routes import router_config as avulso_campos_config_router
+from avulso_campos_routes import router_avulsos as avulsos_router
 from entradas_routes import router as entradas_router
 from conferencia_saida_routes import router as conferencia_saida_router
 from mobile_push_routes import router as mobile_push_router
@@ -153,6 +182,7 @@ from mobile_fechamentos_routes import router as mobile_fechamentos_router
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
 app.include_router(etiquetas_router, prefix=API_PREFIX)
+app.include_router(envio_proprio_router, prefix=API_PREFIX)
 app.include_router(contabilidade_router, prefix=API_PREFIX)
 app.include_router(dashboard_router, prefix=API_PREFIX)
 app.include_router(ui_router, prefix=API_PREFIX)
@@ -182,6 +212,9 @@ app.include_router(signup_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
 app.include_router(config_campos_obrigatorios_router, prefix=API_PREFIX)
+app.include_router(politicas_router, prefix=API_PREFIX)
+app.include_router(avulso_campos_config_router, prefix=API_PREFIX)
+app.include_router(avulsos_router, prefix=API_PREFIX)
 
 
 def _cors_headers_for_request(request: Request):
@@ -197,30 +230,24 @@ def _cors_headers_for_request(request: Request):
 
 @app.exception_handler(FastAPIHTTPException)
 async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
-    """Garante CORS e preserva detail estruturado (ex.: mensagem/pode_ajudar)."""
-    detail = exc.detail
-    # Dict/list devem ir intactos para o cliente montar UI (ex.: "Deseja ajudar?").
-    # Strings simples continuam em {"detail": "..."}.
-    if isinstance(detail, (dict, list)):
-        body = {"detail": detail}
-    else:
-        body = {"detail": str(detail) if detail else "Erro"}
+    """Garante CORS e preserva detail de negócio; 500 técnico não vai ao cliente."""
+    body = public_error_body(exc.status_code, exc.detail)
     headers = dict(_cors_headers_for_request(request))
     return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Garante que respostas de erro (500) incluam headers CORS para o browser não bloquear."""
+    """Garante CORS em 500 e nunca devolve SQL/stack ao browser."""
     status = 500
-    detail = str(exc) or "Erro interno do servidor"
+    detail_for_log = str(exc) or "Erro interno do servidor"
     try:
         if hasattr(exc, "status_code"):
             status = getattr(exc, "status_code", 500)
         if hasattr(exc, "detail"):
             d = getattr(exc, "detail", None)
             if d is not None:
-                detail = d if isinstance(d, str) else str(d.get("message", d.get("detail", d)))
+                detail_for_log = d if isinstance(d, str) else str(d.get("message", d.get("detail", d)))
     except Exception:
         pass
     logger.exception(
@@ -228,11 +255,11 @@ async def global_exception_handler(request: Request, exc: Exception):
         request.method,
         request.url.path,
         status,
-        detail,
+        detail_for_log,
     )
-    body = {"detail": detail}
+    body = public_error_body(status, detail_for_log, unhandled=True)
     headers = dict(_cors_headers_for_request(request))
-    return JSONResponse(status_code=status, content=body, headers=headers)
+    return JSONResponse(status_code=status if isinstance(status, int) else 500, content=body, headers=headers)
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -31,6 +31,7 @@ PREF_RECONFERIR = "reconferir_saida"
 ALWAYS_SEND_TYPES = frozenset(
     {
         "bloqueio_ausencia",
+        "liberacao_ausencia",
         "aviso_urgente",
         "aviso_base",
         "fechamento_pronto",

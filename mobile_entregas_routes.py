@@ -33,6 +33,7 @@ from auth import (
     get_current_user,
     ensure_motoboy_session,
 )
+from saida_prerequisito import avaliar_prerequisito_saida
 from active_route_sync import (
     get_active_route_delivery_ids,
     refresh_active_route_if_stale,
@@ -3068,10 +3069,11 @@ def finalizar_lote(
             if status_novo == STATUS_AUSENTE:
                 try:
                     from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
-                    from push_notification_service import send_to_motoboy
+                    from push_notification_service import send_to_motoboy, send_to_staff_sub_base
 
                     bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
                     if bloqueado and total >= 3:
+                        codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
                         send_to_motoboy(
                             db,
                             motoboy_id=int(user.motoboy_id),
@@ -3079,8 +3081,17 @@ def finalizar_lote(
                             tipo="bloqueio_ausencia",
                             title="Pacote bloqueado",
                             body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
-                            data={"id_saida": id_saida},
+                            data={"id_saida": id_saida, "codigo": codigo},
                             chave_dedupe=str(id_saida),
+                        )
+                        send_to_staff_sub_base(
+                            db,
+                            sub_base=user.sub_base,
+                            tipo="bloqueio_ausencia",
+                            title="Pacote bloqueado por ausência",
+                            body=f"Pacote {codigo} bloqueado por limite de ausências.",
+                            data={"id_saida": id_saida, "codigo": codigo},
+                            chave_dedupe=f"staff:{id_saida}",
                         )
                         db.commit()
                 except Exception:
@@ -3398,10 +3409,11 @@ def marcar_ausente(
     db.refresh(s)
     try:
         from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
-        from push_notification_service import send_to_motoboy
+        from push_notification_service import send_to_motoboy, send_to_staff_sub_base
 
         bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
         if bloqueado and total >= 3:
+            codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
             send_to_motoboy(
                 db,
                 motoboy_id=int(user.motoboy_id),
@@ -3409,8 +3421,17 @@ def marcar_ausente(
                 tipo="bloqueio_ausencia",
                 title="Pacote bloqueado",
                 body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
-                data={"id_saida": id_saida},
+                data={"id_saida": id_saida, "codigo": codigo},
                 chave_dedupe=str(id_saida),
+            )
+            send_to_staff_sub_base(
+                db,
+                sub_base=user.sub_base,
+                tipo="bloqueio_ausencia",
+                title="Pacote bloqueado por ausência",
+                body=f"Pacote {codigo} bloqueado por limite de ausências.",
+                data={"id_saida": id_saida, "codigo": codigo},
+                chave_dedupe=f"staff:{id_saida}",
             )
             db.commit()
     except Exception:
@@ -3724,33 +3745,36 @@ def scan_codigo(
         )
     )
 
-    entrada_obrigatoria = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
-    if not entrada_obrigatoria:
-        # Claim JWT ausente/false: resolve 1x e cacheia no user do request.
-        cache_key = "_entrada_obrigatoria_resolved"
-        cached = getattr(user, cache_key, None)
-        if isinstance(cached, bool):
-            entrada_obrigatoria = cached
-        else:
-            owner_flag = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    # Resolve flags do Owner 1x (JWT pode estar desatualizado).
+    cache_key = "_politicas_saida_resolved"
+    cached = getattr(user, cache_key, None)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        ignorar_coleta, entrada_obrigatoria = cached
+    else:
+        ignorar_coleta = bool(getattr(user, "ignorar_coleta", False))
+        entrada_obrigatoria = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
+        owner_flag = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+        if owner_flag is not None:
+            ignorar_coleta = bool(owner_flag.ignorar_coleta)
             entrada_obrigatoria = bool(
-                owner_flag and getattr(owner_flag, "entrada_obrigatoria_habilitada", False)
+                getattr(owner_flag, "entrada_obrigatoria_habilitada", False)
             )
-            try:
-                setattr(user, cache_key, entrada_obrigatoria)
-            except Exception:
-                pass
+        try:
+            setattr(user, cache_key, (ignorar_coleta, entrada_obrigatoria))
+        except Exception:
+            pass
+    coleta_habilitada = not ignorar_coleta
+    entrada_habilitada = entrada_obrigatoria
 
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
     if not saida:
-        if entrada_obrigatoria:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "code": "ENTRADA_OBRIGATORIA",
-                    "message": "Este pacote ainda não teve entrada na base.",
-                },
-            )
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=False,
+        )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
         motoboy = db.get(Motoboy, motoboy_id) if motoboy_id else None
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
@@ -4033,20 +4057,21 @@ def scan_codigo(
             status_code=422,
             content=_status_finalizado_detail(saida, status_norm),
         )
-    if entrada_obrigatoria and status_norm not in (
-        STATUS_NA_BASE,
+    if status_norm not in (
         STATUS_SAIU_PARA_ENTREGA,
         STATUS_EM_ROTA,
         "saiu",
         STATUS_AUSENTE,
     ):
-        return JSONResponse(
-            status_code=422,
-            content={
-                "code": "ENTRADA_OBRIGATORIA",
-                "message": "Este pacote ainda não teve entrada na base.",
-            },
+        gate = avaliar_prerequisito_saida(
+            coleta_habilitada=coleta_habilitada,
+            entrada_habilitada=entrada_habilitada,
+            saida_existe=True,
+            status_norm=status_norm,
+            ja_em_rota_ou_saida=False,
         )
+        if gate:
+            return JSONResponse(status_code=422, content=gate)
     if (
         status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu")
         and motoboy_id is not None
