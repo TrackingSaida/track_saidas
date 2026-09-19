@@ -454,19 +454,56 @@ def _filtro_avulso(sub_base: str):
     ]
 
 
+def _formatar_cep_busca(digits: str) -> Optional[str]:
+    if len(digits) != 8:
+        return None
+    return f"{digits[:5]}-{digits[5:]}"
+
+
+def _formatar_telefone_busca(digits: str) -> Optional[str]:
+    """Espelha format_valor_tipo(telefone) sem rejeitar tamanho inválido."""
+    phone = digits
+    if phone.startswith("55") and len(phone) in (12, 13):
+        phone = phone[2:]
+    if len(phone) == 11:
+        return f"({phone[:2]}) {phone[2:7]}-{phone[7:]}"
+    if len(phone) == 10:
+        return f"({phone[:2]}) {phone[2:6]}-{phone[6:]}"
+    return None
+
+
+def _append_unique(out: List[str], value: Optional[str]) -> None:
+    if value and value not in out:
+        out.append(value)
+
+
 def _variantes_busca(tipo: Optional[str], valor: str) -> List[str]:
     raw = (valor or "").strip()
     if not raw:
         return []
     out = [raw]
-    if (tipo or "") in ("cep", "telefone"):
-        digits = _somente_digitos(raw)
-        if digits and digits not in out:
-            out.append(digits)
-        if tipo == "cep" and len(digits) == 8:
-            formatted = f"{digits[:5]}-{digits[5:]}"
-            if formatted not in out:
-                out.append(formatted)
+    tipo_n = (tipo or "").strip().lower()
+    if tipo_n not in ("cep", "telefone"):
+        return out
+    digits = _somente_digitos(raw)
+    _append_unique(out, digits)
+    if tipo_n == "cep":
+        _append_unique(out, _formatar_cep_busca(digits))
+    else:
+        _append_unique(out, _formatar_telefone_busca(digits))
+    return out
+
+
+def _variantes_termo_livre(term: str) -> List[str]:
+    """Busca livre: CEP/telefone sem máscara encontra o valor formatado no banco."""
+    raw = (term or "").strip()
+    if not raw:
+        return []
+    out = [raw]
+    digits = _somente_digitos(raw)
+    _append_unique(out, digits)
+    _append_unique(out, _formatar_cep_busca(digits))
+    _append_unique(out, _formatar_telefone_busca(digits))
     return out
 
 
@@ -538,12 +575,14 @@ def _aplicar_busca_contem(
             return None
         out.append(Saida.id_saida.in_(matching))
     if term:
-        like = f"%{term}%"
-        ids_from_eav = select(AvulsoCampoValor.id_saida).where(AvulsoCampoValor.valor_texto.ilike(like))
+        likes = [f"%{v}%" for v in _variantes_termo_livre(term)]
+        ids_from_eav = select(AvulsoCampoValor.id_saida).where(
+            or_(*[AvulsoCampoValor.valor_texto.ilike(lk) for lk in likes])
+        )
         out.append(
             or_(
-                Saida.codigo.ilike(like),
-                Saida.base.ilike(like),
+                *[Saida.codigo.ilike(lk) for lk in likes],
+                *[Saida.base.ilike(lk) for lk in likes],
                 Saida.id_saida.in_(ids_from_eav),
             )
         )
