@@ -13,6 +13,8 @@ from avulso_campos_service import (
     origem_amigavel,
     validate_campos_payload,
     _slug_chave,
+    _variantes_busca,
+    _variantes_termo_livre,
 )
 
 
@@ -257,3 +259,38 @@ def test_tipos_novos_e_labels():
         format_valor_tipo("cep", "123", "CEP")
     with pytest.raises(HTTPException):
         format_valor_tipo("primeiro_nome", "Maria2", "Primeiro nome")
+
+
+def test_variantes_termo_livre_cep_sem_mascara():
+    vs = _variantes_termo_livre("06460110")
+    assert "06460110" in vs
+    assert "06460-110" in vs
+
+
+def test_variantes_termo_livre_cep_com_mascara():
+    vs = _variantes_termo_livre("06460-110")
+    assert "06460-110" in vs
+    assert "06460110" in vs
+
+
+def test_variantes_termo_livre_telefone_sem_mascara():
+    vs = _variantes_termo_livre("11988887777")
+    assert "11988887777" in vs
+    assert "(11) 98888-7777" in vs
+
+
+def test_variantes_termo_livre_telefone_fixo():
+    vs = _variantes_termo_livre("1133334444")
+    assert "1133334444" in vs
+    assert "(11) 3333-4444" in vs
+
+
+def test_variantes_busca_telefone_sem_mascara():
+    vs = _variantes_busca("telefone", "11988887777")
+    assert "(11) 98888-7777" in vs
+    assert "11988887777" in vs
+
+
+def test_variantes_termo_livre_nome_nao_inventa_mascara():
+    vs = _variantes_termo_livre("Maria")
+    assert vs == ["Maria"]
