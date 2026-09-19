@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
+os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -162,6 +163,7 @@ def test_pdf_envio_proprio_nao_explode_sem_logo():
         sub_base="base_teste",
         slogan="Slogan de teste",
         logo_object_key=None,
+        contato="11988887777",
     )
     pdf = gerar_etiqueta(
         modo="envio_proprio",
@@ -171,18 +173,18 @@ def test_pdf_envio_proprio_nao_explode_sem_logo():
             "nome": "Remetente Longo Nome da Empresa XYZ Ltda",
             "telefone": "11988887777",
             "cep": "01310100",
-            "rua": "Avenida Paulista com nome bem extenso para forçar quebra de linha no card",
+            "rua": "Avenida Paulista com nome bem extenso para forcar quebra de linha no card",
             "numero": "1000",
             "complemento": "Sala 101",
             "bairro": "Bela Vista",
-            "cidade": "São Paulo",
+            "cidade": "Sao Paulo",
             "uf": "SP",
         },
         destinatario={
-            "nome": "Destinatário com nome também bem longo para ellipsis",
+            "nome": "Destinatario com nome tambem bem longo para ellipsis",
             "telefone": "21977776666",
             "cep": "20040020",
-            "rua": "Rua do Destino Muito Comprida Número Extenso",
+            "rua": "Rua do Destino Muito Comprida Numero Extenso",
             "numero": "50",
             "complemento": None,
             "bairro": "Centro",
@@ -191,10 +193,21 @@ def test_pdf_envio_proprio_nao_explode_sem_logo():
         },
         peso_kg=None,
         dimensoes=None,
+        observacao="Deixar na portaria com o porteiro",
+        contato_override="11988887777",
     )
     assert isinstance(pdf, (bytes, bytearray))
     assert pdf[:4] == b"%PDF"
     assert len(pdf) > 500
+
+
+def test_fmt_contato_celular_e_vazio():
+    from etiqueta_pdf_service import _fmt_contato
+
+    assert _fmt_contato("11988887777") == "(11) 98888-7777"
+    assert _fmt_contato("1133334444") == "(11) 3333-4444"
+    assert _fmt_contato("") == ""
+    assert _fmt_contato(None) == ""
 
 
 def test_require_owner_tipo_base_rejeita_subbase():

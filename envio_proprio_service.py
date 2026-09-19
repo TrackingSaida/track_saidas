@@ -13,7 +13,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int
-from etiqueta_identidade_service import resolver_nome_exibicao, resolver_slogan
+from etiqueta_identidade_service import resolver_contato, resolver_nome_exibicao, resolver_slogan
 from etiqueta_pdf_service import gerar_etiqueta
 from models import BasePreco, BaseSellerDados, EnvioProprio, Owner, Saida, SaidaDetail, SaidaHistorico, User
 
@@ -287,6 +287,8 @@ def criar_envio_proprio(
         nome_exibicao_override=nome_exib,
         slogan_override=slogan,
         logo_key_hint=logo_key,
+        observacao=observacao,
+        contato_override=resolver_contato(owner),
     )
     db.commit()
     db.refresh(envio)
@@ -312,6 +314,8 @@ def pdf_from_envio(db: Session, envio: EnvioProprio) -> bytes:
         nome_exibicao_override=envio.owner_nome_exibicao,
         slogan_override=envio.owner_slogan or "",
         logo_key_hint=envio.logo_object_key_used,
+        observacao=envio.observacao,
+        contato_override=resolver_contato(owner),
     )
 
 

@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from etiqueta_identidade_service import (
     LOGO_ORIGEM_ROTEVO,
     fit_logo_image,
+    resolver_contato,
     resolver_logo_etiqueta,
     resolver_nome_exibicao,
     resolver_slogan,
@@ -196,6 +197,14 @@ def _fmt_tel(tel: Optional[str]) -> str:
     return (tel or "").strip() or "—"
 
 
+def _fmt_contato(raw: Optional[str]) -> str:
+    digits = "".join(c for c in (raw or "") if c.isdigit())
+    if len(digits) in (10, 11):
+        formatted = _fmt_tel(digits)
+        return "" if formatted == "—" else formatted
+    return (raw or "").strip()
+
+
 def _clip(text: str, max_len: int) -> str:
     t = (text or "").strip()
     if len(t) <= max_len:
@@ -223,6 +232,46 @@ def _endereco_linha(
     return ", ".join(p for p in parts if p)
 
 
+def _wrap_lines(c, text: str, font: str, size: float, max_width: float, max_lines: int = 3) -> list[str]:
+    words = (text or "").split()
+    if not words:
+        return []
+    lines: list[str] = []
+    cur = ""
+    extra = False
+    for w in words:
+        trial = f"{cur} {w}".strip()
+        if c.stringWidth(trial, font, size) <= max_width or not cur:
+            cur = trial
+            continue
+        lines.append(cur)
+        cur = w
+        if len(lines) >= max_lines:
+            extra = True
+            break
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+    elif cur:
+        extra = True
+    if extra and lines:
+        lines[-1] = _clip(lines[-1], max(8, len(lines[-1])))
+    return lines[:max_lines]
+
+
+def _draw_phone_icon(c, x: float, y: float, size: float, color) -> None:
+    """Ícone compacto de telefone (handset) à esquerda do contato."""
+    c.saveState()
+    c.setFillColor(color)
+    c.setStrokeColor(color)
+    c.setLineWidth(max(0.6, size * 0.08))
+    c.setLineCap(1)
+    c.setLineJoin(1)
+    c.translate(x + size * 0.52, y + size * 0.42)
+    c.rotate(40)
+    c.roundRect(-size * 0.18, -size * 0.46, size * 0.36, size * 0.92, size * 0.16, stroke=0, fill=1)
+    c.restoreState()
+
+
 def gerar_pdf_envio_proprio(
     *,
     owner: Optional[Owner],
@@ -235,9 +284,11 @@ def gerar_pdf_envio_proprio(
     nome_exibicao_override: Optional[str] = None,
     slogan_override: Optional[str] = None,
     logo_key_hint: Optional[str] = None,
+    observacao: Optional[str] = None,
+    contato_override: Optional[str] = None,
 ) -> bytes:
     """
-    Layout mockup 100x150mm: header Owner, código+QR, remetente, destinatário, stats, rodapé ROTEVO.
+    Layout mockup 100x150mm: header Owner, código+QR, remetente, destinatário, stats, rodapé.
     """
     from reportlab.lib.colors import Color, black, white, HexColor
     from reportlab.lib.units import mm
@@ -262,6 +313,9 @@ def gerar_pdf_envio_proprio(
 
     nome = (nome_exibicao_override or resolver_nome_exibicao(owner)).strip()
     slogan = (slogan_override if slogan_override is not None else resolver_slogan(owner)).strip()
+    contato_txt = _fmt_contato(
+        contato_override if contato_override is not None else resolver_contato(owner)
+    )
     logo_bytes, logo_origem = resolver_logo_etiqueta(owner)
 
     # Borda externa
@@ -272,8 +326,9 @@ def gerar_pdf_envio_proprio(
     y = altura - margin - 2 * mm
 
     # ---- Header ----
-    # Logo à esquerda; nome + slogan empilhados à direita (evita sobreposição).
-    header_h = 20 * mm
+    # Logo à esquerda; nome + slogan à direita; contato no canto inferior esquerdo, abaixo da logo.
+    header_h = 26 * mm if contato_txt else 20 * mm
+    header_top = y
     logo_max_w, logo_max_h = 28 * mm, 16 * mm
     draw_w = draw_h = 0
     if logo_bytes:
@@ -295,7 +350,7 @@ def gerar_pdf_envio_proprio(
             c.drawImage(
                 ImageReader(logo_buf),
                 margin,
-                y - draw_h,
+                header_top - draw_h,
                 width=draw_w,
                 height=draw_h,
                 mask="auto",
@@ -319,14 +374,14 @@ def gerar_pdf_envio_proprio(
 
     # Empilha nome (acima) e slogan (abaixo), alinhados à esquerda do bloco de texto.
     if show_name and slogan:
-        name_y = y - 6 * mm
-        slogan_y = y - 11 * mm
+        name_y = header_top - 6 * mm
+        slogan_y = header_top - 11 * mm
     elif show_name:
-        name_y = y - (draw_h / 2.0 if draw_h else 6 * mm) - 1.5 * mm
+        name_y = header_top - (draw_h / 2.0 if draw_h else 6 * mm) - 1.5 * mm
         slogan_y = None
     elif slogan:
         name_y = None
-        slogan_y = y - (draw_h / 2.0 if draw_h else 6 * mm) - 1.0 * mm
+        slogan_y = header_top - (draw_h / 2.0 if draw_h else 6 * mm) - 1.0 * mm
     else:
         name_y = slogan_y = None
 
@@ -342,7 +397,15 @@ def gerar_pdf_envio_proprio(
         max_chars_slogan = max(16, int(text_width / (slogan_font_size * 0.48)))
         c.drawString(text_x, slogan_y, _clip(slogan, max_chars_slogan))
 
-    y -= max(header_h, draw_h + 3 * mm)
+    if contato_txt:
+        icon_size = 3.2 * mm
+        contact_baseline = header_top - header_h + 2.6 * mm
+        _draw_phone_icon(c, margin, contact_baseline - 0.3 * mm, icon_size, dark)
+        c.setFillColor(dark)
+        c.setFont("Helvetica", 7)
+        c.drawString(margin + icon_size + 1.5 * mm, contact_baseline, _clip(contato_txt, 28))
+
+    y = header_top - header_h
     c.setStrokeColor(line)
     c.line(margin, y, largura - margin, y)
     y -= 4 * mm
@@ -377,6 +440,21 @@ def gerar_pdf_envio_proprio(
     qr_x = largura - margin - qr_size
     qr_y = y_codigo - qr_size + 4 * mm
     c.drawImage(ImageReader(qr_buf), qr_x, qr_y, width=qr_size, height=qr_size)
+
+    obs = (observacao or "").strip()
+    if obs:
+        y -= 4.2 * mm
+        c.setFillColor(gray)
+        c.setFont("Helvetica", 6)
+        c.drawString(margin, y, "OBSERVAÇÃO")
+        y -= 3.4 * mm
+        c.setFillColor(dark)
+        c.setFont("Helvetica", 7)
+        obs_width = max(20 * mm, qr_x - margin - 2.5 * mm)
+        for obs_line in _wrap_lines(c, obs, "Helvetica", 7, obs_width, max_lines=3):
+            c.drawString(margin, y, obs_line)
+            y -= 3.2 * mm
+        y += 1.2 * mm
 
     y = min(y, qr_y) - 3 * mm
     c.setStrokeColor(line)
@@ -458,14 +536,12 @@ def gerar_pdf_envio_proprio(
     y -= 10 * mm
 
     # ---- Footer ----
-    footer_h = 12 * mm
+    footer_h = 9 * mm
     c.setFillColor(footer_bg)
     c.rect(2 * mm, 2 * mm, largura - 4 * mm, footer_h, stroke=0, fill=1)
     c.setFillColor(white)
     c.setFont("Helvetica-Bold", 8)
-    c.drawCentredString(largura / 2, 2 * mm + footer_h - 5 * mm, "OBRIGADO PELA SUA CONFIANÇA!")
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(largura / 2, 2 * mm + 2.5 * mm, "BY: ROTEVO")
+    c.drawCentredString(largura / 2, 2 * mm + footer_h / 2 - 1.1 * mm, "OBRIGADO PELA SUA CONFIANÇA!")
 
     c.save()
     buf.seek(0)
@@ -489,6 +565,8 @@ def gerar_etiqueta(
     nome_exibicao_override: Optional[str] = None,
     slogan_override: Optional[str] = None,
     logo_key_hint: Optional[str] = None,
+    observacao: Optional[str] = None,
+    contato_override: Optional[str] = None,
 ) -> bytes:
     formato = (formato or "pdf").strip().lower()
     if modo == "envio_proprio":
@@ -506,6 +584,8 @@ def gerar_etiqueta(
             nome_exibicao_override=nome_exibicao_override,
             slogan_override=slogan_override,
             logo_key_hint=logo_key_hint,
+            observacao=observacao,
+            contato_override=contato_override,
         )
     if formato == "png":
         return _gerar_png_etiqueta_codigo(codigo, modo_final, dados_extras, qr_content)
