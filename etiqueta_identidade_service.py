@@ -41,6 +41,12 @@ def resolver_slogan(owner: Optional[Owner]) -> str:
     return (getattr(owner, "slogan", None) or "").strip()
 
 
+def resolver_contato(owner: Optional[Owner]) -> str:
+    if owner is None:
+        return ""
+    return (getattr(owner, "contato", None) or "").strip()
+
+
 def _load_rotevo_logo_bytes() -> Optional[bytes]:
     logo_env = (os.getenv("COMPROVANTE_LOGO_PATH") or "").strip()
     candidates = []

@@ -92,6 +92,7 @@ class OwnerIdentidadeOut(BaseModel):
     nome_exibicao: str
     nome_fantasia: Optional[str] = None
     slogan: Optional[str] = None
+    contato: Optional[str] = None
     tem_logo: bool = False
     logo_filename: Optional[str] = None
     logo_updated_at: Optional[datetime] = None
@@ -100,6 +101,7 @@ class OwnerIdentidadeOut(BaseModel):
 class OwnerIdentidadePatch(BaseModel):
     nome_fantasia: Optional[str] = None
     slogan: Optional[str] = None
+    contato: Optional[str] = None
 
 
 class LogoPresignGetOut(BaseModel):
@@ -155,6 +157,16 @@ def _owner_for_me(db: Session, current_user: User) -> Owner:
     return owner
 
 
+def _normalize_contato_identidade(value: Optional[str]) -> Optional[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    digits = "".join(c for c in raw if c.isdigit())
+    if len(digits) not in (10, 11):
+        raise HTTPException(422, "Contato inválido. Use DDD + número (10 ou 11 dígitos).")
+    return digits
+
+
 def _identidade_out(owner: Owner) -> OwnerIdentidadeOut:
     return OwnerIdentidadeOut(
         id_owner=owner.id_owner,
@@ -162,6 +174,7 @@ def _identidade_out(owner: Owner) -> OwnerIdentidadeOut:
         nome_exibicao=resolver_nome_exibicao(owner),
         nome_fantasia=getattr(owner, "nome_fantasia", None),
         slogan=getattr(owner, "slogan", None),
+        contato=getattr(owner, "contato", None),
         tem_logo=bool((getattr(owner, "logo_object_key", None) or "").strip()),
         logo_filename=getattr(owner, "logo_filename", None),
         logo_updated_at=getattr(owner, "logo_updated_at", None),
@@ -660,6 +673,8 @@ def patch_identidade_me(
         owner.nome_fantasia = (body.nome_fantasia or "").strip() or None
     if body.slogan is not None:
         owner.slogan = (body.slogan or "").strip() or None
+    if body.contato is not None:
+        owner.contato = _normalize_contato_identidade(body.contato)
     db.commit()
     db.refresh(owner)
     return _identidade_out(owner)
@@ -732,6 +747,8 @@ def patch_identidade_owner(
         owner.nome_fantasia = (body.nome_fantasia or "").strip() or None
     if body.slogan is not None:
         owner.slogan = (body.slogan or "").strip() or None
+    if body.contato is not None:
+        owner.contato = _normalize_contato_identidade(body.contato)
     db.commit()
     db.refresh(owner)
     return _identidade_out(owner)
