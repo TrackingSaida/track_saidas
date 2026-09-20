@@ -69,10 +69,68 @@ def ensure_manual_code_entry_allowed(
     return origem_norm
 
 
+def _explicit_bool(obj: object, attr: str) -> Optional[bool]:
+    if obj is None or not hasattr(obj, attr):
+        return None
+    val = getattr(obj, attr)
+    if val is None:
+        return None
+    return bool(val)
+
+
 def motoboy_pode_criar_avulso(motoboy: Motoboy, contexto: AvulsoContexto) -> bool:
+    legado = _explicit_bool(motoboy, "pode_lancar_avulso")
     if contexto == "coleta":
-        return bool(getattr(motoboy, "pode_criar_avulso_coleta", getattr(motoboy, "pode_lancar_avulso", True)))
-    return bool(getattr(motoboy, "pode_criar_avulso_saida", getattr(motoboy, "pode_lancar_avulso", True)))
+        flag = _explicit_bool(motoboy, "pode_criar_avulso_coleta")
+    else:
+        flag = _explicit_bool(motoboy, "pode_criar_avulso_saida")
+    if flag is not None:
+        return flag
+    return True if legado is None else legado
+
+
+def resolve_owner_avulso_defaults(owner: Owner) -> tuple[bool, bool]:
+    """Coleta/saída independentes. False persistido não cai no legado OR."""
+    legado = _explicit_bool(owner, "default_pode_lancar_avulso")
+    coleta = _explicit_bool(owner, "default_pode_criar_avulso_coleta")
+    saida = _explicit_bool(owner, "default_pode_criar_avulso_saida")
+    if coleta is None:
+        coleta = True if legado is None else legado
+    if saida is None:
+        saida = True if legado is None else legado
+    return bool(coleta), bool(saida)
+
+
+def apply_owner_avulso_padroes(
+    owner: Owner,
+    *,
+    pode_criar_avulso_coleta: Optional[bool] = None,
+    pode_criar_avulso_saida: Optional[bool] = None,
+    pode_lancar_avulso: Optional[bool] = None,
+) -> tuple[bool, bool]:
+    coleta, saida = resolve_owner_avulso_defaults(owner)
+    if pode_criar_avulso_coleta is not None or pode_criar_avulso_saida is not None:
+        if pode_criar_avulso_coleta is not None:
+            coleta = bool(pode_criar_avulso_coleta)
+        if pode_criar_avulso_saida is not None:
+            saida = bool(pode_criar_avulso_saida)
+    elif pode_lancar_avulso is not None:
+        coleta = saida = bool(pode_lancar_avulso)
+    owner.default_pode_criar_avulso_coleta = coleta
+    owner.default_pode_criar_avulso_saida = saida
+    sync_owner_avulso_defaults(owner)
+    return coleta, saida
+
+
+def apply_motoboy_avulso_padroes(
+    motoboy: Motoboy,
+    *,
+    pode_criar_avulso_coleta: bool,
+    pode_criar_avulso_saida: bool,
+) -> None:
+    motoboy.pode_criar_avulso_coleta = bool(pode_criar_avulso_coleta)
+    motoboy.pode_criar_avulso_saida = bool(pode_criar_avulso_saida)
+    sync_motoboy_avulso_legado(motoboy)
 
 
 def sync_motoboy_avulso_legado(motoboy: Motoboy) -> None:
