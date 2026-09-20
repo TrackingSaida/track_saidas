@@ -66,11 +66,12 @@ def test_saida_false_nao_volta_pelo_legado_or():
         pode_criar_avulso_saida=False,
         pode_lancar_avulso=True,
     )
+    flags = patch.model_dump(exclude_unset=True)
     apply_owner_avulso_padroes(
         owner,
-        pode_criar_avulso_coleta=patch.pode_criar_avulso_coleta,
-        pode_criar_avulso_saida=patch.pode_criar_avulso_saida,
-        pode_lancar_avulso=patch.pode_lancar_avulso,
+        pode_criar_avulso_coleta=flags.get("pode_criar_avulso_coleta"),
+        pode_criar_avulso_saida=flags.get("pode_criar_avulso_saida"),
+        pode_lancar_avulso=flags.get("pode_lancar_avulso"),
     )
     assert owner.default_pode_criar_avulso_coleta is True
     assert owner.default_pode_criar_avulso_saida is False
@@ -107,3 +108,7 @@ def test_patch_json_false_nao_vira_none():
     )
     assert parsed.pode_criar_avulso_saida is False
     assert parsed.pode_criar_avulso_coleta is True
+    dumped = parsed.model_dump(exclude_unset=True)
+    assert dumped["pode_criar_avulso_saida"] is False
+    assert dumped["pode_criar_avulso_coleta"] is True
+    assert "pode_lancar_avulso" not in dumped

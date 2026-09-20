@@ -169,11 +169,12 @@ def patch_politicas(
             owner.default_pode_ler_saida = bool(p.pode_ler_saida)
         if p.pode_digitar_codigo_manual is not None:
             owner.default_pode_digitar_codigo_manual = bool(p.pode_digitar_codigo_manual)
+        avulso_flags = p.model_dump(exclude_unset=True)
         apply_owner_avulso_padroes(
             owner,
-            pode_criar_avulso_coleta=p.pode_criar_avulso_coleta,
-            pode_criar_avulso_saida=p.pode_criar_avulso_saida,
-            pode_lancar_avulso=p.pode_lancar_avulso,
+            pode_criar_avulso_coleta=avulso_flags.get("pode_criar_avulso_coleta"),
+            pode_criar_avulso_saida=avulso_flags.get("pode_criar_avulso_saida"),
+            pode_lancar_avulso=avulso_flags.get("pode_lancar_avulso"),
         )
         if p.avulso_exige_foto is not None:
             owner.default_avulso_exige_foto = bool(p.avulso_exige_foto)
