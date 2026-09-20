@@ -143,6 +143,10 @@ def get_politicas(
     return _owner_to_out(owner, db)
 
 
+@router.post("", response_model=PoliticasOut)
+@router.post("/", response_model=PoliticasOut)
+@router.put("", response_model=PoliticasOut)
+@router.put("/", response_model=PoliticasOut)
 @router.patch("", response_model=PoliticasOut)
 @router.patch("/", response_model=PoliticasOut)
 def patch_politicas(
