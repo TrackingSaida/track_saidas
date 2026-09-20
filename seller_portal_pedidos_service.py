@@ -9,7 +9,8 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from codigo_normalizer import canonicalize_servico
-from models import BasePreco, EnvioProprio, Saida, SaidaDetail
+from models import BasePreco, EnvioProprio, Motoboy, Saida, SaidaDetail
+from motoboy_nome_utils import get_motoboy_display_name
 from saida_historico_service import listar_historico_saida
 
 STATUS_ETIQUETADO = "ETIQUETADO"
@@ -39,7 +40,6 @@ _EVENTOS_OCULTOS = {
     "saida_conferida",
     "saida_reconferida",
     "entrada_base",
-    "status_saiu_manual",
     "status_coletado_manual",
     "status_nao_coletado_manual",
 }
@@ -51,6 +51,7 @@ _ROTULOS_SELLER = {
     "coleta": "Pacote coletado",
     "lancar_avulso": "Pacote coletado",
     "em_rota": "Saiu para entrega",
+    "status_saiu_manual": "Saiu para entrega",
     "ausente": "Destinatário ausente",
     "ausente_lote": "Destinatário ausente",
     "nova_tentativa": "Nova tentativa de entrega",
@@ -70,6 +71,7 @@ _TIPO_EVENTO = {
     "coleta": "coletado",
     "lancar_avulso": "coletado",
     "em_rota": "em_entrega",
+    "status_saiu_manual": "em_entrega",
     "ausente": "ausente",
     "ausente_lote": "ausente",
     "nova_tentativa": "tentativa",
@@ -80,6 +82,18 @@ _TIPO_EVENTO = {
     "devolucao": "devolvido",
     "encerrado_sistema": "encerrado",
     "rota_cancelada": "cancelado",
+}
+
+# Eventos em que o seller pode ver o entregador atribuído.
+_EVENTOS_COM_ENTREGADOR = {
+    "em_rota",
+    "status_saiu_manual",
+    "ausente",
+    "ausente_lote",
+    "nova_tentativa",
+    "liberacao_ausencias",
+    "entregue",
+    "entregue_lote",
 }
 
 _STATUS_FILTRO = {
@@ -377,10 +391,57 @@ def _item_resumo(
     }
 
 
-def projetar_timeline_seller(db: Session, id_saida: int, saida: Optional[Saida] = None) -> List[Dict[str, Any]]:
+def _nome_motoboy_por_id(db: Session, motoboy_id: Optional[int]) -> Optional[str]:
+    if not motoboy_id:
+        return None
+    try:
+        mid = int(motoboy_id)
+    except (TypeError, ValueError):
+        return None
+    motoboy = db.get(Motoboy, mid)
+    if not motoboy:
+        return None
+    nome = (get_motoboy_display_name(db, motoboy=motoboy) or "").strip()
+    return nome or None
+
+
+def _nome_entregador_saida(db: Session, saida: Optional[Saida]) -> Optional[str]:
+    if saida is None:
+        return None
+    nome = (getattr(saida, "entregador", None) or "").strip()
+    if nome:
+        return nome
+    return _nome_motoboy_por_id(db, getattr(saida, "motoboy_id", None))
+
+
+def _detalhe_recebimento(detail: Optional[SaidaDetail]) -> Optional[str]:
+    if detail is None:
+        return None
+    nome = (getattr(detail, "nome_recebedor", None) or "").strip()
+    if not nome:
+        return None
+    tipo = (getattr(detail, "tipo_recebedor", None) or "").strip()
+    if tipo:
+        return f"Recebido por {nome} ({tipo})"
+    return f"Recebido por {nome}"
+
+
+def _join_detalhe(*parts: Optional[str]) -> Optional[str]:
+    cleaned = [p.strip() for p in parts if p and str(p).strip()]
+    return " · ".join(cleaned) if cleaned else None
+
+
+def projetar_timeline_seller(
+    db: Session,
+    id_saida: int,
+    saida: Optional[Saida] = None,
+    detail: Optional[SaidaDetail] = None,
+) -> List[Dict[str, Any]]:
+    """Timeline amigável ao seller: mais recente no topo; inclui status atual e entregador."""
     items = listar_historico_saida(db, id_saida)
     out: List[Dict[str, Any]] = []
     for item in items:
+        key = (item.evento or "").strip().lower()
         rotulo = rotulo_timeline_seller(item.evento)
         if not rotulo:
             continue
@@ -391,25 +452,79 @@ def projetar_timeline_seller(db: Session, id_saida: int, saida: Optional[Saida] 
                 extra = f"Tentativa {item.tentativa}: {extra}"
         elif item.tentativa:
             extra = f"Tentativa {item.tentativa}"
+
+        entregador = None
+        if key in _EVENTOS_COM_ENTREGADOR:
+            entregador = _nome_motoboy_por_id(db, getattr(item, "motoboy_id_novo", None))
+            if not entregador:
+                entregador = _nome_entregador_saida(db, saida)
+            if entregador:
+                entregador = f"Entregador: {entregador}"
+
+        recebimento = None
+        if key in ("entregue", "entregue_lote"):
+            recebimento = _detalhe_recebimento(detail)
+
         out.append(
             {
                 "quando": _iso(item.timestamp),
                 "titulo": rotulo,
                 "tipo": tipo_timeline_seller(item.evento),
-                "detalhe": extra,
+                "detalhe": _join_detalhe(extra, entregador, recebimento),
+                "motoboy_nome": (entregador or "").replace("Entregador: ", "") or None,
             }
         )
-    if out:
-        return out
+
+    # Garante que o status atual apareça na timeline (ex.: saiu sem evento amigável).
     if saida is not None:
+        label_atual = status_pedido_amigavel(getattr(saida, "status", None))
+        last_title = out[-1]["titulo"] if out else None
+        if label_atual and label_atual != last_title:
+            quando = None
+            if detail is not None and getattr(detail, "timestamp", None):
+                quando = _iso(detail.timestamp)
+            if not quando and getattr(saida, "data_hora_entrega", None):
+                quando = _iso(saida.data_hora_entrega)
+            if not quando:
+                quando = _iso(getattr(saida, "timestamp", None))
+            entregador = _nome_entregador_saida(db, saida)
+            recebimento = None
+            st = (getattr(saida, "status", None) or "").strip().upper().replace(" ", "_")
+            if st == "ENTREGUE":
+                recebimento = _detalhe_recebimento(detail)
+            out.append(
+                {
+                    "quando": quando,
+                    "titulo": label_atual,
+                    "tipo": "status_atual",
+                    "detalhe": _join_detalhe(
+                        f"Entregador: {entregador}" if entregador else None,
+                        recebimento,
+                    ),
+                    "motoboy_nome": entregador,
+                }
+            )
+        elif out and out[-1].get("tipo") in ("em_entrega", "entregue", "ausente", "status_atual"):
+            # Enriquecer último evento com entregador atual se ainda não tiver.
+            if not out[-1].get("motoboy_nome"):
+                entregador = _nome_entregador_saida(db, saida)
+                if entregador:
+                    out[-1]["motoboy_nome"] = entregador
+                    out[-1]["detalhe"] = _join_detalhe(out[-1].get("detalhe"), f"Entregador: {entregador}")
+
+    if not out and saida is not None:
         out.append(
             {
                 "quando": _iso(getattr(saida, "timestamp", None)),
                 "titulo": status_pedido_amigavel(getattr(saida, "status", None)),
                 "tipo": "outro",
                 "detalhe": None,
+                "motoboy_nome": _nome_entregador_saida(db, saida),
             }
         )
+
+    # Padrão de mercado (Correios, marketplaces): última atualização no topo.
+    out.reverse()
     return out
 
 
@@ -485,5 +600,21 @@ def detalhe_pedido_seller(db: Session, seller, id_saida: int) -> Dict[str, Any]:
     resumo = _item_resumo(saida, envio, detail)
     resumo["destinatario"] = dest
     resumo["endereco"] = _endereco_linha(dest)
-    resumo["timeline"] = projetar_timeline_seller(db, saida.id_saida, saida)
+    timeline = projetar_timeline_seller(db, saida.id_saida, saida, detail)
+    resumo["timeline"] = timeline
+    resumo["motoboy_nome"] = _nome_entregador_saida(db, saida)
+    resumo["atualizado_em"] = (timeline[0].get("quando") if timeline else None) or _iso(
+        getattr(saida, "timestamp", None)
+    )
+    # Seller vê quem recebeu (texto), sem foto/comprovante — prova visual fica com o owner.
+    if detail is not None:
+        nome_rec = (getattr(detail, "nome_recebedor", None) or "").strip() or None
+        tipo_rec = (getattr(detail, "tipo_recebedor", None) or "").strip() or None
+        if nome_rec:
+            resumo["recebimento"] = {"nome": nome_rec, "tipo": tipo_rec}
+        else:
+            resumo["recebimento"] = None
+    else:
+        resumo["recebimento"] = None
+    resumo["tem_comprovante"] = False
     return resumo

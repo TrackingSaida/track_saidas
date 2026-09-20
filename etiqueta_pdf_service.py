@@ -506,7 +506,9 @@ def gerar_pdf_envio_proprio(
         c.roundRect(margin, y_top - badge_h + 1 * mm, badge_w, badge_h, 2 * mm, stroke=0, fill=1)
         c.setFillColor(white)
         c.setFont("Helvetica-Bold", 7 if prominent else 6)
-        c.drawCentredString(margin + badge_w / 2, y_top - badge_h / 2 - 0.8 * mm, title)
+        # Texto do badge alinhado à esquerda (mesmo eixo do nome/endereço abaixo).
+        badge_pad = 2.2 * mm
+        c.drawString(margin + badge_pad, y_top - badge_h / 2 - 0.8 * mm, title)
         yy = y_top - badge_h - 3.2 * mm
         c.setFillColor(dark)
         c.setFont("Helvetica-Bold", name_size)

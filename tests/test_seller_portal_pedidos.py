@@ -123,8 +123,9 @@ def test_timeline_projeta_somente_eventos_do_seller(monkeypatch):
         ],
     )
     out = projetar_timeline_seller(MagicMock(), 9)
-    assert [x["titulo"] for x in out] == ["Pacote coletado", "Destinatário ausente"]
-    assert out[1]["detalhe"] == "Tentativa 1: Não atendeu"
+    # Mais recente no topo (padrão de tracking).
+    assert [x["titulo"] for x in out] == ["Destinatário ausente", "Pacote coletado"]
+    assert out[0]["detalhe"] == "Tentativa 1: Não atendeu"
     assert "scan" not in str(out)
 
 
