@@ -4,19 +4,22 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
+from base import _resolve_user_sub_base
 from db import get_db
 from leitura_manual_auth import (
     apply_motoboy_avulso_padroes,
     apply_owner_avulso_padroes,
-    list_motoboys_da_sub_base,
+    flush_motoboy_avulso_columns,
+    flush_owner_avulso_columns,
+    list_users_role4_da_sub_base,
     resolve_owner_avulso_defaults,
 )
-from models import Motoboy, Owner, User
+from models import Owner, User
 
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
 
@@ -45,6 +48,8 @@ class PadroesMotoboyPoliticas(BaseModel):
 class PoliticasOut(BaseModel):
     operacao: OperacaoPoliticas
     padroes_motoboy: PadroesMotoboyPoliticas
+    motoboys_atualizados: Optional[int] = None
+    motoboys_sem_perfil: Optional[int] = None
 
 
 class OperacaoPoliticasPatch(BaseModel):
@@ -79,7 +84,7 @@ def _assert_admin(current_user: User) -> None:
 
 
 def _owner_for_user(db: Session, current_user: User) -> Owner:
-    sub_base = (getattr(current_user, "sub_base", None) or "").strip()
+    sub_base = (_resolve_user_sub_base(db, current_user) or "").strip()
     if not sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida.")
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
@@ -88,7 +93,12 @@ def _owner_for_user(db: Session, current_user: User) -> Owner:
     return owner
 
 
-def _owner_to_out(owner: Owner) -> PoliticasOut:
+def _owner_to_out(
+    owner: Owner,
+    *,
+    motoboys_atualizados: Optional[int] = None,
+    motoboys_sem_perfil: Optional[int] = None,
+) -> PoliticasOut:
     avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
     return PoliticasOut(
         operacao=OperacaoPoliticas(
@@ -108,6 +118,8 @@ def _owner_to_out(owner: Owner) -> PoliticasOut:
             pode_criar_avulso_saida=avulso_saida,
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         ),
+        motoboys_atualizados=motoboys_atualizados,
+        motoboys_sem_perfil=motoboys_sem_perfil,
     )
 
 
@@ -181,12 +193,18 @@ def patch_politicas(
             owner.default_avulso_exige_foto = bool(p.avulso_exige_foto)
         if not bool(owner.default_pode_lancar_avulso):
             owner.default_avulso_exige_foto = False
+        flush_owner_avulso_columns(db, owner)
 
     aplicados = 0
+    sem_perfil = 0
     if body.aplicar_padroes_aos_motoboys:
         avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
-        motoboys = list_motoboys_da_sub_base(db, sub_base)
-        for m in motoboys:
+        users_role4 = list_users_role4_da_sub_base(db, sub_base)
+        for u in users_role4:
+            m = getattr(u, "motoboy", None)
+            if m is None:
+                sem_perfil += 1
+                continue
             m.pode_realizar_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_saida = bool(owner.default_pode_ler_saida)
@@ -199,17 +217,21 @@ def patch_politicas(
             m.avulso_exige_foto = bool(owner.default_avulso_exige_foto) and bool(m.pode_lancar_avulso)
             m.claims_version = int(getattr(m, "claims_version", 0) or 0) + 1
             db.add(m)
+            flush_motoboy_avulso_columns(db, m)
             aplicados += 1
     elif operacao_changed:
-        # Owner flags no JWT: força refresh silencioso dos motoboys da base
         bump_motoboys_claims_version_for_sub_base(db, sub_base)
 
     if owner.ignorar_coleta:
-        # Coleta off: permissão de coleta nos defaults não se aplica na prática
         pass
 
     db.add(owner)
     db.commit()
+    db.expire(owner)
     db.refresh(owner)
-    out = _owner_to_out(owner)
+    out = _owner_to_out(
+        owner,
+        motoboys_atualizados=aplicados if body.aplicar_padroes_aos_motoboys else None,
+        motoboys_sem_perfil=sem_perfil if body.aplicar_padroes_aos_motoboys else None,
+    )
     return out

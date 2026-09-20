@@ -4,10 +4,10 @@ from __future__ import annotations
 from typing import Literal, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import and_, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy import select, update as sa_update
+from sqlalchemy.orm import Session, joinedload
 
-from models import Motoboy, MotoboySubBase, Owner, User
+from models import Motoboy, Owner, User
 
 ORIGENS_LEITURA = ("camera", "manual", "selecao")
 AvulsoContexto = Literal["coleta", "saida"]
@@ -125,6 +125,7 @@ def apply_owner_avulso_padroes(
         "default_pode_criar_avulso_coleta",
         "default_pode_criar_avulso_saida",
         "default_pode_lancar_avulso",
+        "default_avulso_exige_foto",
     )
     return coleta, saida
 
@@ -157,37 +158,85 @@ def resolve_motoboy_avulso_flags(motoboy: Motoboy) -> tuple[bool, bool]:
     return bool(coleta), bool(saida)
 
 
-def list_motoboys_da_sub_base(db: Session, sub_base: str) -> list[Motoboy]:
-    """Motoboys da base: User.sub_base, Motoboy.sub_base ou MotoboySubBase ativa."""
+def list_users_role4_da_sub_base(db: Session, sub_base: str) -> list[User]:
+    """Mesma população de Usuários: User.sub_base + role=4, com perfil motoboy se houver."""
     sub = (sub_base or "").strip()
     if not sub:
         return []
     stmt = (
-        select(Motoboy)
-        .join(User, User.id == Motoboy.user_id)
-        .outerjoin(MotoboySubBase, MotoboySubBase.motoboy_id == Motoboy.id_motoboy)
-        .where(
-            User.role == 4,
-            or_(
-                User.sub_base == sub,
-                Motoboy.sub_base == sub,
-                and_(
-                    MotoboySubBase.sub_base == sub,
-                    MotoboySubBase.ativo.is_(True),
-                ),
-            ),
-        )
-        .order_by(Motoboy.id_motoboy.asc())
+        select(User)
+        .options(joinedload(User.motoboy))
+        .where(User.sub_base == sub, User.role == 4)
+        .order_by(User.id.asc())
     )
-    seen: set[int] = set()
+    return list(db.scalars(stmt).unique().all())
+
+
+def list_motoboys_da_sub_base(db: Session, sub_base: str) -> list[Motoboy]:
+    """Motoboys visíveis em Usuários (User.sub_base + role=4 com linha em motoboys)."""
     out: list[Motoboy] = []
-    for m in db.scalars(stmt).unique().all():
-        mid = int(m.id_motoboy)
-        if mid in seen:
+    seen: set[int] = set()
+    for u in list_users_role4_da_sub_base(db, sub_base):
+        m = getattr(u, "motoboy", None)
+        if m is None:
             continue
-        seen.add(mid)
+        mid = int(getattr(m, "id_motoboy", 0) or 0)
+        if mid and mid in seen:
+            continue
+        if mid:
+            seen.add(mid)
         out.append(m)
     return out
+
+
+def flush_owner_avulso_columns(db: Session, owner: Owner) -> tuple[bool, bool]:
+    """UPDATE explícito das colunas de avulso do owner (False precisa ir ao SQL)."""
+    coleta, saida = resolve_owner_avulso_defaults(owner)
+    legado = bool(coleta or saida)
+    owner.default_pode_criar_avulso_coleta = coleta
+    owner.default_pode_criar_avulso_saida = saida
+    owner.default_pode_lancar_avulso = legado
+    if not legado:
+        owner.default_avulso_exige_foto = False
+    oid = getattr(owner, "id_owner", None)
+    execute = getattr(db, "execute", None)
+    if oid is None or not callable(execute):
+        return coleta, saida
+    foto = bool(getattr(owner, "default_avulso_exige_foto", False))
+    execute(
+        sa_update(Owner)
+        .where(Owner.id_owner == int(oid))
+        .values(
+            default_pode_criar_avulso_coleta=coleta,
+            default_pode_criar_avulso_saida=saida,
+            default_pode_lancar_avulso=legado,
+            default_avulso_exige_foto=foto,
+        )
+    )
+    return coleta, saida
+
+
+def flush_motoboy_avulso_columns(db: Session, motoboy: Motoboy) -> None:
+    """UPDATE explícito das flags do motoboy para o SQL não omitir False."""
+    mid = getattr(motoboy, "id_motoboy", None)
+    execute = getattr(db, "execute", None)
+    if mid is None or not callable(execute):
+        return
+    execute(
+        sa_update(Motoboy)
+        .where(Motoboy.id_motoboy == int(mid))
+        .values(
+            pode_criar_avulso_coleta=bool(getattr(motoboy, "pode_criar_avulso_coleta", False)),
+            pode_criar_avulso_saida=bool(getattr(motoboy, "pode_criar_avulso_saida", False)),
+            pode_lancar_avulso=bool(getattr(motoboy, "pode_lancar_avulso", False)),
+            avulso_exige_foto=bool(getattr(motoboy, "avulso_exige_foto", False)),
+            pode_realizar_coleta=bool(getattr(motoboy, "pode_realizar_coleta", False)),
+            pode_ler_coleta=bool(getattr(motoboy, "pode_ler_coleta", False)),
+            pode_ler_saida=bool(getattr(motoboy, "pode_ler_saida", True)),
+            pode_digitar_codigo_manual=bool(getattr(motoboy, "pode_digitar_codigo_manual", False)),
+            claims_version=int(getattr(motoboy, "claims_version", 0) or 0),
+        )
+    )
 
 
 def _flag_modified_if_mapped(obj: object, *attrs: str) -> None:

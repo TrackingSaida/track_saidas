@@ -20,7 +20,12 @@ from entregador_legado_sync import (
     sincronizar_legado_entregador_com_status_usuario,
 )
 from models import User, Owner, Motoboy, MotoboySubBase
-from leitura_manual_auth import list_motoboys_da_sub_base, resolve_motoboy_avulso_flags, sync_motoboy_avulso_legado
+from leitura_manual_auth import (
+    flush_motoboy_avulso_columns,
+    list_motoboys_da_sub_base,
+    resolve_motoboy_avulso_flags,
+    sync_motoboy_avulso_legado,
+)
 from base import _resolve_user_sub_base
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -422,6 +427,43 @@ def _is_email_safe_for_display(raw: str) -> bool:
         return False
 
 
+def _motoboy_to_out(motoboy: Optional[Any]) -> MotoboyOut:
+    """Flags sempre explícitas. Sem perfil = avulso desligado (não omite nem cai no legado)."""
+    if motoboy is None:
+        return MotoboyOut(
+            pode_lancar_avulso=False,
+            pode_criar_avulso_coleta=False,
+            pode_criar_avulso_saida=False,
+            avulso_exige_foto=False,
+        )
+    coleta, saida = resolve_motoboy_avulso_flags(motoboy)
+    pode_avulso = bool(coleta or saida)
+    return MotoboyOut(
+        id_motoboy=getattr(motoboy, "id_motoboy", None),
+        documento=getattr(motoboy, "documento", None),
+        cnpj=getattr(motoboy, "cnpj", None),
+        chave_pix=getattr(motoboy, "chave_pix", None),
+        rua=getattr(motoboy, "rua", None),
+        numero=getattr(motoboy, "numero", None),
+        complemento=getattr(motoboy, "complemento", None),
+        bairro=getattr(motoboy, "bairro", None),
+        cidade=getattr(motoboy, "cidade", None),
+        estado=getattr(motoboy, "estado", None),
+        cep=getattr(motoboy, "cep", None),
+        pode_ler_coleta=bool(getattr(motoboy, "pode_ler_coleta", False)),
+        pode_realizar_coleta=bool(
+            getattr(motoboy, "pode_realizar_coleta", False)
+            or getattr(motoboy, "pode_ler_coleta", False)
+        ),
+        pode_ler_saida=getattr(motoboy, "pode_ler_saida", True) is not False,
+        pode_digitar_codigo_manual=bool(getattr(motoboy, "pode_digitar_codigo_manual", False)),
+        pode_lancar_avulso=pode_avulso,
+        pode_criar_avulso_coleta=coleta,
+        pode_criar_avulso_saida=saida,
+        avulso_exige_foto=bool(getattr(motoboy, "avulso_exige_foto", False)) and pode_avulso,
+    )
+
+
 def _user_to_out(user: User) -> UserOut:
     """Serializa User para UserOut incluindo motoboy quando role=4.
     Usa fallbacks para campos obrigatórios quando o registro vem da migração
@@ -459,19 +501,8 @@ def _user_to_out(user: User) -> UserOut:
             "motoboy": None,
             "must_change_password": getattr(user, "must_change_password", None),
         }
-        if getattr(user, "role", None) == 4 and hasattr(user, "motoboy") and user.motoboy:
-            try:
-                m = user.motoboy
-                coleta, saida = resolve_motoboy_avulso_flags(m)
-                data["motoboy"] = MotoboyOut.model_validate(m).model_copy(
-                    update={
-                        "pode_criar_avulso_coleta": coleta,
-                        "pode_criar_avulso_saida": saida,
-                        "pode_lancar_avulso": bool(coleta or saida),
-                    }
-                )
-            except Exception:
-                logger.warning("Motoboy id=%s serialization skipped for user id=%s", getattr(user.motoboy, "id_motoboy", None), user.id)
+        if getattr(user, "role", None) == 4:
+            data["motoboy"] = _motoboy_to_out(getattr(user, "motoboy", None))
         return UserOut(**data)
     except Exception as e:
         logger.warning("_user_to_out fallback for user id=%s: %s", getattr(user, "id", None), e)
@@ -479,6 +510,12 @@ def _user_to_out(user: User) -> UserOut:
         sub_base = getattr(user, "sub_base", None)
         nome = getattr(user, "nome", None)
         sobrenome = getattr(user, "sobrenome", None)
+        motoboy_out = None
+        if getattr(user, "role", None) == 4:
+            try:
+                motoboy_out = _motoboy_to_out(getattr(user, "motoboy", None))
+            except Exception:
+                motoboy_out = _motoboy_to_out(None)
         return UserOut(
             id=user_id,
             email=None,
@@ -491,7 +528,7 @@ def _user_to_out(user: User) -> UserOut:
             data_nascimento=getattr(user, "data_nascimento", None),
             role=getattr(user, "role", 2),
             coletador=getattr(user, "coletador", False),
-            motoboy=None,
+            motoboy=motoboy_out,
             must_change_password=getattr(user, "must_change_password", None),
         )
 
@@ -789,8 +826,8 @@ def motoboys_permissoes_lote(
     ):
         raise HTTPException(422, "Informe ao menos uma permissão para atualizar.")
 
-    sub_base = (current_user.sub_base or "").strip()
-    if not sub_base:
+    sub_base = _resolve_user_sub_base(db, current_user)
+    if not sub_base or not str(sub_base).strip():
         raise HTTPException(403, "Sub_base não definida.")
 
     motoboys = list_motoboys_da_sub_base(db, sub_base)
@@ -817,6 +854,7 @@ def motoboys_permissoes_lote(
             changed = True
         if changed:
             m.claims_version = int(getattr(m, "claims_version", 0) or 0) + 1
+            flush_motoboy_avulso_columns(db, m)
             atualizados += 1
 
     db.commit()
@@ -871,7 +909,7 @@ def list_users(
                 data_nascimento=getattr(u, "data_nascimento", None),
                 role=getattr(u, "role", 2),
                 coletador=getattr(u, "coletador", False),
-                motoboy=None,
+                motoboy=_motoboy_to_out(getattr(u, "motoboy", None)) if getattr(u, "role", None) == 4 else None,
             ))
     return out
 

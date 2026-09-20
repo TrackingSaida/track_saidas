@@ -238,9 +238,9 @@ def bump_motoboy_claims_version(db: Session, motoboy: Motoboy, *, commit: bool =
 
 
 def bump_motoboys_claims_version_for_sub_base(db: Session, sub_base: str) -> int:
-    rows = list(
-        db.scalars(select(Motoboy).where(Motoboy.sub_base == (sub_base or "").strip())).all()
-    )
+    from leitura_manual_auth import list_motoboys_da_sub_base
+
+    rows = list_motoboys_da_sub_base(db, sub_base)
     for m in rows:
         m.claims_version = int(getattr(m, "claims_version", 0) or 0) + 1
         db.add(m)
