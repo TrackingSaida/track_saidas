@@ -8,6 +8,15 @@ Obrigatória para o Portal do Seller (PRD-001): área de cobertura, auditoria de
 psql "$DATABASE_URL" -f migrations/portal_seller_etiquetas.sql
 ```
 
+## portal_seller_regioes_cobertura.sql
+
+Aditiva ao Portal do Seller: tabela `cobertura_regiao` e coluna opcional `cobertura_cep_prefixo.id_regiao`.
+Prefixos sem região continuam válidos no match (`CEP.startswith(prefixo)`). Lista vazia = atende qualquer CEP.
+
+```bash
+psql "$DATABASE_URL" -f migrations/portal_seller_regioes_cobertura.sql
+```
+
 ## coleta_flexivel.sql
 
 Obrigatória antes do deploy da coleta flexível. Adiciona agenda por base, calendário de

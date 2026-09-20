@@ -1,7 +1,8 @@
 """Políticas gerais da base (operação + padrões Motoboy)."""
 from __future__ import annotations
 
-from typing import List, Optional
+from cobertura_cep_service import list_prefixos_ativos, listar_cobertura_estruturada, replace_prefixos, replace_regioes
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -11,7 +12,6 @@ from sqlalchemy.orm import Session
 from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from db import get_db
 from models import Motoboy, Owner, User
-from cobertura_cep_service import list_prefixos_ativos, replace_prefixos
 
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
 
@@ -35,8 +35,16 @@ class PadroesMotoboyPoliticas(BaseModel):
     avulso_exige_foto: bool = True
 
 
+class CoberturaRegiaoIn(BaseModel):
+    nome: str
+    prefixos: List[str] = Field(default_factory=list)
+
+
 class CoberturaPoliticas(BaseModel):
     prefixos: List[str] = Field(default_factory=list)
+    regioes: List[Dict[str, Any]] = Field(default_factory=list)
+    modo: str = "ilimitado"
+    prefixos_sem_regiao: List[str] = Field(default_factory=list)
     limite_diario_default: int = 50
     expiracao_dias: int = 30
 
@@ -66,6 +74,7 @@ class PadroesMotoboyPatch(BaseModel):
 
 class CoberturaPoliticasPatch(BaseModel):
     prefixos: Optional[List[str]] = None
+    regioes: Optional[List[CoberturaRegiaoIn]] = None
     limite_diario_default: Optional[int] = Field(default=None, ge=1, le=9999)
     expiracao_dias: Optional[int] = Field(default=None, ge=1, le=365)
 
@@ -95,6 +104,7 @@ def _owner_for_user(db: Session, current_user: User) -> Owner:
 
 def _owner_to_out(owner: Owner, db: Session) -> PoliticasOut:
     sub = (owner.sub_base or "").strip()
+    estrutura = listar_cobertura_estruturada(db, sub)
     return PoliticasOut(
         operacao=OperacaoPoliticas(
             coleta_habilitada=not bool(owner.ignorar_coleta),
@@ -113,6 +123,9 @@ def _owner_to_out(owner: Owner, db: Session) -> PoliticasOut:
         ),
         cobertura=CoberturaPoliticas(
             prefixos=list_prefixos_ativos(db, sub),
+            regioes=list(estrutura.get("regioes") or []),
+            modo=str(estrutura.get("modo") or "ilimitado"),
+            prefixos_sem_regiao=list(estrutura.get("prefixos_sem_regiao") or []),
             limite_diario_default=int(getattr(owner, "etiqueta_limite_diario_default", None) or 50),
             expiracao_dias=int(getattr(owner, "etiqueta_expiracao_dias", None) or 30),
         ),
@@ -188,7 +201,13 @@ def patch_politicas(
 
     if body.cobertura:
         cob = body.cobertura
-        if cob.prefixos is not None:
+        if cob.regioes is not None:
+            replace_regioes(
+                db,
+                sub_base,
+                [{"nome": r.nome, "prefixos": list(r.prefixos or [])} for r in cob.regioes],
+            )
+        elif cob.prefixos is not None:
             replace_prefixos(db, sub_base, cob.prefixos)
         if cob.limite_diario_default is not None:
             owner.etiqueta_limite_diario_default = int(cob.limite_diario_default)
