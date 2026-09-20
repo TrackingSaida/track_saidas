@@ -1609,7 +1609,7 @@ def _lancar_avulso_impl(
 ):
     from leitura_manual_auth import ensure_lancar_avulso_allowed
 
-    ensure_lancar_avulso_allowed(db, current_user)
+    ensure_lancar_avulso_allowed(db, current_user, contexto="saida")
 
     sub_base = current_user.sub_base
     username = current_user.username

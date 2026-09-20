@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from db import get_db
+from leitura_manual_auth import sync_motoboy_avulso_legado, sync_owner_avulso_defaults
 from models import Motoboy, Owner, User
 
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
@@ -31,6 +32,8 @@ class PadroesMotoboyPoliticas(BaseModel):
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = False
     pode_lancar_avulso: bool = True
+    pode_criar_avulso_coleta: bool = True
+    pode_criar_avulso_saida: bool = True
     avulso_exige_foto: bool = True
 
 
@@ -53,6 +56,8 @@ class PadroesMotoboyPatch(BaseModel):
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
+    pode_criar_avulso_coleta: Optional[bool] = None
+    pode_criar_avulso_saida: Optional[bool] = None
     avulso_exige_foto: Optional[bool] = None
 
 
@@ -92,7 +97,17 @@ def _owner_to_out(owner: Owner) -> PoliticasOut:
             pode_realizar_coleta=bool(getattr(owner, "default_pode_realizar_coleta", False)),
             pode_ler_saida=bool(getattr(owner, "default_pode_ler_saida", True)),
             pode_digitar_codigo_manual=bool(getattr(owner, "default_pode_digitar_codigo_manual", False)),
-            pode_lancar_avulso=bool(getattr(owner, "default_pode_lancar_avulso", True)),
+            pode_lancar_avulso=bool(
+                getattr(owner, "default_pode_criar_avulso_coleta", False)
+                or getattr(owner, "default_pode_criar_avulso_saida", False)
+                or getattr(owner, "default_pode_lancar_avulso", True)
+            ),
+            pode_criar_avulso_coleta=bool(
+                getattr(owner, "default_pode_criar_avulso_coleta", getattr(owner, "default_pode_lancar_avulso", True))
+            ),
+            pode_criar_avulso_saida=bool(
+                getattr(owner, "default_pode_criar_avulso_saida", getattr(owner, "default_pode_lancar_avulso", True))
+            ),
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         ),
     )
@@ -157,12 +172,17 @@ def patch_politicas(
             owner.default_pode_ler_saida = bool(p.pode_ler_saida)
         if p.pode_digitar_codigo_manual is not None:
             owner.default_pode_digitar_codigo_manual = bool(p.pode_digitar_codigo_manual)
-        if p.pode_lancar_avulso is not None:
-            owner.default_pode_lancar_avulso = bool(p.pode_lancar_avulso)
+        if p.pode_criar_avulso_coleta is not None or p.pode_criar_avulso_saida is not None:
+            if p.pode_criar_avulso_coleta is not None:
+                owner.default_pode_criar_avulso_coleta = bool(p.pode_criar_avulso_coleta)
+            if p.pode_criar_avulso_saida is not None:
+                owner.default_pode_criar_avulso_saida = bool(p.pode_criar_avulso_saida)
+        elif p.pode_lancar_avulso is not None:
+            owner.default_pode_criar_avulso_coleta = bool(p.pode_lancar_avulso)
+            owner.default_pode_criar_avulso_saida = bool(p.pode_lancar_avulso)
         if p.avulso_exige_foto is not None:
             owner.default_avulso_exige_foto = bool(p.avulso_exige_foto)
-        if not owner.default_pode_lancar_avulso:
-            owner.default_avulso_exige_foto = False
+        sync_owner_avulso_defaults(owner)
 
     aplicados = 0
     if body.aplicar_padroes_aos_motoboys:
@@ -172,8 +192,10 @@ def patch_politicas(
             m.pode_ler_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_saida = bool(owner.default_pode_ler_saida)
             m.pode_digitar_codigo_manual = bool(owner.default_pode_digitar_codigo_manual)
-            m.pode_lancar_avulso = bool(owner.default_pode_lancar_avulso)
-            m.avulso_exige_foto = bool(owner.default_avulso_exige_foto) and bool(m.pode_lancar_avulso)
+            m.pode_criar_avulso_coleta = bool(owner.default_pode_criar_avulso_coleta)
+            m.pode_criar_avulso_saida = bool(owner.default_pode_criar_avulso_saida)
+            m.avulso_exige_foto = bool(owner.default_avulso_exige_foto)
+            sync_motoboy_avulso_legado(m)
             m.claims_version = int(getattr(m, "claims_version", 0) or 0) + 1
             db.add(m)
             aplicados += 1

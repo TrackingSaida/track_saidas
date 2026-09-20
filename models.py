@@ -104,6 +104,8 @@ class Owner(Base):
     default_pode_ler_saida = Column(Boolean, nullable=False, server_default=text("true"))
     default_pode_digitar_codigo_manual = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_lancar_avulso = Column(Boolean, nullable=False, server_default=text("true"))
+    default_pode_criar_avulso_coleta = Column(Boolean, nullable=False, server_default=text("true"))
+    default_pode_criar_avulso_saida = Column(Boolean, nullable=False, server_default=text("true"))
     default_avulso_exige_foto = Column(Boolean, nullable=False, server_default=text("true"))
     # Identidade visual das etiquetas de envio próprio
     logo_object_key = Column(Text, nullable=True)
@@ -178,6 +180,8 @@ class Motoboy(Base):
     pode_ler_saida = Column(Boolean, default=True, nullable=False)
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
     pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
+    pode_criar_avulso_coleta = Column(Boolean, default=True, nullable=False, server_default=text("true"))
+    pode_criar_avulso_saida = Column(Boolean, default=True, nullable=False, server_default=text("true"))
     avulso_exige_foto = Column(Boolean, default=False, nullable=False)
     claims_version = Column(Integer, nullable=False, server_default=text("0"))
 
