@@ -112,3 +112,51 @@ def test_patch_json_false_nao_vira_none():
     assert dumped["pode_criar_avulso_saida"] is False
     assert dumped["pode_criar_avulso_coleta"] is True
     assert "pode_lancar_avulso" not in dumped
+
+
+def test_resolve_motoboy_saida_false_nao_usa_legado():
+    from leitura_manual_auth import resolve_motoboy_avulso_flags
+
+    m = SimpleNamespace(
+        pode_criar_avulso_coleta=True,
+        pode_criar_avulso_saida=False,
+        pode_lancar_avulso=True,
+    )
+    coleta, saida = resolve_motoboy_avulso_flags(m)
+    assert coleta is True
+    assert saida is False
+
+
+def test_aplicar_padrao_saida_false_em_motoboy_de_user_sub_base():
+    from leitura_manual_auth import apply_motoboy_avulso_padroes, apply_owner_avulso_padroes, list_motoboys_da_sub_base
+
+    owner = SimpleNamespace(
+        default_pode_criar_avulso_coleta=True,
+        default_pode_criar_avulso_saida=True,
+        default_pode_lancar_avulso=True,
+        default_avulso_exige_foto=True,
+    )
+    apply_owner_avulso_padroes(
+        owner,
+        pode_criar_avulso_coleta=True,
+        pode_criar_avulso_saida=False,
+    )
+    motoboy = SimpleNamespace(
+        id_motoboy=99,
+        user_id=1,
+        sub_base=None,
+        pode_criar_avulso_coleta=True,
+        pode_criar_avulso_saida=True,
+        pode_lancar_avulso=True,
+        avulso_exige_foto=True,
+        claims_version=0,
+    )
+    apply_motoboy_avulso_padroes(
+        motoboy,
+        pode_criar_avulso_coleta=owner.default_pode_criar_avulso_coleta,
+        pode_criar_avulso_saida=owner.default_pode_criar_avulso_saida,
+    )
+    assert motoboy.pode_criar_avulso_saida is False
+    assert motoboy.pode_criar_avulso_coleta is True
+    assert list_motoboys_da_sub_base is not None
+    assert motoboy.sub_base is None
