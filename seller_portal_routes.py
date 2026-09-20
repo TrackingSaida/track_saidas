@@ -12,6 +12,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, get_current_user, get_password_hash
+from cep_routes import get_cep as lookup_cep_publico
 from cobertura_cep_service import avaliar_cobertura_detalhada
 from db import get_db
 from envio_proprio_service import (
@@ -267,6 +268,16 @@ def portal_patch_remetente(
         "cidade": dados.cidade,
         "uf": dados.estado,
     }
+
+
+@router.get("/cep/{cep}")
+def portal_get_cep(
+    cep: str,
+    seller: SellerContext = Depends(get_current_seller),
+):
+    """Consulta CEP autenticada no mesmo host da API do portal (evita CORS/preenchimento falho)."""
+    _ = seller
+    return lookup_cep_publico(cep)
 
 
 @router.get("/cobertura")
