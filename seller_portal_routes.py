@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import secrets
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, get_current_user, get_password_hash
-from cobertura_cep_service import avaliar_cobertura, normalize_cep_digits
+from cobertura_cep_service import avaliar_cobertura_detalhada
 from db import get_db
 from envio_proprio_service import (
     MSG_CEP_FORA_COBERTURA,
@@ -20,16 +21,17 @@ from envio_proprio_service import (
     criar_envio_proprio,
     pdf_from_envio,
     require_owner_tipo_base,
-    status_etiqueta_amigavel,
 )
-from models import BasePreco, BaseSellerDados, EnvioProprio, Saida, SellerPortalAccess, User
+from etiqueta_identidade_service import resolver_nome_exibicao, resolver_slogan
+from models import BasePreco, BaseSellerDados, EnvioProprio, Owner, Saida, SellerPortalAccess, User
 from seller_portal_auth import (
     SellerContext,
     authenticate_seller,
     get_current_seller,
     issue_seller_token,
 )
-from seller_portal_pedidos_service import detalhe_pedido_seller, listar_pedidos_seller
+from seller_portal_dashboard_service import dashboard_seller
+from seller_portal_pedidos_service import detalhe_pedido_seller, listar_pedidos_seller, status_pedido_amigavel
 
 router = APIRouter(prefix="/portal", tags=["Portal Seller"])
 
@@ -63,6 +65,19 @@ def _acesso_out(access, senha: Optional[str] = None) -> Dict[str, Any]:
     if senha:
         out["senha_temporaria"] = senha
     return out
+
+
+def _parse_date_bound(raw: Optional[str], *, end_of_day: bool = False) -> Optional[datetime]:
+    txt = (raw or "").strip()[:10]
+    if not txt:
+        return None
+    try:
+        d = datetime.strptime(txt, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    if end_of_day:
+        return datetime.combine(d, datetime.max.time().replace(microsecond=0))
+    return datetime.combine(d, datetime.min.time())
 
 
 class SellerLoginIn(BaseModel):
@@ -119,13 +134,39 @@ def portal_login(body: SellerLoginIn, db: Session = Depends(get_db)):
 
 
 @router.get("/me")
-def portal_me(seller: SellerContext = Depends(get_current_seller)):
-    return {
+def portal_me(
+    db: Session = Depends(get_db),
+    seller: SellerContext = Depends(get_current_seller),
+):
+    base = db.get(BasePreco, seller.id_base)
+    seller_nome = (base.base or "").strip() if base else ""
+    owner = getattr(seller, "owner", None)
+    if owner is None:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == seller.sub_base).limit(1))
+    transportadora_nome = resolver_nome_exibicao(owner)
+    slogan = resolver_slogan(owner)
+    out: Dict[str, Any] = {
         "login": seller.login,
         "id_base": seller.id_base,
         "sub_base": seller.sub_base,
         "must_change_password": seller.must_change_password,
+        "seller_nome": seller_nome or None,
+        "transportadora_nome": transportadora_nome,
     }
+    if slogan and len(slogan) <= 80:
+        out["transportadora_slogan"] = slogan
+    return out
+
+
+@router.get("/dashboard")
+def portal_dashboard(
+    periodo: Optional[str] = "hoje",
+    de: Optional[str] = None,
+    ate: Optional[str] = None,
+    db: Session = Depends(get_db),
+    seller: SellerContext = Depends(get_current_seller),
+):
+    return dashboard_seller(db, seller, periodo=periodo, de=de, ate=ate)
 
 
 @router.post("/auth/password")
@@ -170,12 +211,22 @@ def portal_remetente(
 
 @router.get("/cobertura")
 def portal_cobertura(
-    cep: str,
+    cep: Optional[str] = None,
     db: Session = Depends(get_db),
     seller: SellerContext = Depends(get_current_seller),
 ):
-    ok, _ = avaliar_cobertura(db, seller.sub_base, cep)
-    return {"coberto": ok, "cep": normalize_cep_digits(cep), "message": None if ok else MSG_CEP_FORA_COBERTURA}
+    detalhe = avaliar_cobertura_detalhada(db, seller.sub_base, cep)
+    out = {
+        "coberto": detalhe["coberto"] if cep else True,
+        "cep": detalhe.get("cep") or None,
+        "message": None if (not cep or detalhe["coberto"]) else MSG_CEP_FORA_COBERTURA,
+        "regiao_nome": detalhe.get("regiao_nome"),
+        "prefixo_match": detalhe.get("prefixo_match"),
+        "modo": detalhe.get("modo"),
+        "regioes": detalhe.get("regioes") or [],
+        "prefixos_sem_regiao": detalhe.get("prefixos_sem_regiao") or [],
+    }
+    return out
 
 
 @router.post("/envios")
@@ -220,21 +271,63 @@ def portal_emitir(
 def portal_listar_envios(
     page: int = 1,
     per_page: int = 20,
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    de: Optional[str] = None,
+    ate: Optional[str] = None,
     db: Session = Depends(get_db),
     seller: SellerContext = Depends(get_current_seller),
 ):
     page = max(1, int(page or 1))
     per_page = min(100, max(1, int(per_page or 20)))
-    filt = (
+    filt = [
         EnvioProprio.sub_base == seller.sub_base,
         EnvioProprio.id_base == seller.id_base,
-    )
-    total = int(db.scalar(select(func.count(EnvioProprio.id_envio)).where(*filt)) or 0)
+    ]
+    term = (q or "").strip()[:80]
+    if term:
+        like = f"%{term}%"
+        filt.append((EnvioProprio.codigo.ilike(like)) | (EnvioProprio.dest_nome.ilike(like)))
+    start = _parse_date_bound(de, end_of_day=False)
+    end = _parse_date_bound(ate, end_of_day=True)
+    if start is not None:
+        filt.append(EnvioProprio.created_at >= start)
+    if end is not None:
+        filt.append(EnvioProprio.created_at <= end)
+
+    status_key = (status or "").strip().lower()
+    status_map = {
+        "aguardando_coleta": ("ETIQUETADO",),
+        "etiquetado": ("ETIQUETADO",),
+        "cancelado": ("CANCELADO",),
+        "entregue": ("ENTREGUE",),
+        "ausente": ("AUSENTE",),
+        "em_rota": ("EM_ROTA", "SAIU_PARA_ENTREGA", "SAIU_PRA_ENTREGA"),
+        "em_entrega": ("EM_ROTA", "SAIU_PARA_ENTREGA", "SAIU_PRA_ENTREGA"),
+        "coletado": ("COLETADO", "SAIU"),
+    }
+    status_vals = status_map.get(status_key)
+
+    if status_vals:
+        base_q = (
+            select(EnvioProprio)
+            .join(Saida, Saida.id_saida == EnvioProprio.id_saida)
+            .where(*filt, func.upper(func.coalesce(Saida.status, "")).in_(status_vals))
+        )
+        count_q = (
+            select(func.count(EnvioProprio.id_envio))
+            .select_from(EnvioProprio)
+            .join(Saida, Saida.id_saida == EnvioProprio.id_saida)
+            .where(*filt, func.upper(func.coalesce(Saida.status, "")).in_(status_vals))
+        )
+    else:
+        base_q = select(EnvioProprio).where(*filt)
+        count_q = select(func.count(EnvioProprio.id_envio)).where(*filt)
+
+    total = int(db.scalar(count_q) or 0)
     rows = list(
         db.scalars(
-            select(EnvioProprio)
-            .where(*filt)
-            .order_by(EnvioProprio.created_at.desc())
+            base_q.order_by(EnvioProprio.created_at.desc())
             .offset((page - 1) * per_page)
             .limit(per_page)
         ).all()
@@ -256,7 +349,7 @@ def portal_listar_envios(
                 "dest_nome": envio.dest_nome,
                 "dest_cidade": envio.dest_cidade,
                 "status": st,
-                "status_label": status_etiqueta_amigavel(st),
+                "status_label": status_pedido_amigavel(st),
                 "created_at": envio.created_at.isoformat() if envio.created_at else None,
                 "pode_cancelar": (st or "").strip().upper() == "ETIQUETADO",
             }
@@ -271,6 +364,8 @@ def portal_listar_pedidos(
     q: Optional[str] = None,
     canal: Optional[str] = None,
     status: Optional[str] = None,
+    de: Optional[str] = None,
+    ate: Optional[str] = None,
     db: Session = Depends(get_db),
     seller: SellerContext = Depends(get_current_seller),
 ):
@@ -282,6 +377,8 @@ def portal_listar_pedidos(
         q=q,
         canal=canal,
         status=status,
+        de=de,
+        ate=ate,
     )
 
 
@@ -329,7 +426,7 @@ def portal_cancelar(
 ):
     envio = _envio_do_seller(db, seller, id_envio)
     cancelar_envio_proprio(db, envio, cancelado_por=seller.login)
-    return {"ok": True, "status_label": "Cancelada"}
+    return {"ok": True, "status_label": "Cancelado"}
 
 
 @router.get("/acessos")

@@ -440,18 +440,10 @@ def admitir_envio_proprio_no_tenant(
 
 
 def status_etiqueta_amigavel(status: Optional[str]) -> str:
-    st = (status or "").strip().lower()
-    if st == "etiquetado":
-        return "Aguardando coleta"
-    if st == "cancelado":
-        return "Cancelada"
-    if st in ("coletado", "saiu", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega", "em_rota"):
-        return "Coletado"
-    if st == "entregue":
-        return "Entregue"
-    if not st:
-        return "Aguardando coleta"
-    return "Coletado"
+    """Unificado com o portal: mesma linguagem amigável dos pedidos."""
+    from seller_portal_pedidos_service import status_pedido_amigavel
+
+    return status_pedido_amigavel(status)
 
 
 def cancelar_envio_proprio(

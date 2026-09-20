@@ -239,6 +239,32 @@ def _filtro_busca(q: Optional[str]):
     return or_(Saida.codigo.ilike(like), dest_detail, dest_envio)
 
 
+def _parse_date_bound(raw: Optional[str], *, end_of_day: bool = False) -> Optional[datetime]:
+    txt = (raw or "").strip()[:10]
+    if not txt:
+        return None
+    try:
+        d = datetime.strptime(txt, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    if end_of_day:
+        return datetime.combine(d, datetime.max.time().replace(microsecond=0))
+    return datetime.combine(d, datetime.min.time())
+
+
+def _filtro_periodo(de: Optional[str], ate: Optional[str]):
+    start = _parse_date_bound(de, end_of_day=False)
+    end = _parse_date_bound(ate, end_of_day=True)
+    conds = []
+    if start is not None:
+        conds.append(Saida.timestamp >= start)
+    if end is not None:
+        conds.append(Saida.timestamp <= end)
+    if not conds:
+        return None
+    return and_(*conds)
+
+
 def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
@@ -396,6 +422,8 @@ def listar_pedidos_seller(
     q: Optional[str] = None,
     canal: Optional[str] = None,
     status: Optional[str] = None,
+    de: Optional[str] = None,
+    ate: Optional[str] = None,
 ) -> Dict[str, Any]:
     page = max(1, int(page or 1))
     per_page = min(100, max(1, int(per_page or 20)))
@@ -410,6 +438,9 @@ def listar_pedidos_seller(
     fq = _filtro_busca(q)
     if fq is not None:
         conds.append(fq)
+    fp = _filtro_periodo(de, ate)
+    if fp is not None:
+        conds.append(fp)
 
     joined = (
         select(Saida)

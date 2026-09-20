@@ -1354,6 +1354,20 @@ class EnvioProprio(Base):
         return f"<EnvioProprio id_envio={self.id_envio} codigo={self.codigo!r} sub_base={self.sub_base!r}>"
 
 
+class CoberturaRegiao(Base):
+    __tablename__ = "cobertura_regiao"
+    __table_args__ = (
+        UniqueConstraint("sub_base", "nome", name="uq_cobertura_regiao_sub_nome"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    nome = Column(Text, nullable=False)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    ordem = Column(Integer, nullable=False, server_default=text("0"))
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
 class CoberturaCepPrefixo(Base):
     __tablename__ = "cobertura_cep_prefixo"
     __table_args__ = (UniqueConstraint("sub_base", "prefixo", name="uq_cobertura_cep_sub_base_prefixo"),)
@@ -1362,6 +1376,7 @@ class CoberturaCepPrefixo(Base):
     sub_base = Column(Text, nullable=False)
     prefixo = Column(Text, nullable=False)
     ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    id_regiao = Column(BigInteger, ForeignKey("cobertura_regiao.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
 
