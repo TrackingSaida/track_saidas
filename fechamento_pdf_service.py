@@ -58,14 +58,6 @@ def _fmt_signed(v) -> str:
     return f"{sign}{_fmt_brl(abs(n))}"
 
 
-def _fmt_desconto(v) -> str:
-    try:
-        n = Decimal(str(v or 0))
-    except Exception:
-        n = Decimal("0")
-    return f"-{_fmt_brl(n)}" if n > 0 else _fmt_brl(0)
-
-
 def _fmt_date(d) -> str:
     if not d:
         return "—"
@@ -204,7 +196,8 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
         valor_cancelados = (valor_cancel_shopee + valor_cancel_flex + valor_cancel_avulso).quantize(
             Decimal("0.01")
         )
-        total_dia = (valor_feitos - valor_cancelados).quantize(Decimal("0.01"))
+        # Cancelados já estão fora de valor_feitos; total = feitos (sem multa).
+        total_dia = valor_feitos
         out.append(
             {
                 "data": dia,
@@ -363,7 +356,8 @@ def _gerar_pdf_rico(
     total_cancelados = sum(int(r["total_cancelado"]) for r in itens)
     valor_feitos = sum((r["valor_feitos"] for r in itens), Decimal("0"))
     valor_cancelados = sum((r["valor_cancelados"] for r in itens), Decimal("0"))
-    valor_base_calc = (valor_feitos - valor_cancelados).quantize(Decimal("0.01"))
+    # Cancelados já estão fora do bruto; valor base = feitos (sem multa).
+    valor_base_calc = valor_feitos.quantize(Decimal("0.01"))
     total_ajustes = Decimal(str(fech.valor_adicao or 0)) - Decimal(str(fech.valor_subtracao or 0))
     total_g = sum(int(r["g_total"]) for r in itens)
     total_g_shopee = sum(int(r["g_shopee"]) for r in itens)
@@ -424,7 +418,7 @@ def _gerar_pdf_rico(
         M,
         y,
         f"Feitos: {total_feitos} | Cancelados: {total_cancelados} | G: {total_g} | "
-        f"Bruto: {_fmt_brl(valor_feitos)} | Canc.: {_fmt_desconto(valor_cancelados)} | "
+        f"Bruto: {_fmt_brl(valor_feitos)} | Não pagos (canc.): {_fmt_brl(valor_cancelados)} | "
         f"Ajustes: {_fmt_signed(total_ajustes)}",
     )
     y -= 5 * mm
@@ -439,7 +433,7 @@ def _gerar_pdf_rico(
     fin_rows = [
         ["Descrição", "Valor"],
         ["Valor bruto das entregas", _fmt_brl(valor_feitos)],
-        ["Desconto por cancelamentos", _fmt_desconto(valor_cancelados)],
+        ["Cancelados (não pagos)", _fmt_brl(valor_cancelados)],
         ["Valor base", _fmt_brl(valor_base_calc)],
         [
             f"Diárias de coleta ({int(getattr(fech, 'qtd_dias_coleta', 0) or 0)} dias)",
@@ -481,7 +475,7 @@ def _gerar_pdf_rico(
                 str(r["total_feitos"]),
                 str(r["total_cancelado"]),
                 _fmt_brl(r["valor_feitos"]),
-                _fmt_desconto(r["valor_cancelados"]),
+                _fmt_brl(r["valor_cancelados"]),
                 _fmt_brl(r["valor_total"]),
             ]
         )

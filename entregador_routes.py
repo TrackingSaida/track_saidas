@@ -908,15 +908,16 @@ def _calcular_valor_base_periodo(
     for saida in rows:
         status_norm = (saida.status or "").strip().lower()
         is_cancelado = "cancel" in status_norm
+        # Cancelado não paga e não gera multa (contribui R$ 0,00).
+        if is_cancelado:
+            continue
         tipo = _normalizar_servico(saida.servico)
-        delta = Decimal("0.00")
         if tipo == "shopee":
-            delta = precos["shopee_valor"]
+            total += precos["shopee_valor"]
         elif tipo == "flex":
-            delta = precos["ml_valor"]
+            total += precos["ml_valor"]
         else:
-            delta = precos["avulso_valor"]
-        total += (-delta if is_cancelado else delta)
+            total += precos["avulso_valor"]
     return total.quantize(Decimal("0.01"))
 
 
@@ -947,17 +948,19 @@ def _calcular_valor_base_motoboy_periodo(
     for saida in rows:
         status_norm = (saida.status or "").strip().lower()
         is_cancelado = "cancel" in status_norm
+        # Cancelado não paga e não gera multa (contribui R$ 0,00), inclusive Pacote G.
+        if is_cancelado:
+            continue
         tipo = _normalizar_servico(saida.servico)
-        delta = Decimal("0.00")
         if tipo == "shopee":
             delta = precos["shopee_valor"]
         elif tipo == "flex":
             delta = precos["ml_valor"]
         else:
             delta = precos["avulso_valor"]
-        total += (-delta if is_cancelado else delta)
+        total += delta
         if toggle_pacote_g and bool(getattr(saida, "is_grande", False)):
-            total += (-delta if is_cancelado else delta)
+            total += delta
     return total.quantize(Decimal("0.01"))
 
 
@@ -1167,12 +1170,13 @@ def resumo_entregadores(
         valor_flex = item["qtde_flex"] * precos["ml_valor"]
         valor_avulso = item["qtde_avulso"] * precos["avulso_valor"]
         valor_feitos = valor_shopee + valor_flex + valor_avulso
+        # valor_cancelados é informativo (o que não foi pago); não desconta de novo.
         valor_cancelados = (
             Decimal(item.get("cancel_shopee", 0)) * precos["shopee_valor"]
             + Decimal(item.get("cancel_flex", 0)) * precos["ml_valor"]
             + Decimal(item.get("cancel_avulso", 0)) * precos["avulso_valor"]
         ).quantize(Decimal("0.01"))
-        total_dia = (valor_feitos - valor_cancelados).quantize(Decimal("0.01"))
+        total_dia = valor_feitos.quantize(Decimal("0.01"))
 
         fech_status, id_fech, fech = _get_fechamento(eid, mid, item["data"])
 

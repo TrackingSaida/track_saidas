@@ -1,7 +1,7 @@
 """Políticas gerais da base (operação + padrões Motoboy)."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from db import get_db
 from models import Motoboy, Owner, User
+from cobertura_cep_service import list_prefixos_ativos, replace_prefixos
 
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
 
@@ -34,9 +35,16 @@ class PadroesMotoboyPoliticas(BaseModel):
     avulso_exige_foto: bool = True
 
 
+class CoberturaPoliticas(BaseModel):
+    prefixos: List[str] = Field(default_factory=list)
+    limite_diario_default: int = 50
+    expiracao_dias: int = 30
+
+
 class PoliticasOut(BaseModel):
     operacao: OperacaoPoliticas
     padroes_motoboy: PadroesMotoboyPoliticas
+    cobertura: CoberturaPoliticas
 
 
 class OperacaoPoliticasPatch(BaseModel):
@@ -56,9 +64,16 @@ class PadroesMotoboyPatch(BaseModel):
     avulso_exige_foto: Optional[bool] = None
 
 
+class CoberturaPoliticasPatch(BaseModel):
+    prefixos: Optional[List[str]] = None
+    limite_diario_default: Optional[int] = Field(default=None, ge=1, le=9999)
+    expiracao_dias: Optional[int] = Field(default=None, ge=1, le=365)
+
+
 class PoliticasPatch(BaseModel):
     operacao: Optional[OperacaoPoliticasPatch] = None
     padroes_motoboy: Optional[PadroesMotoboyPatch] = None
+    cobertura: Optional[CoberturaPoliticasPatch] = None
     aplicar_padroes_aos_motoboys: bool = False
 
 
@@ -78,7 +93,8 @@ def _owner_for_user(db: Session, current_user: User) -> Owner:
     return owner
 
 
-def _owner_to_out(owner: Owner) -> PoliticasOut:
+def _owner_to_out(owner: Owner, db: Session) -> PoliticasOut:
+    sub = (owner.sub_base or "").strip()
     return PoliticasOut(
         operacao=OperacaoPoliticas(
             coleta_habilitada=not bool(owner.ignorar_coleta),
@@ -95,6 +111,11 @@ def _owner_to_out(owner: Owner) -> PoliticasOut:
             pode_lancar_avulso=bool(getattr(owner, "default_pode_lancar_avulso", True)),
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         ),
+        cobertura=CoberturaPoliticas(
+            prefixos=list_prefixos_ativos(db, sub),
+            limite_diario_default=int(getattr(owner, "etiqueta_limite_diario_default", None) or 50),
+            expiracao_dias=int(getattr(owner, "etiqueta_expiracao_dias", None) or 30),
+        ),
     )
 
 
@@ -105,7 +126,8 @@ def get_politicas(
     current_user: User = Depends(get_current_user),
 ):
     _assert_admin(current_user)
-    return _owner_to_out(_owner_for_user(db, current_user))
+    owner = _owner_for_user(db, current_user)
+    return _owner_to_out(owner, db)
 
 
 @router.patch("", response_model=PoliticasOut)
@@ -164,6 +186,15 @@ def patch_politicas(
         if not owner.default_pode_lancar_avulso:
             owner.default_avulso_exige_foto = False
 
+    if body.cobertura:
+        cob = body.cobertura
+        if cob.prefixos is not None:
+            replace_prefixos(db, sub_base, cob.prefixos)
+        if cob.limite_diario_default is not None:
+            owner.etiqueta_limite_diario_default = int(cob.limite_diario_default)
+        if cob.expiracao_dias is not None:
+            owner.etiqueta_expiracao_dias = int(cob.expiracao_dias)
+
     aplicados = 0
     if body.aplicar_padroes_aos_motoboys:
         motoboys = list(db.scalars(select(Motoboy).where(Motoboy.sub_base == sub_base)).all())
@@ -188,5 +219,5 @@ def patch_politicas(
     db.add(owner)
     db.commit()
     db.refresh(owner)
-    out = _owner_to_out(owner)
+    out = _owner_to_out(owner, db)
     return out

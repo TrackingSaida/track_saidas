@@ -873,6 +873,8 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
     role_int = _coerce_role_int(payload.get("role"))
+    if role_int not in (0, 1, 2, 3, 4):
+        raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
     if not payload.get("owner_ativo", False):
         if role_int != 4:
@@ -1327,14 +1329,9 @@ class ResetPasswordPayload(BaseModel):
 
 @router.post("/reset-password")
 async def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db)):
-    user = get_user_by_identifier(db, payload.identifier)
-    if not user:
-        raise HTTPException(404, "Usuário não encontrado")
-
-    user.password_hash = get_password_hash(payload.new_password)
-    # Reset de senha via identifier define uma nova senha definitiva; não exige troca imediata
-    if hasattr(user, "must_change_password"):
-        user.must_change_password = False
-    db.commit()
-
-    return {"ok": True, "message": "Senha redefinida com sucesso"}
+    """Reset público por identifier foi desativado (takeover). Use o reset autenticado em /users/{id}/reset-password."""
+    del payload, db
+    raise HTTPException(
+        status_code=403,
+        detail="Redefinição pública de senha foi desativada. Solicite o reset ao administrador.",
+    )
