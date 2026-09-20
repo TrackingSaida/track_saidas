@@ -13,6 +13,7 @@ from db import get_db
 from leitura_manual_auth import (
     apply_motoboy_avulso_padroes,
     apply_owner_avulso_padroes,
+    list_motoboys_da_sub_base,
     resolve_owner_avulso_defaults,
 )
 from models import Motoboy, Owner, User
@@ -184,7 +185,7 @@ def patch_politicas(
     aplicados = 0
     if body.aplicar_padroes_aos_motoboys:
         avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
-        motoboys = list(db.scalars(select(Motoboy).where(Motoboy.sub_base == sub_base)).all())
+        motoboys = list_motoboys_da_sub_base(db, sub_base)
         for m in motoboys:
             m.pode_realizar_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_coleta = bool(owner.default_pode_realizar_coleta)

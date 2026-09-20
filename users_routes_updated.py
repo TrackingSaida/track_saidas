@@ -20,7 +20,7 @@ from entregador_legado_sync import (
     sincronizar_legado_entregador_com_status_usuario,
 )
 from models import User, Owner, Motoboy, MotoboySubBase
-from leitura_manual_auth import sync_motoboy_avulso_legado
+from leitura_manual_auth import list_motoboys_da_sub_base, resolve_motoboy_avulso_flags, sync_motoboy_avulso_legado
 from base import _resolve_user_sub_base
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -62,9 +62,9 @@ class MotoboyOut(BaseModel):
     pode_realizar_coleta: bool = False
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = False
-    pode_lancar_avulso: bool = True
-    pode_criar_avulso_coleta: bool = True
-    pode_criar_avulso_saida: bool = True
+    pode_lancar_avulso: bool
+    pode_criar_avulso_coleta: bool
+    pode_criar_avulso_saida: bool
     avulso_exige_foto: bool = True
 
     model_config = ConfigDict(from_attributes=True)
@@ -461,7 +461,15 @@ def _user_to_out(user: User) -> UserOut:
         }
         if getattr(user, "role", None) == 4 and hasattr(user, "motoboy") and user.motoboy:
             try:
-                data["motoboy"] = MotoboyOut.model_validate(user.motoboy)
+                m = user.motoboy
+                coleta, saida = resolve_motoboy_avulso_flags(m)
+                data["motoboy"] = MotoboyOut.model_validate(m).model_copy(
+                    update={
+                        "pode_criar_avulso_coleta": coleta,
+                        "pode_criar_avulso_saida": saida,
+                        "pode_lancar_avulso": bool(coleta or saida),
+                    }
+                )
             except Exception:
                 logger.warning("Motoboy id=%s serialization skipped for user id=%s", getattr(user.motoboy, "id_motoboy", None), user.id)
         return UserOut(**data)
@@ -749,15 +757,12 @@ def list_motoboys(
             nome = format_motoboy_nome_parts(
                 u.nome, u.sobrenome, u.username, motoboy_id=u.motoboy.id_motoboy
             )
+            coleta, saida = resolve_motoboy_avulso_flags(u.motoboy)
             out.append(
                 MotoboyItem(
                     id_motoboy=u.motoboy.id_motoboy,
                     nome=nome or f"Motoboy {u.motoboy.id_motoboy}",
-                    pode_lancar_avulso=bool(
-                        getattr(u.motoboy, "pode_criar_avulso_coleta", False)
-                        or getattr(u.motoboy, "pode_criar_avulso_saida", False)
-                        or getattr(u.motoboy, "pode_lancar_avulso", True)
-                    ),
+                    pode_lancar_avulso=bool(coleta or saida),
                     avulso_exige_foto=bool(getattr(u.motoboy, "avulso_exige_foto", False)),
                 )
             )
@@ -788,11 +793,7 @@ def motoboys_permissoes_lote(
     if not sub_base:
         raise HTTPException(403, "Sub_base não definida.")
 
-    motoboys = list(
-        db.scalars(
-            select(Motoboy).where(Motoboy.sub_base == sub_base)
-        ).all()
-    )
+    motoboys = list_motoboys_da_sub_base(db, sub_base)
     atualizados = 0
     for m in motoboys:
         changed = False
