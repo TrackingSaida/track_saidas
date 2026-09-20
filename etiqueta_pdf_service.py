@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import logging
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -205,11 +206,36 @@ def _fmt_contato(raw: Optional[str]) -> str:
     return (raw or "").strip()
 
 
+_PDF_CHAR_MAP = str.maketrans(
+    {
+        "…": "...",
+        "–": "-",
+        "—": "-",
+        "“": '"',
+        "”": '"',
+        "„": '"',
+        "‘": "'",
+        "’": "'",
+        "´": "'",
+        "\u00a0": " ",
+        "\u200b": "",
+        "\ufeff": "",
+    }
+)
+
+
+def _pdf_safe(text: Optional[str]) -> str:
+    """Helvetica/WinAnsi: NFC + latin-1, evita quadrado preto em acentos/símbolos."""
+    t = unicodedata.normalize("NFC", str(text or ""))
+    t = t.translate(_PDF_CHAR_MAP)
+    return t.encode("latin-1", "replace").decode("latin-1")
+
+
 def _clip(text: str, max_len: int) -> str:
-    t = (text or "").strip()
+    t = _pdf_safe(text).strip()
     if len(t) <= max_len:
         return t
-    return t[: max(0, max_len - 1)] + "…"
+    return t[: max(0, max_len - 3)] + "..."
 
 
 def _endereco_linha(
@@ -229,11 +255,11 @@ def _endereco_linha(
     cidade_uf = f"{cidade} / {uf}".strip(" /")
     if cidade_uf:
         parts.append(cidade_uf)
-    return ", ".join(p for p in parts if p)
+    return _pdf_safe(", ".join(p for p in parts if p))
 
 
 def _wrap_lines(c, text: str, font: str, size: float, max_width: float, max_lines: int = 3) -> list[str]:
-    words = (text or "").split()
+    words = _pdf_safe(text).split()
     if not words:
         return []
     lines: list[str] = []
@@ -467,7 +493,7 @@ def gerar_pdf_envio_proprio(
     qr_y = y_codigo - qr_size + 4 * mm
     c.drawImage(ImageReader(qr_buf), qr_x, qr_y, width=qr_size, height=qr_size)
 
-    obs = (observacao or "").strip()
+    obs = _pdf_safe(observacao or "").strip()
     if obs:
         y -= 6.5 * mm
         c.setFillColor(gray)
