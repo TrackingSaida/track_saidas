@@ -81,10 +81,13 @@ def root():
 # toda resposta, inclusive de erro/500, tenha CORS quando houver Origin.
 from starlette.middleware.base import BaseHTTPMiddleware
 
+_CORS_ALLOW_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+
 
 class CORSFallbackMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         start = time.perf_counter()
+        origin = request.headers.get("origin")
         try:
             response = await call_next(request)
         except RuntimeError as exc:
@@ -102,7 +105,6 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
                 request.method,
                 request.url.path,
             )
-            origin = request.headers.get("origin")
             headers = {}
             if origin:
                 headers["Access-Control-Allow-Origin"] = origin
@@ -116,7 +118,6 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
         end = time.perf_counter()
         response.headers["X-Backend-Process-Time"] = f"{(end - start) * 1000:.3f}"
 
-        origin = request.headers.get("origin")
         if origin and "access-control-allow-origin" not in [k.lower() for k in response.headers.keys()]:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -131,18 +132,42 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["*"],  # inclui PATCH (salvar políticas / portal)
     allow_headers=[
         "Content-Type",
         "Authorization",
         "X-Requested-With",
         "Accept",
         "Accept-Language",
-        "Cache-Control", "Pragma",
+        "Cache-Control",
+        "Pragma",
+        "Content-Language",
     ],
-    max_age=86400,                           # cache do preflight
+    max_age=600,  # evita preflight antigo sem PATCH cacheado por 24h
     expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale", "X-Envio-Id", "X-Codigo", "X-Id-Saida", "X-Cobertura-Aviso"],
 )
+
+
+class EnsurePatchCorsMiddleware(BaseHTTPMiddleware):
+    """Outermost: garante PATCH no Allow-Methods do preflight (após CORSMiddleware)."""
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.method != "OPTIONS":
+            return response
+        origin = request.headers.get("origin")
+        if not origin:
+            return response
+        allow = response.headers.get("access-control-allow-methods") or ""
+        if "PATCH" not in allow.upper():
+            response.headers["Access-Control-Allow-Methods"] = _CORS_ALLOW_METHODS
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Max-Age"] = "600"
+        return response
+
+
+app.add_middleware(EnsurePatchCorsMiddleware)
 
 # ──────────────────────────────────────────────────────────────────
 # Routers em uso

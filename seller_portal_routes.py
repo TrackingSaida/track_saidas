@@ -92,7 +92,7 @@ class SellerPasswordIn(BaseModel):
 
 class PortalDestinatarioIn(BaseModel):
     nome: str
-    telefone: Optional[str] = None
+    telefone: str
     cep: str
     rua: str
     numero: str
@@ -109,6 +109,18 @@ class PortalEmitirIn(BaseModel):
     peso_kg: Optional[float] = None
     dimensoes: Optional[str] = None
     observacao: Optional[str] = None
+    pedido_loja: Optional[str] = Field(default=None, max_length=80)
+    referencia: Optional[str] = Field(default=None, max_length=200)
+
+
+class PortalRemetentePatch(BaseModel):
+    cep: str
+    rua: str
+    numero: str
+    complemento: Optional[str] = None
+    bairro: str
+    cidade: str
+    uf: str
 
 
 class LiberarPortalIn(BaseModel):
@@ -209,6 +221,52 @@ def portal_remetente(
     }
 
 
+@router.patch("/remetente")
+def portal_patch_remetente(
+    body: PortalRemetentePatch,
+    db: Session = Depends(get_db),
+    seller: SellerContext = Depends(get_current_seller),
+):
+    base = db.get(BasePreco, seller.id_base)
+    if not base or (base.sub_base or "").strip() != seller.sub_base:
+        raise HTTPException(404, "Seller não encontrado.")
+    dados = db.scalar(select(BaseSellerDados).where(BaseSellerDados.base_id == seller.id_base).limit(1))
+    if not dados:
+        raise HTTPException(404, "Cadastro de endereço do seller não encontrado.")
+
+    cep = "".join(ch for ch in (body.cep or "") if ch.isdigit())
+    if len(cep) != 8:
+        raise HTTPException(422, "Informe um CEP válido.")
+    rua = (body.rua or "").strip()
+    numero = (body.numero or "").strip()
+    bairro = (body.bairro or "").strip()
+    cidade = (body.cidade or "").strip()
+    uf = (body.uf or "").strip().upper()[:2]
+    if not all([rua, numero, bairro, cidade, uf]):
+        raise HTTPException(422, "Complete o endereço do remetente.")
+
+    dados.cep = cep
+    dados.rua = rua
+    dados.numero = numero
+    dados.complemento = (body.complemento or "").strip() or None
+    dados.bairro = bairro
+    dados.cidade = cidade
+    dados.estado = uf
+    db.commit()
+    db.refresh(dados)
+    return {
+        "id_base": seller.id_base,
+        "nome": (base.base or "").strip(),
+        "cep": dados.cep,
+        "rua": dados.rua,
+        "numero": dados.numero,
+        "complemento": dados.complemento,
+        "bairro": dados.bairro,
+        "cidade": dados.cidade,
+        "uf": dados.estado,
+    }
+
+
 @router.get("/cobertura")
 def portal_cobertura(
     cep: Optional[str] = None,
@@ -245,6 +303,8 @@ def portal_emitir(
         "peso_kg": body.peso_kg,
         "dimensoes": body.dimensoes,
         "observacao": body.observacao,
+        "pedido_loja": body.pedido_loja,
+        "referencia": body.referencia,
     }
     envio, saida, pdf, _aviso = criar_envio_proprio(
         db,

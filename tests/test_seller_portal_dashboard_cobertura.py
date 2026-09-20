@@ -61,13 +61,29 @@ def test_avaliar_cobertura_detalhada_com_regiao(monkeypatch):
     assert out["prefixo_match"] == "064"
 
 
-def test_dashboard_parse_periodo_hoje():
+def test_dashboard_parse_periodo_hoje(monkeypatch):
+    from datetime import date
     from seller_portal_dashboard_service import _parse_periodo
+    import seller_portal_dashboard_service as mod
 
+    monkeypatch.setattr(mod, "_hoje_sp", lambda: date(2026, 9, 20))
     start, end, label = _parse_periodo("hoje", None, None)
     assert label == "hoje"
-    assert end > start
+    assert start.date() == date(2026, 9, 20)
+    assert end.date() == date(2026, 9, 21)
     assert (end - start).days == 1
+
+
+def test_dashboard_parse_periodo_7d(monkeypatch):
+    from datetime import date
+    from seller_portal_dashboard_service import _parse_periodo
+    import seller_portal_dashboard_service as mod
+
+    monkeypatch.setattr(mod, "_hoje_sp", lambda: date(2026, 9, 20))
+    start, end, label = _parse_periodo("7d", None, None)
+    assert label == "7d"
+    assert start.date() == date(2026, 9, 14)
+    assert end.date() == date(2026, 9, 21)
 
 
 def test_dashboard_kpis_escopo(monkeypatch):
