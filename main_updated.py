@@ -149,7 +149,7 @@ app.add_middleware(
 
 
 class EnsurePatchCorsMiddleware(BaseHTTPMiddleware):
-    """Outermost: garante PATCH no Allow-Methods do preflight (após CORSMiddleware)."""
+    """Outermost: força métodos completos no preflight (após CORSMiddleware)."""
 
     async def dispatch(self, request, call_next):
         response = await call_next(request)
@@ -158,12 +158,11 @@ class EnsurePatchCorsMiddleware(BaseHTTPMiddleware):
         origin = request.headers.get("origin")
         if not origin:
             return response
-        allow = response.headers.get("access-control-allow-methods") or ""
-        if "PATCH" not in allow.upper():
-            response.headers["Access-Control-Allow-Methods"] = _CORS_ALLOW_METHODS
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Access-Control-Max-Age"] = "600"
+        response.headers["Access-Control-Allow-Methods"] = _CORS_ALLOW_METHODS
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Max-Age"] = "600"
+        response.headers["Vary"] = "Origin, Access-Control-Request-Method"
         return response
 
 

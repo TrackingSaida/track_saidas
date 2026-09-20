@@ -221,6 +221,8 @@ def portal_remetente(
     }
 
 
+@router.post("/remetente")
+@router.put("/remetente")
 @router.patch("/remetente")
 def portal_patch_remetente(
     body: PortalRemetentePatch,
@@ -598,6 +600,8 @@ def staff_reset_senha(
     return _acesso_out(access, senha=senha)
 
 
+@router.post("/acessos/{access_id}")
+@router.put("/acessos/{access_id}")
 @router.patch("/acessos/{access_id}")
 def staff_patch_acesso(
     access_id: int,

@@ -661,6 +661,8 @@ def get_identidade_me(
     return _identidade_out(_owner_for_me(db, current_user))
 
 
+@router.post("/me/identidade", response_model=OwnerIdentidadeOut)
+@router.put("/me/identidade", response_model=OwnerIdentidadeOut)
 @router.patch("/me/identidade", response_model=OwnerIdentidadeOut)
 def patch_identidade_me(
     body: OwnerIdentidadePatch,
