@@ -209,9 +209,13 @@ def criar_envio_proprio(
         dest_in,
         ("nome", "cep", "rua", "numero", "bairro", "cidade", "uf"),
     )
+    dest_tel = "".join(ch for ch in str(dest_in.get("telefone") or "") if ch.isdigit())
+    if origem_emissao == "portal":
+        if len(dest_tel) not in (10, 11):
+            raise HTTPException(422, "Informe um telefone válido do destinatário.")
     destinatario = {
         **dest_fields,
-        "telefone": (dest_in.get("telefone") or "").strip() or None,
+        "telefone": dest_tel or None,
         "complemento": (dest_in.get("complemento") or "").strip() or None,
     }
 
@@ -232,7 +236,17 @@ def criar_envio_proprio(
         except (TypeError, ValueError):
             raise HTTPException(422, "peso_kg inválido.")
     dimensoes = (payload.get("dimensoes") or "").strip() or None
-    observacao = (payload.get("observacao") or "").strip() or None
+    observacao_pacote = (payload.get("observacao") or "").strip() or None
+    referencia = (payload.get("referencia") or "").strip() or None
+    pedido_loja = (payload.get("pedido_loja") or "").strip() or None
+    if pedido_loja and len(pedido_loja) > 80:
+        pedido_loja = pedido_loja[:80]
+    obs_parts = []
+    if referencia:
+        obs_parts.append(f"Ref.: {referencia}")
+    if observacao_pacote:
+        obs_parts.append(observacao_pacote)
+    observacao = " | ".join(obs_parts) if obs_parts else None
 
     codigo = gerar_codigo_rte(db)
     nome_exib = resolver_nome_exibicao(owner)
@@ -282,6 +296,7 @@ def criar_envio_proprio(
         peso_kg=Decimal(str(peso_kg)) if peso_kg is not None else None,
         dimensoes=dimensoes,
         observacao=observacao,
+        pedido_loja=pedido_loja,
         owner_nome_exibicao=nome_exib,
         owner_slogan=slogan or None,
         logo_object_key_used=logo_key,
@@ -332,6 +347,7 @@ def criar_envio_proprio(
         logo_key_hint=logo_key,
         observacao=observacao,
         contato_override=resolver_contato(owner),
+        pedido_loja=pedido_loja,
     )
     db.commit()
     db.refresh(envio)
@@ -359,6 +375,7 @@ def pdf_from_envio(db: Session, envio: EnvioProprio) -> bytes:
         logo_key_hint=envio.logo_object_key_used,
         observacao=envio.observacao,
         contato_override=resolver_contato(owner),
+        pedido_loja=getattr(envio, "pedido_loja", None),
     )
 
 
@@ -503,13 +520,8 @@ def contar_emissoes_hoje(db: Session, id_base: int) -> int:
 
 
 def assert_limite_diario(db: Session, sub_base: str, id_base: int) -> None:
-    limite = limite_diario_para_seller(db, sub_base, id_base)
-    usados = contar_emissoes_hoje(db, id_base)
-    if usados >= limite:
-        raise HTTPException(
-            409,
-            f"Limite diário de {limite} etiquetas atingido para hoje.",
-        )
+    """Limite diário de etiquetas desativado (configuração removida do produto)."""
+    return
 
 
 def expirar_etiquetas_etiquetado(db: Session, *, max_rows: int = 500) -> Dict[str, Any]:

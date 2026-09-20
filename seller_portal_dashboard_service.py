@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
@@ -17,13 +18,20 @@ from seller_portal_pedidos_service import (
     filtro_pedidos_seller,
 )
 
+_TZ_SP = ZoneInfo("America/Sao_Paulo")
+
+
+def _hoje_sp() -> date:
+    return datetime.now(_TZ_SP).date()
+
 
 def _parse_periodo(
     periodo: Optional[str],
     de: Optional[str],
     ate: Optional[str],
 ) -> Tuple[datetime, datetime, str]:
-    hoje = date.today()
+    """Janela em horário de São Paulo (naive, alinhado a Saida.timestamp operacional)."""
+    hoje = _hoje_sp()
     chave = (periodo or "hoje").strip().lower()
     if chave in ("hoje", "today"):
         ini, fim = hoje, hoje
@@ -42,7 +50,6 @@ def _parse_periodo(
             ini, fim = hoje, hoje
         if fim < ini:
             ini, fim = fim, ini
-        # limita janela a 90 dias
         if (fim - ini).days > 89:
             ini = fim - timedelta(days=89)
         label = "custom"

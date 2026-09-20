@@ -303,9 +303,11 @@ def gerar_pdf_envio_proprio(
     logo_key_hint: Optional[str] = None,
     observacao: Optional[str] = None,
     contato_override: Optional[str] = None,
+    pedido_loja: Optional[str] = None,
 ) -> bytes:
     """
-    Layout mockup 100x150mm: header Owner, código+QR, remetente, destinatário, stats, rodapé.
+    Layout mockup 100x150mm: header Owner, código+QR (+pedido loja),
+    destinatário (destaque), remetente (menor), stats, rodapé.
     """
     from reportlab.lib.colors import Color, black, white, HexColor
     from reportlab.lib.units import mm
@@ -313,7 +315,6 @@ def gerar_pdf_envio_proprio(
     from reportlab.pdfgen import canvas
     import qrcode
 
-    # Se snapshot guarda key usada, preferir owner atual (resolver_logo já faz fallback)
     _ = logo_key_hint
 
     largura = 100 * mm
@@ -335,15 +336,12 @@ def gerar_pdf_envio_proprio(
     )
     logo_bytes, logo_origem = resolver_logo_etiqueta(owner)
 
-    # Borda externa
     c.setStrokeColor(line)
     c.setLineWidth(1)
     c.roundRect(2 * mm, 2 * mm, largura - 4 * mm, altura - 4 * mm, 3 * mm, stroke=1, fill=0)
 
     y = altura - margin - 2 * mm
 
-    # ---- Header ----
-    # Logo à esquerda preenchendo a faixa; nome + slogan à direita; contato abaixo da logo.
     header_h = 26 * mm if contato_txt else 22 * mm
     header_top = y
     contact_row = 5.8 * mm if contato_txt else 0
@@ -378,7 +376,6 @@ def gerar_pdf_envio_proprio(
     else:
         text_x = margin
 
-    # Evita "ROTEVO" + logo ROTEVO duplicados no fallback.
     show_name = True
     if logo_origem == LOGO_ORIGEM_ROTEVO and nome.strip().upper() in {"ROTEVO", "ROTEVO TECNOLOGIA"}:
         show_name = False
@@ -390,7 +387,6 @@ def gerar_pdf_envio_proprio(
     logo_band = draw_h if draw_h else 16 * mm
     mid = header_top - logo_band / 2.0
 
-    # Nome/slogan centralizados na altura real da logo.
     if show_name and slogan:
         name_y = mid + 2.4 * mm
         slogan_y = mid - 2.6 * mm
@@ -429,8 +425,7 @@ def gerar_pdf_envio_proprio(
     c.line(margin, y, largura - margin, y)
     y -= 4 * mm
 
-    # ---- Código + QR ----
-    qr_size = 28 * mm
+    qr_size = 26 * mm
     c.setFillColor(gray)
     c.setFont("Helvetica", 7)
     c.drawString(margin, y, "CÓDIGO DO PEDIDO")
@@ -439,7 +434,19 @@ def gerar_pdf_envio_proprio(
     c.setFont("Helvetica-Bold", 14)
     c.drawString(margin, y, _clip(codigo, 22))
     y_codigo = y
-    y -= 5 * mm
+    y -= 4.2 * mm
+
+    pedido_txt = (pedido_loja or "").strip()
+    if pedido_txt:
+        c.setFillColor(gray)
+        c.setFont("Helvetica", 6)
+        c.drawString(margin, y, "PEDIDO LOJA")
+        y -= 3.4 * mm
+        c.setFillColor(dark)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(margin, y, _clip(pedido_txt, 28))
+        y -= 3.6 * mm
+
     c.setFillColor(gray)
     c.setFont("Helvetica", 6)
     c.drawString(margin, y, "QR CODE DE IDENTIFICAÇÃO DO ENVIO")
@@ -462,36 +469,50 @@ def gerar_pdf_envio_proprio(
 
     obs = (observacao or "").strip()
     if obs:
-        y -= 7.2 * mm
+        y -= 6.5 * mm
         c.setFillColor(gray)
         c.setFont("Helvetica", 6)
         c.drawString(margin, y, "OBSERVAÇÃO")
-        y -= 3.8 * mm
+        y -= 3.4 * mm
         c.setFillColor(dark)
-        c.setFont("Helvetica", 8)
+        c.setFont("Helvetica", 7)
         obs_width = max(20 * mm, qr_x - margin - 2.5 * mm)
-        for obs_line in _wrap_lines(c, obs, "Helvetica", 8, obs_width, max_lines=3):
+        for obs_line in _wrap_lines(c, obs, "Helvetica", 7, obs_width, max_lines=2):
             c.drawString(margin, y, obs_line)
-            y -= 3.6 * mm
-        y += 1.2 * mm
+            y -= 3.2 * mm
+        y += 1.0 * mm
 
     y = min(y, qr_y) - 3 * mm
     c.setStrokeColor(line)
     c.line(margin, y, largura - margin, y)
     y -= 4 * mm
 
-    def _draw_party_block(title: str, person: Dict[str, Any], y_top: float) -> float:
+    def _draw_party_block(
+        title: str,
+        person: Dict[str, Any],
+        y_top: float,
+        *,
+        prominent: bool,
+    ) -> float:
+        badge_w = 32 * mm if prominent else 24 * mm
+        badge_h = 5.2 * mm if prominent else 4.2 * mm
+        name_size = 11 if prominent else 7.5
+        addr_size = 8 if prominent else 6.5
+        meta_size = 7 if prominent else 6
+        line_gap = 3.6 * mm if prominent else 2.8 * mm
+        name_gap = 4.5 * mm if prominent else 3.2 * mm
+
         c.setFillColor(badge_bg)
-        c.roundRect(margin + 8 * mm, y_top - 4 * mm, 28 * mm, 5 * mm, 2 * mm, stroke=0, fill=1)
+        c.roundRect(margin, y_top - badge_h + 1 * mm, badge_w, badge_h, 2 * mm, stroke=0, fill=1)
         c.setFillColor(white)
-        c.setFont("Helvetica-Bold", 7)
-        c.drawCentredString(margin + 8 * mm + 14 * mm, y_top - 2.6 * mm, title)
-        yy = y_top - 8 * mm
+        c.setFont("Helvetica-Bold", 7 if prominent else 6)
+        c.drawCentredString(margin + badge_w / 2, y_top - badge_h / 2 - 0.8 * mm, title)
+        yy = y_top - badge_h - 3.2 * mm
         c.setFillColor(dark)
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(margin, yy, _clip(str(person.get("nome") or "").upper(), 42))
-        yy -= 4 * mm
-        c.setFont("Helvetica", 7)
+        c.setFont("Helvetica-Bold", name_size)
+        c.drawString(margin, yy, _clip(str(person.get("nome") or "").upper(), 40 if prominent else 48))
+        yy -= name_gap
+        c.setFont("Helvetica", addr_size)
         c.setFillColor(dark)
         endereco = _endereco_linha(
             rua=str(person.get("rua") or ""),
@@ -501,41 +522,46 @@ def gerar_pdf_envio_proprio(
             cidade=str(person.get("cidade") or ""),
             uf=str(person.get("uf") or ""),
         )
-        # wrap simples
         max_w = largura - 2 * margin
         words = endereco.split()
         line_cur = ""
+        max_addr_lines = 3 if prominent else 2
+        lines_drawn = 0
         for w in words:
             trial = f"{line_cur} {w}".strip()
-            if c.stringWidth(trial, "Helvetica", 7) > max_w and line_cur:
+            if c.stringWidth(trial, "Helvetica", addr_size) > max_w and line_cur:
                 c.drawString(margin, yy, line_cur)
-                yy -= 3.2 * mm
+                yy -= line_gap
+                lines_drawn += 1
                 line_cur = w
+                if lines_drawn >= max_addr_lines:
+                    line_cur = ""
+                    break
             else:
                 line_cur = trial
-        if line_cur:
+        if line_cur and lines_drawn < max_addr_lines:
             c.drawString(margin, yy, _clip(line_cur, 70))
-            yy -= 3.2 * mm
+            yy -= line_gap
         c.setFillColor(gray)
+        c.setFont("Helvetica", meta_size)
         c.drawString(margin, yy, f"CEP {_fmt_cep(person.get('cep'))}")
-        yy -= 3.2 * mm
+        yy -= line_gap
         if person.get("telefone"):
             c.drawString(margin, yy, _fmt_tel(person.get("telefone")))
-            yy -= 3.2 * mm
+            yy -= line_gap
         return yy
 
-    y = _draw_party_block("REMETENTE", remetente, y)
-    y -= 2 * mm
+    y = _draw_party_block("DESTINATÁRIO", destinatario, y, prominent=True)
+    y -= 1.5 * mm
     c.setStrokeColor(line)
     c.line(margin, y, largura - margin, y)
-    y -= 4 * mm
-    y = _draw_party_block("DESTINATÁRIO", destinatario, y)
-    y -= 2 * mm
+    y -= 3.5 * mm
+    y = _draw_party_block("REMETENTE", remetente, y, prominent=False)
+    y -= 1.5 * mm
     c.setStrokeColor(line)
     c.line(margin, y, largura - margin, y)
     y -= 3 * mm
 
-    # ---- Stats ----
     col_w = (largura - 2 * margin) / 3
     peso_txt = f"{peso_kg:g} kg".replace(".", ",") if peso_kg is not None else "—"
     dim_txt = (dimensoes or "").strip() or "—"
@@ -554,7 +580,6 @@ def gerar_pdf_envio_proprio(
             c.line(x + col_w, y + 2 * mm, x + col_w, y - 6 * mm)
     y -= 10 * mm
 
-    # ---- Footer ----
     footer_h = 9 * mm
     c.setFillColor(footer_bg)
     c.rect(2 * mm, 2 * mm, largura - 4 * mm, footer_h, stroke=0, fill=1)
@@ -565,6 +590,7 @@ def gerar_pdf_envio_proprio(
     c.save()
     buf.seek(0)
     return buf.getvalue()
+
 
 
 def gerar_etiqueta(
@@ -586,6 +612,7 @@ def gerar_etiqueta(
     logo_key_hint: Optional[str] = None,
     observacao: Optional[str] = None,
     contato_override: Optional[str] = None,
+    pedido_loja: Optional[str] = None,
 ) -> bytes:
     formato = (formato or "pdf").strip().lower()
     if modo == "envio_proprio":
@@ -605,6 +632,7 @@ def gerar_etiqueta(
             logo_key_hint=logo_key_hint,
             observacao=observacao,
             contato_override=contato_override,
+            pedido_loja=pedido_loja,
         )
     if formato == "png":
         return _gerar_png_etiqueta_codigo(codigo, modo_final, dados_extras, qr_content)

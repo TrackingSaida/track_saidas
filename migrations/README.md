@@ -17,6 +17,14 @@ Prefixos sem região continuam válidos no match (`CEP.startswith(prefixo)`). Li
 psql "$DATABASE_URL" -f migrations/portal_seller_regioes_cobertura.sql
 ```
 
+## portal_seller_pedido_loja.sql
+
+Coluna opcional `envio_proprio.pedido_loja` para o número do pedido do site (impresso na etiqueta).
+
+```bash
+psql "$DATABASE_URL" -f migrations/portal_seller_pedido_loja.sql
+```
+
 ## coleta_flexivel.sql
 
 Obrigatória antes do deploy da coleta flexível. Adiciona agenda por base, calendário de

@@ -1339,6 +1339,7 @@ class EnvioProprio(Base):
     peso_kg = Column(Numeric(10, 3), nullable=True)
     dimensoes = Column(Text, nullable=True)
     observacao = Column(Text, nullable=True)
+    pedido_loja = Column(Text, nullable=True)
 
     owner_nome_exibicao = Column(Text, nullable=True)
     owner_slogan = Column(Text, nullable=True)
