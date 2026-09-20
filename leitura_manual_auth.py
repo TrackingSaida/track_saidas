@@ -1,14 +1,15 @@
 """Autorização de digitação manual de códigos."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from models import Motoboy, User
+from models import Motoboy, Owner, User
 
 ORIGENS_LEITURA = ("camera", "manual", "selecao")
+AvulsoContexto = Literal["coleta", "saida"]
 
 
 def normalize_origem_leitura(origem: Optional[str], *, default: str = "camera") -> str:
@@ -68,9 +69,38 @@ def ensure_manual_code_entry_allowed(
     return origem_norm
 
 
-def ensure_lancar_avulso_allowed(db: Session, user: User) -> None:
+def motoboy_pode_criar_avulso(motoboy: Motoboy, contexto: AvulsoContexto) -> bool:
+    if contexto == "coleta":
+        return bool(getattr(motoboy, "pode_criar_avulso_coleta", getattr(motoboy, "pode_lancar_avulso", True)))
+    return bool(getattr(motoboy, "pode_criar_avulso_saida", getattr(motoboy, "pode_lancar_avulso", True)))
+
+
+def sync_motoboy_avulso_legado(motoboy: Motoboy) -> None:
+    motoboy.pode_lancar_avulso = bool(
+        getattr(motoboy, "pode_criar_avulso_coleta", False)
+        or getattr(motoboy, "pode_criar_avulso_saida", False)
+    )
+    if not motoboy.pode_lancar_avulso:
+        motoboy.avulso_exige_foto = False
+
+
+def sync_owner_avulso_defaults(owner: Owner) -> None:
+    owner.default_pode_lancar_avulso = bool(
+        getattr(owner, "default_pode_criar_avulso_coleta", False)
+        or getattr(owner, "default_pode_criar_avulso_saida", False)
+    )
+    if not owner.default_pode_lancar_avulso:
+        owner.default_avulso_exige_foto = False
+
+
+def ensure_lancar_avulso_allowed(
+    db: Session,
+    user: User,
+    *,
+    contexto: AvulsoContexto = "saida",
+) -> None:
     """
-    Staff (roles 0-3) sempre pode. Motoboy (role 4) só com flag no banco.
+    Staff (roles 0-3) sempre pode. Motoboy (role 4) só com flag do fluxo.
     Revalida no DB para permitir revogação sem esperar expirar JWT.
     """
     role = int(getattr(user, "role", 0) or 0)
@@ -88,11 +118,12 @@ def ensure_lancar_avulso_allowed(db: Session, user: User) -> None:
         )
 
     motoboy = db.get(Motoboy, int(motoboy_id))
-    if not motoboy or not bool(getattr(motoboy, "pode_lancar_avulso", True)):
+    if not motoboy or not motoboy_pode_criar_avulso(motoboy, contexto):
+        fluxo = "coleta" if contexto == "coleta" else "saída"
         raise HTTPException(
             status_code=403,
             detail={
                 "code": "LANCAR_AVULSO_FORBIDDEN",
-                "message": "Lançar avulso não é permitido para este entregador.",
+                "message": f"Lançar avulso na {fluxo} não é permitido para este entregador.",
             },
         )

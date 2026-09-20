@@ -662,7 +662,7 @@ def lancar_avulso_coleta(
     if bool(getattr(current_user, "ignorar_coleta", False)):
         raise HTTPException(status_code=403, detail="Fluxo de coletas desativado para este owner.")
 
-    ensure_lancar_avulso_allowed(db, current_user)
+    ensure_lancar_avulso_allowed(db, current_user, contexto="coleta")
     base = payload.base.strip()
     if not base:
         raise HTTPException(status_code=422, detail="Informe a base para registrar a coleta.")

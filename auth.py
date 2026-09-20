@@ -193,6 +193,10 @@ class UserResponse(BaseModel):
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
     bloquear_saida_sem_coleta: bool = False
+    pode_lancar_avulso: bool = True
+    pode_criar_avulso_coleta: bool = True
+    pode_criar_avulso_saida: bool = True
+    avulso_exige_foto: bool = False
 
 
 # ======================================================
@@ -635,7 +639,16 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "pode_realizar_coleta": bool(pode_realizar_coleta),
         "pode_ler_saida": bool(motoboy.pode_ler_saida),
         "pode_digitar_codigo_manual": bool(getattr(motoboy, "pode_digitar_codigo_manual", True)),
-        "pode_lancar_avulso": bool(getattr(motoboy, "pode_lancar_avulso", True)),
+        "pode_lancar_avulso": bool(
+            getattr(motoboy, "pode_criar_avulso_coleta", getattr(motoboy, "pode_lancar_avulso", True))
+            or getattr(motoboy, "pode_criar_avulso_saida", getattr(motoboy, "pode_lancar_avulso", True))
+        ),
+        "pode_criar_avulso_coleta": bool(
+            getattr(motoboy, "pode_criar_avulso_coleta", getattr(motoboy, "pode_lancar_avulso", True))
+        ),
+        "pode_criar_avulso_saida": bool(
+            getattr(motoboy, "pode_criar_avulso_saida", getattr(motoboy, "pode_lancar_avulso", True))
+        ),
         "avulso_exige_foto": bool(getattr(motoboy, "avulso_exige_foto", False)),
         "ignorar_coleta": bool(owner.ignorar_coleta),
         "owner_ativo": bool(owner.ativo),
@@ -696,6 +709,12 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.pode_ler_saida = bool(payload.get("pode_ler_saida", True))
     u.pode_digitar_codigo_manual = bool(payload.get("pode_digitar_codigo_manual", True))
     u.pode_lancar_avulso = bool(payload.get("pode_lancar_avulso", True))
+    u.pode_criar_avulso_coleta = bool(
+        payload.get("pode_criar_avulso_coleta", u.pode_lancar_avulso)
+    )
+    u.pode_criar_avulso_saida = bool(
+        payload.get("pode_criar_avulso_saida", u.pode_lancar_avulso)
+    )
     u.avulso_exige_foto = bool(payload.get("avulso_exige_foto", False))
 
     # flags de senha vindas do token (podem ser sobrescritas por leitura direta em /auth/me)
@@ -834,7 +853,13 @@ def _hydrate_motoboy_permissions_from_db(
     user.pode_ler_coleta = bool(pode_ler_coleta)
     user.pode_ler_saida = bool(getattr(motoboy, "pode_ler_saida", True))
     user.pode_digitar_codigo_manual = bool(getattr(motoboy, "pode_digitar_codigo_manual", False))
-    user.pode_lancar_avulso = bool(getattr(motoboy, "pode_lancar_avulso", True))
+    user.pode_criar_avulso_coleta = bool(
+        getattr(motoboy, "pode_criar_avulso_coleta", getattr(motoboy, "pode_lancar_avulso", True))
+    )
+    user.pode_criar_avulso_saida = bool(
+        getattr(motoboy, "pode_criar_avulso_saida", getattr(motoboy, "pode_lancar_avulso", True))
+    )
+    user.pode_lancar_avulso = bool(user.pode_criar_avulso_coleta or user.pode_criar_avulso_saida)
     user.avulso_exige_foto = bool(getattr(motoboy, "avulso_exige_foto", True))
     live_version = int(getattr(motoboy, "claims_version", 0) or 0)
     user.claims_version = live_version
@@ -1314,6 +1339,10 @@ async def read_users_me(
         entrada_obrigatoria_habilitada=entrada_obrigatoria,
         conferencia_saida_habilitada=conferencia,
         bloquear_saida_sem_coleta=bloquear_saida_sem_coleta,
+        pode_lancar_avulso=bool(getattr(current_user, "pode_lancar_avulso", True)) if live_role == 4 else True,
+        pode_criar_avulso_coleta=bool(getattr(current_user, "pode_criar_avulso_coleta", True)) if live_role == 4 else True,
+        pode_criar_avulso_saida=bool(getattr(current_user, "pode_criar_avulso_saida", True)) if live_role == 4 else True,
+        avulso_exige_foto=bool(getattr(current_user, "avulso_exige_foto", False)) if live_role == 4 else False,
     )
 
 

@@ -20,6 +20,7 @@ from entregador_legado_sync import (
     sincronizar_legado_entregador_com_status_usuario,
 )
 from models import User, Owner, Motoboy, MotoboySubBase
+from leitura_manual_auth import sync_motoboy_avulso_legado
 from base import _resolve_user_sub_base
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -62,6 +63,8 @@ class MotoboyOut(BaseModel):
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = False
     pode_lancar_avulso: bool = True
+    pode_criar_avulso_coleta: bool = True
+    pode_criar_avulso_saida: bool = True
     avulso_exige_foto: bool = True
 
     model_config = ConfigDict(from_attributes=True)
@@ -97,6 +100,8 @@ class UserCreate(BaseModel):
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
+    pode_criar_avulso_coleta: Optional[bool] = None
+    pode_criar_avulso_saida: Optional[bool] = None
     avulso_exige_foto: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -153,6 +158,8 @@ class AdminUserUpdate(BaseModel):
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
+    pode_criar_avulso_coleta: Optional[bool] = None
+    pode_criar_avulso_saida: Optional[bool] = None
     avulso_exige_foto: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -161,6 +168,8 @@ class AdminUserUpdate(BaseModel):
 class MotoboyPermissoesLoteIn(BaseModel):
     """Aplica permissão a todos os motoboys da sub_base do admin."""
     pode_lancar_avulso: Optional[bool] = None
+    pode_criar_avulso_coleta: Optional[bool] = None
+    pode_criar_avulso_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     avulso_exige_foto: Optional[bool] = None
 
@@ -585,6 +594,8 @@ def create_user(
             def_saida = bool(getattr(owner, "default_pode_ler_saida", True))
             def_digitar = bool(getattr(owner, "default_pode_digitar_codigo_manual", False))
             def_avulso = bool(getattr(owner, "default_pode_lancar_avulso", True))
+            def_avulso_coleta = bool(getattr(owner, "default_pode_criar_avulso_coleta", def_avulso))
+            def_avulso_saida = bool(getattr(owner, "default_pode_criar_avulso_saida", def_avulso))
             def_foto = bool(getattr(owner, "default_avulso_exige_foto", True))
 
             pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else def_coleta
@@ -597,9 +608,25 @@ def create_user(
             pode_digitar_codigo_manual = (
                 body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else def_digitar
             )
-            pode_lancar_avulso = (
-                body.pode_lancar_avulso if body.pode_lancar_avulso is not None else def_avulso
+            pode_criar_avulso_coleta = (
+                body.pode_criar_avulso_coleta
+                if body.pode_criar_avulso_coleta is not None
+                else (
+                    body.pode_lancar_avulso
+                    if body.pode_lancar_avulso is not None
+                    else def_avulso_coleta
+                )
             )
+            pode_criar_avulso_saida = (
+                body.pode_criar_avulso_saida
+                if body.pode_criar_avulso_saida is not None
+                else (
+                    body.pode_lancar_avulso
+                    if body.pode_lancar_avulso is not None
+                    else def_avulso_saida
+                )
+            )
+            pode_lancar_avulso = bool(pode_criar_avulso_coleta or pode_criar_avulso_saida)
             avulso_exige_foto = (
                 bool(body.avulso_exige_foto) if body.avulso_exige_foto is not None else def_foto
             )
@@ -629,6 +656,8 @@ def create_user(
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=pode_digitar_codigo_manual,
                 pode_lancar_avulso=pode_lancar_avulso,
+                pode_criar_avulso_coleta=bool(pode_criar_avulso_coleta),
+                pode_criar_avulso_saida=bool(pode_criar_avulso_saida),
                 avulso_exige_foto=avulso_exige_foto,
                 claims_version=0,
             )
@@ -724,7 +753,11 @@ def list_motoboys(
                 MotoboyItem(
                     id_motoboy=u.motoboy.id_motoboy,
                     nome=nome or f"Motoboy {u.motoboy.id_motoboy}",
-                    pode_lancar_avulso=bool(getattr(u.motoboy, "pode_lancar_avulso", True)),
+                    pode_lancar_avulso=bool(
+                        getattr(u.motoboy, "pode_criar_avulso_coleta", False)
+                        or getattr(u.motoboy, "pode_criar_avulso_saida", False)
+                        or getattr(u.motoboy, "pode_lancar_avulso", True)
+                    ),
                     avulso_exige_foto=bool(getattr(u.motoboy, "avulso_exige_foto", False)),
                 )
             )
@@ -744,6 +777,8 @@ def motoboys_permissoes_lote(
 
     if (
         body.pode_lancar_avulso is None
+        and body.pode_criar_avulso_coleta is None
+        and body.pode_criar_avulso_saida is None
         and body.pode_digitar_codigo_manual is None
         and body.avulso_exige_foto is None
     ):
@@ -761,10 +796,17 @@ def motoboys_permissoes_lote(
     atualizados = 0
     for m in motoboys:
         changed = False
-        if body.pode_lancar_avulso is not None:
-            m.pode_lancar_avulso = bool(body.pode_lancar_avulso)
-            if not m.pode_lancar_avulso:
-                m.avulso_exige_foto = False
+        if body.pode_criar_avulso_coleta is not None or body.pode_criar_avulso_saida is not None:
+            if body.pode_criar_avulso_coleta is not None:
+                m.pode_criar_avulso_coleta = bool(body.pode_criar_avulso_coleta)
+            if body.pode_criar_avulso_saida is not None:
+                m.pode_criar_avulso_saida = bool(body.pode_criar_avulso_saida)
+            sync_motoboy_avulso_legado(m)
+            changed = True
+        elif body.pode_lancar_avulso is not None:
+            m.pode_criar_avulso_coleta = bool(body.pode_lancar_avulso)
+            m.pode_criar_avulso_saida = bool(body.pode_lancar_avulso)
+            sync_motoboy_avulso_legado(m)
             changed = True
         if body.pode_digitar_codigo_manual is not None:
             m.pode_digitar_codigo_manual = bool(body.pode_digitar_codigo_manual)
@@ -1045,7 +1087,8 @@ def admin_update_user(
     # Campos Motoboy (role=4)
     motoboy_fields = {
         "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
-        "pode_ler_coleta", "pode_realizar_coleta", "pode_ler_saida", "pode_digitar_codigo_manual", "pode_lancar_avulso",
+        "pode_ler_coleta", "pode_realizar_coleta", "pode_ler_saida", "pode_digitar_codigo_manual",
+        "pode_lancar_avulso", "pode_criar_avulso_coleta", "pode_criar_avulso_saida",
         "avulso_exige_foto",
     }
     sub_base = current_user.sub_base or ""
@@ -1065,11 +1108,18 @@ def admin_update_user(
                 user.motoboy.pode_ler_coleta = bool(user.motoboy.pode_realizar_coleta)
             elif "pode_ler_coleta" in updates:
                 user.motoboy.pode_realizar_coleta = bool(user.motoboy.pode_ler_coleta)
+            if "pode_criar_avulso_coleta" in updates or "pode_criar_avulso_saida" in updates:
+                sync_motoboy_avulso_legado(user.motoboy)
+            elif "pode_lancar_avulso" in updates:
+                user.motoboy.pode_criar_avulso_coleta = bool(user.motoboy.pode_lancar_avulso)
+                user.motoboy.pode_criar_avulso_saida = bool(user.motoboy.pode_lancar_avulso)
+                sync_motoboy_avulso_legado(user.motoboy)
             if not bool(getattr(user.motoboy, "pode_lancar_avulso", True)):
                 user.motoboy.avulso_exige_foto = False
             perm_keys = {
                 "pode_ler_coleta", "pode_realizar_coleta", "pode_ler_saida",
-                "pode_digitar_codigo_manual", "pode_lancar_avulso", "avulso_exige_foto",
+                "pode_digitar_codigo_manual", "pode_lancar_avulso",
+                "pode_criar_avulso_coleta", "pode_criar_avulso_saida", "avulso_exige_foto",
             }
             if perm_keys & set(updates.keys()):
                 bump_motoboy_claims_version(db, user.motoboy, commit=False)
@@ -1087,11 +1137,25 @@ def admin_update_user(
                 if updates.get("pode_digitar_codigo_manual") is not None
                 else True
             )
-            pode_lancar_avulso = (
-                updates.get("pode_lancar_avulso", True)
-                if updates.get("pode_lancar_avulso") is not None
-                else True
+            pode_criar_avulso_coleta = (
+                updates.get("pode_criar_avulso_coleta")
+                if updates.get("pode_criar_avulso_coleta") is not None
+                else (
+                    updates.get("pode_lancar_avulso", True)
+                    if updates.get("pode_lancar_avulso") is not None
+                    else True
+                )
             )
+            pode_criar_avulso_saida = (
+                updates.get("pode_criar_avulso_saida")
+                if updates.get("pode_criar_avulso_saida") is not None
+                else (
+                    updates.get("pode_lancar_avulso", True)
+                    if updates.get("pode_lancar_avulso") is not None
+                    else True
+                )
+            )
+            pode_lancar_avulso = bool(pode_criar_avulso_coleta or pode_criar_avulso_saida)
             avulso_exige_foto = bool(updates.get("avulso_exige_foto", False)) and bool(pode_lancar_avulso)
             if owner and owner.ignorar_coleta:
                 pode_ler_coleta = False
@@ -1116,6 +1180,8 @@ def admin_update_user(
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=bool(pode_digitar_codigo_manual),
                 pode_lancar_avulso=bool(pode_lancar_avulso),
+                pode_criar_avulso_coleta=bool(pode_criar_avulso_coleta),
+                pode_criar_avulso_saida=bool(pode_criar_avulso_saida),
                 avulso_exige_foto=avulso_exige_foto,
             )
             db.add(motoboy)

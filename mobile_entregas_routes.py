@@ -3818,7 +3818,7 @@ def scan_codigo(
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
         if servico_val == "Avulso":
-            ensure_lancar_avulso_allowed(db, user)
+            ensure_lancar_avulso_allowed(db, user, contexto="saida")
         qr_raw = qr_payload_raw.strip() if (qr_payload_raw and should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
         try:
             nova = Saida(
