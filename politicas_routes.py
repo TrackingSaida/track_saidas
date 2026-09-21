@@ -126,6 +126,7 @@ def _owner_to_out(
     *,
     motoboys_atualizados: Optional[int] = None,
     motoboys_sem_perfil: Optional[int] = None,
+    padroes_override: Optional[PadroesMotoboyPoliticas] = None,
 ) -> PoliticasOut:
     sub = (getattr(owner, "sub_base", None) or "").strip()
     if db is not None:
@@ -134,7 +135,19 @@ def _owner_to_out(
     else:
         estrutura = {"regioes": [], "modo": "ilimitado", "prefixos_sem_regiao": []}
         prefixos = []
-    avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
+    if padroes_override is not None:
+        padroes = padroes_override
+    else:
+        avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
+        padroes = PadroesMotoboyPoliticas(
+            pode_realizar_coleta=bool(getattr(owner, "default_pode_realizar_coleta", False)),
+            pode_ler_saida=bool(getattr(owner, "default_pode_ler_saida", True)),
+            pode_digitar_codigo_manual=bool(getattr(owner, "default_pode_digitar_codigo_manual", False)),
+            pode_lancar_avulso=bool(avulso_coleta or avulso_saida),
+            pode_criar_avulso_coleta=avulso_coleta,
+            pode_criar_avulso_saida=avulso_saida,
+            avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
+        )
     return PoliticasOut(
         operacao=OperacaoPoliticas(
             coleta_habilitada=not bool(owner.ignorar_coleta),
@@ -144,15 +157,7 @@ def _owner_to_out(
             conferencia_saida_habilitada=bool(getattr(owner, "conferencia_saida_habilitada", False)),
             devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
         ),
-        padroes_motoboy=PadroesMotoboyPoliticas(
-            pode_realizar_coleta=bool(getattr(owner, "default_pode_realizar_coleta", False)),
-            pode_ler_saida=bool(getattr(owner, "default_pode_ler_saida", True)),
-            pode_digitar_codigo_manual=bool(getattr(owner, "default_pode_digitar_codigo_manual", False)),
-            pode_lancar_avulso=bool(avulso_coleta or avulso_saida),
-            pode_criar_avulso_coleta=avulso_coleta,
-            pode_criar_avulso_saida=avulso_saida,
-            avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
-        ),
+        padroes_motoboy=padroes,
         cobertura=CoberturaPoliticas(
             prefixos=prefixos,
             regioes=list(estrutura.get("regioes") or []),
@@ -164,6 +169,31 @@ def _owner_to_out(
         motoboys_atualizados=motoboys_atualizados,
         motoboys_sem_perfil=motoboys_sem_perfil,
     )
+
+
+def _padroes_from_owner(owner: Owner) -> PadroesMotoboyPoliticas:
+    """Snapshot em memória dos padrões (imune a expire_on_commit após db.commit)."""
+    avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
+    return PadroesMotoboyPoliticas(
+        pode_realizar_coleta=bool(getattr(owner, "default_pode_realizar_coleta", False)),
+        pode_ler_saida=bool(getattr(owner, "default_pode_ler_saida", True)),
+        pode_digitar_codigo_manual=bool(getattr(owner, "default_pode_digitar_codigo_manual", False)),
+        pode_lancar_avulso=bool(avulso_coleta or avulso_saida),
+        pode_criar_avulso_coleta=avulso_coleta,
+        pode_criar_avulso_saida=avulso_saida,
+        avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
+    )
+
+
+def _restore_owner_padroes(owner: Owner, pad: PadroesMotoboyPoliticas) -> None:
+    """Reaplica snapshot no objeto após commit (expire_on_commit) sem SELECT stale."""
+    owner.default_pode_realizar_coleta = bool(pad.pode_realizar_coleta)
+    owner.default_pode_ler_saida = bool(pad.pode_ler_saida)
+    owner.default_pode_digitar_codigo_manual = bool(pad.pode_digitar_codigo_manual)
+    owner.default_pode_criar_avulso_coleta = bool(pad.pode_criar_avulso_coleta)
+    owner.default_pode_criar_avulso_saida = bool(pad.pode_criar_avulso_saida)
+    owner.default_pode_lancar_avulso = bool(pad.pode_lancar_avulso)
+    owner.default_avulso_exige_foto = bool(pad.avulso_exige_foto)
 
 
 @router.get("", response_model=PoliticasOut)
@@ -286,14 +316,23 @@ def patch_politicas(
     if owner.ignorar_coleta:
         pass
 
+    # Garante UPDATE Core das colunas de avulso como último write antes do commit.
+    if body.padroes_motoboy:
+        flush_owner_avulso_columns(db, owner)
+
+    # Snapshot ANTES do commit: expire_on_commit recarrega o Owner e pode
+    # devolver valores stale (coleta/foto false) se o UPDATE Core/ORM divergir.
+    padroes_snap = _padroes_from_owner(owner)
+
     db.add(owner)
     db.commit()
-    # Resposta a partir do owner em memória (o que o PATCH gravou).
-    # expire/refresh após UPDATE Core pode devolver stale e remarcar coleta/foto como false.
+
+    _restore_owner_padroes(owner, padroes_snap)
     out = _owner_to_out(
         owner,
         db,
         motoboys_atualizados=aplicados if body.aplicar_padroes_aos_motoboys else None,
         motoboys_sem_perfil=sem_perfil if body.aplicar_padroes_aos_motoboys else None,
+        padroes_override=padroes_snap,
     )
     return out
