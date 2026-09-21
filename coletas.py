@@ -399,6 +399,17 @@ def registrar_coleta_em_lote(
             etiquetados_adotar.append(s)
 
     etiquetado_codigos = {str(s.codigo) for s in etiquetados_adotar}
+    cancelados = sorted(
+        c
+        for c, s in existing_by_codigo.items()
+        if (s.status or "").strip().lower() == "cancelado"
+    )
+    if cancelados:
+        raise HTTPException(
+            409,
+            f"Etiqueta cancelada. O código '{cancelados[0]}' não pode ser coletado.",
+        )
+
     truly_dup = sorted(
         c
         for c in existing_by_codigo.keys()

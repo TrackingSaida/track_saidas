@@ -81,10 +81,13 @@ def root():
 # toda resposta, inclusive de erro/500, tenha CORS quando houver Origin.
 from starlette.middleware.base import BaseHTTPMiddleware
 
+_CORS_ALLOW_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+
 
 class CORSFallbackMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         start = time.perf_counter()
+        origin = request.headers.get("origin")
         try:
             response = await call_next(request)
         except RuntimeError as exc:
@@ -102,7 +105,6 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
                 request.method,
                 request.url.path,
             )
-            origin = request.headers.get("origin")
             headers = {}
             if origin:
                 headers["Access-Control-Allow-Origin"] = origin
@@ -116,7 +118,6 @@ class CORSFallbackMiddleware(BaseHTTPMiddleware):
         end = time.perf_counter()
         response.headers["X-Backend-Process-Time"] = f"{(end - start) * 1000:.3f}"
 
-        origin = request.headers.get("origin")
         if origin and "access-control-allow-origin" not in [k.lower() for k in response.headers.keys()]:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -131,18 +132,41 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["*"],  # inclui PATCH (salvar políticas / portal)
     allow_headers=[
         "Content-Type",
         "Authorization",
         "X-Requested-With",
         "Accept",
         "Accept-Language",
-        "Cache-Control", "Pragma",
+        "Cache-Control",
+        "Pragma",
+        "Content-Language",
     ],
-    max_age=86400,                           # cache do preflight
-    expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale"],
+    max_age=600,  # evita preflight antigo sem PATCH cacheado por 24h
+    expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale", "X-Envio-Id", "X-Codigo", "X-Id-Saida", "X-Cobertura-Aviso"],
 )
+
+
+class EnsurePatchCorsMiddleware(BaseHTTPMiddleware):
+    """Outermost: força métodos completos no preflight (após CORSMiddleware)."""
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.method != "OPTIONS":
+            return response
+        origin = request.headers.get("origin")
+        if not origin:
+            return response
+        response.headers["Access-Control-Allow-Methods"] = _CORS_ALLOW_METHODS
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Max-Age"] = "600"
+        response.headers["Vary"] = "Origin, Access-Control-Request-Method"
+        return response
+
+
+app.add_middleware(EnsurePatchCorsMiddleware)
 
 # ──────────────────────────────────────────────────────────────────
 # Routers em uso
@@ -171,6 +195,7 @@ from acompanhamento_routes import router as acompanhamento_router
 from cep_routes import router as cep_router
 from config_campos_obrigatorios_routes import router as config_campos_obrigatorios_router
 from politicas_routes import router as politicas_router
+from seller_portal_routes import router as seller_portal_router
 from avulso_campos_routes import router_config as avulso_campos_config_router
 from avulso_campos_routes import router_avulsos as avulsos_router
 from entradas_routes import router as entradas_router
@@ -213,6 +238,7 @@ app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
 app.include_router(config_campos_obrigatorios_router, prefix=API_PREFIX)
 app.include_router(politicas_router, prefix=API_PREFIX)
+app.include_router(seller_portal_router, prefix=API_PREFIX)
 app.include_router(avulso_campos_config_router, prefix=API_PREFIX)
 app.include_router(avulsos_router, prefix=API_PREFIX)
 
@@ -392,6 +418,28 @@ def internal_cleanup_history(request: Request):
         return JSONResponse(status_code=500, content={"detail": str(e)})
     finally:
         db.close()
+
+
+@app.post(f"{API_PREFIX}/internal/expirar-etiquetas", tags=["Internal"])
+def internal_expirar_etiquetas(request: Request):
+    """Marca ETIQUETADO antigo como cancelado. Header X-Cron-Secret."""
+    secret = os.getenv("CRON_CLEANUP_SECRET") or os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_CLEANUP_SECRET não configurado"})
+    received = request.headers.get("X-Cron-Secret")
+    if received != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    from envio_proprio_service import expirar_etiquetas_etiquetado
+
+    db = SessionLocal()
+    try:
+        result = expirar_etiquetas_etiquetado(db)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
 
 @app.post(f"{API_PREFIX}/internal/encerrar-pendentes-quinzena", tags=["Internal"])
 def internal_encerrar_pendentes_quinzena(request: Request):

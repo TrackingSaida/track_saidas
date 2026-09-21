@@ -113,6 +113,8 @@ class Owner(Base):
     logo_content_type = Column(Text, nullable=True)
     logo_updated_at = Column(DateTime(timezone=False), nullable=True)
     slogan = Column(Text, nullable=True)
+    etiqueta_limite_diario_default = Column(Integer, nullable=False, server_default=text("50"))
+    etiqueta_expiracao_dias = Column(Integer, nullable=False, server_default=text("30"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -362,6 +364,7 @@ class BasePreco(Base):
     # mas só passa a bloquear alertas/fechamentos após confirmação do admin.
     dias_coleta = Column(JSON, nullable=False, server_default=text("'[1,2,3,4,5,6]'::json"))
     agenda_coleta_confirmada = Column(Boolean, nullable=False, server_default=text("false"))
+    etiqueta_limite_diario = Column(Integer, nullable=True)
 
     def __repr__(self) -> str:
         return f"<BasePreco id_base={self.id_base} sub_base={self.sub_base!r} username={self.username!r}>"
@@ -1340,6 +1343,7 @@ class EnvioProprio(Base):
     peso_kg = Column(Numeric(10, 3), nullable=True)
     dimensoes = Column(Text, nullable=True)
     observacao = Column(Text, nullable=True)
+    pedido_loja = Column(Text, nullable=True)
 
     owner_nome_exibicao = Column(Text, nullable=True)
     owner_slogan = Column(Text, nullable=True)
@@ -1347,6 +1351,54 @@ class EnvioProprio(Base):
 
     criado_por_user_id = Column(BigInteger, nullable=True)
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    origem_emissao = Column(Text, nullable=False, server_default=text("'staff'"))
+    cancelado_at = Column(DateTime(timezone=False), nullable=True)
+    cancelado_por = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<EnvioProprio id_envio={self.id_envio} codigo={self.codigo!r} sub_base={self.sub_base!r}>"
+
+
+class CoberturaRegiao(Base):
+    __tablename__ = "cobertura_regiao"
+    __table_args__ = (
+        UniqueConstraint("sub_base", "nome", name="uq_cobertura_regiao_sub_nome"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    nome = Column(Text, nullable=False)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    ordem = Column(Integer, nullable=False, server_default=text("0"))
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class CoberturaCepPrefixo(Base):
+    __tablename__ = "cobertura_cep_prefixo"
+    __table_args__ = (UniqueConstraint("sub_base", "prefixo", name="uq_cobertura_cep_sub_base_prefixo"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    prefixo = Column(Text, nullable=False)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    id_regiao = Column(BigInteger, ForeignKey("cobertura_regiao.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class SellerPortalAccess(Base):
+    __tablename__ = "seller_portal_access"
+    __table_args__ = (
+        UniqueConstraint("login", name="uq_seller_portal_login"),
+        UniqueConstraint("sub_base", "login", name="uq_seller_portal_sub_base_login"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    id_base = Column(BigInteger, ForeignKey("base.id_base", ondelete="CASCADE"), nullable=False)
+    login = Column(Text, nullable=False)
+    password_hash = Column(Text, nullable=False)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    must_change_password = Column(Boolean, nullable=False, server_default=text("true"))
+    criado_por_user_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    last_login_at = Column(DateTime(timezone=False), nullable=True)

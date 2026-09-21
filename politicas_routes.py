@@ -1,10 +1,11 @@
 """Políticas gerais da base (operação + padrões Motoboy)."""
 from __future__ import annotations
 
-from typing import Optional
+from cobertura_cep_service import list_prefixos_ativos, listar_cobertura_estruturada, replace_prefixos, replace_regioes
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -45,9 +46,24 @@ class PadroesMotoboyPoliticas(BaseModel):
     avulso_exige_foto: bool = True
 
 
+class CoberturaRegiaoIn(BaseModel):
+    nome: str
+    prefixos: List[str] = Field(default_factory=list)
+
+
+class CoberturaPoliticas(BaseModel):
+    prefixos: List[str] = Field(default_factory=list)
+    regioes: List[Dict[str, Any]] = Field(default_factory=list)
+    modo: str = "ilimitado"
+    prefixos_sem_regiao: List[str] = Field(default_factory=list)
+    limite_diario_default: int = 50
+    expiracao_dias: int = 30
+
+
 class PoliticasOut(BaseModel):
     operacao: OperacaoPoliticas
     padroes_motoboy: PadroesMotoboyPoliticas
+    cobertura: CoberturaPoliticas
     motoboys_atualizados: Optional[int] = None
     motoboys_sem_perfil: Optional[int] = None
 
@@ -71,9 +87,17 @@ class PadroesMotoboyPatch(BaseModel):
     avulso_exige_foto: Optional[bool] = None
 
 
+class CoberturaPoliticasPatch(BaseModel):
+    prefixos: Optional[List[str]] = None
+    regioes: Optional[List[CoberturaRegiaoIn]] = None
+    limite_diario_default: Optional[int] = Field(default=None, ge=1, le=9999)
+    expiracao_dias: Optional[int] = Field(default=None, ge=1, le=365)
+
+
 class PoliticasPatch(BaseModel):
     operacao: Optional[OperacaoPoliticasPatch] = None
     padroes_motoboy: Optional[PadroesMotoboyPatch] = None
+    cobertura: Optional[CoberturaPoliticasPatch] = None
     aplicar_padroes_aos_motoboys: bool = False
 
 
@@ -95,10 +119,13 @@ def _owner_for_user(db: Session, current_user: User) -> Owner:
 
 def _owner_to_out(
     owner: Owner,
+    db: Session,
     *,
     motoboys_atualizados: Optional[int] = None,
     motoboys_sem_perfil: Optional[int] = None,
 ) -> PoliticasOut:
+    sub = (owner.sub_base or "").strip()
+    estrutura = listar_cobertura_estruturada(db, sub)
     avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
     return PoliticasOut(
         operacao=OperacaoPoliticas(
@@ -118,6 +145,14 @@ def _owner_to_out(
             pode_criar_avulso_saida=avulso_saida,
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         ),
+        cobertura=CoberturaPoliticas(
+            prefixos=list_prefixos_ativos(db, sub),
+            regioes=list(estrutura.get("regioes") or []),
+            modo=str(estrutura.get("modo") or "ilimitado"),
+            prefixos_sem_regiao=list(estrutura.get("prefixos_sem_regiao") or []),
+            limite_diario_default=int(getattr(owner, "etiqueta_limite_diario_default", None) or 50),
+            expiracao_dias=int(getattr(owner, "etiqueta_expiracao_dias", None) or 30),
+        ),
         motoboys_atualizados=motoboys_atualizados,
         motoboys_sem_perfil=motoboys_sem_perfil,
     )
@@ -130,9 +165,14 @@ def get_politicas(
     current_user: User = Depends(get_current_user),
 ):
     _assert_admin(current_user)
-    return _owner_to_out(_owner_for_user(db, current_user))
+    owner = _owner_for_user(db, current_user)
+    return _owner_to_out(owner, db)
 
 
+@router.post("", response_model=PoliticasOut)
+@router.post("/", response_model=PoliticasOut)
+@router.put("", response_model=PoliticasOut)
+@router.put("/", response_model=PoliticasOut)
 @router.patch("", response_model=PoliticasOut)
 @router.patch("/", response_model=PoliticasOut)
 def patch_politicas(
@@ -195,6 +235,21 @@ def patch_politicas(
             owner.default_avulso_exige_foto = False
         flush_owner_avulso_columns(db, owner)
 
+    if body.cobertura:
+        cob = body.cobertura
+        if cob.regioes is not None:
+            replace_regioes(
+                db,
+                sub_base,
+                [{"nome": r.nome, "prefixos": list(r.prefixos or [])} for r in cob.regioes],
+            )
+        elif cob.prefixos is not None:
+            replace_prefixos(db, sub_base, cob.prefixos)
+        if cob.limite_diario_default is not None:
+            owner.etiqueta_limite_diario_default = int(cob.limite_diario_default)
+        if cob.expiracao_dias is not None:
+            owner.etiqueta_expiracao_dias = int(cob.expiracao_dias)
+
     aplicados = 0
     sem_perfil = 0
     if body.aplicar_padroes_aos_motoboys:
@@ -231,6 +286,7 @@ def patch_politicas(
     db.refresh(owner)
     out = _owner_to_out(
         owner,
+        db,
         motoboys_atualizados=aplicados if body.aplicar_padroes_aos_motoboys else None,
         motoboys_sem_perfil=sem_perfil if body.aplicar_padroes_aos_motoboys else None,
     )
