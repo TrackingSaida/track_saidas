@@ -1,6 +1,7 @@
 """Portal do Seller: auth isolada, emissão e gestão de acesso pelo staff."""
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -132,6 +133,14 @@ class LiberarPortalIn(BaseModel):
 class PortalAcessoPatch(BaseModel):
     ativo: Optional[bool] = None
     etiqueta_limite_diario: Optional[int] = Field(default=None, ge=1, le=9999)
+
+
+_SAFE_FILENAME_RE = re.compile(r"[^\w.\-]+")
+
+
+def _etiqueta_filename(codigo: str) -> str:
+    safe = _SAFE_FILENAME_RE.sub("", str(codigo or "").strip()) or "etiqueta"
+    return f"etq-{safe}_rotevo.pdf"
 
 
 @router.post("/auth/login")
@@ -326,7 +335,7 @@ def portal_emitir(
         force_id_base=seller.id_base,
         sub_base_override=seller.sub_base,
     )
-    filename = f"etq-envio-{envio.codigo}.pdf"
+    filename = _etiqueta_filename(envio.codigo)
     return Response(
         content=pdf,
         media_type="application/pdf",
@@ -483,11 +492,15 @@ def portal_pdf(
 ):
     envio = _envio_do_seller(db, seller, id_envio)
     pdf = pdf_from_envio(db, envio)
-    filename = f"etq-envio-{envio.codigo}.pdf"
+    filename = _etiqueta_filename(envio.codigo)
     return Response(
         content=pdf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Codigo": envio.codigo,
+            "Access-Control-Expose-Headers": "X-Codigo, Content-Disposition",
+        },
     )
 
 
