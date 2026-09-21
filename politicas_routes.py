@@ -17,6 +17,7 @@ from leitura_manual_auth import (
     apply_owner_avulso_padroes,
     flush_motoboy_avulso_columns,
     flush_owner_avulso_columns,
+    list_motoboys_da_sub_base,
     list_users_role4_da_sub_base,
     resolve_owner_avulso_defaults,
 )
@@ -37,12 +38,14 @@ class OperacaoPoliticas(BaseModel):
 
 
 class PadroesMotoboyPoliticas(BaseModel):
+    """Preset oficial: ler saídas + avulso coleta + foto; demais off."""
+
     pode_realizar_coleta: bool = False
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = False
-    pode_lancar_avulso: bool
-    pode_criar_avulso_coleta: bool
-    pode_criar_avulso_saida: bool
+    pode_lancar_avulso: bool = True
+    pode_criar_avulso_coleta: bool = True
+    pode_criar_avulso_saida: bool = False
     avulso_exige_foto: bool = True
 
 
@@ -260,11 +263,9 @@ def patch_politicas(
     if body.aplicar_padroes_aos_motoboys:
         avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
         users_role4 = list_users_role4_da_sub_base(db, sub_base)
-        for u in users_role4:
-            m = getattr(u, "motoboy", None)
-            if m is None:
-                sem_perfil += 1
-                continue
+        sem_perfil = sum(1 for u in users_role4 if getattr(u, "motoboy", None) is None)
+        motoboys = list_motoboys_da_sub_base(db, sub_base)
+        for m in motoboys:
             m.pode_realizar_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_saida = bool(owner.default_pode_ler_saida)
