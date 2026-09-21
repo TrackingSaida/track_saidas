@@ -200,3 +200,87 @@ def test_patch_sem_apply_nao_inventa_contagem():
     assert out.padroes_motoboy.pode_criar_avulso_saida is False
     assert out.motoboys_atualizados is None
     assert out.motoboys_sem_perfil is None
+
+
+def test_patch_coleta_e_foto_false_para_true():
+    """Ligar coleta + foto: resposta deve refletir True (não o estado stale)."""
+    owner = _owner(
+        default_pode_criar_avulso_coleta=False,
+        default_pode_criar_avulso_saida=False,
+        default_pode_lancar_avulso=False,
+        default_avulso_exige_foto=False,
+    )
+    db = _db(owner, [])
+    admin = SimpleNamespace(role=1, sub_base="BASE_X")
+    body = PoliticasPatch(
+        padroes_motoboy=PadroesMotoboyPatch(
+            pode_criar_avulso_coleta=True,
+            pode_criar_avulso_saida=False,
+            avulso_exige_foto=True,
+        ),
+        aplicar_padroes_aos_motoboys=False,
+    )
+    out = patch_politicas(body, db, admin)
+    assert owner.default_pode_criar_avulso_coleta is True
+    assert owner.default_pode_criar_avulso_saida is False
+    assert owner.default_avulso_exige_foto is True
+    assert out.padroes_motoboy.pode_criar_avulso_coleta is True
+    assert out.padroes_motoboy.pode_criar_avulso_saida is False
+    assert out.padroes_motoboy.avulso_exige_foto is True
+    assert out.padroes_motoboy.pode_lancar_avulso is True
+
+
+def test_patch_coleta_true_nao_depende_de_refresh_stale():
+    """Mesmo se expire/refresh viesse a corromper o objeto, a resposta usa memória do PATCH."""
+    owner = _owner(
+        default_pode_criar_avulso_coleta=False,
+        default_pode_criar_avulso_saida=False,
+        default_pode_lancar_avulso=False,
+        default_avulso_exige_foto=False,
+    )
+    db = _db(owner, [])
+
+    def expire_stale(obj, *args, **kwargs):
+        # Simula reload stale que devolveria false (bug que remarcava coleta/foto).
+        if obj is owner:
+            owner.default_pode_criar_avulso_coleta = False
+            owner.default_pode_criar_avulso_saida = False
+            owner.default_pode_lancar_avulso = False
+            owner.default_avulso_exige_foto = False
+
+    def refresh_stale(obj, *args, **kwargs):
+        expire_stale(obj)
+
+    db.expire.side_effect = expire_stale
+    db.refresh.side_effect = refresh_stale
+
+    admin = SimpleNamespace(role=1, sub_base="BASE_X")
+    body = PoliticasPatch(
+        padroes_motoboy=PadroesMotoboyPatch(
+            pode_criar_avulso_coleta=True,
+            pode_criar_avulso_saida=False,
+            avulso_exige_foto=True,
+        ),
+        aplicar_padroes_aos_motoboys=False,
+    )
+    out = patch_politicas(body, db, admin)
+
+    # Sem expire/refresh no patch, memória permanece True e resposta também.
+    assert owner.default_pode_criar_avulso_coleta is True
+    assert owner.default_avulso_exige_foto is True
+    assert out.padroes_motoboy.pode_criar_avulso_coleta is True
+    assert out.padroes_motoboy.avulso_exige_foto is True
+    db.expire.assert_not_called()
+    db.refresh.assert_not_called()
+
+
+def test_flush_owner_usa_synchronize_session_false():
+    owner = _owner(
+        default_pode_criar_avulso_coleta=True,
+        default_pode_criar_avulso_saida=False,
+    )
+    db = MagicMock()
+    flush_owner_avulso_columns(db, owner)
+    stmt = db.execute.call_args.args[0]
+    opts = getattr(stmt, "_execution_options", None) or {}
+    assert opts.get("synchronize_session") is False
