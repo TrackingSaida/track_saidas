@@ -212,6 +212,7 @@ def flush_owner_avulso_columns(db: Session, owner: Owner) -> tuple[bool, bool]:
             default_pode_lancar_avulso=legado,
             default_avulso_exige_foto=foto,
         )
+        .execution_options(synchronize_session=False)
     )
     return coleta, saida
 
@@ -236,6 +237,7 @@ def flush_motoboy_avulso_columns(db: Session, motoboy: Motoboy) -> None:
             pode_digitar_codigo_manual=bool(getattr(motoboy, "pode_digitar_codigo_manual", False)),
             claims_version=int(getattr(motoboy, "claims_version", 0) or 0),
         )
+        .execution_options(synchronize_session=False)
     )
 
 

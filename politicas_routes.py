@@ -119,13 +119,18 @@ def _owner_for_user(db: Session, current_user: User) -> Owner:
 
 def _owner_to_out(
     owner: Owner,
-    db: Session,
+    db: Optional[Session] = None,
     *,
     motoboys_atualizados: Optional[int] = None,
     motoboys_sem_perfil: Optional[int] = None,
 ) -> PoliticasOut:
-    sub = (owner.sub_base or "").strip()
-    estrutura = listar_cobertura_estruturada(db, sub)
+    sub = (getattr(owner, "sub_base", None) or "").strip()
+    if db is not None:
+        estrutura = listar_cobertura_estruturada(db, sub)
+        prefixos = list_prefixos_ativos(db, sub)
+    else:
+        estrutura = {"regioes": [], "modo": "ilimitado", "prefixos_sem_regiao": []}
+        prefixos = []
     avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
     return PoliticasOut(
         operacao=OperacaoPoliticas(
@@ -146,7 +151,7 @@ def _owner_to_out(
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         ),
         cobertura=CoberturaPoliticas(
-            prefixos=list_prefixos_ativos(db, sub),
+            prefixos=prefixos,
             regioes=list(estrutura.get("regioes") or []),
             modo=str(estrutura.get("modo") or "ilimitado"),
             prefixos_sem_regiao=list(estrutura.get("prefixos_sem_regiao") or []),
@@ -282,8 +287,8 @@ def patch_politicas(
 
     db.add(owner)
     db.commit()
-    db.expire(owner)
-    db.refresh(owner)
+    # Resposta a partir do owner em memória (o que o PATCH gravou).
+    # expire/refresh após UPDATE Core pode devolver stale e remarcar coleta/foto como false.
     out = _owner_to_out(
         owner,
         db,
