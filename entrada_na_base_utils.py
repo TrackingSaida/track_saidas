@@ -1,4 +1,4 @@
-"""Helpers para pacotes com entrada na base ainda sem saída (status NA_BASE)."""
+"""Helpers para pacotes ainda na base (entrada NA_BASE e, opcionalmente, coletado)."""
 from __future__ import annotations
 
 from datetime import date
@@ -15,9 +15,11 @@ from entrada_na_base_pure import (
 from models import Saida
 
 STATUS_NA_BASE = "NA_BASE"
+STATUS_COLETADO = "coletado"
 
 __all__ = [
     "STATUS_NA_BASE",
+    "STATUS_COLETADO",
     "listar_ainda_na_base",
     "contar_ainda_na_base",
     "detalhe_ainda_na_base_por_dia",
@@ -40,13 +42,30 @@ def _conds_status_na_base():
     )
 
 
+def _conds_status_coletado():
+    return func.lower(Saida.status) == STATUS_COLETADO
+
+
+def _conds_status_ainda_na_base(*, incluir_coletado: bool):
+    """Estoque físico na base: NA_BASE; com incluir_coletado=True também status coletado."""
+    if incluir_coletado:
+        return or_(_conds_status_na_base(), _conds_status_coletado())
+    return _conds_status_na_base()
+
+
 def listar_ainda_na_base(
     db: Session,
     sub_base: str,
     data_inicio: date,
     data_fim: date,
+    *,
+    incluir_coletado: bool = False,
 ) -> List[Saida]:
-    """Saídas NA_BASE da sub_base com Saida.data no intervalo [data_inicio, data_fim]."""
+    """Saídas ainda na base da sub_base com Saida.data no intervalo [data_inicio, data_fim].
+
+    Por padrão conta só NA_BASE (entrada sem saída — usado pelo alerta push).
+    Com incluir_coletado=True também inclui status coletado (estoque unificado do dashboard).
+    """
     return list(
         db.scalars(
             select(Saida).where(
@@ -54,7 +73,7 @@ def listar_ainda_na_base(
                 Saida.codigo.isnot(None),
                 Saida.data >= data_inicio,
                 Saida.data <= data_fim,
-                _conds_status_na_base(),
+                _conds_status_ainda_na_base(incluir_coletado=incluir_coletado),
             )
         ).all()
     )
@@ -86,8 +105,18 @@ def contar_ainda_na_base(
     sub_base: str,
     data_inicio: date,
     data_fim: date,
+    *,
+    incluir_coletado: bool = False,
 ) -> int:
-    return len(listar_ainda_na_base(db, sub_base, data_inicio, data_fim))
+    return len(
+        listar_ainda_na_base(
+            db,
+            sub_base,
+            data_inicio,
+            data_fim,
+            incluir_coletado=incluir_coletado,
+        )
+    )
 
 
 def detalhe_ainda_na_base_por_dia(
