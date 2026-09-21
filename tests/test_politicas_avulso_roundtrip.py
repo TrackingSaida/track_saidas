@@ -274,6 +274,45 @@ def test_patch_coleta_true_nao_depende_de_refresh_stale():
     db.refresh.assert_not_called()
 
 
+def test_patch_resposta_usa_snapshot_apos_commit_expire():
+    """expire_on_commit que recarrega false não pode desmarcar a resposta do save."""
+    owner = _owner(
+        default_pode_criar_avulso_coleta=False,
+        default_pode_criar_avulso_saida=False,
+        default_pode_lancar_avulso=False,
+        default_avulso_exige_foto=False,
+    )
+    db = _db(owner, [])
+
+    def commit_expire():
+        # Simula expire_on_commit=True recarregando valores antigos do banco.
+        owner.default_pode_criar_avulso_coleta = False
+        owner.default_pode_criar_avulso_saida = False
+        owner.default_pode_lancar_avulso = False
+        owner.default_avulso_exige_foto = False
+
+    db.commit.side_effect = commit_expire
+
+    admin = SimpleNamespace(role=1, sub_base="BASE_X")
+    body = PoliticasPatch(
+        padroes_motoboy=PadroesMotoboyPatch(
+            pode_criar_avulso_coleta=True,
+            pode_criar_avulso_saida=False,
+            avulso_exige_foto=True,
+        ),
+        aplicar_padroes_aos_motoboys=False,
+    )
+    out = patch_politicas(body, db, admin)
+
+    assert out.padroes_motoboy.pode_criar_avulso_coleta is True
+    assert out.padroes_motoboy.pode_criar_avulso_saida is False
+    assert out.padroes_motoboy.avulso_exige_foto is True
+    assert out.padroes_motoboy.pode_lancar_avulso is True
+    # Restaura objeto em memória para não vazar stale a callers.
+    assert owner.default_pode_criar_avulso_coleta is True
+    assert owner.default_avulso_exige_foto is True
+
+
 def test_flush_owner_usa_synchronize_session_false():
     owner = _owner(
         default_pode_criar_avulso_coleta=True,
