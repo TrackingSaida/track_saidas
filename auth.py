@@ -884,10 +884,13 @@ async def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
 
-    token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
-
-    if not token and credentials and credentials.scheme.lower() == "bearer":
+    # Bearer tem prioridade sobre cookie: no app, sessão motoboy (Authorization)
+    # não pode ser sombreada por cookie staff residual (ex.: root-select anterior).
+    token: Optional[str] = None
+    if credentials and credentials.scheme.lower() == "bearer" and credentials.credentials:
         token = credentials.credentials
+    if not token:
+        token = request.cookies.get(ACCESS_COOKIE_NAME)
 
     if not token:
         raise HTTPException(status_code=401, detail="Não autenticado")
