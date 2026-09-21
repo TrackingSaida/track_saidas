@@ -1209,8 +1209,10 @@ def get_dashboard_saidas(
                     evolucao_map[dia_key]["entradas"] += 1
 
         total_entradas = ent_shopee + ent_ml + ent_avulso
-        # Filtra NA_BASE pelo período (Saida.data), alinhado a entradas/saídas do card
-        rows_na_base = listar_ainda_na_base(db, sub_base, data_inicio, data_fim)
+        # Estoque na base no período (Saida.data): NA_BASE + coletado (sem saída)
+        rows_na_base = listar_ainda_na_base(
+            db, sub_base, data_inicio, data_fim, incluir_coletado=True
+        )
         ainda_na_base = len(rows_na_base)
         ainda_na_base_detalhe = [
             DashboardEntradaNaBaseDiaOut(date=d, qty=q)

@@ -10,6 +10,7 @@ from saidas_listar_service import (
     build_operacional_ctx_from_historico_rows,
     clamp_listar_limit,
     filtrar_ordenar_agregar_listagem,
+    _status_group_aliases,
 )
 
 
@@ -244,3 +245,13 @@ def test_matriz_reatribuicao_sem_titular_anterior_equivale_scan():
     ctx = build_operacional_ctx_from_historico_rows([21], historicos, {2: "Max"})
     assert ctx[21].acao_label == "Escaneou pedido"
     assert ctx[21].ultimo_evento == "scan"
+
+
+def test_status_group_alias_ainda_na_base_inclui_coletado():
+    """Alias do card Ainda na base = NA_BASE + coletado; na_base isolado não inclui coletado."""
+    unificado = _status_group_aliases("ainda_na_base")
+    so_entrada = _status_group_aliases("na_base")
+    assert "coletado" in unificado
+    assert "na_base" in unificado or "na base" in unificado
+    assert "coletado" not in so_entrada
+    assert _status_group_aliases("ainda na base") == unificado
