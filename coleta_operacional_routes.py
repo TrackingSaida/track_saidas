@@ -39,6 +39,7 @@ from coleta_leituras_service import (
     listar_leituras,
     remover_leitura,
     resumo_base_dia,
+    transferir_base_coleta,
 )
 
 router = APIRouter(prefix="/coletas/operacionais", tags=["Coletas operacionais"])
@@ -210,6 +211,24 @@ class CorrigirQuantidadesOut(BaseModel):
     valor_anterior: str
     valor_novo: str
     versao: int
+
+
+class TransferirBaseIn(BaseModel):
+    ids_saida: list[int] = Field(min_length=1)
+    base_destino: str = Field(min_length=1, max_length=200)
+    origem_cliente: Literal["web", "mobile"] = "web"
+
+
+class TransferirBaseOut(BaseModel):
+    transferidos: int
+    base_origem: str
+    base_destino: str
+    data_operacao: str
+    contagem: dict[str, int]
+    status_origem: str
+    status_destino: str
+    totais_origem: dict[str, int]
+    totais_destino: dict[str, int]
 
 
 class ParticipanteOut(BaseModel):
@@ -567,6 +586,39 @@ def deletar_leitura_coleta(
     except Exception:
         db.rollback()
         raise HTTPException(500, "Falha ao remover leitura de coleta.")
+
+
+@router.post("/transferir-base", response_model=TransferirBaseOut)
+def transferir_coleta_entre_bases(
+    body: TransferirBaseIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Transfere pacotes entre bases no mesmo dia: move Saida.base e o crédito
+    operacional (quantidades/status) em Consultar Coletas.
+    """
+    sub_base = _sub_base(db, current_user)
+    _exigir_coleta_habilitada(db, sub_base)
+    if not _admin(current_user):
+        raise HTTPException(403, "Somente operador, admin ou root pode transferir base.")
+    resolver_executor(db, current_user)
+    try:
+        result = transferir_base_coleta(
+            db,
+            sub_base=sub_base,
+            current_user=current_user,
+            ids_saida=body.ids_saida,
+            base_destino=body.base_destino,
+            origem_cliente=body.origem_cliente,
+        )
+        return TransferirBaseOut(**result)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Falha ao transferir base da coleta.")
 
 
 @router.post("/bases/{base_id}/iniciar", response_model=ExecucaoOut)

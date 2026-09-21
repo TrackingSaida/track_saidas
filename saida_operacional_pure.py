@@ -77,6 +77,7 @@ ROTULOS_ACAO = {
     "saida_reconferida": "Saída reconferida",
     "criado_coleta": "Pacote coletado",
     "coleta": "Pacote coletado",
+    "base_transferida": "Transferiu base da coleta",
 }
 
 
