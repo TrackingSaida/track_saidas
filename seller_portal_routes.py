@@ -140,7 +140,7 @@ _SAFE_FILENAME_RE = re.compile(r"[^\w.\-]+")
 
 def _etiqueta_filename(codigo: str) -> str:
     safe = _SAFE_FILENAME_RE.sub("", str(codigo or "").strip()) or "etiqueta"
-    return f"etq-{safe}_rotevo.pdf"
+    return f"etq-{safe}.pdf"
 
 
 @router.post("/auth/login")
