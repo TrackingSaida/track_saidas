@@ -80,7 +80,11 @@ from qr_payload_utils import (
     should_store_qr_payload_raw,
 )
 from ausencia_bloqueio_service import raise_if_bloqueado_ausencias, snapshot_bloqueio_ausencias
-from leitura_manual_auth import ensure_manual_code_entry_allowed
+from leitura_manual_auth import (
+    ensure_lancar_avulso_allowed,
+    ensure_manual_code_entry_allowed,
+    raise_if_selecao_sem_registro,
+)
 from upload_storage_utils import extract_foto_keys, parse_foto_items
 from codigo_normalizer import (
     normalize_codigo,
@@ -194,7 +198,7 @@ class EntregaListItem(BaseModel):
 
 class ScanBody(BaseModel):
     codigo: str = Field(min_length=1)
-    origem: str = "camera"  # camera | manual
+    origem: str = "camera"  # camera | manual | selecao
 
 
 class ConfirmarNovaSaidaMesmoEntregadorBody(BaseModel):
@@ -1814,10 +1818,37 @@ def rotas_otimizar(
     ordem_final = ordem_expandida + sem_coordenadas
 
     poly = result.polyline_encoded
+    dist_m = result.distancia_total_m
+    dur_s = result.duracao_total_s
     geom_provider = "google" if poly and result.optimization_mode == "google" else None
+    discard_vehicle_polyline = False
     # Soft / osrm sem polyline no backend: geometry fica missing/stale; mobile legado usa OSRM Route
     if result.optimization_mode == "osrm":
         geom_provider = None
+    elif result.optimization_mode == "google" and geom_provider_flag == "google":
+        from routing.google_route_optimization import resolve_map_polyline_after_optimize
+
+        id_to_point = {p[0]: p for p in com_coord}
+        ordered_points = [id_to_point[sid] for sid in ordem_otimizada if sid in id_to_point]
+        had_vehicle_endpoints = start is not None or end is not None
+        map_geom = resolve_map_polyline_after_optimize(
+            ordered_points,
+            had_vehicle_endpoints=had_vehicle_endpoints,
+            optimize_polyline=poly,
+            optimize_dist_m=dist_m,
+            optimize_dur_s=dur_s,
+        )
+        if map_geom.ok and map_geom.polyline_encoded:
+            poly = map_geom.polyline_encoded
+            geom_provider = "google"
+            if map_geom.distancia_total_m is not None:
+                dist_m = map_geom.distancia_total_m
+            if map_geom.duracao_total_s is not None:
+                dur_s = map_geom.duracao_total_s
+        elif had_vehicle_endpoints:
+            poly = None
+            geom_provider = "google"
+            discard_vehicle_polyline = True
 
     rota = _upsert_rota_preparando(
         db,
@@ -1827,11 +1858,18 @@ def rotas_otimizar(
         ordem=ordem_final,
         optimization_mode=result.optimization_mode,
         optimization_input_hash=input_hash,
-        distancia_total_m=result.distancia_total_m,
-        duracao_total_s=result.duracao_total_s,
+        distancia_total_m=dist_m,
+        duracao_total_s=dur_s,
         polyline_encoded=poly,
         geometry_provider=geom_provider,
     )
+    if discard_vehicle_polyline:
+        rota.polyline_encoded = None
+        rota.geometry_provider = "google"
+        rota.geometry_status = "failed"
+        rota.geometry_order_hash = None
+        db.commit()
+        db.refresh(rota)
 
     # Se priority_soft + geometry google: geometria via refresh (endpoint dedicado / pós-POC)
     geom = geometry_payload_for_api(rota)
@@ -1840,8 +1878,8 @@ def rotas_otimizar(
         modo=result.optimization_mode,
         optimization_mode=result.optimization_mode,
         sem_coordenadas=sem_coordenadas,
-        distancia_total_m=result.distancia_total_m,
-        duracao_total_s=result.duracao_total_s,
+        distancia_total_m=dist_m,
+        duracao_total_s=dur_s,
         geometry_provider=geom.get("geometry_provider"),
         geometry_status=geom.get("geometry_status"),
         route_revision=int(getattr(rota, "route_revision", 0) or 0),
@@ -3768,6 +3806,7 @@ def scan_codigo(
 
     # ——— Código não existe: registrar como novo (leitura sequencial, igual web) ———
     if not saida:
+        raise_if_selecao_sem_registro(origem)
         gate = avaliar_prerequisito_saida(
             coleta_habilitada=coleta_habilitada,
             entrada_habilitada=entrada_habilitada,
@@ -3778,6 +3817,8 @@ def scan_codigo(
         motoboy = db.get(Motoboy, motoboy_id) if motoboy_id else None
         entregador_nome = _get_motoboy_nome(db, motoboy) if motoboy else (user.username or "Operacao Mobile")
         servico_val = canonicalize_servico(servico)
+        if servico_val == "Avulso":
+            ensure_lancar_avulso_allowed(db, user, contexto="saida")
         qr_raw = qr_payload_raw.strip() if (qr_payload_raw and should_store_qr_payload_raw(servico_val, qr_payload_raw)) else None
         try:
             nova = Saida(

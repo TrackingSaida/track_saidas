@@ -10,8 +10,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
+from base import _resolve_user_sub_base
 from db import get_db
-from models import Motoboy, Owner, User
+from leitura_manual_auth import (
+    apply_motoboy_avulso_padroes,
+    apply_owner_avulso_padroes,
+    flush_motoboy_avulso_columns,
+    flush_owner_avulso_columns,
+    list_users_role4_da_sub_base,
+    resolve_owner_avulso_defaults,
+)
+from models import Owner, User
 
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
 
@@ -31,7 +40,9 @@ class PadroesMotoboyPoliticas(BaseModel):
     pode_realizar_coleta: bool = False
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = False
-    pode_lancar_avulso: bool = True
+    pode_lancar_avulso: bool
+    pode_criar_avulso_coleta: bool
+    pode_criar_avulso_saida: bool
     avulso_exige_foto: bool = True
 
 
@@ -53,6 +64,8 @@ class PoliticasOut(BaseModel):
     operacao: OperacaoPoliticas
     padroes_motoboy: PadroesMotoboyPoliticas
     cobertura: CoberturaPoliticas
+    motoboys_atualizados: Optional[int] = None
+    motoboys_sem_perfil: Optional[int] = None
 
 
 class OperacaoPoliticasPatch(BaseModel):
@@ -69,6 +82,8 @@ class PadroesMotoboyPatch(BaseModel):
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
+    pode_criar_avulso_coleta: Optional[bool] = None
+    pode_criar_avulso_saida: Optional[bool] = None
     avulso_exige_foto: Optional[bool] = None
 
 
@@ -93,7 +108,7 @@ def _assert_admin(current_user: User) -> None:
 
 
 def _owner_for_user(db: Session, current_user: User) -> Owner:
-    sub_base = (getattr(current_user, "sub_base", None) or "").strip()
+    sub_base = (_resolve_user_sub_base(db, current_user) or "").strip()
     if not sub_base:
         raise HTTPException(403, "Usuário sem sub_base definida.")
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
@@ -102,9 +117,16 @@ def _owner_for_user(db: Session, current_user: User) -> Owner:
     return owner
 
 
-def _owner_to_out(owner: Owner, db: Session) -> PoliticasOut:
+def _owner_to_out(
+    owner: Owner,
+    db: Session,
+    *,
+    motoboys_atualizados: Optional[int] = None,
+    motoboys_sem_perfil: Optional[int] = None,
+) -> PoliticasOut:
     sub = (owner.sub_base or "").strip()
     estrutura = listar_cobertura_estruturada(db, sub)
+    avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
     return PoliticasOut(
         operacao=OperacaoPoliticas(
             coleta_habilitada=not bool(owner.ignorar_coleta),
@@ -118,7 +140,9 @@ def _owner_to_out(owner: Owner, db: Session) -> PoliticasOut:
             pode_realizar_coleta=bool(getattr(owner, "default_pode_realizar_coleta", False)),
             pode_ler_saida=bool(getattr(owner, "default_pode_ler_saida", True)),
             pode_digitar_codigo_manual=bool(getattr(owner, "default_pode_digitar_codigo_manual", False)),
-            pode_lancar_avulso=bool(getattr(owner, "default_pode_lancar_avulso", True)),
+            pode_lancar_avulso=bool(avulso_coleta or avulso_saida),
+            pode_criar_avulso_coleta=avulso_coleta,
+            pode_criar_avulso_saida=avulso_saida,
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         ),
         cobertura=CoberturaPoliticas(
@@ -129,6 +153,8 @@ def _owner_to_out(owner: Owner, db: Session) -> PoliticasOut:
             limite_diario_default=int(getattr(owner, "etiqueta_limite_diario_default", None) or 50),
             expiracao_dias=int(getattr(owner, "etiqueta_expiracao_dias", None) or 30),
         ),
+        motoboys_atualizados=motoboys_atualizados,
+        motoboys_sem_perfil=motoboys_sem_perfil,
     )
 
 
@@ -196,12 +222,18 @@ def patch_politicas(
             owner.default_pode_ler_saida = bool(p.pode_ler_saida)
         if p.pode_digitar_codigo_manual is not None:
             owner.default_pode_digitar_codigo_manual = bool(p.pode_digitar_codigo_manual)
-        if p.pode_lancar_avulso is not None:
-            owner.default_pode_lancar_avulso = bool(p.pode_lancar_avulso)
+        avulso_flags = p.model_dump(exclude_unset=True)
+        apply_owner_avulso_padroes(
+            owner,
+            pode_criar_avulso_coleta=avulso_flags.get("pode_criar_avulso_coleta"),
+            pode_criar_avulso_saida=avulso_flags.get("pode_criar_avulso_saida"),
+            pode_lancar_avulso=avulso_flags.get("pode_lancar_avulso"),
+        )
         if p.avulso_exige_foto is not None:
             owner.default_avulso_exige_foto = bool(p.avulso_exige_foto)
-        if not owner.default_pode_lancar_avulso:
+        if not bool(owner.default_pode_lancar_avulso):
             owner.default_avulso_exige_foto = False
+        flush_owner_avulso_columns(db, owner)
 
     if body.cobertura:
         cob = body.cobertura
@@ -219,28 +251,43 @@ def patch_politicas(
             owner.etiqueta_expiracao_dias = int(cob.expiracao_dias)
 
     aplicados = 0
+    sem_perfil = 0
     if body.aplicar_padroes_aos_motoboys:
-        motoboys = list(db.scalars(select(Motoboy).where(Motoboy.sub_base == sub_base)).all())
-        for m in motoboys:
+        avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
+        users_role4 = list_users_role4_da_sub_base(db, sub_base)
+        for u in users_role4:
+            m = getattr(u, "motoboy", None)
+            if m is None:
+                sem_perfil += 1
+                continue
             m.pode_realizar_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_saida = bool(owner.default_pode_ler_saida)
             m.pode_digitar_codigo_manual = bool(owner.default_pode_digitar_codigo_manual)
-            m.pode_lancar_avulso = bool(owner.default_pode_lancar_avulso)
+            apply_motoboy_avulso_padroes(
+                m,
+                pode_criar_avulso_coleta=avulso_coleta,
+                pode_criar_avulso_saida=avulso_saida,
+            )
             m.avulso_exige_foto = bool(owner.default_avulso_exige_foto) and bool(m.pode_lancar_avulso)
             m.claims_version = int(getattr(m, "claims_version", 0) or 0) + 1
             db.add(m)
+            flush_motoboy_avulso_columns(db, m)
             aplicados += 1
     elif operacao_changed:
-        # Owner flags no JWT: força refresh silencioso dos motoboys da base
         bump_motoboys_claims_version_for_sub_base(db, sub_base)
 
     if owner.ignorar_coleta:
-        # Coleta off: permissão de coleta nos defaults não se aplica na prática
         pass
 
     db.add(owner)
     db.commit()
+    db.expire(owner)
     db.refresh(owner)
-    out = _owner_to_out(owner, db)
+    out = _owner_to_out(
+        owner,
+        db,
+        motoboys_atualizados=aplicados if body.aplicar_padroes_aos_motoboys else None,
+        motoboys_sem_perfil=sem_perfil if body.aplicar_padroes_aos_motoboys else None,
+    )
     return out
