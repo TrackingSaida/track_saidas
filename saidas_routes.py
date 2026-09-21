@@ -1607,7 +1607,7 @@ def _lancar_avulso_impl(
     db: Session,
     current_user: User,
 ):
-    from leitura_manual_auth import ensure_lancar_avulso_allowed
+    from leitura_manual_auth import ensure_lancar_avulso_allowed, resolve_avulso_exige_foto
 
     ensure_lancar_avulso_allowed(db, current_user, contexto="saida")
 
@@ -1645,12 +1645,9 @@ def _lancar_avulso_impl(
             detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe motoboy_id ou entregador_id/entregador."},
         )
 
-    avulso_exige_foto = bool(
-        motoboy_row is not None and getattr(motoboy_row, "avulso_exige_foto", False)
+    avulso_exige_foto = resolve_avulso_exige_foto(
+        db, sub_base=sub_base, motoboy=motoboy_row
     )
-    # Root/admin: foto sempre opcional, mesmo se o motoboy exigir.
-    if role in (0, 1):
-        avulso_exige_foto = False
     from upload_storage_utils import MAX_FOTOS_POR_EVENTO_TENTATIVA
 
     foto_keys: List[str] = []
@@ -1687,7 +1684,7 @@ def _lancar_avulso_impl(
             status_code=422,
             detail={
                 "code": "FOTO_OBRIGATORIA",
-                "message": "Este entregador exige foto ao lançar avulso.",
+                "message": "É necessário enviar foto ao lançar avulso.",
             },
         )
 

@@ -217,6 +217,29 @@ def flush_owner_avulso_columns(db: Session, owner: Owner) -> tuple[bool, bool]:
     return coleta, saida
 
 
+def resolve_avulso_exige_foto(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy: Optional[Motoboy] = None,
+) -> bool:
+    """
+    Foto obrigatória no lançamento de avulso.
+
+    - Política global do owner (`default_avulso_exige_foto`) vale para todos os perfis
+      (root/admin/operador/motoboy).
+    - Sem global: exige se o motoboy da operação tiver `avulso_exige_foto`.
+    """
+    sub = (sub_base or "").strip()
+    if sub:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == sub))
+        if owner is not None and bool(getattr(owner, "default_avulso_exige_foto", False)):
+            return True
+    if motoboy is not None and bool(getattr(motoboy, "avulso_exige_foto", False)):
+        return True
+    return False
+
+
 def flush_motoboy_avulso_columns(db: Session, motoboy: Motoboy) -> None:
     """UPDATE explícito das flags do motoboy para o SQL não omitir False."""
     mid = getattr(motoboy, "id_motoboy", None)
