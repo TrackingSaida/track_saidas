@@ -743,14 +743,21 @@ def transferir_base_coleta(
         ensure_ascii=False,
     )
 
-    # Ledger + histórico primeiro; Saida.base/id_coleta via Core UPDATE
-    # (evita models.saida_after_update → recalcular_coleta + commit aninhado).
+    # Snapshot de status para histórico (antes de mover / expunge).
+    n_transferidos = len(saidas)
+    status_por_id = {int(s.id_saida): s.status for s in saidas}
+    origem_coleta_por_saida = {
+        int(s.id_saida): int(s.id_coleta) for s in saidas if getattr(s, "id_coleta", None)
+    }
+
+    # 1) Ledger (participantes) — não toca Saida via ORM.
     for saida in saidas:
         servico_key = _normalize_servico_key(saida.servico)
         is_grande = bool(getattr(saida, "is_grande", False))
         contagem[servico_key] = contagem.get(servico_key, 0) + 1
 
-        coleta_origem = db.get(Coleta, saida.id_coleta) if saida.id_coleta else None
+        id_coleta_origem = origem_coleta_por_saida.get(int(saida.id_saida))
+        coleta_origem = db.get(Coleta, id_coleta_origem) if id_coleta_origem else None
         if coleta_origem:
             coletas_origem_ids.add(coleta_origem.id_coleta)
             execucao = _decrementar_participante(
@@ -774,13 +781,17 @@ def transferir_base_coleta(
             SaidaHistorico(
                 id_saida=saida.id_saida,
                 evento="base_transferida",
-                status_anterior=saida.status,
-                status_novo=saida.status,
+                status_anterior=status_por_id.get(int(saida.id_saida)),
+                status_novo=status_por_id.get(int(saida.id_saida)),
                 user_id=current_user.id,
                 payload=hist_payload,
             )
         )
 
+    db.flush()
+
+    # 2) Move Saida com Core UPDATE (não dispara saida_after_update).
+    # synchronize_session=False: não tenta reconciliar o identity map ORM.
     db.execute(
         update(Saida)
         .where(
@@ -788,11 +799,19 @@ def transferir_base_coleta(
             Saida.id_saida.in_(ids_unicos),
         )
         .values(base=base_dest.base, id_coleta=coleta_dest.id_coleta)
+        .execution_options(synchronize_session=False)
     )
-    # Evita objetos ORM stale com base/id_coleta antigos na mesma sessão.
-    for saida in saidas:
-        db.expire(saida, ["base", "id_coleta"])
 
+    # 3) Remove Saidas da sessão — evita FlushError/FK ao apagar coletas origem
+    #    enquanto o identity map ainda aponta id_coleta antigo.
+    for saida in list(saidas):
+        try:
+            db.expunge(saida)
+        except Exception:
+            pass
+    saidas = []
+
+    # 4) Recalcula/apaga coletas origem e destino; limpa execução vazia.
     for id_coleta in coletas_origem_ids:
         coleta = db.get(Coleta, id_coleta)
         if coleta:
@@ -812,7 +831,11 @@ def transferir_base_coleta(
         db.commit()
     except Exception as exc:
         db.rollback()
-        raise HTTPException(500, f"Erro ao transferir base da coleta: {exc}") from exc
+        # Mensagem curta sem dump SQL (sanitizer de 500).
+        raise HTTPException(
+            500,
+            "Não foi possível gravar a transferência da coleta. Código TFB-COMMIT.",
+        ) from exc
 
     invalidate_listar_cache(sub_base)
 
@@ -833,7 +856,7 @@ def transferir_base_coleta(
     status_destino = "pendente" if totais_destino["total"] == 0 else "coletado"
 
     return {
-        "transferidos": len(saidas),
+        "transferidos": n_transferidos,
         "base_origem": base_origem.base,
         "base_destino": base_dest.base,
         "data_operacao": data_operacao.isoformat(),

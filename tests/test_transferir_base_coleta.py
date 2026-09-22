@@ -233,5 +233,5 @@ def test_transferir_fluxo_feliz_usa_core_update_e_ledger():
     assert db.execute.called
     stmt = db.execute.call_args[0][0]
     assert "Update" in type(stmt).__name__ or "UPDATE" in type(stmt).__name__.upper()
-    db.expire.assert_called()
+    db.expunge.assert_called()
     db.commit.assert_called_once()
