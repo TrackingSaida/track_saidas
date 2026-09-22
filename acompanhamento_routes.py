@@ -28,6 +28,7 @@ from saida_operacional_utils import (
     carregar_saidas_candidatas_periodo,
     filtrar_saidas_por_periodo_operacional,
 )
+from entrada_na_base_utils import listar_ainda_na_base
 
 router = APIRouter(prefix="/acompanhamento", tags=["Acompanhamento"])
 
@@ -108,6 +109,19 @@ class AcompanhamentoDiaResponse(BaseModel):
     data_fim: Optional[str] = None
 
 
+class AcompanhamentoServicoBreakdown(BaseModel):
+    total: int = 0
+    pendentes: int = 0
+    entregues: int = 0
+    ausentes: int = 0
+
+
+class AcompanhamentoPorServico(BaseModel):
+    shopee: AcompanhamentoServicoBreakdown = AcompanhamentoServicoBreakdown()
+    mercado_livre: AcompanhamentoServicoBreakdown = AcompanhamentoServicoBreakdown()
+    avulso: AcompanhamentoServicoBreakdown = AcompanhamentoServicoBreakdown()
+
+
 class AcompanhamentoSaidasDiaResponse(BaseModel):
     data: str
     motoboy_id: int
@@ -118,6 +132,11 @@ class AcompanhamentoSaidasDiaResponse(BaseModel):
     sum_avulso: int
     data_inicio: Optional[str] = None
     data_fim: Optional[str] = None
+    # Breakdown opcional (clientes antigos ignoram).
+    por_servico: Optional[AcompanhamentoPorServico] = None
+    total_hoje: Optional[int] = None
+    entregues_hoje: Optional[int] = None
+    ausentes_hoje: Optional[int] = None
 
 
 class AcompanhamentoMapaItem(BaseModel):
@@ -331,17 +350,25 @@ def acompanhamento_dia(
     saidas_count: Optional[int] = None
     pct_saida: Optional[float] = None
     if entrada_habilitada:
-        entradas_count = int(
-            db.scalar(
-                select(func.count(func.distinct(SaidaHistorico.id_saida)))
+        ids_entrada_base = set(
+            db.scalars(
+                select(SaidaHistorico.id_saida)
                 .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
                 .where(Saida.sub_base == sub_base)
                 .where(SaidaHistorico.evento == "entrada_base")
                 .where(func.date(SaidaHistorico.timestamp) >= inicio)
                 .where(func.date(SaidaHistorico.timestamp) <= fim)
-            )
-            or 0
+            ).all()
         )
+        # Unifica com estoque dos indicadores: NA_BASE + coletado no período.
+        ids_estoque = {
+            int(s.id_saida)
+            for s in listar_ainda_na_base(
+                db, sub_base, inicio, fim, incluir_coletado=True
+            )
+            if getattr(s, "id_saida", None) is not None
+        }
+        entradas_count = len(ids_entrada_base | ids_estoque)
         saidas_count = int(
             db.scalar(
                 select(func.count())
@@ -402,6 +429,40 @@ def _somar_servicos(rows: List[Saida]) -> Tuple[int, int, int]:
         else:
             sum_avulso += 1
     return sum_shopee, sum_mercado, sum_avulso
+
+
+def _bucket_status_acompanhamento(status_raw: Optional[str]) -> Optional[str]:
+    """pendentes | entregues | ausentes — alinhado ao /acompanhamento/dia."""
+    st = normalizar_status_saida(status_raw)
+    if st == STATUS_ENTREGUE:
+        return "entregues"
+    if st in (STATUS_EM_ROTA, STATUS_SAIU_PARA_ENTREGA, "saiu"):
+        return "pendentes"
+    if st == STATUS_AUSENTE:
+        return "ausentes"
+    return None
+
+
+def _por_servico_breakdown(rows: List[Saida]) -> AcompanhamentoPorServico:
+    buckets = {
+        "shopee": {"total": 0, "pendentes": 0, "entregues": 0, "ausentes": 0},
+        "mercado_livre": {"total": 0, "pendentes": 0, "entregues": 0, "ausentes": 0},
+        "avulso": {"total": 0, "pendentes": 0, "entregues": 0, "ausentes": 0},
+    }
+    for s in rows:
+        kind = _classificar_servico_saida(s.servico)
+        key = "mercado_livre" if kind == "mercado" else kind
+        if key not in buckets:
+            key = "avulso"
+        buckets[key]["total"] += 1
+        bucket = _bucket_status_acompanhamento(getattr(s, "status", None))
+        if bucket:
+            buckets[key][bucket] += 1
+    return AcompanhamentoPorServico(
+        shopee=AcompanhamentoServicoBreakdown(**buckets["shopee"]),
+        mercado_livre=AcompanhamentoServicoBreakdown(**buckets["mercado_livre"]),
+        avulso=AcompanhamentoServicoBreakdown(**buckets["avulso"]),
+    )
 
 
 @router.get("/saidas-dia", response_model=AcompanhamentoSaidasDiaResponse)
@@ -479,6 +540,25 @@ def acompanhamento_saidas_dia(
         ]
 
     sum_shopee, sum_mercado, sum_avulso = _somar_servicos(rows_periodo)
+    por_servico = _por_servico_breakdown(rows_periodo)
+    pendentes_hoje = (
+        por_servico.shopee.pendentes
+        + por_servico.mercado_livre.pendentes
+        + por_servico.avulso.pendentes
+    )
+    entregues_hoje = (
+        por_servico.shopee.entregues
+        + por_servico.mercado_livre.entregues
+        + por_servico.avulso.entregues
+    )
+    ausentes_hoje = (
+        por_servico.shopee.ausentes
+        + por_servico.mercado_livre.ausentes
+        + por_servico.avulso.ausentes
+    )
+    # modo=pendentes: mantém semântica antiga (todas as linhas são "pendentes").
+    if modo_norm == "pendentes":
+        pendentes_hoje = len(rows_periodo)
 
     motoboy_nome = _carregar_nomes_motoboy_ids(db, [motoboy_id]).get(
         motoboy_id, f"Motoboy {motoboy_id}"
@@ -488,10 +568,14 @@ def acompanhamento_saidas_dia(
         data=fim.isoformat(),
         motoboy_id=motoboy_id,
         motoboy_nome=motoboy_nome,
-        pendentes_hoje=len(rows_periodo),
+        pendentes_hoje=pendentes_hoje,
         sum_shopee=sum_shopee,
         sum_mercado=sum_mercado,
         sum_avulso=sum_avulso,
         data_inicio=inicio.isoformat(),
         data_fim=fim.isoformat(),
+        por_servico=por_servico,
+        total_hoje=len(rows_periodo),
+        entregues_hoje=entregues_hoje,
+        ausentes_hoje=ausentes_hoje,
     )

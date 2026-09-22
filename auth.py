@@ -30,6 +30,7 @@ from sqlalchemy import select, or_
 from db import get_db
 from db_utils import run_db_query_with_retry
 from models import User, Owner, Motoboy, MotoboySubBase, MotoboyRefreshToken
+from aniversario_greeting import resolve_aniversario_payload
 
 
 # ======================================================
@@ -177,6 +178,12 @@ class RootSelectSubBase(BaseModel):
     remember: bool = False
 
 
+class AniversarioOut(BaseModel):
+    titulo: str
+    mensagem: str
+    botao: str
+
+
 class UserResponse(BaseModel):
     id: int
     email: Optional[EmailStr]
@@ -197,6 +204,7 @@ class UserResponse(BaseModel):
     pode_criar_avulso_coleta: bool = True
     pode_criar_avulso_saida: bool = True
     avulso_exige_foto: bool = False
+    aniversario: Optional[AniversarioOut] = None
 
 
 # ======================================================
@@ -1349,6 +1357,22 @@ async def read_users_me(
         avulso_exige_foto = bool(getattr(current_user, "avulso_exige_foto", False))
     elif owner is not None:
         avulso_exige_foto = bool(getattr(owner, "default_avulso_exige_foto", False))
+
+    aniversario_payload = resolve_aniversario_payload(
+        getattr(db_user, "data_nascimento", None),
+        live_role,
+        nome=nome_val,
+    )
+    aniversario_out = (
+        AniversarioOut(
+            titulo=aniversario_payload.titulo,
+            mensagem=aniversario_payload.mensagem,
+            botao=aniversario_payload.botao,
+        )
+        if aniversario_payload is not None
+        else None
+    )
+
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
@@ -1369,6 +1393,7 @@ async def read_users_me(
         pode_criar_avulso_coleta=bool(getattr(current_user, "pode_criar_avulso_coleta", True)) if live_role == 4 else True,
         pode_criar_avulso_saida=bool(getattr(current_user, "pode_criar_avulso_saida", True)) if live_role == 4 else True,
         avulso_exige_foto=avulso_exige_foto,
+        aniversario=aniversario_out,
     )
 
 
