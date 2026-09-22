@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from coleta_operacional_service import (
@@ -743,6 +743,8 @@ def transferir_base_coleta(
         ensure_ascii=False,
     )
 
+    # Ledger + histórico primeiro; Saida.base/id_coleta via Core UPDATE
+    # (evita models.saida_after_update → recalcular_coleta + commit aninhado).
     for saida in saidas:
         servico_key = _normalize_servico_key(saida.servico)
         is_grande = bool(getattr(saida, "is_grande", False))
@@ -759,9 +761,6 @@ def transferir_base_coleta(
             )
             if execucao and execucao.id_execucao:
                 execucoes_origem[execucao.id_execucao] = execucao
-
-        saida.base = base_dest.base
-        saida.id_coleta = coleta_dest.id_coleta
 
         _incrementar_participante(
             db,
@@ -781,6 +780,18 @@ def transferir_base_coleta(
                 payload=hist_payload,
             )
         )
+
+    db.execute(
+        update(Saida)
+        .where(
+            Saida.sub_base == sub_base,
+            Saida.id_saida.in_(ids_unicos),
+        )
+        .values(base=base_dest.base, id_coleta=coleta_dest.id_coleta)
+    )
+    # Evita objetos ORM stale com base/id_coleta antigos na mesma sessão.
+    for saida in saidas:
+        db.expire(saida, ["base", "id_coleta"])
 
     for id_coleta in coletas_origem_ids:
         coleta = db.get(Coleta, id_coleta)
