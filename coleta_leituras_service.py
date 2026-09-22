@@ -378,7 +378,13 @@ def _decimal(v) -> Decimal:
 def _recalcular_coleta_sem_commit(db: Session, coleta: Coleta) -> Optional[Coleta]:
     saidas = list(db.scalars(select(Saida).where(Saida.id_coleta == coleta.id_coleta)).all())
     if not saidas:
-        # Evita FK quebrada ao apagar execução depois.
+        # Defesa: saidas.id_coleta → coletas (NO ACTION). Nullifica residual antes do DELETE.
+        db.execute(
+            update(Saida)
+            .where(Saida.id_coleta == coleta.id_coleta)
+            .values(id_coleta=None)
+            .execution_options(synchronize_session=False)
+        )
         coleta.execucao_id = None
         coleta.participante_id = None
         db.delete(coleta)
@@ -508,6 +514,7 @@ def _obter_ou_criar_participante_destino(
     )
     if participante:
         return participante
+    # status=em_coleta evita ck_coleta_participante_volume (finalizado + volume 0).
     participante = ColetaExecucaoParticipante(
         execucao_id=execucao.id_execucao,
         sub_base=sub_base,
@@ -518,7 +525,7 @@ def _obter_ou_criar_participante_destino(
         mercado_livre=0,
         avulso=0,
         pacotes_g=0,
-        status="finalizado",
+        status="em_coleta",
         atualizado_por_user_id=current_user.id,
     )
     db.add(participante)
@@ -565,6 +572,18 @@ def _limpar_execucao_sem_volume(db: Session, execucao: Optional[ColetaExecucao])
     )
     for part in vivos:
         if _quantidade_participante(part) == 0:
+            # Nullifica FKs em coletas antes do DELETE do participante.
+            for coleta in list(
+                db.scalars(
+                    select(Coleta).where(
+                        Coleta.participante_id == part.id_participante
+                    )
+                ).all()
+            ):
+                coleta.participante_id = None
+                if coleta.execucao_id == execucao_id:
+                    coleta.execucao_id = None
+            db.flush()
             db.delete(part)
     db.flush()
     restantes = list(

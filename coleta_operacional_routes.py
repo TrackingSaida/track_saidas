@@ -621,13 +621,22 @@ def transferir_coleta_entre_bases(
     except Exception as exc:
         db.rollback()
         err_name = type(exc).__name__
+        # Constraint/origem DB (diagnóstico em log; não vai ao cliente).
+        orig = getattr(exc, "orig", None)
+        constraint = None
+        if orig is not None:
+            diag = getattr(orig, "diag", None)
+            constraint = getattr(diag, "constraint_name", None) if diag else None
+            if not constraint:
+                constraint = str(orig)[:200]
         logger.exception(
-            "transferir_base_falhou sub_base=%s user_id=%s destino=%s qtd=%s err=%s",
+            "transferir_base_falhou sub_base=%s user_id=%s destino=%s qtd=%s err=%s constraint=%s",
             sub_base,
             getattr(current_user, "id", None),
             body.base_destino,
             len(body.ids_saida or []),
             err_name,
+            constraint,
         )
         # Códigos curtos sem nomes técnicos (evita sanitizer CLIENT_SAFE_500).
         codigo = {
