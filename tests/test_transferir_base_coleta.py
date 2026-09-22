@@ -120,7 +120,7 @@ def test_transferir_exige_coleta_vinculada():
     assert "coleta" in str(exc.value.detail).lower()
 
 
-def test_transferir_fluxo_feliz_move_base_e_ledger():
+def test_transferir_fluxo_feliz_usa_core_update_e_ledger():
     hoje = date.today()
     saida = _saida(id_saida=10, data=hoje, servico="Mercado Livre")
     coleta_origem = SimpleNamespace(
@@ -178,37 +178,13 @@ def test_transferir_fluxo_feliz_move_base_e_ledger():
 
     db = MagicMock()
     db.scalars.return_value.all.return_value = [saida]
-
-    def get_side_effect(model, pk=None, *args, **kwargs):
-        # SQLAlchemy 2 style db.get(Model, id)
-        name = getattr(model, "__name__", str(model))
-        if name == "Coleta" or model is type(coleta_origem):
-            if pk == 5 or pk is None:
-                return coleta_origem
-        if pk == 5:
-            return coleta_origem
-        if pk == 11:
-            return part_origem
-        if pk == 21:
-            return exec_origem
-        if pk == 22:
-            return exec_dest
-        if pk == 12:
-            return part_dest
-        return None
-
-    # Usar mapeamento por id para os gets relevantes
     gets = {
         5: coleta_origem,
         11: part_origem,
         21: exec_origem,
         22: exec_dest,
     }
-
-    def db_get(model, ident):
-        return gets.get(ident)
-
-    db.get.side_effect = db_get
+    db.get.side_effect = lambda model, ident: gets.get(ident)
 
     with patch("coleta_leituras_service.resolver_base", side_effect=[base_dest, base_origem]), \
          patch("coleta_leituras_service._garantir_nao_fechado"), \
@@ -229,7 +205,6 @@ def test_transferir_fluxo_feliz_move_base_e_ledger():
          ), \
          patch("coleta_leituras_service.invalidate_listar_cache"), \
          patch("coleta_leituras_service.resolver_executor", return_value=(_user(), None)):
-        # Coleta criada no flush — simular id
         def add_side_effect(obj):
             if getattr(obj, "base", None) == "FABFLAY LOGISTICA" and not hasattr(obj, "id_saida"):
                 obj.id_coleta = 99
@@ -251,7 +226,12 @@ def test_transferir_fluxo_feliz_move_base_e_ledger():
     assert result["status_origem"] == "pendente"
     assert result["status_destino"] == "coletado"
     assert result["contagem"]["mercado_livre"] == 1
-    assert saida.base == "FABFLAY LOGISTICA"
     assert part_origem.mercado_livre == 0
     assert part_dest.mercado_livre == 1
+    # Sem atribuição ORM em Saida (evita saida_after_update / commit aninhado).
+    assert saida.base == "FABFLAY CONFERENCIA"
+    assert db.execute.called
+    stmt = db.execute.call_args[0][0]
+    assert "Update" in type(stmt).__name__ or "UPDATE" in type(stmt).__name__.upper()
+    db.expire.assert_called()
     db.commit.assert_called_once()
