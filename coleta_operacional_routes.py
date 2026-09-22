@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Literal, Optional
@@ -42,6 +43,7 @@ from coleta_leituras_service import (
     transferir_base_coleta,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/coletas/operacionais", tags=["Coletas operacionais"])
 ADMIN_ROLES = {0, 1, 2}
 # Correção financeira de quantidade: somente root/admin.
@@ -616,9 +618,16 @@ def transferir_coleta_entre_bases(
     except HTTPException:
         db.rollback()
         raise
-    except Exception:
+    except Exception as exc:
         db.rollback()
-        raise HTTPException(500, "Falha ao transferir base da coleta.")
+        logger.exception(
+            "transferir_base_falhou sub_base=%s user_id=%s destino=%s qtd=%s",
+            sub_base,
+            getattr(current_user, "id", None),
+            body.base_destino,
+            len(body.ids_saida or []),
+        )
+        raise HTTPException(500, f"Falha ao transferir base da coleta: {exc}") from exc
 
 
 @router.post("/bases/{base_id}/iniciar", response_model=ExecucaoOut)

@@ -166,7 +166,12 @@ def resolver_executor(db: Session, current_user: User, executor_user_id: Optiona
         executor = db.get(User, executor_user_id)
     else:
         executor = db.get(User, current_user.id)
-    if not executor or executor.sub_base != current_user.sub_base or not executor.status:
+    if not executor or not executor.status:
+        raise HTTPException(404, "Executor não encontrado nesta sub_base.")
+    # Root/admin: sub_base do JWT (selecionada no login) pode diferir de users.sub_base.
+    claim_sub = (getattr(current_user, "sub_base", None) or "").strip()
+    exec_sub = (getattr(executor, "sub_base", None) or "").strip()
+    if role not in (0, 1) and exec_sub != claim_sub:
         raise HTTPException(404, "Executor não encontrado nesta sub_base.")
     motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == executor.id))
     if motoboy and not bool(getattr(motoboy, "pode_realizar_coleta", False)):

@@ -371,9 +371,16 @@ def listar_leituras(
     }
 
 
+def _decimal(v) -> Decimal:
+    return Decimal(str(v or 0))
+
+
 def _recalcular_coleta_sem_commit(db: Session, coleta: Coleta) -> Optional[Coleta]:
     saidas = list(db.scalars(select(Saida).where(Saida.id_coleta == coleta.id_coleta)).all())
     if not saidas:
+        # Evita FK quebrada ao apagar execução depois.
+        coleta.execucao_id = None
+        coleta.participante_id = None
         db.delete(coleta)
         db.flush()
         return None
@@ -393,9 +400,15 @@ def _recalcular_coleta_sem_commit(db: Session, coleta: Coleta) -> Optional[Colet
             else:
                 g_avulso += 1
 
-    from coletas import _get_precos_cached, _decimal
+    # Case-insensitive (mesmo critério de resolver_base); evita import circular de coletas.
+    try:
+        base_ref = resolver_base(db, coleta.sub_base or "", nome=coleta.base or "")
+        p_shopee = _decimal(base_ref.shopee)
+        p_ml = _decimal(base_ref.ml)
+        p_avulso = _decimal(base_ref.avulso)
+    except HTTPException:
+        p_shopee = p_ml = p_avulso = Decimal("0.00")
 
-    p_shopee, p_ml, p_avulso = _get_precos_cached(db, coleta.sub_base, coleta.base)
     total = (
         _decimal(count["shopee"]) * p_shopee
         + _decimal(count["mercado_livre"]) * p_ml
@@ -565,6 +578,13 @@ def _limpar_execucao_sem_volume(db: Session, execucao: Optional[ColetaExecucao])
     if not atual:
         return
     if not restantes:
+        # Desvincula coletas remanescentes antes de apagar a execução (evita IntegrityError).
+        for coleta in list(
+            db.scalars(select(Coleta).where(Coleta.execucao_id == execucao_id)).all()
+        ):
+            coleta.execucao_id = None
+            coleta.participante_id = None
+        db.flush()
         db.delete(atual)
         db.flush()
         return
@@ -767,19 +787,21 @@ def transferir_base_coleta(
         if coleta:
             _recalcular_coleta_sem_commit(db, coleta)
 
+    db.flush()
     _recalcular_coleta_sem_commit(db, coleta_dest)
 
     for execucao in list(execucoes_origem.values()):
         _limpar_execucao_sem_volume(db, execucao)
 
-    db.refresh(execucao_dest)
-    atualizar_status_execucao(execucao_dest)
+    execucao_dest_atual = db.get(ColetaExecucao, execucao_dest.id_execucao)
+    if execucao_dest_atual:
+        atualizar_status_execucao(execucao_dest_atual)
 
     try:
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
-        raise HTTPException(500, "Erro ao transferir base da coleta.")
+        raise HTTPException(500, f"Erro ao transferir base da coleta: {exc}") from exc
 
     invalidate_listar_cache(sub_base)
 
