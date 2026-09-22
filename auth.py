@@ -5,7 +5,7 @@ import uuid
 import hashlib
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
 
@@ -251,6 +251,15 @@ def _hash_refresh_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _as_naive_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normaliza datetime aware/naive para naive UTC (colunas timezone=False)."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _generate_refresh_token_plain() -> str:
     return secrets.token_urlsafe(48)
 
@@ -434,12 +443,13 @@ def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, 
         ),
     )
     now = datetime.utcnow()
-    if not row or row.expires_at < now:
+    expires_at = _as_naive_utc(getattr(row, "expires_at", None) if row else None)
+    if not row or expires_at is None or expires_at < now:
         raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado")
 
     # Teto absoluto desde a criação do refresh
     absolute_limit = timedelta(days=max(1, MOTOBOY_REFRESH_ABSOLUTE_DAYS))
-    created = getattr(row, "created_at", None) or now
+    created = _as_naive_utc(getattr(row, "created_at", None)) or now
     if created + absolute_limit < now:
         row.revoked_at = now
         run_db_query_with_retry(db, db.commit)
@@ -447,7 +457,7 @@ def _rotate_motoboy_refresh_token(db: Session, plain_refresh: str) -> Dict[str, 
 
     # Idle: sem uso por N dias
     idle_limit = timedelta(days=max(1, MOTOBOY_IDLE_TIMEOUT_DAYS))
-    last_act = getattr(row, "last_activity_at", None) or created
+    last_act = _as_naive_utc(getattr(row, "last_activity_at", None)) or created
     if last_act + idle_limit < now:
         row.revoked_at = now
         run_db_query_with_retry(db, db.commit)
