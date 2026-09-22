@@ -532,6 +532,8 @@ def _claims(user: User, owner: Owner, sub_base: Optional[str] = None) -> Dict[st
         "bloquear_saida_sem_coleta": bool(
             getattr(owner, "bloquear_saida_sem_coleta", False)
         ),
+        # Política global: staff (root/admin/operador) também recebe no JWT.
+        "avulso_exige_foto": bool(getattr(owner, "default_avulso_exige_foto", False)),
     }
 
 
@@ -649,7 +651,8 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "pode_criar_avulso_saida": bool(
             getattr(motoboy, "pode_criar_avulso_saida", getattr(motoboy, "pode_lancar_avulso", True))
         ),
-        "avulso_exige_foto": bool(getattr(motoboy, "avulso_exige_foto", False)),
+        "avulso_exige_foto": bool(getattr(motoboy, "avulso_exige_foto", False))
+        or bool(getattr(owner, "default_avulso_exige_foto", False)),
         "ignorar_coleta": bool(owner.ignorar_coleta),
         "owner_ativo": bool(owner.ativo),
         "modo_operacao": (owner.modo_operacao or "codigo") if hasattr(owner, "modo_operacao") else "codigo",
@@ -860,7 +863,9 @@ def _hydrate_motoboy_permissions_from_db(
         getattr(motoboy, "pode_criar_avulso_saida", getattr(motoboy, "pode_lancar_avulso", True))
     )
     user.pode_lancar_avulso = bool(user.pode_criar_avulso_coleta or user.pode_criar_avulso_saida)
-    user.avulso_exige_foto = bool(getattr(motoboy, "avulso_exige_foto", True))
+    user.avulso_exige_foto = bool(getattr(motoboy, "avulso_exige_foto", False)) or bool(
+        owner is not None and getattr(owner, "default_avulso_exige_foto", False)
+    )
     live_version = int(getattr(motoboy, "claims_version", 0) or 0)
     user.claims_version = live_version
 
@@ -884,10 +889,13 @@ async def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
 
-    token: Optional[str] = request.cookies.get(ACCESS_COOKIE_NAME)
-
-    if not token and credentials and credentials.scheme.lower() == "bearer":
+    # Bearer tem prioridade sobre cookie: no app, sessão motoboy (Authorization)
+    # não pode ser sombreada por cookie staff residual (ex.: root-select anterior).
+    token: Optional[str] = None
+    if credentials and credentials.scheme.lower() == "bearer" and credentials.credentials:
         token = credentials.credentials
+    if not token:
+        token = request.cookies.get(ACCESS_COOKIE_NAME)
 
     if not token:
         raise HTTPException(status_code=401, detail="Não autenticado")
@@ -1302,6 +1310,7 @@ async def read_users_me(
     nome_val, sobrenome_val = _nome_exibicao(current_user)
     # tipo_owner vivo do Owner (não só do JWT) — sessão mobile longa pode ficar desatualizada
     # Preferir sub_base da sessão (JWT), essencial para root com base selecionada no login
+    avulso_exige_foto = False
     tipo_owner = getattr(current_user, "tipo_owner", None) or "subbase"
     ignorar_coleta = bool(getattr(request.state, "ignorar_coleta", False))
     modo_operacao = getattr(current_user, "modo_operacao", None) or "codigo"
@@ -1313,6 +1322,7 @@ async def read_users_me(
         or getattr(db_user, "sub_base", None)
         or ""
     ).strip()
+    owner = None
     if sub_base:
         owner = run_db_query_with_retry(
             db,
@@ -1325,6 +1335,10 @@ async def read_users_me(
             entrada_obrigatoria = bool(getattr(owner, "entrada_obrigatoria_habilitada", False))
             conferencia = bool(getattr(owner, "conferencia_saida_habilitada", False))
             bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
+    if live_role == 4:
+        avulso_exige_foto = bool(getattr(current_user, "avulso_exige_foto", False))
+    elif owner is not None:
+        avulso_exige_foto = bool(getattr(owner, "default_avulso_exige_foto", False))
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
@@ -1344,7 +1358,7 @@ async def read_users_me(
         pode_lancar_avulso=bool(getattr(current_user, "pode_lancar_avulso", True)) if live_role == 4 else True,
         pode_criar_avulso_coleta=bool(getattr(current_user, "pode_criar_avulso_coleta", True)) if live_role == 4 else True,
         pode_criar_avulso_saida=bool(getattr(current_user, "pode_criar_avulso_saida", True)) if live_role == 4 else True,
-        avulso_exige_foto=bool(getattr(current_user, "avulso_exige_foto", False)) if live_role == 4 else False,
+        avulso_exige_foto=avulso_exige_foto,
     )
 
 

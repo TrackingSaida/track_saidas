@@ -57,7 +57,7 @@ class ColetaLancarAvulsoIn(BaseModel):
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
     campos: Optional[Dict[str, Any]] = None
-    # Foto(s) opcionais; obrigatórias só se o usuário (motoboy) exigir e não for root/admin.
+    # Foto(s) opcionais; obrigatórias se a política global ou o motoboy exigir.
     foto_object_key: Optional[str] = Field(default=None, max_length=500)
     foto_object_keys: Optional[List[str]] = None
     photo_id: Optional[str] = Field(default=None, max_length=80)
@@ -678,14 +678,14 @@ def lancar_avulso_coleta(
     if not base:
         raise HTTPException(status_code=422, detail="Informe a base para registrar a coleta.")
 
-    # Obrigação por usuário (motoboy); root/admin nunca exigem.
-    avulso_exige_foto = False
-    if role == 4 and role not in (0, 1):
+    # Obrigação: política global do owner e/ou flag do motoboy da sessão.
+    motoboy = None
+    if role == 4:
         motoboy_id = getattr(current_user, "motoboy_id", None)
         motoboy = db.get(Motoboy, int(motoboy_id)) if motoboy_id else None
-        avulso_exige_foto = bool(motoboy and getattr(motoboy, "avulso_exige_foto", False))
-    if role in (0, 1):
-        avulso_exige_foto = False
+    from leitura_manual_auth import resolve_avulso_exige_foto
+
+    avulso_exige_foto = resolve_avulso_exige_foto(db, sub_base=sub_base, motoboy=motoboy)
 
     foto_keys: List[str] = []
     for k in list(payload.foto_object_keys or []):
@@ -720,7 +720,7 @@ def lancar_avulso_coleta(
             status_code=422,
             detail={
                 "code": "FOTO_OBRIGATORIA",
-                "message": "Este usuário exige foto ao lançar avulso.",
+                "message": "É necessário enviar foto ao lançar avulso.",
             },
         )
 

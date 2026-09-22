@@ -58,16 +58,24 @@ def test_padroes_motoboy_oficiais():
         entrada_obrigatoria_habilitada=False,
         conferencia_saida_habilitada=False,
         devolucao_sub_base_habilitada=False,
+        bloquear_saida_sem_coleta=False,
+        etiqueta_limite_diario_default=50,
+        etiqueta_expiracao_dias=30,
+        sub_base="RUB_TEST1",
         default_pode_realizar_coleta=False,
         default_pode_ler_saida=True,
         default_pode_digitar_codigo_manual=False,
         default_pode_lancar_avulso=True,
+        default_pode_criar_avulso_coleta=True,
+        default_pode_criar_avulso_saida=False,
         default_avulso_exige_foto=True,
     )
     pad = _owner_to_out(owner).padroes_motoboy
     assert pad.pode_realizar_coleta is False
     assert pad.pode_ler_saida is True
     assert pad.pode_digitar_codigo_manual is False
+    assert pad.pode_criar_avulso_coleta is True
+    assert pad.pode_criar_avulso_saida is False
     assert pad.pode_lancar_avulso is True
     assert pad.avulso_exige_foto is True
 

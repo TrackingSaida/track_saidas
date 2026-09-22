@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import _coerce_role_int, get_current_user
+from base import _resolve_user_sub_base
 from avulso_campos_service import (
     CONTEXTOS_META,
     TIPOS_META,
@@ -102,11 +103,12 @@ def _assert_admin(current_user: User) -> None:
         raise HTTPException(403, "Acesso restrito a administradores.")
 
 
-def _sub_base(current_user: User) -> str:
-    sub = (getattr(current_user, "sub_base", None) or "").strip()
-    if not sub:
-        raise HTTPException(401, "Usuário sem sub_base.")
-    return sub
+def _sub_base(db: Session, current_user: User) -> str:
+    """
+    Tenant da request.
+    Motoboy (role=4): claim só vale se estiver em MotoboySubBase (anti cross-tenant).
+    """
+    return _resolve_user_sub_base(db, current_user)
 
 
 def _row_to_out(row: AvulsoCampoConfig) -> CampoAvulsoOut:
@@ -154,7 +156,7 @@ def list_campos_avulso(
     current_user: User = Depends(get_current_user),
 ):
     _assert_admin(current_user)
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     q = select(AvulsoCampoConfig).where(AvulsoCampoConfig.sub_base == sub_base)
     if contexto:
         ctx = normalize_contexto_avulso(contexto)
@@ -173,7 +175,7 @@ def schema_campos_avulso(
     role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(403, "Acesso restrito.")
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     campos = resolve_campos_ativos(db, sub_base=sub_base, contexto=contexto)
     return {
         "contexto": normalize_contexto_avulso(contexto),
@@ -188,7 +190,7 @@ def create_campo_avulso(
     current_user: User = Depends(get_current_user),
 ):
     _assert_admin(current_user)
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     ctx = normalize_contexto_avulso(body.contexto)
     tipo = normalize_tipo_campo(body.tipo)
     if tipo in TIPOS_RETIRADOS:
@@ -233,7 +235,7 @@ def update_campo_avulso(
     current_user: User = Depends(get_current_user),
 ):
     _assert_admin(current_user)
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     row = db.get(AvulsoCampoConfig, campo_id)
     if not row or row.sub_base != sub_base:
         raise HTTPException(404, "Campo não encontrado.")
@@ -266,7 +268,7 @@ def delete_campo_avulso(
     current_user: User = Depends(get_current_user),
 ):
     _assert_admin(current_user)
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     row = db.get(AvulsoCampoConfig, campo_id)
     if not row or row.sub_base != sub_base:
         raise HTTPException(404, "Campo não encontrado.")
@@ -311,7 +313,7 @@ def get_avulsos_pendentes(
     role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(403, "Acesso restrito.")
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     ids_map: Dict[str, str] = {}
     if identificadores and str(identificadores).strip():
         try:
@@ -361,7 +363,7 @@ def get_avulso_detalhe(
     role = _coerce_role_int(getattr(current_user, "role", None))
     if role not in (0, 1, 2, 3, 4):
         raise HTTPException(403, "Acesso restrito.")
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     row = db.get(Saida, id_saida)
     if not row or (row.sub_base or "").strip() != sub_base:
         raise HTTPException(404, "Avulso não encontrado.")

@@ -45,7 +45,7 @@ class EntradaLancarAvulsoIn(BaseModel):
     identificacao: Optional[str] = Field(default=None, max_length=32)
     quantidade: int = Field(default=1, ge=1, le=50)
     campos: Optional[Dict[str, Any]] = None
-    # Foto opcional (root/admin nunca obrigatória; staff operação sem flag de motoboy).
+    # Foto opcional; obrigatória se a política global do owner estiver ativa.
     foto_object_key: Optional[str] = Field(default=None, max_length=500)
     foto_object_keys: Optional[List[str]] = None
     photo_id: Optional[str] = Field(default=None, max_length=80)
@@ -345,12 +345,10 @@ def lancar_avulso_entrada(
 
     from saidas_routes import _PENDING_AVULSO_KEY_RE
     from upload_storage_utils import MAX_FOTOS_POR_EVENTO_TENTATIVA, build_foto_item, serialize_foto_items
+    from leitura_manual_auth import resolve_avulso_exige_foto
 
-    role = int(getattr(current_user, "role", 0) or 0)
-    # Entrada é staff; root/admin nunca exigem. Sem motoboy no fluxo → foto opcional.
-    avulso_exige_foto = False
-    if role in (0, 1):
-        avulso_exige_foto = False
+    # Entrada é staff: segue política global do owner (também para root/admin/operador).
+    avulso_exige_foto = resolve_avulso_exige_foto(db, sub_base=sub_base, motoboy=None)
 
     foto_keys: List[str] = []
     for k in list(payload.foto_object_keys or []):

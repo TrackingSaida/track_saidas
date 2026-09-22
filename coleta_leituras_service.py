@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
@@ -11,7 +12,12 @@ from fastapi import HTTPException
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
-from coleta_operacional_service import atualizar_status_execucao, resolver_base
+from coleta_operacional_service import (
+    atualizar_status_execucao,
+    obter_ou_criar_execucao,
+    resolver_base,
+    resolver_executor,
+)
 from models import (
     BaseFechamento,
     Coleta,
@@ -24,6 +30,7 @@ from models import (
     SaidaHistorico,
     User,
 )
+from saidas_listar_service import invalidate_listar_cache
 
 ROOT_ADMIN_ROLES = {0, 1}
 
@@ -406,6 +413,40 @@ def _recalcular_coleta_sem_commit(db: Session, coleta: Coleta) -> Optional[Colet
     return coleta
 
 
+def _quantidade_participante(participante: ColetaExecucaoParticipante) -> int:
+    return (
+        int(participante.shopee or 0)
+        + int(participante.mercado_livre or 0)
+        + int(participante.avulso or 0)
+    )
+
+
+def _aplicar_delta_servico(
+    participante: ColetaExecucaoParticipante,
+    *,
+    servico_key: str,
+    is_grande: bool,
+    delta: int,
+) -> None:
+    """Aplica +1/-1 em contadores do participante por serviço."""
+    if delta == 0:
+        return
+    if servico_key == "shopee":
+        participante.shopee = max(0, int(participante.shopee or 0) + delta)
+        if is_grande:
+            participante.g_shopee = max(0, int(participante.g_shopee or 0) + delta)
+    elif servico_key == "mercado_livre":
+        participante.mercado_livre = max(0, int(participante.mercado_livre or 0) + delta)
+        if is_grande:
+            participante.g_ml = max(0, int(participante.g_ml or 0) + delta)
+    else:
+        participante.avulso = max(0, int(participante.avulso or 0) + delta)
+        if is_grande:
+            participante.g_avulso = max(0, int(participante.g_avulso or 0) + delta)
+    if is_grande:
+        participante.pacotes_g = max(0, int(participante.pacotes_g or 0) + delta)
+
+
 def _decrementar_participante(
     db: Session,
     *,
@@ -423,27 +464,11 @@ def _decrementar_participante(
     if not participante:
         return None
 
-    if servico_key == "shopee":
-        participante.shopee = max(0, int(participante.shopee or 0) - 1)
-        if is_grande:
-            participante.g_shopee = max(0, int(participante.g_shopee or 0) - 1)
-    elif servico_key == "mercado_livre":
-        participante.mercado_livre = max(0, int(participante.mercado_livre or 0) - 1)
-        if is_grande:
-            participante.g_ml = max(0, int(participante.g_ml or 0) - 1)
-    else:
-        participante.avulso = max(0, int(participante.avulso or 0) - 1)
-        if is_grande:
-            participante.g_avulso = max(0, int(participante.g_avulso or 0) - 1)
-
-    if is_grande:
-        participante.pacotes_g = max(0, int(participante.pacotes_g or 0) - 1)
-
-    total = (
-        int(participante.shopee or 0)
-        + int(participante.mercado_livre or 0)
-        + int(participante.avulso or 0)
+    _aplicar_delta_servico(
+        participante, servico_key=servico_key, is_grande=is_grande, delta=-1
     )
+
+    total = _quantidade_participante(participante)
     participante.sem_volume = total == 0
     participante.versao = int(participante.versao or 1) + 1
     participante.atualizado_em = datetime.now()
@@ -452,6 +477,339 @@ def _decrementar_participante(
     if execucao:
         atualizar_status_execucao(execucao)
     return execucao
+
+
+def _obter_ou_criar_participante_destino(
+    db: Session,
+    *,
+    execucao: ColetaExecucao,
+    sub_base: str,
+    current_user: User,
+) -> ColetaExecucaoParticipante:
+    executor, motoboy_id = resolver_executor(db, current_user)
+    participante = db.scalar(
+        select(ColetaExecucaoParticipante).where(
+            ColetaExecucaoParticipante.execucao_id == execucao.id_execucao,
+            ColetaExecucaoParticipante.user_id == executor.id,
+        )
+    )
+    if participante:
+        return participante
+    participante = ColetaExecucaoParticipante(
+        execucao_id=execucao.id_execucao,
+        sub_base=sub_base,
+        user_id=executor.id,
+        motoboy_id=motoboy_id,
+        username=executor.username or current_user.username or "-",
+        shopee=0,
+        mercado_livre=0,
+        avulso=0,
+        pacotes_g=0,
+        status="finalizado",
+        atualizado_por_user_id=current_user.id,
+    )
+    db.add(participante)
+    db.flush()
+    return participante
+
+
+def _incrementar_participante(
+    db: Session,
+    *,
+    participante: ColetaExecucaoParticipante,
+    servico_key: str,
+    is_grande: bool,
+    current_user: User,
+) -> ColetaExecucao:
+    _aplicar_delta_servico(
+        participante, servico_key=servico_key, is_grande=is_grande, delta=1
+    )
+    participante.sem_volume = False
+    participante.status = "finalizado"
+    participante.versao = int(participante.versao or 1) + 1
+    participante.atualizado_em = datetime.now()
+    participante.atualizado_por_user_id = current_user.id
+    execucao = db.get(ColetaExecucao, participante.execucao_id)
+    if not execucao:
+        raise HTTPException(500, "Execução de destino não encontrada.")
+    if execucao.status not in ("coletado", "sem_volume", "em_coleta"):
+        execucao.status = "em_coleta"
+    atualizar_status_execucao(execucao)
+    return execucao
+
+
+def _limpar_execucao_sem_volume(db: Session, execucao: Optional[ColetaExecucao]) -> None:
+    """Remove participantes zerados; se ninguém restar, apaga a execução (volta a Pendente)."""
+    if not execucao or not getattr(execucao, "id_execucao", None):
+        return
+    execucao_id = execucao.id_execucao
+    vivos = list(
+        db.scalars(
+            select(ColetaExecucaoParticipante).where(
+                ColetaExecucaoParticipante.execucao_id == execucao_id
+            )
+        ).all()
+    )
+    for part in vivos:
+        if _quantidade_participante(part) == 0:
+            db.delete(part)
+    db.flush()
+    restantes = list(
+        db.scalars(
+            select(ColetaExecucaoParticipante).where(
+                ColetaExecucaoParticipante.execucao_id == execucao_id
+            )
+        ).all()
+    )
+    atual = db.get(ColetaExecucao, execucao_id)
+    if not atual:
+        return
+    if not restantes:
+        db.delete(atual)
+        db.flush()
+        return
+    atualizar_status_execucao(atual)
+
+
+def transferir_base_coleta(
+    db: Session,
+    *,
+    sub_base: str,
+    current_user: User,
+    ids_saida: list[int],
+    base_destino: str,
+    origem_cliente: str = "web",
+) -> dict[str, Any]:
+    """
+    Transfere pacotes de uma base de coleta para outra no mesmo dia operacional.
+
+    Atualiza Saida.base, move o crédito no ledger (ColetaExecucao) e recalcula status:
+    origem sem volume → Pendente; destino com volume → Coletada.
+    """
+    ids_unicos: list[int] = []
+    vistos: set[int] = set()
+    for raw in ids_saida:
+        try:
+            sid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if sid in vistos:
+            continue
+        vistos.add(sid)
+        ids_unicos.append(sid)
+
+    if not ids_unicos:
+        raise HTTPException(422, "Informe ao menos um pacote para transferir.")
+
+    dest_nome = (base_destino or "").strip()
+    if not dest_nome:
+        raise HTTPException(422, "Informe a base de destino.")
+
+    base_dest = resolver_base(db, sub_base, nome=dest_nome)
+
+    saidas = list(
+        db.scalars(
+            select(Saida)
+            .where(Saida.sub_base == sub_base, Saida.id_saida.in_(ids_unicos))
+            .with_for_update()
+        ).all()
+    )
+    if len(saidas) != len(ids_unicos):
+        raise HTTPException(404, "Um ou mais pacotes não foram encontrados nesta sub_base.")
+
+    origens = {(s.base or "").strip() for s in saidas}
+    if "" in origens:
+        raise HTTPException(422, "Todos os pacotes precisam ter base de origem informada.")
+    if len(origens) != 1:
+        raise HTTPException(
+            422,
+            "Para transferir, selecione apenas pacotes da mesma base de origem.",
+        )
+    base_origem_nome = next(iter(origens))
+    if base_origem_nome.strip().upper() == dest_nome.strip().upper():
+        raise HTTPException(422, "A base de destino deve ser diferente da origem.")
+
+    if any(not getattr(s, "id_coleta", None) for s in saidas):
+        raise HTTPException(
+            422,
+            "Só é possível transferir pacotes vinculados a uma coleta operacional.",
+        )
+
+    dias = {s.data or (s.timestamp.date() if s.timestamp else None) for s in saidas}
+    if None in dias or len(dias) != 1:
+        raise HTTPException(
+            422,
+            "Para transferir, selecione apenas pacotes do mesmo dia operacional.",
+        )
+    data_operacao = next(iter(dias))
+
+    # Dias anteriores: admin/root/operador no painel web (mesmo critério das coletas).
+    if data_operacao != date.today():
+        try:
+            role = int(getattr(current_user, "role", -1))
+        except (TypeError, ValueError):
+            role = -1
+        if role not in {0, 1, 2}:
+            raise HTTPException(403, "O usuário pode transferir somente coletas do dia atual.")
+        if (origem_cliente or "").strip().lower() != "web":
+            raise HTTPException(
+                403,
+                "Transferências de dias anteriores são permitidas somente no painel web.",
+            )
+
+    try:
+        base_origem = resolver_base(db, sub_base, nome=base_origem_nome)
+    except HTTPException as exc:
+        raise HTTPException(
+            exc.status_code,
+            f"Base de origem '{base_origem_nome}' inválida ou inativa.",
+        ) from exc
+
+    _garantir_nao_fechado(
+        db,
+        sub_base=sub_base,
+        base_nome=base_origem.base,
+        data_operacao=data_operacao,
+        motoboy_id=None,
+    )
+    _garantir_nao_fechado(
+        db,
+        sub_base=sub_base,
+        base_nome=base_dest.base,
+        data_operacao=data_operacao,
+        motoboy_id=None,
+    )
+
+    contagem = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
+    coletas_origem_ids: set[int] = set()
+    execucoes_origem: dict[int, ColetaExecucao] = {}
+
+    execucao_dest = obter_ou_criar_execucao(
+        db,
+        sub_base=sub_base,
+        base=base_dest,
+        data_operacao=data_operacao,
+        modo="codigo",
+    )
+    participante_dest = _obter_ou_criar_participante_destino(
+        db,
+        execucao=execucao_dest,
+        sub_base=sub_base,
+        current_user=current_user,
+    )
+
+    coleta_dest = Coleta(
+        sub_base=sub_base,
+        base=base_dest.base,
+        username_entregador=getattr(current_user, "username", None),
+        shopee=0,
+        mercado_livre=0,
+        avulso=0,
+        pacotes_g=0,
+        valor_total=Decimal("0.00"),
+        origem="codigo",
+        execucao_id=execucao_dest.id_execucao,
+        participante_id=participante_dest.id_participante,
+    )
+    db.add(coleta_dest)
+    db.flush()
+
+    hist_payload = json.dumps(
+        {
+            "base_origem": base_origem.base,
+            "base_destino": base_dest.base,
+            "data_operacao": data_operacao.isoformat(),
+        },
+        ensure_ascii=False,
+    )
+
+    for saida in saidas:
+        servico_key = _normalize_servico_key(saida.servico)
+        is_grande = bool(getattr(saida, "is_grande", False))
+        contagem[servico_key] = contagem.get(servico_key, 0) + 1
+
+        coleta_origem = db.get(Coleta, saida.id_coleta) if saida.id_coleta else None
+        if coleta_origem:
+            coletas_origem_ids.add(coleta_origem.id_coleta)
+            execucao = _decrementar_participante(
+                db,
+                coleta=coleta_origem,
+                servico_key=servico_key,
+                is_grande=is_grande,
+            )
+            if execucao and execucao.id_execucao:
+                execucoes_origem[execucao.id_execucao] = execucao
+
+        saida.base = base_dest.base
+        saida.id_coleta = coleta_dest.id_coleta
+
+        _incrementar_participante(
+            db,
+            participante=participante_dest,
+            servico_key=servico_key,
+            is_grande=is_grande,
+            current_user=current_user,
+        )
+
+        db.add(
+            SaidaHistorico(
+                id_saida=saida.id_saida,
+                evento="base_transferida",
+                status_anterior=saida.status,
+                status_novo=saida.status,
+                user_id=current_user.id,
+                payload=hist_payload,
+            )
+        )
+
+    for id_coleta in coletas_origem_ids:
+        coleta = db.get(Coleta, id_coleta)
+        if coleta:
+            _recalcular_coleta_sem_commit(db, coleta)
+
+    _recalcular_coleta_sem_commit(db, coleta_dest)
+
+    for execucao in list(execucoes_origem.values()):
+        _limpar_execucao_sem_volume(db, execucao)
+
+    db.refresh(execucao_dest)
+    atualizar_status_execucao(execucao_dest)
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Erro ao transferir base da coleta.")
+
+    invalidate_listar_cache(sub_base)
+
+    totais_origem = obter_totais_base_dia(
+        db,
+        sub_base=sub_base,
+        base_id=base_origem.id_base,
+        data_operacao=data_operacao,
+    )
+    totais_destino = obter_totais_base_dia(
+        db,
+        sub_base=sub_base,
+        base_id=base_dest.id_base,
+        data_operacao=data_operacao,
+    )
+
+    status_origem = "pendente" if totais_origem["total"] == 0 else "coletado"
+    status_destino = "pendente" if totais_destino["total"] == 0 else "coletado"
+
+    return {
+        "transferidos": len(saidas),
+        "base_origem": base_origem.base,
+        "base_destino": base_dest.base,
+        "data_operacao": data_operacao.isoformat(),
+        "contagem": contagem,
+        "status_origem": status_origem,
+        "status_destino": status_destino,
+        "totais_origem": totais_origem,
+        "totais_destino": totais_destino,
+    }
 
 
 def remover_leitura(

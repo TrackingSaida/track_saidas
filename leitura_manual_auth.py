@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.orm import Session, joinedload
 
-from models import Motoboy, Owner, User
+from models import Motoboy, MotoboySubBase, Owner, User
 
 ORIGENS_LEITURA = ("camera", "manual", "selecao")
 AvulsoContexto = Literal["coleta", "saida"]
@@ -173,19 +173,40 @@ def list_users_role4_da_sub_base(db: Session, sub_base: str) -> list[User]:
 
 
 def list_motoboys_da_sub_base(db: Session, sub_base: str) -> list[Motoboy]:
-    """Motoboys visíveis em Usuários (User.sub_base + role=4 com linha em motoboys)."""
+    """
+    Motoboys da base operacional:
+    - User.sub_base == sub + role=4 com perfil motoboy; e/ou
+    - vínculo ativo em MotoboySubBase para a sub_base.
+    Deduplica por id_motoboy.
+    """
+    sub = (sub_base or "").strip()
+    if not sub:
+        return []
     out: list[Motoboy] = []
     seen: set[int] = set()
-    for u in list_users_role4_da_sub_base(db, sub_base):
-        m = getattr(u, "motoboy", None)
+
+    def _add(m: Optional[Motoboy]) -> None:
         if m is None:
-            continue
+            return
         mid = int(getattr(m, "id_motoboy", 0) or 0)
-        if mid and mid in seen:
-            continue
-        if mid:
-            seen.add(mid)
+        if not mid or mid in seen:
+            return
+        seen.add(mid)
         out.append(m)
+
+    for u in list_users_role4_da_sub_base(db, sub):
+        _add(getattr(u, "motoboy", None))
+
+    vinculados = db.scalars(
+        select(Motoboy)
+        .join(MotoboySubBase, MotoboySubBase.motoboy_id == Motoboy.id_motoboy)
+        .where(
+            MotoboySubBase.sub_base == sub,
+            MotoboySubBase.ativo.is_(True),
+        )
+    ).unique().all()
+    for m in vinculados:
+        _add(m)
     return out
 
 
@@ -212,8 +233,32 @@ def flush_owner_avulso_columns(db: Session, owner: Owner) -> tuple[bool, bool]:
             default_pode_lancar_avulso=legado,
             default_avulso_exige_foto=foto,
         )
+        .execution_options(synchronize_session=False)
     )
     return coleta, saida
+
+
+def resolve_avulso_exige_foto(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy: Optional[Motoboy] = None,
+) -> bool:
+    """
+    Foto obrigatória no lançamento de avulso.
+
+    - Política global do owner (`default_avulso_exige_foto`) vale para todos os perfis
+      (root/admin/operador/motoboy).
+    - Sem global: exige se o motoboy da operação tiver `avulso_exige_foto`.
+    """
+    sub = (sub_base or "").strip()
+    if sub:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == sub))
+        if owner is not None and bool(getattr(owner, "default_avulso_exige_foto", False)):
+            return True
+    if motoboy is not None and bool(getattr(motoboy, "avulso_exige_foto", False)):
+        return True
+    return False
 
 
 def flush_motoboy_avulso_columns(db: Session, motoboy: Motoboy) -> None:
@@ -236,6 +281,7 @@ def flush_motoboy_avulso_columns(db: Session, motoboy: Motoboy) -> None:
             pode_digitar_codigo_manual=bool(getattr(motoboy, "pode_digitar_codigo_manual", False)),
             claims_version=int(getattr(motoboy, "claims_version", 0) or 0),
         )
+        .execution_options(synchronize_session=False)
     )
 
 

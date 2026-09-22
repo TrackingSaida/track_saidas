@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
+from base import _resolve_user_sub_base
 from coleta_operacional_service import (
     atualizar_status_execucao,
     combinar_modo_execucao,
@@ -38,6 +39,7 @@ from coleta_leituras_service import (
     listar_leituras,
     remover_leitura,
     resumo_base_dia,
+    transferir_base_coleta,
 )
 
 router = APIRouter(prefix="/coletas/operacionais", tags=["Coletas operacionais"])
@@ -47,11 +49,12 @@ ROOT_ADMIN_ROLES = {0, 1}
 TIPOS_EXCECAO = {"FERIADO", "SEM_COLETA", "COLETA_EXTRA", "JUSTIFICADO"}
 
 
-def _sub_base(current_user: User) -> str:
-    value = (getattr(current_user, "sub_base", None) or "").strip()
-    if not value:
-        raise HTTPException(422, "Usuário sem sub_base definida.")
-    return value
+def _sub_base(db: Session, current_user: User) -> str:
+    """
+    Tenant da request.
+    Motoboy (role=4): claim só vale se estiver em MotoboySubBase (anti cross-tenant).
+    """
+    return _resolve_user_sub_base(db, current_user)
 
 
 def _admin(current_user: User) -> bool:
@@ -208,6 +211,24 @@ class CorrigirQuantidadesOut(BaseModel):
     valor_anterior: str
     valor_novo: str
     versao: int
+
+
+class TransferirBaseIn(BaseModel):
+    ids_saida: list[int] = Field(min_length=1)
+    base_destino: str = Field(min_length=1, max_length=200)
+    origem_cliente: Literal["web", "mobile"] = "web"
+
+
+class TransferirBaseOut(BaseModel):
+    transferidos: int
+    base_origem: str
+    base_destino: str
+    data_operacao: str
+    contagem: dict[str, int]
+    status_origem: str
+    status_destino: str
+    totais_origem: dict[str, int]
+    totais_destino: dict[str, int]
 
 
 class ParticipanteOut(BaseModel):
@@ -406,7 +427,7 @@ def obter_configuracao(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     modo = modo_coleta(db, sub_base)
     return {
         "modo_operacao": modo,
@@ -422,7 +443,7 @@ def consultar_situacao_bases(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     resolver_executor(db, current_user)
     bases = db.scalars(
@@ -503,7 +524,7 @@ def consultar_resumo_base(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     resolver_executor(db, current_user)
     return resumo_base_dia(
@@ -524,7 +545,7 @@ def consultar_leituras_coleta(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     exigir_modo(db, sub_base, "codigo")
     resolver_executor(db, current_user)
@@ -547,7 +568,7 @@ def deletar_leitura_coleta(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     exigir_modo(db, sub_base, "codigo")
     resolver_executor(db, current_user)
@@ -567,6 +588,39 @@ def deletar_leitura_coleta(
         raise HTTPException(500, "Falha ao remover leitura de coleta.")
 
 
+@router.post("/transferir-base", response_model=TransferirBaseOut)
+def transferir_coleta_entre_bases(
+    body: TransferirBaseIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Transfere pacotes entre bases no mesmo dia: move Saida.base e o crédito
+    operacional (quantidades/status) em Consultar Coletas.
+    """
+    sub_base = _sub_base(db, current_user)
+    _exigir_coleta_habilitada(db, sub_base)
+    if not _admin(current_user):
+        raise HTTPException(403, "Somente operador, admin ou root pode transferir base.")
+    resolver_executor(db, current_user)
+    try:
+        result = transferir_base_coleta(
+            db,
+            sub_base=sub_base,
+            current_user=current_user,
+            ids_saida=body.ids_saida,
+            base_destino=body.base_destino,
+            origem_cliente=body.origem_cliente,
+        )
+        return TransferirBaseOut(**result)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Falha ao transferir base da coleta.")
+
+
 @router.post("/bases/{base_id}/iniciar", response_model=ExecucaoOut)
 def iniciar_coleta(
     base_id: int,
@@ -574,7 +628,7 @@ def iniciar_coleta(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     exigir_modo(db, sub_base, body.metodo)
     base = resolver_base(db, sub_base, base_id=base_id)
     executor, motoboy_id = resolver_executor(db, current_user)
@@ -659,7 +713,7 @@ def finalizar_coleta(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     execucao = db.scalar(
         select(ColetaExecucao).where(
             ColetaExecucao.id_execucao == id_execucao,
@@ -695,7 +749,7 @@ def liberar_participacao(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     execucao = db.scalar(
         select(ColetaExecucao).where(
             ColetaExecucao.id_execucao == id_execucao,
@@ -720,7 +774,7 @@ def lancar_manual(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     exigir_modo(db, sub_base, "coleta_manual")
     _validar_data_edicao(current_user, body.data_operacao, body.origem_cliente)
     if body.client_request_id:
@@ -795,7 +849,7 @@ def editar_participante(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     exigir_modo(db, sub_base, "coleta_manual")
     participante = db.get(ColetaExecucaoParticipante, id_participante)
     if not participante or participante.sub_base != sub_base:
@@ -843,7 +897,7 @@ def corrigir_quantidades_participante(
     """
     if not _root_admin(current_user):
         raise HTTPException(403, "Somente administrador ou root pode corrigir quantidades.")
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     participante = db.get(ColetaExecucaoParticipante, id_participante)
     if not participante or participante.sub_base != sub_base:
@@ -948,7 +1002,7 @@ def listar_execucoes(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     if data_fim < data_inicio or (data_fim - data_inicio).days > 366:
         raise HTTPException(422, "Período inválido ou superior a 366 dias.")
@@ -991,7 +1045,7 @@ def salvar_excecao(
 ):
     if not _admin(current_user):
         raise HTTPException(403, "Apenas admin/root pode alterar o calendário de coleta.")
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     tipo = body.tipo.strip().upper()
     if tipo not in TIPOS_EXCECAO:
@@ -1032,9 +1086,9 @@ def excluir_excecao(
 ):
     if not _admin(current_user):
         raise HTTPException(403, "Apenas admin/root pode alterar o calendário de coleta.")
-    _exigir_coleta_habilitada(db, _sub_base(current_user))
+    _exigir_coleta_habilitada(db, _sub_base(db, current_user))
     item = db.get(ColetaCalendarioExcecao, id_excecao)
-    if not item or item.sub_base != _sub_base(current_user):
+    if not item or item.sub_base != _sub_base(db, current_user):
         raise HTTPException(404, "Exceção não encontrada.")
     db.delete(item)
     db.commit()
@@ -1048,7 +1102,7 @@ def listar_excecoes(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     stmt = select(ColetaCalendarioExcecao).where(
         ColetaCalendarioExcecao.sub_base == sub_base,
@@ -1068,7 +1122,7 @@ def consultar_pendencias(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _sub_base(current_user)
+    sub_base = _sub_base(db, current_user)
     _exigir_coleta_habilitada(db, sub_base)
     if data_fim < data_inicio or (data_fim - data_inicio).days > 366:
         raise HTTPException(422, "Período inválido ou superior a 366 dias.")
