@@ -203,6 +203,7 @@ from conferencia_saida_routes import router as conferencia_saida_router
 from mobile_push_routes import router as mobile_push_router
 from avisos_routes import router as avisos_router, mobile_router as avisos_mobile_router
 from mobile_fechamentos_routes import router as mobile_fechamentos_router
+from mobile_app_version_routes import router as mobile_app_version_router
 
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
@@ -230,6 +231,7 @@ app.include_router(mobile_push_router, prefix=API_PREFIX)
 app.include_router(avisos_router, prefix=API_PREFIX)
 app.include_router(avisos_mobile_router, prefix=API_PREFIX)
 app.include_router(mobile_fechamentos_router, prefix=API_PREFIX)
+app.include_router(mobile_app_version_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
