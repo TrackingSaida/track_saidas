@@ -604,8 +604,8 @@ def transferir_coleta_entre_bases(
     _exigir_coleta_habilitada(db, sub_base)
     if not _admin(current_user):
         raise HTTPException(403, "Somente operador, admin ou root pode transferir base.")
-    resolver_executor(db, current_user)
     try:
+        resolver_executor(db, current_user)
         result = transferir_base_coleta(
             db,
             sub_base=sub_base,
@@ -620,14 +620,30 @@ def transferir_coleta_entre_bases(
         raise
     except Exception as exc:
         db.rollback()
+        err_name = type(exc).__name__
         logger.exception(
-            "transferir_base_falhou sub_base=%s user_id=%s destino=%s qtd=%s",
+            "transferir_base_falhou sub_base=%s user_id=%s destino=%s qtd=%s err=%s",
             sub_base,
             getattr(current_user, "id", None),
             body.base_destino,
             len(body.ids_saida or []),
+            err_name,
         )
-        raise HTTPException(500, f"Falha ao transferir base da coleta: {exc}") from exc
+        # Códigos curtos sem nomes técnicos (evita sanitizer CLIENT_SAFE_500).
+        codigo = {
+            "IntegrityError": "01",
+            "FlushError": "02",
+            "InvalidRequestError": "03",
+            "OperationalError": "04",
+            "DataError": "05",
+            "ObjectDeletedError": "06",
+            "StaleDataError": "07",
+            "ValidationError": "08",
+        }.get(err_name, "99")
+        raise HTTPException(
+            500,
+            f"Não foi possível transferir a base da coleta. Código TFB-{codigo}.",
+        ) from exc
 
 
 @router.post("/bases/{base_id}/iniciar", response_model=ExecucaoOut)
