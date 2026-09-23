@@ -298,3 +298,9 @@ def test_listar_codigo_parcial_localizar_inclui_avulso_exists():
     assert "_orm_localizar_avulso_exists" in src
     assert "_localizar_avulso_variants" in src
     assert "Consulta mobile filtra por código no cliente; busca só em codigo." not in src
+
+
+def test_status_group_alias_etiqueta_gerada():
+    from saidas_listar_service import _status_group_aliases
+    aliases = _status_group_aliases("etiqueta gerada")
+    assert "etiquetado" in aliases
