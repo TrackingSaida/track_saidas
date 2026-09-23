@@ -119,6 +119,8 @@ def carregar_contexto_operacional(
             estado["op"] = h
             estado["removido_ativo"] = False
 
+    from name_normalizer import format_person_full_name
+
     user_map: Dict[int, str] = {}
     if user_ids:
         rows_user = []
@@ -126,11 +128,18 @@ def carregar_contexto_operacional(
             rows_lote = run_db_query_with_retry(
                 db,
                 lambda user_ids_lote=user_ids_lote: db.execute(
-                    select(User.id, User.username).where(User.id.in_(user_ids_lote))
+                    select(User.id, User.nome, User.sobrenome, User.username).where(
+                        User.id.in_(user_ids_lote)
+                    )
                 ).all(),
             )
             rows_user.extend(rows_lote)
-        user_map = {int(uid): (uname or "") for uid, uname in rows_user}
+        user_map = {
+            int(uid): format_person_full_name(
+                nome, sobrenome, username=uname, fallback=uname or ""
+            )
+            for uid, nome, sobrenome, uname in rows_user
+        }
 
     out: Dict[int, SaidaOperacionalContext] = {}
     for sid in ids:

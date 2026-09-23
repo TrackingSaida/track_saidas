@@ -409,10 +409,12 @@ def _load_historico_tuples(db, ids: Sequence[int]) -> List[Any]:
 
 
 def _load_user_map(db, user_ids: Sequence[int]) -> Dict[int, str]:
+    """Mapa user_id → Nome + sobrenome (fallback: username)."""
     from sqlalchemy import select
 
     from db_utils import run_db_query_with_retry
     from models import User
+    from name_normalizer import format_person_full_name
 
     if not user_ids:
         return {}
@@ -421,11 +423,18 @@ def _load_user_map(db, user_ids: Sequence[int]) -> Dict[int, str]:
         rows_lote = run_db_query_with_retry(
             db,
             lambda user_ids_lote=user_ids_lote: db.execute(
-                select(User.id, User.username).where(User.id.in_(user_ids_lote))
+                select(User.id, User.nome, User.sobrenome, User.username).where(
+                    User.id.in_(user_ids_lote)
+                )
             ).all(),
         )
         rows_user.extend(rows_lote)
-    return {int(uid): (uname or "") for uid, uname in rows_user}
+    out: Dict[int, str] = {}
+    for uid, nome, sobrenome, uname in rows_user:
+        out[int(uid)] = format_person_full_name(
+            nome, sobrenome, username=uname, fallback=uname or ""
+        )
+    return out
 
 
 def _load_motoboy_nome_map(db, motoboy_ids: Sequence[int]) -> Dict[int, str]:

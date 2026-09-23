@@ -287,3 +287,14 @@ def test_sql_localizar_avulso_exists_usa_unaccent_e_contem():
     assert "acc.sub_base = :sub_base" in sql
     assert params["localizar_avulso_0"] == "%Leticia%"
     assert params["localizar_avulso_1"] == "%06007%"
+
+
+def test_listar_codigo_parcial_localizar_inclui_avulso_exists():
+    """Regressão: localizar no caminho leve deve buscar identificação do avulso."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1].joinpath("saidas_routes.py").read_text(encoding="utf-8")
+    # Trecho do handler de localizar em _listar_saidas_codigo_parcial
+    assert "_orm_localizar_avulso_exists" in src
+    assert "_localizar_avulso_variants" in src
+    assert "Consulta mobile filtra por código no cliente; busca só em codigo." not in src
