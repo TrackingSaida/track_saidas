@@ -745,6 +745,8 @@ def _status_group_aliases(token: str) -> List[str]:
         "nao coletado": ["nao coletado", "não coletado"],
         "cancelado": ["cancelado", "cancelados"],
         "na base": ["na base", "na_base"],
+        "etiquetado": ["etiquetado"],
+        "etiqueta gerada": ["etiquetado"],
     }
     normalized = list(groups.get(key, [key]))
     out: set[str] = set()
@@ -2001,12 +2003,16 @@ def _montar_item_listar_saida(
     op_ctx: Optional[SaidaOperacionalContext],
     nome_executor: Optional[str],
 ) -> Dict[str, Any]:
+    acao = (op_ctx.acao_label if op_ctx else None) or None
+    status_up = (getattr(row, "status", None) or "").strip().upper()
+    if (not acao or acao.strip() in {"", "—", "-"}) and status_up == "ETIQUETADO":
+        acao = "Etiqueta gerada"
     return {
         "id_saida": row.id_saida,
         "timestamp": row.timestamp,
         "data": row.data.isoformat() if getattr(row, "data", None) else None,
         "data_hora_acao": (op_ctx.ultimo_evento_ts if op_ctx else None) or row.timestamp,
-        "acao": (op_ctx.acao_label if op_ctx else None) or "Sem ação",
+        "acao": acao or "Sem ação",
         "executado_por": (op_ctx.executado_por if op_ctx else None) or "—",
         "sub_base": row.sub_base,
         "username": (op_ctx.ultimo_ator_username if op_ctx else None) or row.username,

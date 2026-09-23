@@ -113,6 +113,8 @@ def _status_group_aliases(token: str) -> List[str]:
         "na base": ["na base", "na_base"],
         # Alias do card "Ainda na base": entrada sem saída + coletado sem saída
         "ainda na base": ["na base", "na_base", "coletado"],
+        "etiquetado": ["etiquetado"],
+        "etiqueta gerada": ["etiquetado"],
     }
     normalized = list(groups.get(key, [key]))
     # Sempre incluir variantes com espaço e underscore (DB usa NA_BASE → na_base).
