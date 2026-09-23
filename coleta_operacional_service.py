@@ -216,16 +216,18 @@ def agregar_leitura(
     current_user: User,
     coleta: Coleta,
     base_nome: str,
+    data_operacao: Optional[date] = None,
 ) -> ColetaExecucaoParticipante:
     sub_base = current_user.sub_base
     exigir_modo(db, sub_base, "codigo")
     base = resolver_base(db, sub_base, nome=base_nome)
     executor, motoboy_id = resolver_executor(db, current_user)
+    dia = data_operacao or date.today()
     execucao = obter_ou_criar_execucao(
         db,
         sub_base=sub_base,
         base=base,
-        data_operacao=date.today(),
+        data_operacao=dia,
         modo="codigo",
     )
     # Se a execução ainda está pendente de início, marca Em coleta para os demais verem.
