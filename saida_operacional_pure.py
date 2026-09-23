@@ -78,8 +78,8 @@ ROTULOS_ACAO = {
     "criado_coleta": "Pacote coletado",
     "coleta": "Pacote coletado",
     "base_transferida": "Transferiu base da coleta",
-    "etiqueta_gerada": "Etiqueta gerada",
-    "etiqueta_cancelada": "Etiqueta cancelada",
+    "etiqueta_gerada": "Emitiu etiqueta",
+    "etiqueta_cancelada": "Cancelou etiqueta",
     "etiqueta_expirada": "Etiqueta expirada",
 }
 
