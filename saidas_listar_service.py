@@ -493,14 +493,17 @@ def _localizar_avulso_variants(term: str) -> List[str]:
 
 
 def _sql_localizar_avulso_exists(variants: Sequence[str], params: Dict[str, Any]) -> str:
-    """EXISTS em avulso_campo_valor restrito ao sub_base da listagem."""
+    """EXISTS em avulso_campo_valor restrito ao sub_base (contém + unaccent)."""
     if not variants:
         return ""
     likes = []
     for i, v in enumerate(variants):
         key = f"localizar_avulso_{i}"
         params[key] = f"%{v}%"
-        likes.append(f"acv.valor_texto ILIKE :{key}")
+        likes.append(
+            "unaccent(lower(coalesce(acv.valor_texto, ''))) "
+            f"ILIKE unaccent(lower(:{key}))"
+        )
     return f"""EXISTS (
               SELECT 1
               FROM avulso_campo_valor acv
@@ -512,13 +515,18 @@ def _sql_localizar_avulso_exists(variants: Sequence[str], params: Dict[str, Any]
 
 
 def _orm_localizar_avulso_exists(sub_base: str, variants: Sequence[str]):
-    from sqlalchemy import exists, or_, select
+    from sqlalchemy import exists, func, or_, select
 
     from models import AvulsoCampoConfig, AvulsoCampoValor, Saida
 
     if not variants:
         return None
-    conds = [AvulsoCampoValor.valor_texto.ilike(f"%{v}%") for v in variants]
+    conds = [
+        func.unaccent(func.lower(func.coalesce(AvulsoCampoValor.valor_texto, ""))).ilike(
+            func.unaccent(func.lower(f"%{v}%"))
+        )
+        for v in variants
+    ]
     return exists(
         select(1)
         .select_from(AvulsoCampoValor)
@@ -648,13 +656,20 @@ def _build_candidate_stmt(
     elif localizar and localizar.strip():
         q = f"%{localizar.strip()}%"
         variants = _localizar_avulso_variants(localizar)
+        from sqlalchemy import func
+
+        def _ua_ilike(col):
+            return func.unaccent(func.lower(func.coalesce(col, ""))).ilike(
+                func.unaccent(func.lower(q))
+            )
+
         or_conds = [
-            Saida.base.ilike(q),
-            Saida.username.ilike(q),
-            Saida.entregador.ilike(q),
+            _ua_ilike(Saida.base),
+            _ua_ilike(Saida.username),
+            _ua_ilike(Saida.entregador),
             Saida.codigo.ilike(q),
-            Saida.servico.ilike(q),
-            Saida.status.ilike(q),
+            _ua_ilike(Saida.servico),
+            _ua_ilike(Saida.status),
         ]
         avulso_ex = _orm_localizar_avulso_exists(sub_base, variants)
         if avulso_ex is not None:
@@ -968,12 +983,12 @@ def listar_saidas_paginado(
         params["localizar_q"] = f"%{localizar.strip()}%"
         avulso_sql = _sql_localizar_avulso_exists(variants, params)
         parts = [
-            "s.base ILIKE :localizar_q",
-            "s.username ILIKE :localizar_q",
-            "s.entregador ILIKE :localizar_q",
+            "unaccent(lower(coalesce(s.base, ''))) ILIKE unaccent(lower(:localizar_q))",
+            "unaccent(lower(coalesce(s.username, ''))) ILIKE unaccent(lower(:localizar_q))",
+            "unaccent(lower(coalesce(s.entregador, ''))) ILIKE unaccent(lower(:localizar_q))",
             "s.codigo ILIKE :localizar_q",
-            "s.servico ILIKE :localizar_q",
-            "s.status ILIKE :localizar_q",
+            "unaccent(lower(coalesce(s.servico, ''))) ILIKE unaccent(lower(:localizar_q))",
+            "unaccent(lower(coalesce(s.status, ''))) ILIKE unaccent(lower(:localizar_q))",
         ]
         if avulso_sql:
             parts.append(avulso_sql)
