@@ -130,7 +130,7 @@ def hoje_operacional() -> date:
 
 def status_avulso_label(status: Optional[str]) -> str:
     raw = (status or "").strip()
-    key = raw.lower()
+    key = raw.lower().replace(" ", "_")
     mapping = {
         "coletado": "Coletado",
         "na_base": "Na base",
@@ -138,16 +138,36 @@ def status_avulso_label(status: Optional[str]) -> str:
         "saiu_para_entrega": "Saiu para entrega",
         "em_rota": "Em rota",
         "entregue": "Entregue",
-        "nao coletado": "Não coletado",
-        "não coletado": "Não coletado",
+        "nao_coletado": "Não coletado",
+        "não_coletado": "Não coletado",
         "ausente": "Ausente",
         "devolvido": "Devolvido",
+        "cancelado": "Cancelado",
+        "encerrado_sistema": "Encerrado pelo sistema",
+        "encerrado": "Encerrado pelo sistema",
     }
     if key in mapping:
         return mapping[key]
     if raw:
         return raw.replace("_", " ").strip().capitalize()
     return "Sem status"
+
+
+def eh_status_elegivel_saida(status: Optional[str]) -> bool:
+    """True se o avulso ainda pode receber saída (coleta/entrada na base)."""
+    key = (status or "").strip().lower().replace(" ", "_")
+    return key in {"coletado", "na_base"}
+
+
+def ordenar_avulsos_elegivel_primeiro(rows: Sequence[Saida]) -> List[Saida]:
+    """Mantém todos os resultados; elegíveis para saída vêm primeiro (mais recentes no topo)."""
+    return sorted(
+        list(rows),
+        key=lambda r: (
+            0 if eh_status_elegivel_saida(getattr(r, "status", None)) else 1,
+            -(int(getattr(r, "id_saida", 0) or 0)),
+        ),
+    )
 
 
 def motoboy_nome_saida(db: Session, row: Saida) -> Optional[str]:
@@ -467,6 +487,126 @@ def valores_por_saida(db: Session, id_saida: int) -> Dict[str, str]:
     return out
 
 
+def valores_por_saidas(db: Session, id_saidas: Sequence[int]) -> Dict[int, Dict[str, str]]:
+    """Batch: id_saida → {chave: valor}."""
+    ids = sorted({int(i) for i in id_saidas if i is not None})
+    if not ids:
+        return {}
+    result = db.execute(
+        select(
+            AvulsoCampoValor.id_saida,
+            AvulsoCampoConfig.chave,
+            AvulsoCampoValor.valor_texto,
+        )
+        .join(AvulsoCampoConfig, AvulsoCampoValor.campo_config_id == AvulsoCampoConfig.id)
+        .where(AvulsoCampoValor.id_saida.in_(ids))
+    ).all()
+    out: Dict[int, Dict[str, str]] = {i: {} for i in ids}
+    for sid, chave, valor in result:
+        if sid is None or not chave or not valor:
+            continue
+        out.setdefault(int(sid), {})[str(chave)] = str(valor)
+    return out
+
+
+def labels_exibicao_por_saidas(
+    db: Session,
+    *,
+    sub_base: str,
+    rows: Sequence[Any],
+    contexto: str = "TODOS_AVULSO",
+) -> Dict[int, str]:
+    """Mapa id_saida → rótulo amigável (identificação configurada; AVULSO- só fallback)."""
+    saidas = [r for r in rows if r is not None and getattr(r, "id_saida", None) is not None]
+    if not saidas:
+        return {}
+    campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto=contexto)
+    vals_map = valores_por_saidas(db, [int(r.id_saida) for r in saidas])
+    out: Dict[int, str] = {}
+    for r in saidas:
+        sid = int(r.id_saida)
+        out[sid] = build_label_amigavel(
+            getattr(r, "codigo", None),
+            base_legado=getattr(r, "base", None),
+            campos_cfg=campos_cfg,
+            valores=vals_map.get(sid) or {},
+        )
+    return out
+
+
+def encontrar_pendentes_mesma_identificacao(
+    db: Session,
+    *,
+    sub_base: str,
+    saida: Saida,
+    limit: int = 5,
+) -> List[Saida]:
+    """Outros avulsos elegíveis à saída com a mesma identificação (nome/CEP/etc.).
+
+    Usado para evitar reativar um encerrado quando já existe pacote novo pendente.
+    """
+    sid = int(getattr(saida, "id_saida", 0) or 0)
+    if not sid or not sub_base:
+        return []
+    campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto="TODOS_AVULSO")
+    vals = valores_por_saida(db, sid)
+    ids_busca: Dict[str, str] = {}
+    for cfg in campos_cfg:
+        if not getattr(cfg, "usar_na_identificacao", False):
+            continue
+        chave = str(getattr(cfg, "chave", "") or "").strip()
+        val = (vals.get(chave) or "").strip()
+        if chave and val:
+            ids_busca[chave] = val
+    if not ids_busca:
+        base_legado = (getattr(saida, "base", None) or "").strip()
+        if not base_legado:
+            return []
+        # Legado sem campos: mesmo texto em base
+        rows = list(
+            db.scalars(
+                select(Saida)
+                .where(
+                    *_filtro_avulso(sub_base),
+                    Saida.id_saida != sid,
+                    func.lower(func.coalesce(Saida.base, "")) == base_legado.lower(),
+                    or_(
+                        func.lower(func.coalesce(Saida.status, "")).in_(
+                            ["coletado", "na_base"]
+                        ),
+                        Saida.status == "NA_BASE",
+                    ),
+                )
+                .order_by(Saida.id_saida.desc())
+                .limit(limit)
+            ).all()
+        )
+        return rows
+
+    matching = _ids_por_identificadores(db, sub_base=sub_base, identificadores=ids_busca)
+    if matching is None:
+        return []
+    rows = list(
+        db.scalars(
+            select(Saida)
+            .where(
+                *_filtro_avulso(sub_base),
+                Saida.id_saida != sid,
+                Saida.id_saida.in_(matching),
+                or_(
+                    func.lower(func.coalesce(Saida.status, "")).in_(
+                        ["coletado", "na_base"]
+                    ),
+                    Saida.status == "NA_BASE",
+                ),
+            )
+            .order_by(Saida.id_saida.desc())
+            .limit(limit)
+        ).all()
+    )
+    return rows
+
+
 def owner_exige_selecao_avulso(db: Session, sub_base: str) -> bool:
     """Coleta e/ou Entrada habilitados → saída deve preferir seleção."""
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
@@ -697,7 +837,11 @@ def list_pendentes(
             db, filtros_hoje, joined_lote=True, limit=limit, offset=offset
         )
         if total > 0:
-            return ListagemAvulsos(rows=rows, total=total, modo="busca")
+            return ListagemAvulsos(
+                rows=ordenar_avulsos_elegivel_primeiro(rows),
+                total=total,
+                modo="busca",
+            )
 
         filtros_outros = _aplicar_busca_contem(
             _filtro_avulso(sub_base),
@@ -714,7 +858,7 @@ def list_pendentes(
                 mensagem="Nenhum avulso encontrado com esses dados.",
             )
         outros_rows, outros_total = _contar_e_listar(
-            db, filtros_outros, joined_lote=False, limit=2, offset=0
+            db, filtros_outros, joined_lote=False, limit=max(limit, 20), offset=0
         )
         if outros_total == 0:
             return ListagemAvulsos(
@@ -723,17 +867,35 @@ def list_pendentes(
                 modo="busca",
                 mensagem="Nenhum avulso encontrado com esses dados.",
             )
-        if outros_total > 1:
+        # Não oculta encerrados/finalizados: devolve a lista ordenando elegíveis primeiro.
+        ordenados = ordenar_avulsos_elegivel_primeiro(outros_rows)
+        if outros_total > 1 and not any(eh_status_elegivel_saida(r.status) for r in ordenados):
+            # Só encerrados/finalizados em outros dias → pede refino (evita escolher o errado no escuro)
             return ListagemAvulsos(
-                rows=[],
+                rows=ordenados[:limit],
                 total=outros_total,
                 modo="busca",
-                ambiguo=True,
-                mensagem="Nada encontrado hoje. Em outros dias há vários avulsos com esses dados. Refine a busca ou leia a etiqueta.",
+                mensagem=(
+                    "Nada elegível para saída hoje. Encontrados pedidos antigos "
+                    "(já finalizados/encerrados) com esses dados — confira o status antes de selecionar."
+                ),
             )
-        return ListagemAvulsos(rows=outros_rows[:1], total=1, modo="busca")
+        return ListagemAvulsos(
+            rows=ordenados[:limit],
+            total=outros_total,
+            modo="busca",
+            mensagem=(
+                None
+                if any(eh_status_elegivel_saida(r.status) for r in ordenados)
+                else "Nada encontrado hoje. Exibindo avulsos de outros dias com esses dados."
+            ),
+        )
 
     rows, total = _contar_e_listar(
         db, _filtros_hoje(sub_base), joined_lote=True, limit=limit, offset=offset
     )
-    return ListagemAvulsos(rows=rows, total=total, modo="hoje")
+    return ListagemAvulsos(
+        rows=ordenar_avulsos_elegivel_primeiro(rows),
+        total=total,
+        modo="hoje",
+    )

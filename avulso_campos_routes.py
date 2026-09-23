@@ -86,10 +86,13 @@ class AvulsoCampoExibicaoOut(BaseModel):
 class AvulsoPendenteOut(BaseModel):
     id_saida: int
     codigo: Optional[str] = None
+    # Identificação amigável para UI (mesma regra de label); codigo permanece interno AVULSO-*.
+    codigo_exibicao: Optional[str] = None
     status: Optional[str] = None
     status_label: str = ""
     base: Optional[str] = None
     label: str
+    elegivel_saida: bool = False
     campos: Dict[str, str] = Field(default_factory=dict)
     avulso_lote_id: Optional[int] = None
     avulso_criado_excepcional: bool = False
@@ -286,20 +289,25 @@ def delete_campo_avulso(
 
 
 def _saida_to_pendente(db: Session, row: Saida, campos_cfg) -> AvulsoPendenteOut:
+    from avulso_campos_service import eh_status_elegivel_saida
+
     vals = valores_por_saida(db, int(row.id_saida))
     motoboy_nome = motoboy_nome_saida(db, row)
+    label = build_label_amigavel(
+        row.codigo,
+        base_legado=row.base,
+        campos_cfg=campos_cfg,
+        valores=vals,
+    )
     return AvulsoPendenteOut(
         id_saida=int(row.id_saida),
         codigo=row.codigo,
+        codigo_exibicao=label,
         status=row.status,
         status_label=status_avulso_label(row.status),
         base=row.base,
-        label=build_label_amigavel(
-            row.codigo,
-            base_legado=row.base,
-            campos_cfg=campos_cfg,
-            valores=vals,
-        ),
+        label=label,
+        elegivel_saida=eh_status_elegivel_saida(row.status),
         campos=vals,
         avulso_lote_id=int(row.avulso_lote_id) if getattr(row, "avulso_lote_id", None) else None,
         avulso_criado_excepcional=bool(getattr(row, "avulso_criado_excepcional", False)),
