@@ -16,6 +16,7 @@ from avulso_campos_service import (
     CONTEXTOS_META,
     TIPOS_META,
     TIPOS_RETIRADOS,
+    build_campos_exibicao,
     build_label_amigavel,
     contexto_meta,
     list_pendentes,
@@ -76,6 +77,12 @@ class CampoAvulsoOut(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class AvulsoCampoExibicaoOut(BaseModel):
+    chave: str
+    label: str
+    valor: str
+
+
 class AvulsoPendenteOut(BaseModel):
     id_saida: int
     codigo: Optional[str] = None
@@ -95,6 +102,7 @@ class AvulsoDetalheOut(AvulsoPendenteOut):
     timestamp: Optional[datetime] = None
     origem: Optional[str] = None
     origem_label: Optional[str] = None
+    campos_exibicao: List[AvulsoCampoExibicaoOut] = Field(default_factory=list)
 
 
 def _assert_admin(current_user: User) -> None:
@@ -375,10 +383,15 @@ def get_avulso_detalhe(
         if lote:
             origem = lote.origem
     excepcional = bool(getattr(row, "avulso_criado_excepcional", False))
+    campos_exibicao = [
+        AvulsoCampoExibicaoOut(**item)
+        for item in build_campos_exibicao(campos_cfg, base.campos)
+    ]
     return AvulsoDetalheOut(
         **base.model_dump(),
         servico=row.servico,
         timestamp=row.timestamp,
         origem=origem or ("saida_excecao" if excepcional else None),
         origem_label=origem_amigavel(origem, excepcional=excepcional),
+        campos_exibicao=campos_exibicao,
     )

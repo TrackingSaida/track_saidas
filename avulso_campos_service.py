@@ -386,23 +386,65 @@ def build_label_amigavel(
     campos_cfg: Sequence[AvulsoCampoConfig] = (),
     valores: Optional[Dict[str, str]] = None,
 ) -> str:
-    parts: List[str] = []
-    code = (codigo or "").strip()
-    if code:
-        parts.append(code)
+    """Rótulo amigável do avulso.
+
+    Com campos marcados como ``usar_na_identificacao`` preenchidos, o código
+    interno (AVULSO-…) fica de fora — ele é chave de sistema, não identificação
+    operacional. Sem identificação configurada, mantém o legado código + base.
+    """
     valores = valores or {}
+    code = (codigo or "").strip()
     id_parts: List[str] = []
     for cfg in campos_cfg:
-        if not (cfg.usar_na_identificacao or cfg.exibir_na_selecao):
+        if not getattr(cfg, "usar_na_identificacao", False):
             continue
         val = (valores.get(cfg.chave) or "").strip()
         if val:
             id_parts.append(val)
     if id_parts:
-        parts.append(" • ".join(id_parts[:4]))
+        return " • ".join(id_parts[:4])
+
+    parts: List[str] = []
+    if code:
+        parts.append(code)
+    sel_parts: List[str] = []
+    for cfg in campos_cfg:
+        if not getattr(cfg, "exibir_na_selecao", False):
+            continue
+        val = (valores.get(cfg.chave) or "").strip()
+        if val:
+            sel_parts.append(val)
+    if sel_parts:
+        parts.append(" • ".join(sel_parts[:4]))
     elif base_legado and str(base_legado).strip():
         parts.append(str(base_legado).strip())
-    return " ".join(parts) if len(parts) == 1 else (" • ".join(parts) if parts else code or "Avulso")
+    if not parts:
+        return code or "Avulso"
+    return parts[0] if len(parts) == 1 else " • ".join(parts)
+
+
+def build_campos_exibicao(
+    campos_cfg: Sequence[AvulsoCampoConfig] = (),
+    valores: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, str]]:
+    """Lista ordenada de campos com rótulo amigável para detalhe/UI."""
+    valores = valores or {}
+    out: List[Dict[str, str]] = []
+    for cfg in campos_cfg:
+        chave = str(getattr(cfg, "chave", "") or "").strip()
+        if not chave:
+            continue
+        val = (valores.get(chave) or "").strip()
+        if not val:
+            continue
+        out.append(
+            {
+                "chave": chave,
+                "label": str(getattr(cfg, "label", None) or chave).strip() or chave,
+                "valor": val,
+            }
+        )
+    return out
 
 
 def origem_amigavel(origem: Optional[str] = None, *, excepcional: bool = False) -> str:

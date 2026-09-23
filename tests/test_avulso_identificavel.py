@@ -88,9 +88,25 @@ def test_label_amigavel_com_identificacao():
         campos_cfg=cfg,
         valores={"pedido": "99821", "dest": "Maria"},
     )
-    assert "AVULSO-000184" in label
-    assert "99821" in label
-    assert "Maria" in label
+    assert label == "99821 • Maria"
+    assert "AVULSO-000184" not in label
+
+
+def test_build_campos_exibicao_usa_label():
+    from avulso_campos_service import build_campos_exibicao
+
+    cfg = [
+        SimpleNamespace(chave="cliente_destinatario", label="Cliente destinatário"),
+        SimpleNamespace(chave="cep", label="CEP"),
+    ]
+    out = build_campos_exibicao(
+        cfg,
+        {"cliente_destinatario": "Tamires Rapozo", "cep": "06775-340"},
+    )
+    assert out == [
+        {"chave": "cliente_destinatario", "label": "Cliente destinatário", "valor": "Tamires Rapozo"},
+        {"chave": "cep", "label": "CEP", "valor": "06775-340"},
+    ]
 
 
 def test_tipo_lista_invalido():
