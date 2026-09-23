@@ -310,3 +310,19 @@ def test_variantes_busca_telefone_sem_mascara():
 def test_variantes_termo_livre_nome_nao_inventa_mascara():
     vs = _variantes_termo_livre("Maria")
     assert vs == ["Maria"]
+
+
+def test_ordenar_avulsos_elegivel_primeiro():
+    from types import SimpleNamespace
+    from avulso_campos_service import ordenar_avulsos_elegivel_primeiro, eh_status_elegivel_saida
+
+    assert eh_status_elegivel_saida("coletado") is True
+    assert eh_status_elegivel_saida("ENCERRADO_SISTEMA") is False
+    rows = [
+        SimpleNamespace(id_saida=1, status="ENCERRADO_SISTEMA"),
+        SimpleNamespace(id_saida=3, status="coletado"),
+        SimpleNamespace(id_saida=2, status="ENTREGUE"),
+        SimpleNamespace(id_saida=4, status="NA_BASE"),
+    ]
+    ordered = ordenar_avulsos_elegivel_primeiro(rows)
+    assert [r.id_saida for r in ordered] == [4, 3, 2, 1]
