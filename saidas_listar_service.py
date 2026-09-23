@@ -478,6 +478,59 @@ def _load_motoboy_nome_map(db, motoboy_ids: Sequence[int]) -> Dict[int, str]:
     return out
 
 
+def _localizar_avulso_variants(term: str) -> List[str]:
+    """Variantes de busca livre (CEP/telefone com/sem máscara), sem duplicar."""
+    from avulso_campos_service import _variantes_termo_livre
+
+    raw = (term or "").strip()
+    if not raw:
+        return []
+    out: List[str] = []
+    for v in _variantes_termo_livre(raw):
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def _sql_localizar_avulso_exists(variants: Sequence[str], params: Dict[str, Any]) -> str:
+    """EXISTS em avulso_campo_valor restrito ao sub_base da listagem."""
+    if not variants:
+        return ""
+    likes = []
+    for i, v in enumerate(variants):
+        key = f"localizar_avulso_{i}"
+        params[key] = f"%{v}%"
+        likes.append(f"acv.valor_texto ILIKE :{key}")
+    return f"""EXISTS (
+              SELECT 1
+              FROM avulso_campo_valor acv
+              JOIN avulso_campo_config acc ON acc.id = acv.campo_config_id
+              WHERE acv.id_saida = s.id_saida
+                AND acc.sub_base = :sub_base
+                AND ({' OR '.join(likes)})
+            )"""
+
+
+def _orm_localizar_avulso_exists(sub_base: str, variants: Sequence[str]):
+    from sqlalchemy import exists, or_, select
+
+    from models import AvulsoCampoConfig, AvulsoCampoValor, Saida
+
+    if not variants:
+        return None
+    conds = [AvulsoCampoValor.valor_texto.ilike(f"%{v}%") for v in variants]
+    return exists(
+        select(1)
+        .select_from(AvulsoCampoValor)
+        .join(AvulsoCampoConfig, AvulsoCampoValor.campo_config_id == AvulsoCampoConfig.id)
+        .where(
+            AvulsoCampoValor.id_saida == Saida.id_saida,
+            AvulsoCampoConfig.sub_base == sub_base,
+            or_(*conds),
+        )
+    )
+
+
 def _build_candidate_stmt(
     sub_base: str,
     de: Optional[date],
@@ -594,16 +647,19 @@ def _build_candidate_stmt(
             stmt = stmt.where(or_(Saida.codigo == codigo_trim, Saida.codigo.ilike(f"{codigo_trim}%")))
     elif localizar and localizar.strip():
         q = f"%{localizar.strip()}%"
-        stmt = stmt.where(
-            or_(
-                Saida.base.ilike(q),
-                Saida.username.ilike(q),
-                Saida.entregador.ilike(q),
-                Saida.codigo.ilike(q),
-                Saida.servico.ilike(q),
-                Saida.status.ilike(q),
-            )
-        )
+        variants = _localizar_avulso_variants(localizar)
+        or_conds = [
+            Saida.base.ilike(q),
+            Saida.username.ilike(q),
+            Saida.entregador.ilike(q),
+            Saida.codigo.ilike(q),
+            Saida.servico.ilike(q),
+            Saida.status.ilike(q),
+        ]
+        avulso_ex = _orm_localizar_avulso_exists(sub_base, variants)
+        if avulso_ex is not None:
+            or_conds.append(avulso_ex)
+        stmt = stmt.where(or_(*or_conds))
 
     return stmt
 
@@ -908,14 +964,20 @@ def listar_saidas_paginado(
             where_extra.append("(s.codigo = :codigo_trim OR s.codigo ILIKE :codigo_prefix)")
             params["codigo_prefix"] = params["codigo_trim"] + "%"
     elif localizar and localizar.strip():
+        variants = _localizar_avulso_variants(localizar)
         params["localizar_q"] = f"%{localizar.strip()}%"
-        where_extra.append(
-            """(
-              s.base ILIKE :localizar_q OR s.username ILIKE :localizar_q
-              OR s.entregador ILIKE :localizar_q OR s.codigo ILIKE :localizar_q
-              OR s.servico ILIKE :localizar_q OR s.status ILIKE :localizar_q
-            )"""
-        )
+        avulso_sql = _sql_localizar_avulso_exists(variants, params)
+        parts = [
+            "s.base ILIKE :localizar_q",
+            "s.username ILIKE :localizar_q",
+            "s.entregador ILIKE :localizar_q",
+            "s.codigo ILIKE :localizar_q",
+            "s.servico ILIKE :localizar_q",
+            "s.status ILIKE :localizar_q",
+        ]
+        if avulso_sql:
+            parts.append(avulso_sql)
+        where_extra.append("(" + " OR ".join(parts) + ")")
 
     entregador_filter_norm = ""
     if entregador and entregador.strip() and entregador.lower() != "(todos)":
