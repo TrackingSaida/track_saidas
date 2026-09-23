@@ -2006,7 +2006,7 @@ def _montar_item_listar_saida(
     acao = (op_ctx.acao_label if op_ctx else None) or None
     status_up = (getattr(row, "status", None) or "").strip().upper()
     if (not acao or acao.strip() in {"", "—", "-"}) and status_up == "ETIQUETADO":
-        acao = "Etiqueta gerada"
+        acao = "Emitiu etiqueta"
     return {
         "id_saida": row.id_saida,
         "timestamp": row.timestamp,
