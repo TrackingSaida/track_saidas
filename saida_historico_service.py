@@ -101,22 +101,27 @@ def _campos_from_payload(raw: Optional[str]) -> Dict[str, Any]:
 
 def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoItemOut]:
     """Lista eventos da saída ordenados por timestamp (asc)."""
+    from name_normalizer import format_person_full_name
+
     rows = db.execute(
-        select(SaidaHistorico, User.username)
+        select(SaidaHistorico, User.nome, User.sobrenome, User.username)
         .outerjoin(User, SaidaHistorico.user_id == User.id)
         .where(SaidaHistorico.id_saida == id_saida)
         .order_by(SaidaHistorico.timestamp.asc())
     ).all()
     out: List[SaidaHistoricoItemOut] = []
     for row in rows:
-        h, username = row[0], row[1]
+        h, nome, sobrenome, username = row[0], row[1], row[2], row[3]
         evento_norm = (h.evento or "").strip().lower()
         extra = _campos_from_payload(getattr(h, "payload", None))
         acao_label = rotulo_acao_evento(evento_norm)
         if evento_norm == "devolucao":
             data = parse_historico_payload(getattr(h, "payload", None))
-            nome = str(data.get("sub_base_nome") or "").strip()
-            acao_label = f"Devolvido à {nome}" if nome else "Devolvido à base"
+            base_nome = str(data.get("sub_base_nome") or "").strip()
+            acao_label = f"Devolvido à {base_nome}" if base_nome else "Devolvido à base"
+        usuario_nome = format_person_full_name(
+            nome, sobrenome, username=username, fallback=username or ""
+        ) or None
         out.append(
             SaidaHistoricoItemOut(
                 id=h.id,
@@ -126,7 +131,7 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
                 status_anterior=h.status_anterior,
                 status_novo=h.status_novo,
                 user_id=h.user_id,
-                usuario_nome=username,
+                usuario_nome=usuario_nome,
                 motoboy_id_anterior=h.motoboy_id_anterior,
                 motoboy_id_novo=h.motoboy_id_novo,
                 acao_label=acao_label,

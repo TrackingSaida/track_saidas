@@ -34,7 +34,12 @@ from saida_operacional_utils import (
     timestamp_operacional_saida,
     SaidaOperacionalContext,
 )
-from saidas_listar_service import invalidate_listar_cache, listar_saidas_paginado
+from saidas_listar_service import (
+    invalidate_listar_cache,
+    listar_saidas_paginado,
+    _localizar_avulso_variants,
+    _orm_localizar_avulso_exists,
+)
 from saidas_exportar_service import (
     MAX_EXPORTAR_LIMIT,
     ExportarSaidasError,
@@ -2188,9 +2193,28 @@ def _listar_saidas_codigo_parcial(
             )
         )
     elif localizar and localizar.strip():
+        # Contém em código + campos de identificação do avulso (nome/CEP/etc.).
+        # Antes só buscava em s.codigo — nome/CEP nunca encontravam o pedido.
         q = f"%{localizar.strip()}%"
-        # Consulta mobile filtra por código no cliente; busca só em codigo.
-        stmt = stmt.where(Saida.codigo.ilike(q))
+        variants = _localizar_avulso_variants(localizar)
+
+        def _ua_ilike(col):
+            return func.unaccent(func.lower(func.coalesce(col, ""))).ilike(
+                func.unaccent(func.lower(q))
+            )
+
+        or_conds = [
+            Saida.codigo.ilike(q),
+            _ua_ilike(Saida.base),
+            _ua_ilike(Saida.username),
+            _ua_ilike(Saida.entregador),
+            _ua_ilike(Saida.servico),
+            _ua_ilike(Saida.status),
+        ]
+        avulso_ex = _orm_localizar_avulso_exists(sub_base, variants)
+        if avulso_ex is not None:
+            or_conds.append(avulso_ex)
+        stmt = stmt.where(or_(*or_conds))
     else:
         return _listar_resposta_vazia()
 
