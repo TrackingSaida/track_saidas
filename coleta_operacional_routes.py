@@ -96,12 +96,13 @@ def _exigir_coleta_habilitada(db: Session, sub_base: str) -> str:
 
 
 def _validar_data_edicao(current_user: User, data_operacao: date, origem_cliente: str) -> None:
+    """Dia passado: somente root/admin/operador (0–2). Web e app permitidos."""
+    if data_operacao > date.today():
+        raise HTTPException(422, "Não é permitido lançar coleta em data futura.")
     if data_operacao == date.today():
         return
     if not _admin(current_user):
         raise HTTPException(403, "O usuário pode alterar somente coletas do dia atual.")
-    if origem_cliente != "web":
-        raise HTTPException(403, "Alterações de dias anteriores são permitidas somente no painel web.")
 
 
 def _quantidade_total(obj) -> int:
@@ -153,6 +154,8 @@ class ContribuicaoManualIn(BaseModel):
     g_ml: int = Field(default=0, ge=0)
     g_avulso: int = Field(default=0, ge=0)
     sem_volume: bool = False
+    # True: soma ao volume já lançado (lançamento retroativo / acréscimo).
+    acrescentar: bool = False
     client_request_id: Optional[str] = Field(default=None, min_length=8, max_length=100)
     origem_cliente: Literal["web", "mobile"] = "web"
 
@@ -163,6 +166,8 @@ class ContribuicaoManualIn(BaseModel):
             raise ValueError("sem_volume não pode ser combinado com quantidades")
         if not self.sem_volume and total == 0:
             raise ValueError("Informe alguma quantidade ou marque sem_volume")
+        if self.acrescentar and self.sem_volume:
+            raise ValueError("acrescentar não pode ser combinado com sem_volume")
         return self
 
 
@@ -269,6 +274,7 @@ class ExecucaoOut(BaseModel):
 class IniciarColetaIn(BaseModel):
     ajudar: bool = False
     metodo: Literal["codigo", "coleta_manual"]
+    data_operacao: Optional[date] = None
 
 
 def _participante_atual(execucao: ColetaExecucao, user_id: int) -> Optional[ColetaExecucaoParticipante]:
@@ -666,13 +672,27 @@ def iniciar_coleta(
     exigir_modo(db, sub_base, body.metodo)
     base = resolver_base(db, sub_base, base_id=base_id)
     executor, motoboy_id = resolver_executor(db, current_user)
+    data_operacao = body.data_operacao or date.today()
+    if data_operacao > date.today():
+        raise HTTPException(422, "Não é permitido iniciar coleta em data futura.")
+    retroativo = data_operacao < date.today()
+    if retroativo and not _admin(current_user):
+        raise HTTPException(403, "O usuário pode iniciar coleta somente no dia atual.")
+    if retroativo:
+        _garantir_nao_fechado(
+            db,
+            sub_base=sub_base,
+            base_nome=base.base,
+            data_operacao=data_operacao,
+            motoboy_id=motoboy_id,
+        )
     # Trocar de base sem lançamento: libera a(s) anterior(es) e volta status para Pendente.
     # Commit antecipado: se o iniciar falhar (ex.: base ocupada), a liberação não é desfeita.
     liberados = liberar_participacoes_vazias_do_usuario(
         db,
         sub_base=sub_base,
         user_id=executor.id,
-        data_operacao=date.today(),
+        data_operacao=data_operacao,
         exceto_base_id=base.id_base,
     )
     if liberados:
@@ -681,14 +701,14 @@ def iniciar_coleta(
         select(ColetaExecucao).where(
             ColetaExecucao.sub_base == sub_base,
             ColetaExecucao.base_id == base.id_base,
-            ColetaExecucao.data_operacao == date.today(),
+            ColetaExecucao.data_operacao == data_operacao,
         ).with_for_update()
     )
     if not execucao:
         execucao = ColetaExecucao(
             sub_base=sub_base,
             base_id=base.id_base,
-            data_operacao=date.today(),
+            data_operacao=data_operacao,
             modo=body.metodo,
             status="em_coleta",
         )
@@ -703,17 +723,20 @@ def iniciar_coleta(
                 select(ColetaExecucao).where(
                     ColetaExecucao.sub_base == sub_base,
                     ColetaExecucao.base_id == base_id,
-                    ColetaExecucao.data_operacao == date.today(),
+                    ColetaExecucao.data_operacao == data_operacao,
                 ).with_for_update()
             )
             if not execucao:
                 raise HTTPException(409, "A situação desta base mudou. Atualize a lista e tente novamente.")
-    if execucao.status in ("coletado", "sem_volume"):
+    if execucao.status in ("coletado", "sem_volume") and not retroativo:
         raise HTTPException(409, "Esta base já foi coletada hoje.")
+    # Retroativo admin: reabre execução já coletada para permitir acréscimo.
+    if retroativo and execucao.status in ("coletado", "sem_volume"):
+        execucao.status = "em_coleta"
     execucao.modo = combinar_modo_execucao(execucao.modo, body.metodo)
     participante = _participante_atual(execucao, executor.id)
     outros_ativos = [p.username for p in execucao.participantes if p.user_id != executor.id and getattr(p, "status", "finalizado") == "em_coleta"]
-    if not participante and outros_ativos and not body.ajudar:
+    if not participante and outros_ativos and not body.ajudar and not retroativo:
         raise HTTPException(
             409,
             {
@@ -734,7 +757,12 @@ def iniciar_coleta(
         )
         db.add(participante)
     elif getattr(participante, "status", "finalizado") != "em_coleta":
-        raise HTTPException(409, "Sua participação nesta coleta já foi finalizada.")
+        if retroativo:
+            participante.status = "em_coleta"
+            participante.atualizado_em = datetime.now()
+            participante.atualizado_por_user_id = current_user.id
+        else:
+            raise HTTPException(409, "Sua participação nesta coleta já foi finalizada.")
     atualizar_status_execucao(execucao)
     db.commit()
     db.refresh(execucao)
@@ -802,6 +830,45 @@ def liberar_participacao(
     db.commit()
 
 
+def _criar_coleta_manual_delta(
+    db: Session,
+    *,
+    participante: ColetaExecucaoParticipante,
+    execucao: ColetaExecucao,
+    shopee: int,
+    mercado_livre: int,
+    avulso: int,
+    pacotes_g: int = 0,
+    g_shopee: int = 0,
+    g_ml: int = 0,
+    g_avulso: int = 0,
+) -> Coleta:
+    """Nova linha financeira só com o delta (acréscimo), sem sobrescrever lotes existentes."""
+    base = execucao.base_ref
+    valor = _valor_servicos(base, shopee, mercado_livre, avulso)
+    agora = datetime.now()
+    ts = datetime.combine(execucao.data_operacao, agora.time().replace(microsecond=0))
+    coleta = Coleta(
+        sub_base=participante.sub_base,
+        base=base.base,
+        username_entregador=participante.username,
+        origem="manual",
+        timestamp=ts,
+        execucao_id=execucao.id_execucao,
+        participante_id=participante.id_participante,
+        shopee=shopee,
+        mercado_livre=mercado_livre,
+        avulso=avulso,
+        pacotes_g=pacotes_g,
+        g_shopee=g_shopee,
+        g_ml=g_ml,
+        g_avulso=g_avulso,
+        valor_total=valor,
+    )
+    db.add(coleta)
+    return coleta
+
+
 @router.post("/manual", response_model=ExecucaoOut, status_code=201)
 def lancar_manual(
     body: ContribuicaoManualIn,
@@ -844,6 +911,56 @@ def lancar_manual(
             ColetaExecucaoParticipante.user_id == executor.id,
         )
     )
+    if body.acrescentar:
+        if body.sem_volume:
+            raise HTTPException(422, "Acréscimo não pode usar sem_volume.")
+        delta_s = int(body.shopee or 0)
+        delta_ml = int(body.mercado_livre or 0)
+        delta_a = int(body.avulso or 0)
+        if delta_s + delta_ml + delta_a <= 0:
+            raise HTTPException(422, "Informe a quantidade a acrescentar.")
+        participante = existente or ColetaExecucaoParticipante(
+            execucao_id=execucao.id_execucao,
+            sub_base=sub_base,
+            user_id=executor.id,
+            motoboy_id=motoboy_id,
+            username=executor.username,
+            atualizado_por_user_id=current_user.id,
+        )
+        if not existente:
+            db.add(participante)
+            db.flush()
+        participante.shopee = int(participante.shopee or 0) + delta_s
+        participante.mercado_livre = int(participante.mercado_livre or 0) + delta_ml
+        participante.avulso = int(participante.avulso or 0) + delta_a
+        participante.pacotes_g = int(participante.pacotes_g or 0) + int(body.pacotes_g or 0)
+        participante.g_shopee = int(participante.g_shopee or 0) + int(body.g_shopee or 0)
+        participante.g_ml = int(participante.g_ml or 0) + int(body.g_ml or 0)
+        participante.g_avulso = int(participante.g_avulso or 0) + int(body.g_avulso or 0)
+        participante.sem_volume = False
+        participante.client_request_id = body.client_request_id
+        participante.status = "finalizado"
+        participante.versao = int(participante.versao or 1) + 1
+        participante.atualizado_em = datetime.now()
+        participante.atualizado_por_user_id = current_user.id
+        db.flush()
+        atualizar_status_execucao(execucao)
+        _criar_coleta_manual_delta(
+            db,
+            participante=participante,
+            execucao=execucao,
+            shopee=delta_s,
+            mercado_livre=delta_ml,
+            avulso=delta_a,
+            pacotes_g=int(body.pacotes_g or 0),
+            g_shopee=int(body.g_shopee or 0),
+            g_ml=int(body.g_ml or 0),
+            g_avulso=int(body.g_avulso or 0),
+        )
+        db.commit()
+        db.refresh(execucao)
+        return _serializar_execucao(execucao, current_user, execucao.participantes)
+
     if existente and getattr(existente, "status", "finalizado") != "em_coleta":
         raise HTTPException(409, "Este usuário já lançou a coleta nesta base. Use Editar.")
     participante = existente or ColetaExecucaoParticipante(
