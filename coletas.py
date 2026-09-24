@@ -193,6 +193,45 @@ def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
 
     return should_store_qr_payload_raw(servico, qr_raw)
 
+
+def _normalize_item_coleta(item: ItemLote) -> ItemLote:
+    """
+    Revalida código/serviço com a mesma regra de entrada/saída.
+    Ignora o `servico` enviado pelo cliente (mobile antigo pode marcar
+    qualquer numérico 10+ dígitos como Mercado Livre).
+    """
+    from codigo_normalizer import canonicalize_servico, normalize_codigo
+
+    raw_codigo = (item.codigo or "").strip()
+    if not raw_codigo:
+        raise HTTPException(422, "Código inválido.")
+
+    codigo_norm, servico_norm, qr_from_norm = normalize_codigo(
+        raw_codigo, strict_qr=False
+    )
+    if codigo_norm is None or servico_norm is None:
+        qr_try = (getattr(item, "qr_payload_raw", None) or "").strip()
+        if qr_try and qr_try != raw_codigo:
+            codigo_norm, servico_norm, qr_from_norm = normalize_codigo(
+                qr_try, strict_qr=False
+            )
+
+    if codigo_norm is None or servico_norm is None:
+        raise HTTPException(
+            422,
+            f"Código inválido: '{raw_codigo}'. Use etiqueta Shopee, Mercado Livre, "
+            "telefone válido ou AVULSO-*.",
+        )
+
+    qr_raw = getattr(item, "qr_payload_raw", None) or qr_from_norm
+    qr_clean = qr_raw.strip() if isinstance(qr_raw, str) and qr_raw.strip() else None
+    return ItemLote(
+        codigo=codigo_norm,
+        servico=canonicalize_servico(servico_norm),
+        qr_payload_raw=qr_clean,
+        is_grande=bool(getattr(item, "is_grande", False)),
+    )
+
 def _sub_base_from_token_or_422(user: User) -> str:
     """
     Novo contrato: sub_base vem no JWT (auth stateless).
@@ -381,19 +420,19 @@ def registrar_coleta_em_lote(
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     valor_cobranca_owner = _decimal(getattr(owner, "valor", 0)) if owner else Decimal("0")
 
-    # 4) Normaliza itens e detecta duplicados no próprio payload (zero DB)
-    #    (você vai tratar duplicidade no front, mas aqui evita lixo óbvio e reduz queries)
-    norm_codes: List[str] = []
+    # 4) Normaliza códigos/serviço (mesma regra de entrada/saída) e detecta
+    #    duplicados no próprio payload. Não confiar no `servico` do cliente —
+    #    mobile antigo classifica qualquer \d{10,} como Mercado Livre.
+    itens_normalizados: List[ItemLote] = []
     seen = set()
     for it in payload.itens:
-        c = (it.codigo or "").strip()
-        if not c:
-            raise HTTPException(422, "Código inválido.")
-        if c in seen:
-            # Mantém comportamento de falhar, mas agora sem DB
-            raise HTTPException(409, f"Código '{c}' duplicado no lote.")
-        seen.add(c)
-        norm_codes.append(c)
+        item_norm = _normalize_item_coleta(it)
+        if item_norm.codigo in seen:
+            raise HTTPException(409, f"Código '{item_norm.codigo}' duplicado no lote.")
+        seen.add(item_norm.codigo)
+        itens_normalizados.append(item_norm)
+
+    norm_codes = [it.codigo for it in itens_normalizados]
 
     # 5) Checagem de duplicidade / upgrade de QR no banco
     from qr_payload_utils import (
@@ -413,9 +452,7 @@ def registrar_coleta_em_lote(
     )
     existing_by_codigo = {str(s.codigo): s for s in existing_rows}
 
-    items_by_codigo = {}
-    for it in payload.itens:
-        items_by_codigo[(it.codigo or "").strip()] = it
+    items_by_codigo = {it.codigo: it for it in itens_normalizados}
 
     codigos_qr_atualizados: List[str] = []
     qr_alerta_lote = False
@@ -464,9 +501,8 @@ def registrar_coleta_em_lote(
     # Apenas upgrades (nenhum código novo no lote)
     novos_itens = [
         it
-        for it in payload.itens
-        if (it.codigo or "").strip() not in existing_by_codigo
-        or (it.codigo or "").strip() in etiquetado_codigos
+        for it in itens_normalizados
+        if it.codigo not in existing_by_codigo or it.codigo in etiquetado_codigos
     ]
 
     if truly_dup and not novos_itens and not codigos_qr_atualizados:
