@@ -94,3 +94,11 @@ def test_volume_coletados_ou_entrada_casos():
         )
         == 468
     )
+
+
+def test_volume_por_marketplace_aproximado():
+    from acompanhamento_volume_service import volume_por_marketplace_aproximado
+
+    assert volume_por_marketplace_aproximado(252, 0) == 252
+    assert volume_por_marketplace_aproximado(0, 10) == 10
+    assert volume_por_marketplace_aproximado(10, 5) == 15

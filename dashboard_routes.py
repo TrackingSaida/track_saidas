@@ -45,6 +45,7 @@ from entrada_na_base_utils import (
     listar_ainda_na_base,
     listar_cancelados_apos_entrada,
 )
+from acompanhamento_volume_service import calcular_volume_que_entrou
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -1018,6 +1019,9 @@ class DashboardEntradaOut(BaseModel):
     taxa_saida_pct: float
     gap_entrada_saida: int
     por_marketplace: List[DashboardEntradaMarketplaceOut]
+    # Coletas ∪ Entradas — mesmo denominador do Acompanhamento / card unificado mobile.
+    volume_que_entrou: int = 0
+    total_coletas: int = 0
 
 
 class DashboardSaidasResponse(BaseModel):
@@ -1232,14 +1236,21 @@ def get_dashboard_saidas(
         pct_nb_shopee = round(nb_shopee / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
         pct_nb_ml = round(nb_ml / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
         pct_nb_avulso = round(nb_avulso / ainda_na_base * 100, 1) if ainda_na_base > 0 else 0.0
-        taxa_saida_pct = round((total_saidas / total_entradas) * 100, 1) if total_entradas > 0 else 0.0
-        gap_entrada_saida = total_entradas - total_saidas
         pct_e_shopee = round(ent_shopee / total_entradas * 100, 1) if total_entradas > 0 else 0.0
         pct_e_ml = round(ent_ml / total_entradas * 100, 1) if total_entradas > 0 else 0.0
         pct_e_avulso = round(ent_avulso / total_entradas * 100, 1) if total_entradas > 0 else 0.0
         pct_c_shopee = round(canc_shopee / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
         pct_c_ml = round(canc_ml / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
         pct_c_avulso = round(canc_avulso / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
+
+        volume_que_entrou, total_coletas_vol, _ = calcular_volume_que_entrou(
+            db, sub_base, data_inicio, data_fim
+        )
+        taxa_saida_pct = (
+            round((total_saidas / volume_que_entrou) * 100, 1) if volume_que_entrou > 0 else 0.0
+        )
+        gap_entrada_saida = volume_que_entrou - total_saidas
+
         entrada_out = DashboardEntradaOut(
             total_entradas=total_entradas,
             ainda_na_base=ainda_na_base,
@@ -1263,6 +1274,8 @@ def get_dashboard_saidas(
                 DashboardEntradaMarketplaceOut(nome="Mercado Livre", qty=ent_ml, pct=pct_e_ml),
                 DashboardEntradaMarketplaceOut(nome="Avulso", qty=ent_avulso, pct=pct_e_avulso),
             ],
+            volume_que_entrou=volume_que_entrou,
+            total_coletas=total_coletas_vol,
         )
 
     evolucao_diaria = [
