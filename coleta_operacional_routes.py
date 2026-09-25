@@ -59,6 +59,13 @@ def _sub_base(db: Session, current_user: User) -> str:
     return _resolve_user_sub_base(db, current_user)
 
 
+def _admin(current_user: User) -> bool:
+    try:
+        return int(current_user.role) in ADMIN_ROLES
+    except (TypeError, ValueError):
+        return False
+
+
 def _exigir_sem_volume_permitido(current_user: User) -> None:
     """Marcar sem volume: Root/Admin/Operador (0/1/2). Coletador e motoboy: 403."""
     if not _admin(current_user):
