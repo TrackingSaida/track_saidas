@@ -1,8 +1,9 @@
 # base.py
 from __future__ import annotations
 
-from typing import Optional, List, Dict
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,6 +11,13 @@ from sqlalchemy.orm import Session
 from db import get_db
 from auth import get_current_user
 from models import User, BasePreco, BaseSellerDados, MotoboySubBase  # classe do models.py com __tablename__ = "base"
+from base_import_service import (
+    MODELO_FILENAME,
+    XLSX_MEDIA_TYPE,
+    confirmar_importacao,
+    gerar_modelo_xlsx,
+    preview_importacao,
+)
 
 router = APIRouter(prefix="/base", tags=["Base"])
 
@@ -71,6 +79,10 @@ class BaseUpdate(BaseModel):
             raise ValueError("dias_coleta deve conter dias ISO entre 1 e 7")
         return dias
     model_config = ConfigDict(from_attributes=True)
+
+
+class BaseImportConfirmIn(BaseModel):
+    linhas: List[Dict[str, Any]] = Field(default_factory=list)
 
 # =========================
 # Helper
@@ -286,6 +298,51 @@ def list_bases(
         _base_to_out(r, enderecos.get(int(r.id_base)))
         for r in rows
     ]
+
+
+# =========================
+# Importação em massa (PRD-002) — rotas estáticas antes de /{id_base}
+# =========================
+@router.get("/import/modelo")
+def baixar_modelo_import_bases(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Garante sessão válida / sub_base (mesmo escopo do create)
+    _resolve_user_sub_base(db, current_user)
+    content = gerar_modelo_xlsx()
+    return Response(
+        content=content,
+        media_type=XLSX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{MODELO_FILENAME}"',
+        },
+    )
+
+
+@router.post("/import/preview")
+async def preview_import_bases(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base_user = _resolve_user_sub_base(db, current_user)
+    filename = (file.filename or "").lower()
+    if filename and not filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx.")
+    content = await file.read()
+    return preview_importacao(db, sub_base_user, content)
+
+
+@router.post("/import/confirmar")
+def confirmar_import_bases(
+    body: BaseImportConfirmIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub_base_user = _resolve_user_sub_base(db, current_user)
+    return confirmar_importacao(db, sub_base_user, current_user, body.linhas)
+
 
 # =========================
 # GET /base/{id_base}
