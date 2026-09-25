@@ -4,7 +4,7 @@ Prefixo: /acompanhamento
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time
 from typing import Optional, List, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from conferencia_saida_pure import filtrar_status_conferencia
 from db import get_db
 from auth import get_current_user
-from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy, Owner, RotasMotoboy
+from models import User, Saida, SaidaDetail, SaidaHistorico, Motoboy, Owner, RotasMotoboy, Coleta
 from saidas_routes import (
     normalizar_status_saida,
     STATUS_SAIU_PARA_ENTREGA,
@@ -28,7 +28,7 @@ from saida_operacional_utils import (
     carregar_saidas_candidatas_periodo,
     filtrar_saidas_por_periodo_operacional,
 )
-from entrada_na_base_utils import listar_ainda_na_base
+from acompanhamento_entradas_pure import volume_coletados_ou_entrada
 
 router = APIRouter(prefix="/acompanhamento", tags=["Acompanhamento"])
 
@@ -350,25 +350,59 @@ def acompanhamento_dia(
     saidas_count: Optional[int] = None
     pct_saida: Optional[float] = None
     if entrada_habilitada:
-        ids_entrada_base = set(
-            db.scalars(
-                select(SaidaHistorico.id_saida)
-                .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
-                .where(Saida.sub_base == sub_base)
-                .where(SaidaHistorico.evento == "entrada_base")
-                .where(func.date(SaidaHistorico.timestamp) >= inicio)
-                .where(func.date(SaidaHistorico.timestamp) <= fim)
-            ).all()
-        )
-        # Unifica com estoque dos indicadores: NA_BASE + coletado no período.
-        ids_estoque = {
-            int(s.id_saida)
-            for s in listar_ainda_na_base(
-                db, sub_base, inicio, fim, incluir_coletado=True
+        # Paridade Indicadores: Entradas = Coletados OU Entrada (não estoque residual).
+        dt_start = datetime.combine(inicio, time.min)
+        dt_end = datetime.combine(fim, time(23, 59, 59))
+
+        # Mesma regra do card Indicadores → Entradas (1ª entrada_base no período).
+        rows_entrada = db.execute(
+            select(SaidaHistorico.id_saida, SaidaHistorico.timestamp)
+            .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
+            .where(Saida.sub_base == sub_base)
+            .where(SaidaHistorico.evento == "entrada_base")
+            .where(SaidaHistorico.timestamp >= dt_start)
+            .where(SaidaHistorico.timestamp <= dt_end)
+        ).all()
+        ids_entrada: set[int] = set()
+        for id_saida, _ts in rows_entrada:
+            if id_saida is not None:
+                ids_entrada.add(int(id_saida))
+
+        # Mesma regra do card Indicadores → Coletas (soma volumes na tabela Coleta).
+        rows_coletas = db.scalars(
+            select(Coleta)
+            .where(Coleta.sub_base == sub_base)
+            .where(Coleta.timestamp >= dt_start)
+            .where(Coleta.timestamp <= dt_end)
+            .where(
+                (Coleta.shopee != 0)
+                | (Coleta.mercado_livre != 0)
+                | (Coleta.avulso != 0)
+                | (Coleta.valor_total != 0)
             )
-            if getattr(s, "id_saida", None) is not None
-        }
-        entradas_count = len(ids_entrada_base | ids_estoque)
+        ).all()
+        total_coletas = sum(
+            (c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0) for c in rows_coletas
+        )
+        ids_coleta_periodo = {int(c.id_coleta) for c in rows_coletas if c.id_coleta is not None}
+        ids_coleta_pacotes: set[int] = set()
+        if ids_coleta_periodo:
+            ids_coleta_pacotes = {
+                int(sid)
+                for sid in db.scalars(
+                    select(Saida.id_saida).where(
+                        Saida.sub_base == sub_base,
+                        Saida.id_coleta.in_(ids_coleta_periodo),
+                    )
+                ).all()
+                if sid is not None
+            }
+
+        entradas_count = volume_coletados_ou_entrada(
+            total_coletas=total_coletas,
+            ids_entrada=ids_entrada,
+            ids_coleta_pacotes=ids_coleta_pacotes,
+        )
         saidas_count = int(
             db.scalar(
                 select(func.count())

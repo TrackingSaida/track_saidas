@@ -59,11 +59,10 @@ def _sub_base(db: Session, current_user: User) -> str:
     return _resolve_user_sub_base(db, current_user)
 
 
-def _admin(current_user: User) -> bool:
-    try:
-        return int(current_user.role) in ADMIN_ROLES
-    except (TypeError, ValueError):
-        return False
+def _exigir_sem_volume_permitido(current_user: User) -> None:
+    """Marcar sem volume: Root/Admin/Operador (0/1/2). Coletador e motoboy: 403."""
+    if not _admin(current_user):
+        raise HTTPException(403, "Somente root, admin ou operador pode marcar coleta sem volume.")
 
 
 def _root_admin(current_user: User) -> bool:
@@ -520,7 +519,8 @@ def consultar_situacao_bases(
         "resumo": {
             "pendentes": sum(item["status"] == "pendente" for item in itens),
             "em_coleta": sum(item["status"] == "em_coleta" for item in itens),
-            "coletadas": sum(item["status"] in ("coletado", "sem_volume") for item in itens),
+            "sem_volume": sum(item["status"] == "sem_volume" for item in itens),
+            "coletadas": sum(item["status"] == "coletado" for item in itens),
         },
         "itens": itens,
     }
@@ -878,6 +878,8 @@ def lancar_manual(
     sub_base = _sub_base(db, current_user)
     exigir_modo(db, sub_base, "coleta_manual")
     _validar_data_edicao(current_user, body.data_operacao, body.origem_cliente)
+    if body.sem_volume:
+        _exigir_sem_volume_permitido(current_user)
     if body.client_request_id:
         existente_request = db.scalar(
             select(ColetaExecucaoParticipante).where(
@@ -1021,6 +1023,8 @@ def editar_participante(
     )
     for campo in ("shopee", "mercado_livre", "avulso", "pacotes_g", "g_shopee", "g_ml", "g_avulso"):
         setattr(participante, campo, getattr(body, campo))
+    if body.sem_volume:
+        _exigir_sem_volume_permitido(current_user)
     participante.sem_volume = body.sem_volume
     participante.versao += 1
     participante.atualizado_em = datetime.now()

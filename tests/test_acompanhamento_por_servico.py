@@ -45,7 +45,52 @@ def test_por_servico_breakdown_conta_status_por_marketplace():
 
 
 def test_entradas_uniao_entrada_base_e_estoque():
-    """Simula a união usada em /acompanhamento/dia (sem DB)."""
-    ids_entrada_base = {1, 2}
-    ids_estoque = {2, 3}  # 3 = coletado sem entrada_base
-    assert len(ids_entrada_base | ids_estoque) == 3
+    """Legado: união com estoque — substituído por Coletados OU Entrada (PRD-003)."""
+    from acompanhamento_entradas_pure import volume_coletados_ou_entrada
+
+    # Só coleta por código (100 pacotes), 0 entrada, sem estoque residual
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=100,
+            ids_entrada=[],
+            ids_coleta_pacotes=range(1, 101),
+        )
+        == 100
+    )
+
+
+def test_volume_coletados_ou_entrada_casos():
+    from acompanhamento_entradas_pure import volume_coletados_ou_entrada
+
+    # Só entrada_base
+    assert volume_coletados_ou_entrada(total_coletas=0, ids_entrada={1, 2, 3}, ids_coleta_pacotes=[]) == 3
+
+    # Coleta + entrada no mesmo pacote: conta uma vez (OU)
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=2,
+            ids_entrada={1, 2},
+            ids_coleta_pacotes={2, 3},
+        )
+        == 3
+    )
+
+    # Coleta manual (sem Saida) + entradas: soma excesso agregado
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=50,
+            ids_entrada={10, 11},
+            ids_coleta_pacotes=[],
+        )
+        == 52
+    )
+
+    # Pacotes já saídos continuam no denominador (ids_coleta independe de status atual)
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=468,
+            ids_entrada=set(),
+            ids_coleta_pacotes=range(1, 469),
+        )
+        == 468
+    )
