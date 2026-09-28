@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
+from base_fechamento_status_pure import status_base_bloqueia_edicao_coleta
 from coleta_operacional_service import (
     atualizar_status_execucao,
     obter_ou_criar_execucao,
@@ -30,6 +31,7 @@ from models import (
     SaidaHistorico,
     User,
 )
+from entregador_fechamento_status_pure import STATUS_PAGO, normalizar_status_fechamento
 from saidas_listar_service import invalidate_listar_cache
 
 ROOT_ADMIN_ROLES = {0, 1}
@@ -200,29 +202,34 @@ def _garantir_nao_fechado(
     data_operacao: date,
     motoboy_id: Optional[int],
 ) -> None:
-    fechamento_base = db.scalar(
-        select(BaseFechamento.id_fechamento).where(
+    """Fechamentos GERADO/REAJUSTADO aceitam ajuste; RECEBIDO (base) ou PAGO (motoboy) não."""
+    status_base = db.scalars(
+        select(BaseFechamento.status).where(
             BaseFechamento.sub_base == sub_base,
             func.upper(BaseFechamento.base) == base_nome.upper(),
             BaseFechamento.periodo_inicio <= data_operacao,
             BaseFechamento.periodo_fim >= data_operacao,
         )
-    )
-    fechamento_motoboy = None
+    ).all()
+    if any(status_base_bloqueia_edicao_coleta(st) for st in status_base):
+        raise HTTPException(
+            409,
+            "A coleta pertence a um período com fechamento já recebido e não pode mais ser alterada.",
+        )
     if motoboy_id:
-        fechamento_motoboy = db.scalar(
-            select(EntregadorFechamento.id_fechamento).where(
+        status_motoboy = db.scalars(
+            select(EntregadorFechamento.status).where(
                 EntregadorFechamento.sub_base == sub_base,
                 EntregadorFechamento.id_motoboy == motoboy_id,
                 EntregadorFechamento.periodo_inicio <= data_operacao,
                 EntregadorFechamento.periodo_fim >= data_operacao,
             )
-        )
-    if fechamento_base or fechamento_motoboy:
-        raise HTTPException(
-            409,
-            "A coleta pertence a um período com fechamento gerado e não pode mais ser alterada.",
-        )
+        ).all()
+        if any(normalizar_status_fechamento(st) == STATUS_PAGO for st in status_motoboy):
+            raise HTTPException(
+                409,
+                "A coleta pertence a um período com fechamento do entregador já pago e não pode mais ser alterada.",
+            )
 
 
 def avaliar_remocao(
