@@ -33,6 +33,7 @@ from models import (
     User,
 )
 
+from base_fechamento_status_pure import status_base_permite_reajuste
 from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
 
 router = APIRouter(prefix="/fechamentos", tags=["Fechamentos Bases"])
@@ -1036,8 +1037,17 @@ def obter_fechamento(
     itens_rec, valor_bruto_rec, valor_cancelados_rec, valor_final_rec = _build_itens_e_valores(
         db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim
     )
-    valor_final_esperado = (fech.valor_bruto - fech.valor_cancelados + (fech.valor_adicao or Decimal("0")) - (fech.valor_subtracao or Decimal("0"))).quantize(Decimal("0.01"))
-    if valor_bruto_rec != fech.valor_bruto or valor_cancelados_rec != fech.valor_cancelados:
+    g_gravado = (total_g_shopee, total_g_ml, total_g_avulso)
+    g_rec = (
+        sum(x.get("g_shopee", 0) for x in itens_rec),
+        sum(x.get("g_ml", 0) for x in itens_rec),
+        sum(x.get("g_avulso", 0) for x in itens_rec),
+    )
+    if (
+        valor_bruto_rec != fech.valor_bruto
+        or valor_cancelados_rec != fech.valor_cancelados
+        or g_rec != g_gravado
+    ):
         divergencia = True
         valor_final_rec = (valor_bruto_rec - valor_cancelados_rec + (fech.valor_adicao or Decimal("0")) - (fech.valor_subtracao or Decimal("0"))).quantize(Decimal("0.01"))
 
@@ -1090,12 +1100,10 @@ def atualizar_fechamento(
     fech = db.get(BaseFechamento, id_fechamento)
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
-    raise HTTPException(
-        409,
-        "Fechamentos gerados são imutáveis. Resolva os lançamentos antes de gerar o fechamento.",
-    )
-    if (fech.status or "").upper() != STATUS_GERADO:
-        raise HTTPException(400, "Apenas fechamentos com status GERADO podem ser reajustados.")
+    if not status_base_permite_reajuste(fech.status):
+        if (fech.status or "").strip().upper() == STATUS_RECEBIDO:
+            raise HTTPException(409, "Fechamentos já recebidos não podem ser reajustados.")
+        raise HTTPException(400, "Apenas fechamentos com status GERADO ou REAJUSTADO podem ser reajustados.")
 
     try:
         p_s, p_m, p_a = _get_precos_cached(db, sub_base, fech.base)

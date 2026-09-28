@@ -7,7 +7,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,16 +27,15 @@ from coleta_operacional_service import (
 )
 from db import get_db
 from models import (
-    BaseFechamento,
     BasePreco,
     Coleta,
     ColetaCalendarioExcecao,
     ColetaExecucao,
     ColetaExecucaoParticipante,
-    EntregadorFechamento,
     User,
 )
 from coleta_leituras_service import (
+    _garantir_nao_fechado,
     listar_leituras,
     remover_leitura,
     resumo_base_dia,
@@ -106,39 +105,6 @@ def _validar_data_edicao(current_user: User, data_operacao: date, origem_cliente
 
 def _quantidade_total(obj) -> int:
     return int(obj.shopee or 0) + int(obj.mercado_livre or 0) + int(obj.avulso or 0)
-
-
-def _garantir_nao_fechado(
-    db: Session,
-    *,
-    sub_base: str,
-    base_nome: str,
-    data_operacao: date,
-    motoboy_id: Optional[int],
-) -> None:
-    fechamento_base = db.scalar(
-        select(BaseFechamento.id_fechamento).where(
-            BaseFechamento.sub_base == sub_base,
-            func.upper(BaseFechamento.base) == base_nome.upper(),
-            BaseFechamento.periodo_inicio <= data_operacao,
-            BaseFechamento.periodo_fim >= data_operacao,
-        )
-    )
-    fechamento_motoboy = None
-    if motoboy_id:
-        fechamento_motoboy = db.scalar(
-            select(EntregadorFechamento.id_fechamento).where(
-                EntregadorFechamento.sub_base == sub_base,
-                EntregadorFechamento.id_motoboy == motoboy_id,
-                EntregadorFechamento.periodo_inicio <= data_operacao,
-                EntregadorFechamento.periodo_fim >= data_operacao,
-            )
-        )
-    if fechamento_base or fechamento_motoboy:
-        raise HTTPException(
-            409,
-            "A coleta pertence a um período com fechamento gerado e não pode mais ser alterada.",
-        )
 
 
 class ContribuicaoManualIn(BaseModel):
