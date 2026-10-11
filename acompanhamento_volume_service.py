@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
-from typing import Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -71,6 +71,25 @@ def coletas_periodo(
             if sid is not None
         }
     return total_coletas, ids_pacotes
+
+
+def pacotes_coletados_por_leitura_periodo(
+    db: Session, sub_base: str, inicio: date, fim: date
+) -> Dict[int, Optional[str]]:
+    """{id_saida: servico} dos pacotes vinculados às coletas do período (coleta manual não tem pacote)."""
+    dt_start, dt_end = _bounds_dia(inicio, fim)
+    ids_coleta = select(Coleta.id_coleta).where(
+        Coleta.sub_base == sub_base,
+        Coleta.timestamp >= dt_start,
+        Coleta.timestamp <= dt_end,
+    )
+    rows = db.execute(
+        select(Saida.id_saida, Saida.servico).where(
+            Saida.sub_base == sub_base,
+            Saida.id_coleta.in_(ids_coleta),
+        )
+    ).all()
+    return {int(sid): servico for sid, servico in rows if sid is not None}
 
 
 def calcular_volume_que_entrou(

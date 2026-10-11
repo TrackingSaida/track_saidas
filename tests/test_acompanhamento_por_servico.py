@@ -102,3 +102,17 @@ def test_volume_por_marketplace_aproximado():
     assert volume_por_marketplace_aproximado(252, 0) == 252
     assert volume_por_marketplace_aproximado(0, 10) == 10
     assert volume_por_marketplace_aproximado(10, 5) == 15
+
+
+def test_volume_entrou_por_leitura_ignora_coleta_manual_e_nao_duplica():
+    from acompanhamento_entradas_pure import volume_entrou_por_leitura
+
+    # Só coleta manual (sem pacotes) + entradas: conta apenas as entradas.
+    assert volume_entrou_por_leitura(ids_entrada={1, 2, 3}, ids_coleta_pacotes=[]) == (3, set())
+
+    # Pacote coletado por leitura e depois com entrada conta uma vez.
+    volume, so_coleta = volume_entrou_por_leitura(ids_entrada=[1, 2, 3], ids_coleta_pacotes=[2, 3, 4, 5])
+    assert volume == 5
+    assert so_coleta == {4, 5}
+
+    assert volume_entrou_por_leitura(ids_entrada=[], ids_coleta_pacotes=[7, 7, 8]) == (2, {7, 8})

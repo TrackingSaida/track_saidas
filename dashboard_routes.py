@@ -45,7 +45,11 @@ from entrada_na_base_utils import (
     listar_ainda_na_base,
     listar_cancelados_apos_entrada,
 )
-from acompanhamento_volume_service import calcular_volume_que_entrou
+from acompanhamento_entradas_pure import volume_entrou_por_leitura
+from acompanhamento_volume_service import (
+    calcular_volume_que_entrou,
+    pacotes_coletados_por_leitura_periodo,
+)
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -1019,9 +1023,13 @@ class DashboardEntradaOut(BaseModel):
     taxa_saida_pct: float
     gap_entrada_saida: int
     por_marketplace: List[DashboardEntradaMarketplaceOut]
-    # Coletas ∪ Entradas — mesmo denominador do Acompanhamento / card unificado mobile.
+    # Pacotes lidos: Entradas ∪ Coletas por leitura, sem coleta manual (card "Total que entrou").
     volume_que_entrou: int = 0
+    # Soma agregada das coletas, inclusive manuais.
     total_coletas: int = 0
+    # Coletados por leitura sem entrada no período: coletas_sem_entrada + total_entradas = volume_que_entrou.
+    coletas_sem_entrada: int = 0
+    volume_que_entrou_por_marketplace: List[DashboardEntradaMarketplaceOut] = []
 
 
 class DashboardSaidasResponse(BaseModel):
@@ -1243,9 +1251,19 @@ def get_dashboard_saidas(
         pct_c_ml = round(canc_ml / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
         pct_c_avulso = round(canc_avulso / cancelados_apos_entrada * 100, 1) if cancelados_apos_entrada > 0 else 0.0
 
-        volume_que_entrou, total_coletas_vol, _ = calcular_volume_que_entrou(
-            db, sub_base, data_inicio, data_fim
+        _, total_coletas_vol, _ = calcular_volume_que_entrou(db, sub_base, data_inicio, data_fim)
+        coletados_leitura = pacotes_coletados_por_leitura_periodo(db, sub_base, data_inicio, data_fim)
+        volume_que_entrou, ids_coleta_sem_entrada = volume_entrou_por_leitura(
+            ids_entrada=primeira_entrada.keys(),
+            ids_coleta_pacotes=coletados_leitura.keys(),
         )
+        vol_mp = {"shopee": ent_shopee, "mercado_livre": ent_ml, "avulso": ent_avulso}
+        for sid in ids_coleta_sem_entrada:
+            vol_mp[_classify_servico(coletados_leitura.get(sid))] += 1
+
+        def _pct_vol(qty: int) -> float:
+            return round(qty / volume_que_entrou * 100, 1) if volume_que_entrou > 0 else 0.0
+
         taxa_saida_pct = (
             round((total_saidas / volume_que_entrou) * 100, 1) if volume_que_entrou > 0 else 0.0
         )
@@ -1276,6 +1294,14 @@ def get_dashboard_saidas(
             ],
             volume_que_entrou=volume_que_entrou,
             total_coletas=total_coletas_vol,
+            coletas_sem_entrada=len(ids_coleta_sem_entrada),
+            volume_que_entrou_por_marketplace=[
+                DashboardEntradaMarketplaceOut(nome="Shopee", qty=vol_mp["shopee"], pct=_pct_vol(vol_mp["shopee"])),
+                DashboardEntradaMarketplaceOut(
+                    nome="Mercado Livre", qty=vol_mp["mercado_livre"], pct=_pct_vol(vol_mp["mercado_livre"])
+                ),
+                DashboardEntradaMarketplaceOut(nome="Avulso", qty=vol_mp["avulso"], pct=_pct_vol(vol_mp["avulso"])),
+            ],
         )
 
     evolucao_diaria = [
