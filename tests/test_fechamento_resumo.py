@@ -1,7 +1,7 @@
 """Agregação do resumo de fechamento (mesmo recorte do relatório)."""
 from decimal import Decimal
 
-from fechamento_resumo_utils import agregar_resumo_fechamento
+from fechamento_resumo_utils import agregar_resumo_fechamento, base_filtro_ativo, saida_pertence_base
 
 
 def test_resumo_exemplo_relatorio():
@@ -75,3 +75,23 @@ def test_resumo_vazio():
     assert resumo["valor_bruto"] == Decimal("0.00")
     assert resumo["ajustes"] == Decimal("0.00")
     assert resumo["por_servico"]["flex"]["feitos"] == 0
+
+
+def test_base_filtro_vazio_ou_todas_nao_filtra():
+    for valor in (None, "", "   ", "(Todas)", "(todas)"):
+        assert base_filtro_ativo(valor) is None
+        assert saida_pertence_base("CENTRO", base_filtro_ativo(valor)) is True
+        assert saida_pertence_base(None, base_filtro_ativo(valor)) is True
+
+
+def test_base_filtro_ignora_acento_maiuscula_e_espacos():
+    alvo = base_filtro_ativo("  São José ")
+    assert saida_pertence_base("SAO JOSE", alvo) is True
+    assert saida_pertence_base("são josé", alvo) is True
+
+
+def test_base_filtro_exclui_outra_base_e_sem_base():
+    alvo = base_filtro_ativo("Centro")
+    assert saida_pertence_base("Centro Sul", alvo) is False
+    assert saida_pertence_base(None, alvo) is False
+    assert saida_pertence_base("", alvo) is False
