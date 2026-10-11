@@ -214,6 +214,34 @@ class MotoboySubBase(Base):
 
 
 # ==========================
+# Tabela: motoboy_convite (PRD-004)
+# ==========================
+class MotoboyConvite(Base):
+    __tablename__ = "motoboy_convite"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    token = Column(Text, nullable=False, unique=True)
+    criado_por_user_id = Column(BigInteger, nullable=True)
+    expira_em = Column(DateTime(timezone=False), nullable=False)
+    limite_usos = Column(Integer, nullable=True)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class MotoboyCadastroConvite(Base):
+    __tablename__ = "motoboy_cadastro_convite"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    convite_id = Column(BigInteger, ForeignKey("motoboy_convite.id", ondelete="CASCADE"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    ip_origem = Column(Text, nullable=True)
+    aceite_privacidade_em = Column(DateTime(timezone=False), nullable=False)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+# ==========================
 # Tabela: coletas
 # ==========================
 class Coleta(Base):

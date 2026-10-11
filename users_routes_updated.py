@@ -27,6 +27,7 @@ from leitura_manual_auth import (
     sync_motoboy_avulso_legado,
 )
 from base import _resolve_user_sub_base
+from motoboy_cadastro_service import PERMISSOES_MOTOBOY as _PERMISSOES_MOTOBOY, adicionar_registro_motoboy
 
 router = APIRouter(prefix="/users", tags=["Users"])
 logger = logging.getLogger("routes.users")
@@ -654,83 +655,14 @@ def create_user(
         db.flush()
 
         if body.role == 4:
-            # Defaults oficiais do Owner (Políticas gerais); body sobrescreve se enviado
-            def_coleta = bool(getattr(owner, "default_pode_realizar_coleta", False))
-            def_saida = bool(getattr(owner, "default_pode_ler_saida", True))
-            def_digitar = bool(getattr(owner, "default_pode_digitar_codigo_manual", False))
-            def_avulso = bool(getattr(owner, "default_pode_lancar_avulso", True))
-            def_avulso_coleta = bool(getattr(owner, "default_pode_criar_avulso_coleta", def_avulso))
-            def_avulso_saida = bool(getattr(owner, "default_pode_criar_avulso_saida", def_avulso))
-            def_foto = bool(getattr(owner, "default_avulso_exige_foto", True))
-
-            pode_ler_coleta = body.pode_ler_coleta if body.pode_ler_coleta is not None else def_coleta
-            pode_realizar_coleta = (
-                body.pode_realizar_coleta
-                if body.pode_realizar_coleta is not None
-                else (pode_ler_coleta if body.pode_ler_coleta is not None else def_coleta)
-            )
-            pode_ler_saida = body.pode_ler_saida if body.pode_ler_saida is not None else def_saida
-            pode_digitar_codigo_manual = (
-                body.pode_digitar_codigo_manual if body.pode_digitar_codigo_manual is not None else def_digitar
-            )
-            pode_criar_avulso_coleta = (
-                body.pode_criar_avulso_coleta
-                if body.pode_criar_avulso_coleta is not None
-                else (
-                    body.pode_lancar_avulso
-                    if body.pode_lancar_avulso is not None
-                    else def_avulso_coleta
-                )
-            )
-            pode_criar_avulso_saida = (
-                body.pode_criar_avulso_saida
-                if body.pode_criar_avulso_saida is not None
-                else (
-                    body.pode_lancar_avulso
-                    if body.pode_lancar_avulso is not None
-                    else def_avulso_saida
-                )
-            )
-            pode_lancar_avulso = bool(pode_criar_avulso_coleta or pode_criar_avulso_saida)
-            avulso_exige_foto = (
-                bool(body.avulso_exige_foto) if body.avulso_exige_foto is not None else def_foto
-            )
-            if not pode_lancar_avulso:
-                avulso_exige_foto = False
-            if owner.ignorar_coleta:
-                pode_ler_coleta = False
-                pode_realizar_coleta = False
-
-            motoboy = Motoboy(
-                user_id=new_user.id,
+            adicionar_registro_motoboy(
+                db,
+                user=new_user,
+                owner=owner,
                 sub_base=sub_base,
-                documento=(body.documento or "").strip(),
-                cnpj=(body.cnpj or "").strip(),
-                chave_pix=(body.chave_pix or "").strip() or None,
-                rua=(body.rua or "").strip(),
-                numero=(body.numero or "").strip(),
-                complemento=(body.complemento or "").strip() or None,
-                bairro=(body.bairro or "").strip(),
-                cidade=(body.cidade or "").strip(),
-                estado=(body.estado or "").strip() or None,
-                cep=(body.cep or "").strip(),
-                ativo=True,
-                data_cadastro=date.today(),
-                pode_ler_coleta=pode_ler_coleta,
-                pode_realizar_coleta=pode_realizar_coleta,
-                pode_ler_saida=pode_ler_saida,
-                pode_digitar_codigo_manual=pode_digitar_codigo_manual,
-                pode_lancar_avulso=pode_lancar_avulso,
-                pode_criar_avulso_coleta=bool(pode_criar_avulso_coleta),
-                pode_criar_avulso_saida=bool(pode_criar_avulso_saida),
-                avulso_exige_foto=avulso_exige_foto,
-                claims_version=0,
+                dados=body.model_dump(),
+                overrides=body.model_dump(include=set(_PERMISSOES_MOTOBOY)),
             )
-            db.add(motoboy)
-            db.flush()
-
-            sb = MotoboySubBase(motoboy_id=motoboy.id_motoboy, sub_base=sub_base, ativo=True)
-            db.add(sb)
 
         db.commit()
         db.refresh(new_user)
