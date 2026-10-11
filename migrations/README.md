@@ -1,5 +1,14 @@
 # Migrações
 
+## motoboy_convite_cadastro.sql
+
+Obrigatória antes do deploy do autocadastro de motoboy por link de convite (PRD-004).
+Cria `motoboy_convite` e `motoboy_cadastro_convite` (log). Aditiva e idempotente.
+
+```bash
+psql "$DATABASE_URL" -f migrations/motoboy_convite_cadastro.sql
+```
+
 ## portal_seller_etiquetas.sql
 
 Obrigatória para o Portal do Seller (PRD-001): área de cobertura, auditoria de envio próprio, limites e `seller_portal_access`.

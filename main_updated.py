@@ -204,6 +204,10 @@ from mobile_push_routes import router as mobile_push_router
 from avisos_routes import router as avisos_router, mobile_router as avisos_mobile_router
 from mobile_fechamentos_routes import router as mobile_fechamentos_router
 from mobile_app_version_routes import router as mobile_app_version_router
+from motoboy_convite_routes import (
+    admin_router as motoboy_convite_admin_router,
+    public_router as motoboy_convite_public_router,
+)
 
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
@@ -236,6 +240,8 @@ app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
 app.include_router(signup_router, prefix=API_PREFIX)
+app.include_router(motoboy_convite_public_router, prefix=API_PREFIX)
+app.include_router(motoboy_convite_admin_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
 app.include_router(config_campos_obrigatorios_router, prefix=API_PREFIX)
