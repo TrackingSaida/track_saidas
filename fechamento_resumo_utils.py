@@ -1,10 +1,29 @@
 """Agregação do resumo de fechamento (mesmo recorte do relatório)."""
 from __future__ import annotations
 
+import unicodedata
 from decimal import Decimal
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 _ZERO = Decimal("0.00")
+
+
+def _norm_base(value: Optional[str]) -> str:
+    return unicodedata.normalize("NFD", (value or "").strip().lower()).encode("ascii", "ignore").decode("ascii")
+
+
+def base_filtro_ativo(base: Optional[str]) -> Optional[str]:
+    """Retorna a base normalizada do filtro, ou None quando o filtro abrange todas."""
+    alvo = _norm_base(base)
+    if not alvo or alvo == "(todas)":
+        return None
+    return alvo
+
+
+def saida_pertence_base(base_saida: Optional[str], base_filtro_norm: Optional[str]) -> bool:
+    if base_filtro_norm is None:
+        return True
+    return _norm_base(base_saida) == base_filtro_norm
 
 
 def _dec(v: Any) -> Decimal:
