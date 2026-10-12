@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -26,6 +26,7 @@ from coleta_operacional_service import (
     resolver_executor,
 )
 from db import get_db
+from pacote_g_categorias import garantir_categoria_padrao, normalizar_g_categorias
 from models import (
     BasePreco,
     Coleta,
@@ -114,6 +115,32 @@ def _quantidade_total(obj) -> int:
     return int(obj.shopee or 0) + int(obj.mercado_livre or 0) + int(obj.avulso or 0)
 
 
+class GCategoriaQtdIn(BaseModel):
+    categoria_g_id: int
+    shopee: int = Field(default=0, ge=0)
+    ml: int = Field(default=0, ge=0)
+    avulso: int = Field(default=0, ge=0)
+
+
+def _resolver_g_manual(db: Session, sub_base: str, body) -> tuple[Optional[dict], int, int, int]:
+    """G por categoria do lançamento manual. Sem categorias, os totais por serviço vão para a padrão."""
+    itens = [i.model_dump() for i in (body.g_categorias or [])]
+    if not itens and (body.g_shopee or body.g_ml or body.g_avulso):
+        padrao = garantir_categoria_padrao(db, sub_base)
+        itens = [{"categoria_g_id": padrao.id, "shopee": body.g_shopee, "ml": body.g_ml, "avulso": body.g_avulso}]
+    mapa, tot = normalizar_g_categorias(db, sub_base, itens)
+    return mapa, tot["shopee"], tot["ml"], tot["avulso"]
+
+
+def _somar_g_categorias(atual: Optional[dict], delta: Optional[dict]) -> Optional[dict]:
+    out = {k: dict(v) for k, v in (atual or {}).items()}
+    for cid, qtds in (delta or {}).items():
+        bucket = out.setdefault(cid, {"shopee": 0, "ml": 0, "avulso": 0})
+        for s in ("shopee", "ml", "avulso"):
+            bucket[s] = int(bucket.get(s) or 0) + int(qtds.get(s) or 0)
+    return out or None
+
+
 class ContribuicaoManualIn(BaseModel):
     base_id: int
     data_operacao: date = Field(default_factory=date.today)
@@ -125,6 +152,7 @@ class ContribuicaoManualIn(BaseModel):
     g_shopee: int = Field(default=0, ge=0)
     g_ml: int = Field(default=0, ge=0)
     g_avulso: int = Field(default=0, ge=0)
+    g_categorias: Optional[List[GCategoriaQtdIn]] = None
     sem_volume: bool = False
     # True: soma ao volume já lançado (lançamento retroativo / acréscimo).
     acrescentar: bool = False
@@ -151,6 +179,7 @@ class ContribuicaoManualUpdate(BaseModel):
     g_shopee: int = Field(default=0, ge=0)
     g_ml: int = Field(default=0, ge=0)
     g_avulso: int = Field(default=0, ge=0)
+    g_categorias: Optional[List[GCategoriaQtdIn]] = None
     sem_volume: bool = False
     versao: int = Field(ge=1)
     origem_cliente: Literal["web", "mobile"] = "web"
@@ -222,6 +251,7 @@ class ParticipanteOut(BaseModel):
     g_shopee: int
     g_ml: int
     g_avulso: int
+    g_categorias: Optional[dict] = None
     sem_volume: bool
     status: str
     versao: int
@@ -320,6 +350,7 @@ def _serializar_execucao(execucao: ColetaExecucao, current_user: User, participa
                 g_shopee=p.g_shopee,
                 g_ml=p.g_ml,
                 g_avulso=p.g_avulso,
+                g_categorias=getattr(p, "g_categorias", None),
                 sem_volume=bool(p.sem_volume),
                 status=getattr(p, "status", "finalizado"),
                 versao=p.versao,
@@ -365,6 +396,7 @@ def _sincronizar_coleta_legada(db: Session, participante: ColetaExecucaoParticip
     coleta.g_shopee = participante.g_shopee
     coleta.g_ml = participante.g_ml
     coleta.g_avulso = participante.g_avulso
+    coleta.g_categorias = getattr(participante, "g_categorias", None)
     coleta.valor_total = valor
 
 
@@ -815,6 +847,7 @@ def _criar_coleta_manual_delta(
     g_shopee: int = 0,
     g_ml: int = 0,
     g_avulso: int = 0,
+    g_categorias: Optional[dict] = None,
 ) -> Coleta:
     """Nova linha financeira só com o delta (acréscimo), sem sobrescrever lotes existentes."""
     base = execucao.base_ref
@@ -836,6 +869,7 @@ def _criar_coleta_manual_delta(
         g_shopee=g_shopee,
         g_ml=g_ml,
         g_avulso=g_avulso,
+        g_categorias=g_categorias,
         valor_total=valor,
     )
     db.add(coleta)
@@ -865,6 +899,7 @@ def lancar_manual(
             return _serializar_execucao(execucao, current_user, execucao.participantes)
 
     base = resolver_base(db, sub_base, base_id=body.base_id)
+    g_mapa, g_s, g_m, g_a = _resolver_g_manual(db, sub_base, body)
     executor, motoboy_id = resolver_executor(db, current_user, body.executor_user_id)
     _garantir_nao_fechado(
         db,
@@ -908,10 +943,11 @@ def lancar_manual(
         participante.shopee = int(participante.shopee or 0) + delta_s
         participante.mercado_livre = int(participante.mercado_livre or 0) + delta_ml
         participante.avulso = int(participante.avulso or 0) + delta_a
-        participante.pacotes_g = int(participante.pacotes_g or 0) + int(body.pacotes_g or 0)
-        participante.g_shopee = int(participante.g_shopee or 0) + int(body.g_shopee or 0)
-        participante.g_ml = int(participante.g_ml or 0) + int(body.g_ml or 0)
-        participante.g_avulso = int(participante.g_avulso or 0) + int(body.g_avulso or 0)
+        participante.pacotes_g = int(participante.pacotes_g or 0) + g_s + g_m + g_a
+        participante.g_shopee = int(participante.g_shopee or 0) + g_s
+        participante.g_ml = int(participante.g_ml or 0) + g_m
+        participante.g_avulso = int(participante.g_avulso or 0) + g_a
+        participante.g_categorias = _somar_g_categorias(getattr(participante, "g_categorias", None), g_mapa)
         participante.sem_volume = False
         participante.client_request_id = body.client_request_id
         participante.status = "finalizado"
@@ -927,10 +963,11 @@ def lancar_manual(
             shopee=delta_s,
             mercado_livre=delta_ml,
             avulso=delta_a,
-            pacotes_g=int(body.pacotes_g or 0),
-            g_shopee=int(body.g_shopee or 0),
-            g_ml=int(body.g_ml or 0),
-            g_avulso=int(body.g_avulso or 0),
+            pacotes_g=g_s + g_m + g_a,
+            g_shopee=g_s,
+            g_ml=g_m,
+            g_avulso=g_a,
+            g_categorias=g_mapa,
         )
         db.commit()
         db.refresh(execucao)
@@ -949,10 +986,11 @@ def lancar_manual(
     participante.shopee = body.shopee
     participante.mercado_livre = body.mercado_livre
     participante.avulso = body.avulso
-    participante.pacotes_g = body.pacotes_g
-    participante.g_shopee = body.g_shopee
-    participante.g_ml = body.g_ml
-    participante.g_avulso = body.g_avulso
+    participante.pacotes_g = g_s + g_m + g_a
+    participante.g_shopee = g_s
+    participante.g_ml = g_m
+    participante.g_avulso = g_a
+    participante.g_categorias = g_mapa
     participante.sem_volume = body.sem_volume
     participante.client_request_id = body.client_request_id
     participante.status = "finalizado"
@@ -994,8 +1032,14 @@ def editar_participante(
         data_operacao=execucao.data_operacao,
         motoboy_id=participante.motoboy_id,
     )
-    for campo in ("shopee", "mercado_livre", "avulso", "pacotes_g", "g_shopee", "g_ml", "g_avulso"):
+    g_mapa, g_s, g_m, g_a = _resolver_g_manual(db, sub_base, body)
+    for campo in ("shopee", "mercado_livre", "avulso"):
         setattr(participante, campo, getattr(body, campo))
+    participante.pacotes_g = g_s + g_m + g_a
+    participante.g_shopee = g_s
+    participante.g_ml = g_m
+    participante.g_avulso = g_a
+    participante.g_categorias = g_mapa
     if body.sem_volume:
         _exigir_sem_volume_permitido(current_user)
     participante.sem_volume = body.sem_volume

@@ -1,6 +1,7 @@
 """
 Rotas de Contabilidade / Financeiro
-GET /contabilidade/resumo — resumo financeiro por período (receita, despesas confirmadas/pendentes, lucro).
+GET /contabilidade/resumo — resumo financeiro por período (receita, despesas confirmadas/pendentes, lucro)
+e balanço por status de fechamento (pendente, gerado, recebido/pago).
 """
 from __future__ import annotations
 
@@ -16,10 +17,23 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import Coleta, Entregador, EntregadorFechamento, Motoboy, Saida, User
+from models import BaseFechamento, Coleta, Entregador, EntregadorFechamento, Motoboy, Saida, User
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
+from base_fechamento_routes import _normalizar_servico_saida
+from coletas import _get_precos_cached
+from contabilidade_balanco_pure import (
+    FAIXA_GERADO,
+    FAIXA_PAGO,
+    FAIXA_RECEBIDO,
+    faixa_despesa,
+    faixa_receita,
+    montar_lado,
+    resultado_previsto,
+    resultado_realizado,
+    variacao_pct,
+)
 
 router = APIRouter(prefix="/contabilidade", tags=["Contabilidade"])
 
@@ -152,6 +166,34 @@ class EvolucaoDiariaItem(BaseModel):
     lucro: Decimal
 
 
+class BalancoFaixa(BaseModel):
+    valor: Decimal
+    quantidade: int
+    unidade: str  # pacotes | saidas | fechamentos
+
+
+class BalancoLado(BaseModel):
+    pendente: BalancoFaixa
+    gerado: BalancoFaixa
+    baixado: BalancoFaixa  # recebido (coletas) ou pago (motoboys)
+    total: Decimal
+
+
+class BalancoResultado(BaseModel):
+    valor: Decimal
+    anterior: Optional[Decimal] = None
+    variacao_pct: Optional[Decimal] = None
+
+
+class Balanco(BaseModel):
+    receber: BalancoLado
+    pagar: BalancoLado
+    previsto: BalancoResultado
+    realizado: BalancoResultado
+    periodo_anterior_inicio: Optional[str] = None
+    periodo_anterior_fim: Optional[str] = None
+
+
 class ContabilidadeResumoResponse(BaseModel):
     data_inicio: str
     data_fim: str
@@ -171,33 +213,18 @@ class ContabilidadeResumoResponse(BaseModel):
     aviso_apenas_fechamentos_gerados: bool = True
     aviso_pendentes: bool = False
     total_fechamentos_no_periodo: int = 0
+    balanco: Optional[Balanco] = None
 
 
 # --------------- Lógica ---------------
 
+_PRECOS_ZERADOS = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
 
-@router.get("/resumo", response_model=ContabilidadeResumoResponse)
-def get_resumo_contabilidade(
-    data_inicio: date = Query(..., description="Data inicial do período"),
-    data_fim: date = Query(..., description="Data final do período"),
-    modo_entregas: str = Query("saiu", description="Base de contagem: 'saiu'/'operacional' (status operacionais válidos) ou 'entregue' (status entregue app mobile)"),
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    if data_inicio > data_fim:
-        raise HTTPException(400, "data_inicio deve ser menor ou igual a data_fim.")
-    modo = (modo_entregas or "saiu").strip().lower()
-    if modo not in ("saiu", "operacional", "entregue"):
-        modo = "saiu"
 
-    sub_base = getattr(current_user, "sub_base", None)
-    if not sub_base:
-        raise HTTPException(403, "sub_base não encontrada no token. Faça login novamente.")
+def _consultar_coletas(db: Session, sub_base: str, data_inicio: date, data_fim: date) -> List[Coleta]:
     dt_start = datetime.combine(data_inicio, time.min)
     dt_end = datetime.combine(data_fim, time(23, 59, 59))
-
-    # ---- 1) RECEITA (coletas no período) ----
-    stmt_coletas = (
+    return db.scalars(
         select(Coleta)
         .where(
             Coleta.sub_base == sub_base,
@@ -207,46 +234,40 @@ def get_resumo_contabilidade(
         .where(
             (Coleta.shopee != 0) | (Coleta.mercado_livre != 0) | (Coleta.avulso != 0) | (Coleta.valor_total != 0)
         )
-    )
-    rows_coletas = db.scalars(stmt_coletas).all()
-    receita_bruta = sum(_decimal(c.valor_total) for c in rows_coletas)
-    total_coletas = sum((c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0) for c in rows_coletas)
+    ).all()
 
-    # Receita por serviço (proporcional pelo volume da coleta)
-    receita_shopee = Decimal("0")
-    receita_ml = Decimal("0")
-    receita_avulso = Decimal("0")
-    coletas_shopee = 0
-    coletas_ml = 0
-    coletas_avulso = 0
-    for c in rows_coletas:
-        s, m, a = (c.shopee or 0), (c.mercado_livre or 0), (c.avulso or 0)
-        tot = s + m + a
-        v = _decimal(c.valor_total)
-        if tot > 0:
-            receita_shopee += v * Decimal(s) / Decimal(tot)
-            receita_ml += v * Decimal(m) / Decimal(tot)
-            receita_avulso += v * Decimal(a) / Decimal(tot)
-        coletas_shopee += s
-        coletas_ml += m
-        coletas_avulso += a
 
-    # ---- 2) SAÍDAS (contagem no período) ----
-    stmt_saidas = (
-        select(Saida)
-        .where(
+def _consultar_fechamentos_entregador(
+    db: Session, sub_base: str, data_inicio: date, data_fim: date
+) -> List[EntregadorFechamento]:
+    return db.scalars(
+        select(EntregadorFechamento).where(
+            EntregadorFechamento.sub_base == sub_base,
+            EntregadorFechamento.periodo_inicio <= data_fim,
+            EntregadorFechamento.periodo_fim >= data_inicio,
+            func.upper(EntregadorFechamento.status).in_(STATUS_FECHAMENTO_CONTABIL),
+        )
+    ).all()
+
+
+def _carregar_saidas_periodo(
+    db: Session, sub_base: str, data_inicio: date, data_fim: date, modo: str
+) -> Tuple[List[Saida], Dict[int, Any], Dict[int, Tuple[Optional[int], Optional[int]]]]:
+    """Saídas que contam no período (data operacional e modo) e o ator (entregador ou motoboy) de cada uma."""
+    dt_start = datetime.combine(data_inicio, time.min)
+    dt_end = datetime.combine(data_fim, time(23, 59, 59))
+    rows_saidas_all = db.scalars(
+        select(Saida).where(
             Saida.sub_base == sub_base,
             Saida.codigo.isnot(None),
             func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
             Saida.timestamp >= dt_start,
             Saida.timestamp <= dt_end,
         )
-    )
-    rows_saidas_all = db.scalars(stmt_saidas).all()
+    ).all()
     rows_saidas_raw, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_saidas_all, data_inicio, data_fim)
-    # Filtrar pelo modo de indicadores: só contam saídas que "entregaram" conforme modo (saiu vs entregue)
     rows_saidas = [s for s in rows_saidas_raw if _saida_conta_para_indicador(s, modo)]
-    total_saidas = len(rows_saidas)
+
     # Resolve ator de cada saída uma única vez para reutilizar em todos os loops.
     nome_legacy_norms = {
         _normalizar_nome_entregador((s.entregador or ""))
@@ -274,6 +295,284 @@ def get_resumo_contabilidade(
             continue
         nome_norm = _normalizar_nome_entregador(s.entregador or "")
         actor_por_saida[int(s.id_saida)] = (ent_por_nome_norm.get(nome_norm), None)
+    return rows_saidas, op_ctx_map, actor_por_saida
+
+
+def _mapa_cobertura_entregador(rows_fech: List[EntregadorFechamento]) -> Dict[tuple, bool]:
+    """(("e", entregador_id) ou ("m", motoboy_id), data) -> coberto por fechamento."""
+    cache_coberto: Dict[tuple, bool] = {}
+    for f in rows_fech:
+        d = f.periodo_inicio
+        while d <= f.periodo_fim:
+            if getattr(f, "id_motoboy", None) is not None:
+                cache_coberto[(("m", f.id_motoboy), d)] = True
+            else:
+                cache_coberto[(("e", f.id_entregador), d)] = True
+            d += timedelta(days=1)
+    return cache_coberto
+
+
+def _valor_saida_pendente(
+    db: Session,
+    sub_base: str,
+    eid: Optional[int],
+    mid: Optional[int],
+    servico: Optional[str],
+    cache_precos: Dict[tuple, Dict[str, Decimal]],
+) -> Decimal:
+    key = ("e", eid) if eid is not None else ("m", mid)
+    if key not in cache_precos:
+        try:
+            if eid is not None:
+                cache_precos[key] = resolver_precos_entregador(db, eid, sub_base)
+            else:
+                cache_precos[key] = resolver_precos_motoboy(db, sub_base)
+        except Exception:
+            cache_precos[key] = dict(_PRECOS_ZERADOS)
+    precos = cache_precos[key]
+    tipo = _normalizar_servico(servico)
+    if tipo == "shopee":
+        return _decimal(precos.get("shopee_valor", 0))
+    if tipo == "flex":
+        return _decimal(precos.get("ml_valor", 0))
+    return _decimal(precos.get("avulso_valor", 0))
+
+
+def _estimar_despesa_pendente(
+    db: Session,
+    sub_base: str,
+    rows_saidas: List[Saida],
+    actor_por_saida: Dict[int, Tuple[Optional[int], Optional[int]]],
+    op_ctx_map: Dict[int, Any],
+    cache_coberto: Dict[tuple, bool],
+    cache_precos: Dict[tuple, Dict[str, Decimal]],
+) -> Tuple[Decimal, Dict[int, Decimal], Dict[int, Decimal], int]:
+    """Saídas não cobertas por fechamento, ao preço do entregador. Retorna (total, por_entregador, por_motoboy, qtd)."""
+    total = Decimal("0")
+    por_ent: Dict[int, Decimal] = {}
+    por_motoboy: Dict[int, Decimal] = {}
+    qtd = 0
+    for s in rows_saidas:
+        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
+        if eid is None and mid is None:
+            continue
+        ctx = op_ctx_map.get(s.id_saida)
+        op_ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
+        data_saida = op_ts.date()
+        chave_ator = ("e", eid) if eid is not None else ("m", mid)
+        if cache_coberto.get((chave_ator, data_saida), False):
+            continue
+        valor = _valor_saida_pendente(db, sub_base, eid, mid, s.servico, cache_precos)
+        total += valor
+        qtd += 1
+        if eid is not None:
+            por_ent[eid] = por_ent.get(eid, Decimal("0")) + valor
+        else:
+            por_motoboy[mid] = por_motoboy.get(mid, Decimal("0")) + valor
+    return total, por_ent, por_motoboy, qtd
+
+
+def _lado_receber(
+    db: Session, sub_base: str, data_inicio: date, data_fim: date, rows_coletas: List[Coleta]
+) -> BalancoLado:
+    """
+    Receita por status do fechamento de base.
+    Gerado/recebido: valor_final dos fechamentos que tocam o período.
+    Pendente: coletas de base/dia sem fechamento, menos os cancelados dessa base/dia,
+    ao preço da base (mesma conta do fechamento, sem ajustes manuais).
+    """
+    rows_bf = db.scalars(
+        select(BaseFechamento).where(
+            BaseFechamento.sub_base == sub_base,
+            BaseFechamento.periodo_inicio <= data_fim,
+            BaseFechamento.periodo_fim >= data_inicio,
+        )
+    ).all()
+    gerado = recebido = Decimal("0")
+    qtd_gerado = qtd_recebido = 0
+    coberto: set = set()
+    for f in rows_bf:
+        faixa = faixa_receita(f.status)
+        if faixa is None:
+            continue
+        if faixa == FAIXA_RECEBIDO:
+            recebido += _decimal(f.valor_final)
+            qtd_recebido += 1
+        else:
+            gerado += _decimal(f.valor_final)
+            qtd_gerado += 1
+        base_key = (f.base or "").strip().upper()
+        d = max(f.periodo_inicio, data_inicio)
+        fim = min(f.periodo_fim, data_fim)
+        while d <= fim:
+            coberto.add((base_key, d))
+            d += timedelta(days=1)
+
+    pendente = Decimal("0")
+    qtd_pacotes = 0
+    nome_base: Dict[str, str] = {}
+    for c in rows_coletas:
+        base_key = (c.base or "").strip().upper()
+        if (base_key, c.timestamp.date()) in coberto:
+            continue
+        pendente += _decimal(c.valor_total)
+        qtd_pacotes += (c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0)
+        if base_key and base_key not in nome_base:
+            nome_base[base_key] = (c.base or "").strip()
+
+    rows_canc = db.scalars(
+        select(Saida).where(
+            Saida.sub_base == sub_base,
+            func.lower(Saida.status) == "cancelado",
+            Saida.data >= data_inicio,
+            Saida.data <= data_fim,
+        )
+    ).all()
+    precos_base: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}
+    for s in rows_canc:
+        base_key = (s.base or "").strip().upper()
+        if not base_key:
+            continue
+        dia = s.data or s.timestamp.date()
+        if (base_key, dia) in coberto:
+            continue
+        if base_key not in precos_base:
+            nome = nome_base.get(base_key) or (s.base or "").strip()
+            try:
+                precos_base[base_key] = _get_precos_cached(db, sub_base, nome)
+            except HTTPException:
+                precos_base[base_key] = (Decimal("0"), Decimal("0"), Decimal("0"))
+        p_shopee, p_ml, p_avulso = precos_base[base_key]
+        tipo = _normalizar_servico_saida(s.servico or "")
+        pendente -= p_shopee if tipo == "shopee" else p_ml if tipo == "ml" else p_avulso
+
+    valores = montar_lado(pendente, gerado, recebido)
+    return BalancoLado(
+        pendente=BalancoFaixa(valor=valores["pendente"], quantidade=qtd_pacotes, unidade="pacotes"),
+        gerado=BalancoFaixa(valor=valores["gerado"], quantidade=qtd_gerado, unidade="fechamentos"),
+        baixado=BalancoFaixa(valor=valores["baixado"], quantidade=qtd_recebido, unidade="fechamentos"),
+        total=valores["total"],
+    )
+
+
+def _lado_pagar(rows_fech: List[EntregadorFechamento], pendente: Decimal, qtd_pendente: int) -> BalancoLado:
+    gerado = pago = Decimal("0")
+    qtd_gerado = qtd_pago = 0
+    for f in rows_fech:
+        faixa = faixa_despesa(f.status)
+        if faixa == FAIXA_PAGO:
+            pago += _decimal(f.valor_final)
+            qtd_pago += 1
+        elif faixa == FAIXA_GERADO:
+            gerado += _decimal(f.valor_final)
+            qtd_gerado += 1
+    valores = montar_lado(pendente, gerado, pago)
+    return BalancoLado(
+        pendente=BalancoFaixa(valor=valores["pendente"], quantidade=qtd_pendente, unidade="saidas"),
+        gerado=BalancoFaixa(valor=valores["gerado"], quantidade=qtd_gerado, unidade="fechamentos"),
+        baixado=BalancoFaixa(valor=valores["baixado"], quantidade=qtd_pago, unidade="fechamentos"),
+        total=valores["total"],
+    )
+
+
+def _lados_periodo(
+    db: Session, sub_base: str, data_inicio: date, data_fim: date, modo: str
+) -> Tuple[BalancoLado, BalancoLado]:
+    """Balanço completo de um período avulso (usado na comparação com o período anterior)."""
+    rows_coletas = _consultar_coletas(db, sub_base, data_inicio, data_fim)
+    rows_fech = _consultar_fechamentos_entregador(db, sub_base, data_inicio, data_fim)
+    rows_saidas, op_ctx_map, actor_por_saida = _carregar_saidas_periodo(db, sub_base, data_inicio, data_fim, modo)
+    pendente, _, _, qtd = _estimar_despesa_pendente(
+        db, sub_base, rows_saidas, actor_por_saida, op_ctx_map, _mapa_cobertura_entregador(rows_fech), {}
+    )
+    return (
+        _lado_receber(db, sub_base, data_inicio, data_fim, rows_coletas),
+        _lado_pagar(rows_fech, pendente, qtd),
+    )
+
+
+def _montar_balanco(
+    receber: BalancoLado,
+    pagar: BalancoLado,
+    anterior: Optional[Tuple[BalancoLado, BalancoLado]],
+    prev_ini: Optional[date],
+    prev_fim: Optional[date],
+) -> Balanco:
+    def _valores(lado: BalancoLado) -> Dict[str, Decimal]:
+        return {"total": lado.total, "baixado": lado.baixado.valor}
+
+    previsto = resultado_previsto(_valores(receber), _valores(pagar))
+    realizado = resultado_realizado(_valores(receber), _valores(pagar))
+    prev_previsto = prev_realizado = None
+    if anterior is not None:
+        prev_previsto = resultado_previsto(_valores(anterior[0]), _valores(anterior[1]))
+        prev_realizado = resultado_realizado(_valores(anterior[0]), _valores(anterior[1]))
+    return Balanco(
+        receber=receber,
+        pagar=pagar,
+        previsto=BalancoResultado(
+            valor=previsto,
+            anterior=prev_previsto,
+            variacao_pct=variacao_pct(previsto, prev_previsto) if prev_previsto is not None else None,
+        ),
+        realizado=BalancoResultado(
+            valor=realizado,
+            anterior=prev_realizado,
+            variacao_pct=variacao_pct(realizado, prev_realizado) if prev_realizado is not None else None,
+        ),
+        periodo_anterior_inicio=prev_ini.isoformat() if prev_ini else None,
+        periodo_anterior_fim=prev_fim.isoformat() if prev_fim else None,
+    )
+
+
+@router.get("/resumo", response_model=ContabilidadeResumoResponse)
+def get_resumo_contabilidade(
+    data_inicio: date = Query(..., description="Data inicial do período"),
+    data_fim: date = Query(..., description="Data final do período"),
+    modo_entregas: str = Query("saiu", description="Base de contagem: 'saiu'/'operacional' (status operacionais válidos) ou 'entregue' (status entregue app mobile)"),
+    comparar_anterior: bool = Query(
+        True,
+        description="Calcula o balanço do período anterior para a variação. Com false a resposta sai mais rápido e balanco.*.anterior vem nulo.",
+    ),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    if data_inicio > data_fim:
+        raise HTTPException(400, "data_inicio deve ser menor ou igual a data_fim.")
+    modo = (modo_entregas or "saiu").strip().lower()
+    if modo not in ("saiu", "operacional", "entregue"):
+        modo = "saiu"
+
+    sub_base = getattr(current_user, "sub_base", None)
+    if not sub_base:
+        raise HTTPException(403, "sub_base não encontrada no token. Faça login novamente.")
+    # ---- 1) RECEITA (coletas no período) ----
+    rows_coletas = _consultar_coletas(db, sub_base, data_inicio, data_fim)
+    receita_bruta = sum(_decimal(c.valor_total) for c in rows_coletas)
+    total_coletas = sum((c.shopee or 0) + (c.mercado_livre or 0) + (c.avulso or 0) for c in rows_coletas)
+
+    # Receita por serviço (proporcional pelo volume da coleta)
+    receita_shopee = Decimal("0")
+    receita_ml = Decimal("0")
+    receita_avulso = Decimal("0")
+    coletas_shopee = 0
+    coletas_ml = 0
+    coletas_avulso = 0
+    for c in rows_coletas:
+        s, m, a = (c.shopee or 0), (c.mercado_livre or 0), (c.avulso or 0)
+        tot = s + m + a
+        v = _decimal(c.valor_total)
+        if tot > 0:
+            receita_shopee += v * Decimal(s) / Decimal(tot)
+            receita_ml += v * Decimal(m) / Decimal(tot)
+            receita_avulso += v * Decimal(a) / Decimal(tot)
+        coletas_shopee += s
+        coletas_ml += m
+        coletas_avulso += a
+
+    # ---- 2) SAÍDAS (contagem no período) ----
+    rows_saidas, op_ctx_map, actor_por_saida = _carregar_saidas_periodo(db, sub_base, data_inicio, data_fim, modo)
+    total_saidas = len(rows_saidas)
     nomes_motoboy_map = _carregar_nomes_motoboy_ids(
         db,
         [mid for eid, mid in actor_por_saida.values() if mid is not None],
@@ -284,73 +583,19 @@ def get_resumo_contabilidade(
     saidas_ml = sum(1 for s in rows_saidas if (s.servico or "").lower() in ("mercado livre", "mercado_livre", "ml", "flex"))
     saidas_avulso = total_saidas - saidas_shopee - saidas_ml
 
-    # ---- 3) DESPESA CONFIRMADA (fechamentos GERADO/REAJUSTADO/FECHADO) ----
-    stmt_fech = (
-        select(EntregadorFechamento)
-        .where(
-            EntregadorFechamento.sub_base == sub_base,
-            EntregadorFechamento.periodo_inicio <= data_fim,
-            EntregadorFechamento.periodo_fim >= data_inicio,
-            func.upper(EntregadorFechamento.status).in_(STATUS_FECHAMENTO_CONTABIL),
-        )
-    )
-    rows_fech = db.scalars(stmt_fech).all()
+    # ---- 3) DESPESA CONFIRMADA (fechamentos GERADO/REAJUSTADO/FECHADO/PAGO) ----
+    rows_fech = _consultar_fechamentos_entregador(db, sub_base, data_inicio, data_fim)
     despesas_confirmadas = sum(_decimal(f.valor_final) for f in rows_fech)
-
-    # Cache: (("e", entregador_id) ou ("m", motoboy_id), data) -> fechamento cobre
-    cache_coberto: Dict[tuple, bool] = {}
-    for f in rows_fech:
-        d = f.periodo_inicio
-        while d <= f.periodo_fim:
-            if getattr(f, "id_motoboy", None) is not None:
-                cache_coberto[(("m", f.id_motoboy), d)] = True
-            else:
-                cache_coberto[(("e", f.id_entregador), d)] = True
-            d += timedelta(days=1)
+    cache_coberto = _mapa_cobertura_entregador(rows_fech)
 
     # ---- 3b) DESPESA PENDENTE (saídas não cobertas por fechamento) ----
-    # Ator = entregador ou motoboy; cache de preços por tipo para não colidir
     cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
-    despesas_pendentes = Decimal("0")
-    despesa_pendente_por_ent: Dict[int, Decimal] = {}
-    despesa_pendente_por_motoboy: Dict[int, Decimal] = {}
-    for s in rows_saidas:
-        eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
-        if eid is None and mid is None:
-            continue
-        ctx = op_ctx_map.get(s.id_saida)
-        op_ts = (ctx.operacional_ts if ctx and ctx.operacional_ts else None) or s.timestamp
-        data_saida = op_ts.date()
-        if eid is not None:
-            if cache_coberto.get((("e", eid), data_saida), False):
-                continue
-            key = ("e", eid)
-        else:
-            if cache_coberto.get((("m", mid), data_saida), False):
-                continue
-            key = ("m", mid)
-        if key not in cache_precos:
-            try:
-                if eid is not None:
-                    cache_precos[key] = resolver_precos_entregador(db, eid, sub_base)
-                else:
-                    cache_precos[key] = resolver_precos_motoboy(db, sub_base)
-            except Exception:
-                cache_precos[key] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
-        precos = cache_precos[key]
-        tipo = _normalizar_servico(s.servico)
-        valor = Decimal("0")
-        if tipo == "shopee":
-            valor = _decimal(precos.get("shopee_valor", 0))
-        elif tipo == "flex":
-            valor = _decimal(precos.get("ml_valor", 0))
-        else:
-            valor = _decimal(precos.get("avulso_valor", 0))
-        despesas_pendentes += valor
-        if eid is not None:
-            despesa_pendente_por_ent[eid] = despesa_pendente_por_ent.get(eid, Decimal("0")) + valor
-        else:
-            despesa_pendente_por_motoboy[mid] = despesa_pendente_por_motoboy.get(mid, Decimal("0")) + valor
+    (
+        despesas_pendentes,
+        despesa_pendente_por_ent,
+        despesa_pendente_por_motoboy,
+        qtd_saidas_pendentes,
+    ) = _estimar_despesa_pendente(db, sub_base, rows_saidas, actor_por_saida, op_ctx_map, cache_coberto, cache_precos)
 
     despesas_pendentes = _decimal(despesas_pendentes).quantize(Decimal("0.01"))
     despesas_totais = _decimal(despesas_confirmadas + despesas_pendentes).quantize(Decimal("0.01"))
@@ -525,31 +770,10 @@ def get_resumo_contabilidade(
         eid, mid = actor_por_saida.get(int(s.id_saida), (None, None))
         if eid is None and mid is None:
             continue
-        if eid is not None:
-            if cache_coberto.get((("e", eid), data_saida), False):
-                continue
-            key = ("e", eid)
-        else:
-            if cache_coberto.get((("m", mid), data_saida), False):
-                continue
-            key = ("m", mid)
-        if key not in cache_precos:
-            try:
-                if eid is not None:
-                    cache_precos[key] = resolver_precos_entregador(db, eid, sub_base)
-                else:
-                    cache_precos[key] = resolver_precos_motoboy(db, sub_base)
-            except Exception:
-                cache_precos[key] = {"shopee_valor": Decimal("0"), "ml_valor": Decimal("0"), "avulso_valor": Decimal("0")}
-        precos = cache_precos[key]
-        tipo = _normalizar_servico(s.servico)
-        valor = Decimal("0")
-        if tipo == "shopee":
-            valor = _decimal(precos.get("shopee_valor", 0))
-        elif tipo == "flex":
-            valor = _decimal(precos.get("ml_valor", 0))
-        else:
-            valor = _decimal(precos.get("avulso_valor", 0))
+        chave_ator = ("e", eid) if eid is not None else ("m", mid)
+        if cache_coberto.get((chave_ator, data_saida), False):
+            continue
+        valor = _valor_saida_pendente(db, sub_base, eid, mid, s.servico, cache_precos)
         if data_inicio <= data_saida <= data_fim:
             despesas_por_dia[data_saida] = despesas_por_dia.get(data_saida, Decimal("0")) + valor
 
@@ -641,6 +865,26 @@ def get_resumo_contabilidade(
     except Exception:
         comparacao = None
 
+    # ---- 10b) Balanço por status (pendente, gerado, recebido/pago) ----
+    receber = _lado_receber(db, sub_base, data_inicio, data_fim, rows_coletas)
+    pagar = _lado_pagar(rows_fech, despesas_pendentes, qtd_saidas_pendentes)
+    delta_dias_bal = (data_fim - data_inicio).days + 1
+    bal_prev_fim = data_inicio - timedelta(days=1)
+    bal_prev_ini = bal_prev_fim - timedelta(days=delta_dias_bal - 1)
+    anterior_bal = None
+    if comparar_anterior and bal_prev_ini >= date(2000, 1, 1):
+        try:
+            anterior_bal = _lados_periodo(db, sub_base, bal_prev_ini, bal_prev_fim, modo)
+        except Exception:
+            anterior_bal = None
+    balanco = _montar_balanco(
+        receber,
+        pagar,
+        anterior_bal,
+        bal_prev_ini if anterior_bal is not None else None,
+        bal_prev_fim if anterior_bal is not None else None,
+    )
+
     # ---- 11) Avisos ----
     aviso_pendentes = total_saidas > 0 and len(rows_fech) == 0
 
@@ -663,4 +907,5 @@ def get_resumo_contabilidade(
         aviso_apenas_fechamentos_gerados=True,
         aviso_pendentes=aviso_pendentes,
         total_fechamentos_no_periodo=len(rows_fech),
+        balanco=balanco,
     )

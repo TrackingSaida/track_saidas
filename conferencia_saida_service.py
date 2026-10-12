@@ -352,6 +352,29 @@ def conferencia_por_dia_periodo(
     ]
 
 
+def status_conferencia_registrada_motoboys(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_ids: List[int],
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> Dict[Tuple[int, date], str]:
+    """Status gravado por (motoboy_id, data_ref) — uma consulta para todos os motoboys."""
+    ids = sorted({int(m) for m in motoboy_ids if m is not None})
+    if not ids:
+        return {}
+    rows = db.execute(
+        select(ConferenciaSaida.motoboy_id, ConferenciaSaida.data_ref, ConferenciaSaida.status).where(
+            ConferenciaSaida.sub_base == sub_base,
+            ConferenciaSaida.motoboy_id.in_(ids),
+            ConferenciaSaida.data_ref >= periodo_inicio,
+            ConferenciaSaida.data_ref <= periodo_fim,
+        )
+    ).all()
+    return {(int(mid), d): st for mid, d, st in rows}
+
+
 def conferir_saida(
     db: Session,
     *,

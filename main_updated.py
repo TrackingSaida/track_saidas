@@ -173,6 +173,7 @@ app.add_middleware(EnsurePatchCorsMiddleware)
 from users_routes_updated import router as users_router
 from entregador_routes import router as entregadores_router
 from entregador_fechamento_routes import router as fechamento_router
+from pacote_g_categorias import router as pacote_g_categorias_router
 from auth import router as auth_router
 from saidas_routes import router as saidas_router, pedidos_router
 from owner_routes import router as owners_router
@@ -204,6 +205,7 @@ from mobile_push_routes import router as mobile_push_router
 from avisos_routes import router as avisos_router, mobile_router as avisos_mobile_router
 from mobile_fechamentos_routes import router as mobile_fechamentos_router
 from mobile_app_version_routes import router as mobile_app_version_router
+from owner_cobranca_routes import router as owner_cobranca_router
 from motoboy_convite_routes import (
     admin_router as motoboy_convite_admin_router,
     public_router as motoboy_convite_public_router,
@@ -223,6 +225,7 @@ app.include_router(users_router,        prefix=API_PREFIX)
 # Fechamentos ANTES de entregadores: evita que GET /entregadores/{id_entregador}
 # capture /entregadores/fechamentos (id="fechamentos" → HTTP 422).
 app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")
+app.include_router(pacote_g_categorias_router, prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)
@@ -249,6 +252,7 @@ app.include_router(politicas_router, prefix=API_PREFIX)
 app.include_router(seller_portal_router, prefix=API_PREFIX)
 app.include_router(avulso_campos_config_router, prefix=API_PREFIX)
 app.include_router(avulsos_router, prefix=API_PREFIX)
+app.include_router(owner_cobranca_router, prefix=API_PREFIX)
 
 
 def _cors_headers_for_request(request: Request):

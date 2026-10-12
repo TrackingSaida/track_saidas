@@ -1,5 +1,67 @@
 # Migrações
 
+## pacote_g_categorias.sql
+
+**Obrigatória antes** do deploy das categorias de pacote grande (G1, G2…). Sem ela a API
+responde **500** em Registros (`/saidas/listar`), Preços de Entrega, Fechamento de Motoboys,
+A Pagar e Fechamento de Bases, porque o modelo já usa `saidas.categoria_g_id`.
+
+Cria `pacote_g_categoria` por `sub_base`, colunas `categoria_g_id` / `categoria_g_atualizado_*`
+em `saidas`, `g_categorias` em `coletas`, `coleta_execucao_participantes` e
+`base_fechamento_itens`, e `valor_g` em `base_fechamentos`. Backfill: cria a categoria "G"
+para cada `sub_base` e liga os pacotes `is_grande` existentes a ela. Aditiva e idempotente.
+
+```bash
+psql "$DATABASE_URL" -f migrations/pacote_g_categorias.sql
+```
+
+## entregador_fechamento_unicidade.sql
+
+Obrigatória no deploy do Fechamento de Motoboys v2 (geração em lote). Cria índices únicos
+parciais que impedem dois fechamentos do mesmo motoboy/entregador no mesmo período
+(a constraint antiga não protegia por causa do NULL). Aditiva e idempotente.
+Se existirem duplicatas, a migration falha e lista os `id_fechamento` para correção manual.
+
+```bash
+psql "$DATABASE_URL" -f migrations/entregador_fechamento_unicidade.sql
+```
+
+Rollback (remove só os índices): `migrations/entregador_fechamento_unicidade_rollback.sql`.
+
+## owner_cobranca_modulo.sql
+
+Obrigatória antes do deploy de **Financeiro → Cobrança de Owners** (somente root).
+Cria configuração comercial, preço por vigência, aceite de conferência, decisões,
+fechamento versionado (snapshot, composição, itens, ajustes, histórico) e a trava
+de unidade faturada. Aditiva e idempotente; não altera `owner_cobranca_itens`.
+
+Seed: cada Owner recebe o modelo **sugerido** pelas flags (`ignorar_coleta`,
+`entrada_obrigatoria_habilitada`) como `pendente_confirmacao`, e uma vigência de
+preço aberta copiada de `owner.valor`. Nada é confirmado nem fechado sozinho.
+
+```bash
+psql "$DATABASE_URL" -f migrations/owner_cobranca_modulo.sql
+# índice de leitura (CONCURRENTLY, fora de transação)
+psql "$DATABASE_URL" -f migrations/owner_cobranca_indexes.sql
+```
+
+Rollback (apaga fechamentos de cobrança; só com confirmação explícita):
+`migrations/owner_cobranca_modulo_rollback.sql`.
+
+## owner_cobranca_v2.sql
+
+Obrigatória antes do deploy da Cobrança de Owners v2. Permite desconto (R$ ou %),
+acréscimo e isenção lançados dentro do período, antes do fechamento: colunas
+`periodo_inicio`, `periodo_fim`, `percentual`, `removido_em`, `removido_por_username`
+e tipo `isencao`. Aditiva e idempotente; requer `owner_cobranca_modulo.sql`.
+
+```bash
+psql "$DATABASE_URL" -f migrations/owner_cobranca_v2.sql
+```
+
+Rollback (apaga ajustes do período; só com confirmação explícita):
+`migrations/owner_cobranca_v2_rollback.sql`.
+
 ## motoboy_convite_cadastro.sql
 
 Obrigatória antes do deploy do autocadastro de motoboy por link de convite (PRD-004).

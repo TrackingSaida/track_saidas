@@ -25,7 +25,7 @@ from saida_operacional_pure import (
     timestamp_operacional_saida,
 )
 
-MAX_IDS_POR_LOTE = 250
+MAX_IDS_POR_LOTE = 1000
 T = TypeVar("T")
 
 # Reexport para compatibilidade com imports existentes
@@ -72,7 +72,13 @@ def carregar_contexto_operacional(
         rows_lote = run_db_query_with_retry(
             db,
             lambda ids_lote=ids_lote: db.execute(
-                select(SaidaHistorico)
+                select(
+                    SaidaHistorico.id_saida,
+                    SaidaHistorico.evento,
+                    SaidaHistorico.user_id,
+                    SaidaHistorico.motoboy_id_anterior,
+                    SaidaHistorico.timestamp,
+                )
                 .where(
                     SaidaHistorico.id_saida.in_(ids_lote),
                     SaidaHistorico.evento.in_(eventos_filtro),
@@ -82,7 +88,7 @@ def carregar_contexto_operacional(
                     SaidaHistorico.timestamp.asc(),
                     SaidaHistorico.id.asc(),
                 )
-            ).scalars().all(),
+            ).all(),
         )
         historicos.extend(rows_lote)
 

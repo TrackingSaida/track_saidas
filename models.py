@@ -14,6 +14,7 @@ from sqlalchemy import (
     text,
     UniqueConstraint,
     ForeignKey,
+    Index,
 )
 from sqlalchemy.sql import func
 
@@ -261,6 +262,7 @@ class Coleta(Base):
     g_shopee = Column(Integer, nullable=False, server_default=text("0"))  # pacotes G da coleta manual por serviço
     g_ml = Column(Integer, nullable=False, server_default=text("0"))
     g_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    g_categorias = Column(JSON, nullable=True)  # {"<categoria_id>": {"shopee": n, "ml": n, "avulso": n}}
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     origem = Column(Text, nullable=False, server_default=text("'codigo'"))
@@ -326,6 +328,7 @@ class ColetaExecucaoParticipante(Base):
     g_shopee = Column(Integer, nullable=False, server_default=text("0"))
     g_ml = Column(Integer, nullable=False, server_default=text("0"))
     g_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    g_categorias = Column(JSON, nullable=True)
     sem_volume = Column(Boolean, nullable=False, server_default=text("false"))
     status = Column(Text, nullable=False, server_default=text("'finalizado'"))  # em_coleta | finalizado
     client_request_id = Column(Text, nullable=True)
@@ -426,7 +429,11 @@ class Saida(Base):
     qr_payload_raw = Column(Text, nullable=True)  # Payload bruto do QR (ML) para gerar etiqueta reconhecível
     ml_shipment_id = Column(BigInteger, nullable=True, index=True)  # vínculo envio ML (evita duplicata no auto-fill)
     ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
-    is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande) — única fonte da sinalização
+    is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande); espelha categoria_g_id
+    categoria_g_id = Column(BigInteger, ForeignKey("pacote_g_categoria.id", ondelete="RESTRICT"), nullable=True)
+    # Última marcação de tamanho (fora do saida_historico para não virar "última ação").
+    categoria_g_atualizado_em = Column(DateTime(timezone=False), nullable=True)
+    categoria_g_atualizado_por = Column(BigInteger, nullable=True)
     avulso_lote_id = Column(BigInteger, nullable=True, index=True)
     avulso_criado_excepcional = Column(Boolean, nullable=False, server_default=text("false"))
 
@@ -494,6 +501,34 @@ class EntregadorPrecoGlobal(Base):
 
     def __repr__(self) -> str:
         return f"<EntregadorPrecoGlobal id={self.id} sub_base={self.sub_base!r}>"
+
+
+# ==========================
+# Tabela: pacote_g_categoria
+# ==========================
+class PacoteGCategoria(Base):
+    __tablename__ = "pacote_g_categoria"
+    __table_args__ = (
+        UniqueConstraint("sub_base", "nome", name="uq_pacote_g_categoria_nome"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    nome = Column(Text, nullable=False)
+    descricao = Column(Text, nullable=True)
+    # multiplicador: adicional = preço do serviço × valor | valor_fixo: adicional = valor em R$
+    motoboy_modo = Column(Text, nullable=False, server_default=text("'multiplicador'"))
+    motoboy_valor = Column(Numeric(12, 2), nullable=False, server_default=text("1.00"))
+    base_modo = Column(Text, nullable=False, server_default=text("'valor_fixo'"))
+    base_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ordem = Column(Integer, nullable=False, server_default=text("0"))
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<PacoteGCategoria id={self.id} sub_base={self.sub_base!r} nome={self.nome!r}>"
 
 
 # ==========================
@@ -609,6 +644,216 @@ class OwnerCobrancaItem(Base):
 
 
 # ==========================
+# Cobrança de Owners (Financeiro, somente root)
+# ==========================
+class OwnerConfiguracaoCobranca(Base):
+    __tablename__ = "owner_configuracao_cobranca"
+    __table_args__ = (UniqueConstraint("owner_id", name="uq_owner_config_cobranca_owner"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="CASCADE"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    modelo = Column(Text, nullable=False)  # coleta_saida | entrada_saida | coleta_entrada_saida | somente_saida
+    modelo_sugerido = Column(Text, nullable=True)
+    periodicidade = Column(Text, nullable=False, server_default=text("'quinzenal'"))  # quinzenal | mensal
+    status = Column(Text, nullable=False, server_default=text("'pendente_confirmacao'"))  # pendente_confirmacao | confirmado
+    razao_social = Column(Text, nullable=True)
+    documento = Column(Text, nullable=True)
+    telefone = Column(Text, nullable=True)
+    endereco = Column(Text, nullable=True)
+    contato_financeiro = Column(Text, nullable=True)
+    observacao = Column(Text, nullable=True)
+    confirmado_por = Column(BigInteger, nullable=True)
+    confirmado_em = Column(DateTime(timezone=False), nullable=True)
+    atualizado_por = Column(BigInteger, nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class OwnerPrecoVigencia(Base):
+    __tablename__ = "owner_preco_vigencia"
+    __table_args__ = (UniqueConstraint("owner_id", "inicio", name="uq_owner_preco_vigencia_inicio"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="CASCADE"), nullable=False)
+    valor = Column(Numeric(12, 4), nullable=False)
+    inicio = Column(Date, nullable=False)
+    fim = Column(Date, nullable=True)
+    motivo = Column(Text, nullable=True)
+    criado_por = Column(BigInteger, nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class OwnerApuracao(Base):
+    """Aceite Conferido de período aberto. Não guarda quantidade; cai se o hash mudar."""
+
+    __tablename__ = "owner_apuracao"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "periodo_inicio", "periodo_fim", name="uq_owner_apuracao_periodo"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="CASCADE"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+    hash = Column(Text, nullable=False)
+    conferido_por = Column(BigInteger, nullable=True)
+    conferido_por_username = Column(Text, nullable=True)
+    conferido_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class OwnerApuracaoDecisao(Base):
+    __tablename__ = "owner_apuracao_decisao"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="CASCADE"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+    tipo = Column(Text, nullable=False)  # volumes_distintos | vinculo_codigos | ajuste_quantidade
+    id_coleta = Column(BigInteger, nullable=False)
+    servico = Column(Text, nullable=False)  # shopee | mercado_livre | avulso
+    codigos = Column(JSON, nullable=True)
+    quantidade_ajustada = Column(Integer, nullable=True)
+    motivo = Column(Text, nullable=False)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    criado_por = Column(BigInteger, nullable=True)
+    criado_por_username = Column(Text, nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    revogado_por = Column(BigInteger, nullable=True)
+    revogado_em = Column(DateTime(timezone=False), nullable=True)
+
+
+class OwnerFechamento(Base):
+    __tablename__ = "owner_fechamento"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "periodo_inicio", "periodo_fim", "versao", name="uq_owner_fechamento_versao"
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="RESTRICT"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+    versao = Column(Integer, nullable=False, server_default=text("1"))
+    status = Column(Text, nullable=False, server_default=text("'fechado'"))  # fechado | informado | reaberto | anulado
+    modelo = Column(Text, nullable=False)
+    periodicidade = Column(Text, nullable=False)
+    preco_unitario = Column(Numeric(12, 4), nullable=False)
+    qtd_bruto = Column(Integer, nullable=False, server_default=text("0"))
+    qtd_cancelados = Column(Integer, nullable=False, server_default=text("0"))
+    qtd_faturavel = Column(Integer, nullable=False, server_default=text("0"))
+    qtd_desconsiderados = Column(Integer, nullable=False, server_default=text("0"))
+    valor_pacotes = Column(Numeric(14, 2), nullable=False, server_default=text("0"))
+    valor_ajustes = Column(Numeric(14, 2), nullable=False, server_default=text("0"))
+    valor_total = Column(Numeric(14, 2), nullable=False, server_default=text("0"))
+    hash = Column(Text, nullable=False)
+    owner_snapshot = Column(JSON, nullable=False, server_default=text("'{}'::jsonb"))
+    config_snapshot = Column(JSON, nullable=False, server_default=text("'{}'::jsonb"))
+    observacao = Column(Text, nullable=True)
+    fechado_por = Column(BigInteger, nullable=True)
+    fechado_por_username = Column(Text, nullable=True)
+    fechado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    informado_por = Column(BigInteger, nullable=True)
+    informado_em = Column(DateTime(timezone=False), nullable=True)
+    reaberto_por = Column(BigInteger, nullable=True)
+    reaberto_em = Column(DateTime(timezone=False), nullable=True)
+    reaberto_motivo = Column(Text, nullable=True)
+    anulado_por = Column(BigInteger, nullable=True)
+    anulado_em = Column(DateTime(timezone=False), nullable=True)
+    anulado_motivo = Column(Text, nullable=True)
+
+
+class OwnerFechamentoComposicao(Base):
+    __tablename__ = "owner_fechamento_composicao"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    fechamento_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="CASCADE"), nullable=False)
+    classificacao = Column(Text, nullable=False)
+    quantidade = Column(Integer, nullable=False, server_default=text("0"))
+    valor = Column(Numeric(14, 2), nullable=False, server_default=text("0"))
+    ordem = Column(Integer, nullable=False, server_default=text("0"))
+
+
+class OwnerFechamentoItem(Base):
+    __tablename__ = "owner_fechamento_item"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    fechamento_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="CASCADE"), nullable=False)
+    tipo = Column(Text, nullable=False)  # codigo | manual
+    codigo = Column(Text, nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
+    id_coleta = Column(BigInteger, nullable=True)
+    avulso_lote_id = Column(BigInteger, nullable=True)
+    servico = Column(Text, nullable=True)
+    base = Column(Text, nullable=True)
+    data_competencia = Column(Date, nullable=True)
+    origem = Column(Text, nullable=False)
+    status_financeiro = Column(Text, nullable=False)  # cobrado | nao_cobrado | reconciliado
+    motivo = Column(Text, nullable=True)
+    quantidade = Column(Integer, nullable=False, server_default=text("1"))
+    is_grande = Column(Boolean, nullable=False, server_default=text("false"))
+    status_operacional = Column(Text, nullable=True)
+
+
+class OwnerFechamentoAjuste(Base):
+    __tablename__ = "owner_fechamento_ajuste"
+    __table_args__ = (UniqueConstraint("chave_idempotencia", name="uq_owner_fechamento_ajuste_chave"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="RESTRICT"), nullable=False)
+    sub_base = Column(Text, nullable=False)
+    fechamento_origem_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="SET NULL"), nullable=True)
+    fechamento_aplicado_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="SET NULL"), nullable=True)
+    tipo = Column(Text, nullable=False)  # acrescimo | desconto | credito | correcao | isencao
+    valor = Column(Numeric(14, 2), nullable=False)
+    motivo = Column(Text, nullable=False)
+    chave_idempotencia = Column(Text, nullable=False)
+    # Ajuste do próprio período (antes do fechamento); NULL = veio de um fechamento anterior.
+    periodo_inicio = Column(Date, nullable=True)
+    periodo_fim = Column(Date, nullable=True)
+    percentual = Column(Numeric(5, 2), nullable=True)
+    removido_em = Column(DateTime(timezone=False), nullable=True)
+    removido_por_username = Column(Text, nullable=True)
+    criado_por = Column(BigInteger, nullable=True)
+    criado_por_username = Column(Text, nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class OwnerFechamentoHistorico(Base):
+    __tablename__ = "owner_fechamento_historico"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=False)
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+    fechamento_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="SET NULL"), nullable=True)
+    acao = Column(Text, nullable=False)
+    status_anterior = Column(Text, nullable=True)
+    status_novo = Column(Text, nullable=True)
+    motivo = Column(Text, nullable=True)
+    detalhes = Column(JSON, nullable=True)
+    user_id = Column(BigInteger, nullable=True)
+    username = Column(Text, nullable=True)
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class OwnerUnidadeFaturada(Base):
+    __tablename__ = "owner_unidade_faturada"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    fechamento_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="CASCADE"), nullable=False)
+    owner_id = Column(BigInteger, nullable=False)
+    sub_base = Column(Text, nullable=False)
+    codigo = Column(Text, nullable=False)
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+    criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+# ==========================
 # Tabela: entregador_fechamentos
 # ==========================
 class EntregadorFechamento(Base):
@@ -618,6 +863,21 @@ class EntregadorFechamento(Base):
         UniqueConstraint(
             "sub_base", "id_entregador", "id_motoboy", "periodo_inicio", "periodo_fim",
             name="uq_entregador_fechamento_periodo",
+        ),
+        # A constraint acima não protege por causa do NULL; ver migrations/entregador_fechamento_unicidade.sql.
+        Index(
+            "uq_entregador_fechamento_motoboy_periodo",
+            "sub_base", "id_motoboy", "periodo_inicio", "periodo_fim",
+            unique=True,
+            postgresql_where=text("id_motoboy IS NOT NULL"),
+            sqlite_where=text("id_motoboy IS NOT NULL"),
+        ),
+        Index(
+            "uq_entregador_fechamento_entregador_periodo",
+            "sub_base", "id_entregador", "periodo_inicio", "periodo_fim",
+            unique=True,
+            postgresql_where=text("id_entregador IS NOT NULL"),
+            sqlite_where=text("id_entregador IS NOT NULL"),
         ),
     )
 
@@ -697,6 +957,7 @@ class BaseFechamento(Base):
 
     valor_bruto = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     valor_cancelados = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_g = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     valor_adicao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     motivo_adicao = Column(Text, nullable=True)
     valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
@@ -742,6 +1003,7 @@ class BaseFechamentoItem(Base):
     g_shopee = Column(Integer, nullable=False, server_default=text("0"))
     g_ml = Column(Integer, nullable=False, server_default=text("0"))
     g_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    g_categorias = Column(JSON, nullable=True)
 
     fechamento = relationship("BaseFechamento", back_populates="itens")
 

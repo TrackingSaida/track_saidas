@@ -10,14 +10,15 @@ GET /entregadores/fechamentos/calcular — preview valor base
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -50,13 +51,19 @@ from entregador_fechamento_status_pure import (
 
 from entregador_routes import (
     _resolve_user_base,
+    _resolve_executor_scope_ids,
     resolver_precos_entregador,
     resolver_precos_motoboy,
     _calcular_valor_base_motoboy_periodo,
     _calcular_valor_base_periodo,
     _normalizar_servico,
+    precos_motoboy_cache,
+    valores_base_atuais_motoboys,
+    usuario_financeiro,
     STATUS_VALOR_BASE_VALIDOS,
 )
+from fechamento_valor_pure import ajustes_mudaram, contar_g, saida_cancelada
+from pacote_g_categorias import categoria_da_saida, nomes_por_categoria, padrao_id_ou_none
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +73,32 @@ router = APIRouter(prefix="", tags=["Fechamentos"])
 STATUS_SAIDAS_VALIDOS = STATUS_VALOR_BASE_VALIDOS
 
 
+def _contar_g_periodo(db: Session, executor_cond, sub_base: str, periodo_inicio: date, periodo_fim: date) -> dict:
+    """Pacotes G não cancelados no período, no mesmo recorte do cálculo do valor base."""
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base,
+        executor_cond,
+        Saida.codigo.isnot(None),
+        Saida.is_grande.is_(True),
+        func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
+        Saida.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()),
+        Saida.timestamp < datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time()),
+    )
+    rows_raw = db.scalars(stmt).all()
+    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
+    out = contar_g(rows)
+    nomes = nomes_por_categoria(db, sub_base)
+    padrao = padrao_id_ou_none(db, sub_base)
+    por_categoria: dict = {}
+    for s in rows:
+        if saida_cancelada(getattr(s, "status", None)):
+            continue
+        nome = nomes.get(categoria_da_saida(s, padrao)) or "G"
+        por_categoria[nome] = por_categoria.get(nome, 0) + 1
+    out["por_categoria"] = por_categoria
+    return out
+
+
 def _contar_g_por_servico_entregador(
     db: Session,
     sub_base: str,
@@ -73,25 +106,17 @@ def _contar_g_por_servico_entregador(
     periodo_inicio: date,
     periodo_fim: date,
 ) -> dict:
-    """Conta saídas com is_grande no período por serviço (shopee, ml, avulso)."""
-    stmt = select(Saida).where(
-        Saida.sub_base == sub_base,
-        Saida.entregador_id == id_entregador,
-        Saida.is_grande.is_(True),
+    entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
+        db=db, sub_base_user=sub_base, entregador_id=id_entregador, motoboy_id=None
     )
-    stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
-    rows_raw = db.scalars(stmt).all()
-    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
-    g_shopee = g_ml = g_avulso = 0
-    for s in rows:
-        t = _normalizar_servico(s.servico)
-        if t == "shopee":
-            g_shopee += 1
-        elif t == "flex":
-            g_ml += 1
-        else:
-            g_avulso += 1
-    return {"shopee": g_shopee, "ml": g_ml, "avulso": g_avulso, "total": g_shopee + g_ml + g_avulso}
+    conds = []
+    if entregador_ids:
+        conds.append(Saida.entregador_id.in_(sorted(entregador_ids)))
+    if motoboy_ids:
+        conds.append(Saida.motoboy_id.in_(sorted(motoboy_ids)))
+    if not conds:
+        return {"shopee": 0, "ml": 0, "avulso": 0, "total": 0}
+    return _contar_g_periodo(db, or_(*conds), sub_base, periodo_inicio, periodo_fim)
 
 
 def _contar_g_por_servico_motoboy(
@@ -101,25 +126,7 @@ def _contar_g_por_servico_motoboy(
     periodo_inicio: date,
     periodo_fim: date,
 ) -> dict:
-    """Conta saídas com is_grande no período por serviço (shopee, ml, avulso)."""
-    stmt = select(Saida).where(
-        Saida.sub_base == sub_base,
-        Saida.motoboy_id == motoboy_id,
-        Saida.is_grande.is_(True),
-    )
-    stmt = stmt.where(func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS))
-    rows_raw = db.scalars(stmt).all()
-    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
-    g_shopee = g_ml = g_avulso = 0
-    for s in rows:
-        t = _normalizar_servico(s.servico)
-        if t == "shopee":
-            g_shopee += 1
-        elif t == "flex":
-            g_ml += 1
-        else:
-            g_avulso += 1
-    return {"shopee": g_shopee, "ml": g_ml, "avulso": g_avulso, "total": g_shopee + g_ml + g_avulso}
+    return _contar_g_periodo(db, Saida.motoboy_id == motoboy_id, sub_base, periodo_inicio, periodo_fim)
 
 
 def _resolve_motoboy_subbase(db: Session, sub_base: str, motoboy_id: int) -> Motoboy:
@@ -216,8 +223,24 @@ def _calcular_diarias_coleta_motoboy(
     periodo_fim: date,
 ) -> tuple[int, Decimal, list[dict]]:
     """Uma diária por motoboy/data, independentemente da quantidade de bases."""
+    return calcular_diarias_coleta_motoboys(db, sub_base, [motoboy_id], periodo_inicio, periodo_fim)[int(motoboy_id)]
+
+
+def calcular_diarias_coleta_motoboys(
+    db: Session,
+    sub_base: str,
+    motoboy_ids: list[int],
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    precos_cache: Optional[dict] = None,
+) -> dict[int, tuple[int, Decimal, list[dict]]]:
+    """Diárias de coleta de vários motoboys do período numa única consulta."""
+    ids = sorted({int(m) for m in motoboy_ids if m is not None})
+    if not ids:
+        return {}
     rows = db.execute(
-        select(ColetaExecucao.data_operacao, BasePreco.base)
+        select(ColetaExecucaoParticipante.motoboy_id, ColetaExecucao.data_operacao, BasePreco.base)
         .join(
             ColetaExecucaoParticipante,
             ColetaExecucaoParticipante.execucao_id == ColetaExecucao.id_execucao,
@@ -226,24 +249,29 @@ def _calcular_diarias_coleta_motoboy(
         .where(
             ColetaExecucao.sub_base == sub_base,
             ColetaExecucaoParticipante.sub_base == sub_base,
-            ColetaExecucaoParticipante.motoboy_id == motoboy_id,
+            ColetaExecucaoParticipante.motoboy_id.in_(ids),
             ColetaExecucaoParticipante.status == "finalizado",
             ColetaExecucao.data_operacao >= periodo_inicio,
             ColetaExecucao.data_operacao <= periodo_fim,
         )
-        .order_by(ColetaExecucao.data_operacao, BasePreco.base)
     ).all()
-    bases_por_dia: dict[date, set[str]] = {}
-    for data_operacao, base_nome in rows:
-        bases_por_dia.setdefault(data_operacao, set()).add(base_nome)
-    valor_diaria = Decimal(
-        resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id).get("coleta_valor") or 0
-    ).quantize(Decimal("0.01"))
-    itens = [
-        {"data": dia, "bases": sorted(bases), "valor_diaria": valor_diaria}
-        for dia, bases in sorted(bases_por_dia.items())
-    ]
-    return len(itens), (valor_diaria * len(itens)).quantize(Decimal("0.01")), itens
+    bases_por_motoboy: dict[int, dict[date, set[str]]] = {mid: {} for mid in ids}
+    for motoboy_id, data_operacao, base_nome in rows:
+        bases_por_motoboy[int(motoboy_id)].setdefault(data_operacao, set()).add(base_nome)
+    out: dict[int, tuple[int, Decimal, list[dict]]] = {}
+    for mid, bases_por_dia in bases_por_motoboy.items():
+        if not bases_por_dia:
+            out[mid] = (0, Decimal("0.00"), [])
+            continue
+        valor_diaria = Decimal(
+            precos_motoboy_cache(db, sub_base, mid, precos_cache).get("coleta_valor") or 0
+        ).quantize(Decimal("0.01"))
+        itens = [
+            {"data": dia, "bases": sorted(bases), "valor_diaria": valor_diaria}
+            for dia, bases in sorted(bases_por_dia.items())
+        ]
+        out[mid] = (len(itens), (valor_diaria * len(itens)).quantize(Decimal("0.01")), itens)
+    return out
 
 
 def _sincronizar_itens_coleta_fechamento(
@@ -570,7 +598,7 @@ def calcular_valor_base_preview(
     periodo_inicio: date = Query(...),
     periodo_fim: date = Query(...),
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_financeiro),
 ):
     """Retorna valor_base calculado para o período (sem criar fechamento). Informe entregador_id ou motoboy_id."""
     sub_base = _resolve_user_base(db, current_user)
@@ -625,6 +653,7 @@ def calcular_valor_base_preview(
             "periodo_fim": periodo_fim.isoformat(),
             "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
             "g_total": g["total"],
+            "g_por_categoria": g.get("por_categoria") or {},
             "conferencia_habilitada": conferencia_habilitada,
             "conferencia_por_dia": conferencia_por_dia,
             "avulso_valor": _resolver_avulso_valor(db, sub_base, id_motoboy=motoboy_id),
@@ -652,6 +681,7 @@ def calcular_valor_base_preview(
         "periodo_fim": periodo_fim.isoformat(),
         "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
         "g_total": g["total"],
+        "g_por_categoria": g.get("por_categoria") or {},
         "conferencia_habilitada": conferencia_habilitada,
         "conferencia_por_dia": [],
         "avulso_valor": _resolver_avulso_valor(db, sub_base, id_entregador=entregador_id),
@@ -669,7 +699,7 @@ def listar_fechamentos_admin(
     status: Optional[str] = Query(None, description="GERADO|REAJUSTADO|PAGO"),
     apenas_com_divergencia: bool = Query(False),
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_financeiro),
 ):
     """Lista fechamentos consolidados do período (não é o resumo diário)."""
     sub_base = _resolve_user_base(db, current_user)
@@ -690,6 +720,7 @@ def listar_fechamentos_admin(
         if getattr(f, "id_motoboy", None) is not None
     ]
     nomes_motoboy_map = carregar_nomes_motoboy_ids(db, motoboy_ids)
+    valores_atuais = valores_base_atuais_motoboys(db, sub_base, motoboy_ids, periodo_inicio, periodo_fim)
 
     status_filtro = (status or "").strip().upper() or None
     items: List[FechamentoOut] = []
@@ -700,8 +731,13 @@ def listar_fechamentos_admin(
     qtd_pago = 0
 
     for fech in rows:
+        mid = getattr(fech, "id_motoboy", None)
         out = _fechamento_to_out(
-            db, sub_base, fech, nomes_motoboy_map=nomes_motoboy_map
+            db,
+            sub_base,
+            fech,
+            nomes_motoboy_map=nomes_motoboy_map,
+            valor_base_recalc=valores_atuais.get(int(mid)) if mid is not None else None,
         )
         st = (out.status or "").upper()
 
@@ -748,7 +784,7 @@ def listar_fechamentos_admin(
 def marcar_fechamentos_pagos(
     payload: MarcarPagoRequest,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_financeiro),
 ):
     sub_base = _resolve_user_base(db, current_user)
     pago_por = (getattr(current_user, "username", None) or "").strip() or str(
@@ -836,37 +872,90 @@ def marcar_fechamentos_pagos(
 # POST — Criar fechamento
 # =========================================================
 
-@router.post("/fechamentos", response_model=FechamentoOut, status_code=201)
-def criar_fechamento(
-    payload: FechamentoCreate,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    sub_base = _resolve_user_base(db, current_user)
+MSG_FECHAMENTO_JA_EXISTE = "Já existe fechamento para este motoboy neste período."
 
-    if payload.periodo_inicio > payload.periodo_fim:
+
+def _validar_periodo_fechado(periodo_inicio: date, periodo_fim: date) -> None:
+    if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if payload.periodo_fim >= date.today():
+    if periodo_fim >= date.today():
         raise HTTPException(
             400,
             "Não é permitido criar fechamento para período ainda em aberto. "
             "Escolha um período cuja data final seja anterior à data de hoje.",
         )
 
+
+def _travar_executor(db: Session, sub_base: str, tipo: str, executor_id: int) -> None:
+    """Serializa criações concorrentes do mesmo executor até o fim da transação."""
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+        {"k": f"fechamento:{sub_base}:{tipo}:{int(executor_id)}"},
+    )
+
+
+def _fechamento_sobreposto(
+    db: Session,
+    sub_base: str,
+    *,
+    id_entregador: Optional[int],
+    id_motoboy: Optional[int],
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> Optional[EntregadorFechamento]:
+    if id_motoboy is not None:
+        cond = EntregadorFechamento.id_motoboy == id_motoboy
+    else:
+        cond = EntregadorFechamento.id_entregador == id_entregador
+    return db.scalar(
+        select(EntregadorFechamento)
+        .where(
+            EntregadorFechamento.sub_base == sub_base,
+            cond,
+            EntregadorFechamento.periodo_inicio <= periodo_fim,
+            EntregadorFechamento.periodo_fim >= periodo_inicio,
+        )
+        .order_by(EntregadorFechamento.periodo_inicio)
+        .limit(1)
+    )
+
+
+def _erro_sobreposicao(existente: EntregadorFechamento, periodo_inicio: date, periodo_fim: date) -> HTTPException:
+    if existente.periodo_inicio == periodo_inicio and existente.periodo_fim == periodo_fim:
+        return HTTPException(409, MSG_FECHAMENTO_JA_EXISTE)
+    return HTTPException(
+        409,
+        f"Já existe fechamento de {existente.periodo_inicio.strftime('%d/%m/%Y')} a "
+        f"{existente.periodo_fim.strftime('%d/%m/%Y')} que cobre parte deste período.",
+    )
+
+
+def _criar_fechamento_core(
+    db: Session,
+    sub_base: str,
+    payload: FechamentoCreate,
+    *,
+    pular_sem_valor: bool = False,
+) -> Optional[tuple]:
+    """Valida, calcula e insere (flush) o fechamento. Não faz commit, PDF nem push.
+
+    Retorna (fechamento, chave_pix) ou None quando pular_sem_valor e não há valor a pagar.
+    """
+    _validar_periodo_fechado(payload.periodo_inicio, payload.periodo_fim)
+
     chave_pix: Optional[str] = None
     if payload.id_motoboy is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, payload.id_motoboy)
+        _travar_executor(db, sub_base, "m", payload.id_motoboy)
         username_ent = _get_motoboy_username(db, motoboy)
         chave_pix = (getattr(motoboy, "chave_pix", None) or "").strip() or None
         id_entregador_val = None
         id_motoboy_val = payload.id_motoboy
-        existente = db.scalar(
-            select(EntregadorFechamento).where(
-                EntregadorFechamento.sub_base == sub_base,
-                EntregadorFechamento.id_motoboy == payload.id_motoboy,
-                EntregadorFechamento.periodo_inicio == payload.periodo_inicio,
-                EntregadorFechamento.periodo_fim == payload.periodo_fim,
-            )
+        existente = _fechamento_sobreposto(
+            db, sub_base, id_entregador=None, id_motoboy=payload.id_motoboy,
+            periodo_inicio=payload.periodo_inicio, periodo_fim=payload.periodo_fim,
         )
         valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, payload.id_motoboy,
@@ -881,16 +970,13 @@ def criar_fechamento(
         ent = db.get(Entregador, payload.id_entregador)
         if not ent or ent.sub_base != sub_base:
             raise HTTPException(404, "Entregador não encontrado.")
+        _travar_executor(db, sub_base, "e", payload.id_entregador)
         username_ent = ent.username_entregador or ent.nome or ""
         id_entregador_val = payload.id_entregador
         id_motoboy_val = None
-        existente = db.scalar(
-            select(EntregadorFechamento).where(
-                EntregadorFechamento.sub_base == sub_base,
-                EntregadorFechamento.id_entregador == payload.id_entregador,
-                EntregadorFechamento.periodo_inicio == payload.periodo_inicio,
-                EntregadorFechamento.periodo_fim == payload.periodo_fim,
-            )
+        existente = _fechamento_sobreposto(
+            db, sub_base, id_entregador=payload.id_entregador, id_motoboy=None,
+            periodo_inicio=payload.periodo_inicio, periodo_fim=payload.periodo_fim,
         )
         valor_entregas = _calcular_valor_base_periodo(
             db, sub_base, payload.id_entregador,
@@ -902,10 +988,7 @@ def criar_fechamento(
         valor_base = valor_entregas
 
     if existente:
-        raise HTTPException(
-            409,
-            "Já existe fechamento para este executor e período."
-        )
+        raise _erro_sobreposicao(existente, payload.periodo_inicio, payload.periodo_fim)
 
     if id_motoboy_val is not None and dias_coleta:
         dias = [item["data"] for item in dias_coleta]
@@ -925,6 +1008,8 @@ def criar_fechamento(
     valor_ad = Decimal(str(payload.valor_adicao or 0)).quantize(Decimal("0.01"))
     valor_sub = Decimal(str(payload.valor_subtracao or 0)).quantize(Decimal("0.01"))
     valor_final = (valor_base + valor_ad - valor_sub).quantize(Decimal("0.01"))
+    if pular_sem_valor and valor_base == 0 and valor_ad == 0 and valor_sub == 0:
+        return None
 
     fech = EntregadorFechamento(
         sub_base=sub_base,
@@ -944,23 +1029,34 @@ def criar_fechamento(
         valor_final=valor_final,
         status=STATUS_GERADO,
     )
-    db.add(fech)
-    db.flush()
-    if id_motoboy_val is not None:
-        for item in dias_coleta:
-            db.add(
-                EntregadorFechamentoColetaItem(
-                    id_fechamento=fech.id_fechamento,
-                    sub_base=sub_base,
-                    motoboy_id=id_motoboy_val,
-                    data=item["data"],
-                    bases=item["bases"],
-                    valor_diaria=item["valor_diaria"],
+    try:
+        db.add(fech)
+        db.flush()
+        if id_motoboy_val is not None:
+            for item in dias_coleta:
+                db.add(
+                    EntregadorFechamentoColetaItem(
+                        id_fechamento=fech.id_fechamento,
+                        sub_base=sub_base,
+                        motoboy_id=id_motoboy_val,
+                        data=item["data"],
+                        bases=item["bases"],
+                        valor_diaria=item["valor_diaria"],
+                    )
                 )
-            )
-    db.commit()
-    db.refresh(fech)
+            db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, MSG_FECHAMENTO_JA_EXISTE)
+    return fech, chave_pix
 
+
+def _pos_criar_fechamento(
+    db: Session,
+    fech: EntregadorFechamento,
+    chave_pix: Optional[str],
+) -> EntregadorFechamento:
+    """PDF e push após o commit; falhas não desfazem o fechamento."""
     fech_id = int(fech.id_fechamento)
     try:
         from fechamento_pdf_service import upload_fechamento_pdf
@@ -1015,6 +1111,28 @@ def criar_fechamento(
             except Exception:
                 pass
         fech = db.get(EntregadorFechamento, fech_id) or fech
+    return fech
+
+
+def _commit_criacao(db: Session) -> None:
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, MSG_FECHAMENTO_JA_EXISTE)
+
+
+@router.post("/fechamentos", response_model=FechamentoOut, status_code=201)
+def criar_fechamento(
+    payload: FechamentoCreate,
+    db: Session = Depends(get_db),
+    current_user=Depends(usuario_financeiro),
+):
+    sub_base = _resolve_user_base(db, current_user)
+    fech, chave_pix = _criar_fechamento_core(db, sub_base, payload)
+    _commit_criacao(db)
+    db.refresh(fech)
+    fech = _pos_criar_fechamento(db, fech, chave_pix)
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
@@ -1040,6 +1158,142 @@ def criar_fechamento(
 
 
 # =========================================================
+# POST — Gerar fechamentos em lote (todos os pendentes do período)
+# =========================================================
+
+class FechamentoLoteRequest(BaseModel):
+    periodo_inicio: date
+    periodo_fim: date
+    chave_idempotencia: Optional[str] = Field(None, max_length=80)
+
+
+class FechamentoLoteItem(BaseModel):
+    executor_tipo: str
+    executor_id: int
+    nome: str
+    id_fechamento: Optional[int] = None
+    valor_final: Optional[Decimal] = None
+    motivo: Optional[str] = None
+
+
+class FechamentoLoteResponse(BaseModel):
+    criados: List[FechamentoLoteItem] = Field(default_factory=list)
+    ja_existentes: List[FechamentoLoteItem] = Field(default_factory=list)
+    sem_valor: List[FechamentoLoteItem] = Field(default_factory=list)
+    erros: List[FechamentoLoteItem] = Field(default_factory=list)
+    total_gerado: Decimal = Decimal("0.00")
+
+
+@router.post("/fechamentos/lote", response_model=FechamentoLoteResponse)
+def gerar_fechamentos_lote(
+    payload: FechamentoLoteRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(usuario_financeiro),
+):
+    """Gera, sem ajustes, o fechamento de cada executor pendente no período.
+
+    Cada fechamento é confirmado separadamente; repetir a chamada não duplica
+    (quem já tem fechamento volta em ja_existentes).
+    """
+    from entregador_routes import resumo_entregadores
+
+    sub_base = _resolve_user_base(db, current_user)
+    _validar_periodo_fechado(payload.periodo_inicio, payload.periodo_fim)
+    logger.info(
+        "fechamento_lote_inicio sub_base=%s periodo=%s..%s chave=%s",
+        sub_base, payload.periodo_inicio, payload.periodo_fim, payload.chave_idempotencia,
+    )
+
+    resumo = resumo_entregadores(
+        data_inicio=payload.periodo_inicio,
+        data_fim=payload.periodo_fim,
+        entregador_id=None,
+        motoboy_id=None,
+        executor_tipo=None,
+        executor_id=None,
+        fechamento_status=None,
+        base=None,
+        agrupar="executor",
+        page=1,
+        pageSize=100000,
+        db=db,
+        current_user=current_user,
+    )
+    linhas = list(resumo.items)
+    motoboys_na_lista = {r.executor_id for r in linhas if r.executor_tipo == "m"}
+
+    out = FechamentoLoteResponse()
+    pos_criacao: list = []
+    for r in linhas:
+        item = FechamentoLoteItem(executor_tipo=r.executor_tipo, executor_id=r.executor_id, nome=r.nome)
+        if r.fechamento_status != "PENDENTE":
+            item.id_fechamento = r.id_fechamento
+            item.valor_final = r.valor_final
+            out.ja_existentes.append(item)
+            continue
+        if r.parcial:
+            item.motivo = "Parte do período já tem fechamento. Gere individualmente."
+            out.erros.append(item)
+            continue
+        if r.executor_tipo == "e":
+            _, mids = _resolve_executor_scope_ids(
+                db=db, sub_base_user=sub_base, entregador_id=r.executor_id, motoboy_id=None
+            )
+            if mids & motoboys_na_lista:
+                item.motivo = "Registros antigos ligados a um motoboy da lista. Gere individualmente."
+                out.erros.append(item)
+                continue
+
+        req = FechamentoCreate(
+            id_motoboy=r.executor_id if r.executor_tipo == "m" else None,
+            id_entregador=r.executor_id if r.executor_tipo == "e" else None,
+            periodo_inicio=payload.periodo_inicio,
+            periodo_fim=payload.periodo_fim,
+        )
+        try:
+            criado = _criar_fechamento_core(db, sub_base, req, pular_sem_valor=True)
+            if criado is None:
+                db.rollback()
+                out.sem_valor.append(item)
+                continue
+            fech, chave_pix = criado
+            _commit_criacao(db)
+        except HTTPException as exc:
+            db.rollback()
+            if exc.status_code == 409 and exc.detail == MSG_FECHAMENTO_JA_EXISTE:
+                out.ja_existentes.append(item)
+            else:
+                item.motivo = str(exc.detail)
+                out.erros.append(item)
+            continue
+        except Exception:
+            logger.exception("fechamento_lote_item_failed sub_base=%s executor=%s_%s", sub_base, r.executor_tipo, r.executor_id)
+            db.rollback()
+            item.motivo = "Não foi possível gerar. Tente individualmente."
+            out.erros.append(item)
+            continue
+
+        db.refresh(fech)
+        item.id_fechamento = int(fech.id_fechamento)
+        item.valor_final = fech.valor_final
+        out.criados.append(item)
+        out.total_gerado += Decimal(str(fech.valor_final or 0))
+        pos_criacao.append((int(fech.id_fechamento), chave_pix))
+
+    for fech_id, chave_pix in pos_criacao:
+        fech = db.get(EntregadorFechamento, fech_id)
+        if fech is not None:
+            _pos_criar_fechamento(db, fech, chave_pix)
+
+    out.total_gerado = out.total_gerado.quantize(Decimal("0.01"))
+    logger.info(
+        "fechamento_lote_fim sub_base=%s criados=%s existentes=%s sem_valor=%s erros=%s",
+        sub_base, len(out.criados), len(out.ja_existentes), len(out.sem_valor), len(out.erros),
+    )
+    return out
+
+
+# =========================================================
 # GET — Obter fechamento (para modal de edição)
 # =========================================================
 
@@ -1047,7 +1301,7 @@ def criar_fechamento(
 def obter_fechamento(
     id_fechamento: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_financeiro),
 ):
     sub_base = _resolve_user_base(db, current_user)
 
@@ -1074,7 +1328,7 @@ def atualizar_fechamento(
     id_fechamento: int,
     payload: FechamentoUpdate,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_financeiro),
 ):
     sub_base = _resolve_user_base(db, current_user)
 
@@ -1115,6 +1369,24 @@ def atualizar_fechamento(
         valor_coletas = Decimal("0.00")
         qtd_dias_coleta = 0
         valor_base_recalc = valor_entregas
+
+    novos_valores = {
+        "valor_adicao": payload.valor_adicao,
+        "motivo_adicao": payload.motivo_adicao,
+        "valor_subtracao": payload.valor_subtracao,
+        "motivo_subtracao": payload.motivo_subtracao,
+    }
+    if payload.atualizar_valor_base is True:
+        novos_valores["valor_base"] = valor_base_recalc
+    valores_atuais = {
+        "valor_base": fech.valor_base,
+        "valor_adicao": fech.valor_adicao,
+        "motivo_adicao": fech.motivo_adicao,
+        "valor_subtracao": fech.valor_subtracao,
+        "motivo_subtracao": fech.motivo_subtracao,
+    }
+    if not ajustes_mudaram(valores_atuais, novos_valores):
+        return _fechamento_to_out(db, sub_base, fech)
 
     if payload.atualizar_valor_base is True:
         if getattr(fech, "id_motoboy", None) is not None:
@@ -1209,7 +1481,7 @@ def atualizar_fechamento(
 def baixar_pdf_fechamento_admin(
     id_fechamento: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_financeiro),
 ):
     sub_base = _resolve_user_base(db, current_user)
     fech = db.get(EntregadorFechamento, id_fechamento)

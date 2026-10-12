@@ -55,9 +55,9 @@ def test_menu_ignorar_coleta_oculta_todos_os_itens_de_coleta():
     assert "dashboard-coletas.html" not in hrefs
 
 
-def test_menu_manual_oculta_scanner_mas_mantem_gestao():
+def test_menu_manual_mantem_registro_por_quantidades_e_gestao():
     hrefs = _hrefs_menu(menu_for_role(1, ignorar_coleta=False, modo_operacao="coleta_manual"))
-    assert "tracking-coleta-leitura.html" not in hrefs
+    assert "tracking-coleta-leitura.html" in hrefs
     assert "tracking-coletas-resumo.html" in hrefs
     assert "tracking-coletas-operacao.html" in hrefs
 
