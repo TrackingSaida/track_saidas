@@ -25,7 +25,6 @@ MENU_DEFS = [
                 "roles": [0, 1, 2, 3],
                 "group": "leituras",
                 "coleta_only": True,
-                "coleta_leitura_only": True,
             },
             {
                 "label": "Registrar Saídas",
@@ -158,7 +157,6 @@ def menu_for_role(
         if role in section["roles"]:
             # Filtra os itens permitidos (role + ignorar_coleta + modo_operacao + base_only)
             # coleta_only: ocultar sempre quando ignorar_coleta
-            # coleta_leitura_only: mostrar apenas nos modos codigo/ambos
             # visao360_only: sempre ocultar quando ignorar_coleta
             # entrada_only: mostrar só quando owner habilitou entrada obrigatória
             # base_only: mostrar só quando tipo_owner == "base"; base_only_roles: aplicar só a esses roles (ex.: [1] = só admin exige base)
@@ -175,8 +173,6 @@ def menu_for_role(
                 if ignorar_coleta and item.get("visao360_only"):
                     continue
                 if ignorar_coleta and item.get("coleta_only"):
-                    continue
-                if item.get("coleta_leitura_only") and modo_operacao not in ("codigo", "ambos"):
                     continue
                 # Aplica label por tipo (Base -> Seller quando tipo_owner == "base")
                 label = _menu_label_for_owner(item.get("label", ""), tipo_owner)

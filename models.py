@@ -14,6 +14,7 @@ from sqlalchemy import (
     text,
     UniqueConstraint,
     ForeignKey,
+    Index,
 )
 from sqlalchemy.sql import func
 
@@ -828,6 +829,21 @@ class EntregadorFechamento(Base):
         UniqueConstraint(
             "sub_base", "id_entregador", "id_motoboy", "periodo_inicio", "periodo_fim",
             name="uq_entregador_fechamento_periodo",
+        ),
+        # A constraint acima não protege por causa do NULL; ver migrations/entregador_fechamento_unicidade.sql.
+        Index(
+            "uq_entregador_fechamento_motoboy_periodo",
+            "sub_base", "id_motoboy", "periodo_inicio", "periodo_fim",
+            unique=True,
+            postgresql_where=text("id_motoboy IS NOT NULL"),
+            sqlite_where=text("id_motoboy IS NOT NULL"),
+        ),
+        Index(
+            "uq_entregador_fechamento_entregador_periodo",
+            "sub_base", "id_entregador", "periodo_inicio", "periodo_fim",
+            unique=True,
+            postgresql_where=text("id_entregador IS NOT NULL"),
+            sqlite_where=text("id_entregador IS NOT NULL"),
         ),
     )
 
