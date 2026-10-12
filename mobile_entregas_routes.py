@@ -56,6 +56,7 @@ from models import (
     RotasMotoboy,
     Owner,
     OwnerCobrancaItem,
+    EntregadorFechamento,
 )
 from saidas_routes import (
     STATUS_SAIU_PARA_ENTREGA,
@@ -92,7 +93,7 @@ from codigo_normalizer import (
     is_qr_like_scan_payload,
 )
 from entregador_routes import resolver_precos_motoboy
-from extrato_valor_utils import valor_extrato_por_filtro
+from extrato_valor_utils import situacao_fechamento_periodo, valor_extrato_por_filtro
 from route_api_status import (
     API_STATUS_EM_ENTREGA,
     build_rotas_ativa_out,
@@ -479,6 +480,7 @@ class ExtratoFinanceiroOut(BaseModel):
     resumo_por_servico: Dict[str, int]
     dias: List[ExtratoDiaItem]
     itens_cancelados: List[ExtratoPedidoItem] = Field(default_factory=list)
+    situacao_fechamento: str = "sem_fechamento"
 
 
 # ============================================================
@@ -1196,7 +1198,8 @@ def extrato_financeiro_motoboy(
     valor_total = valor_extrato_por_filtro(valor_feitos, valor_cancelados, modo)
     dias = []
     for d, v in dias_map.items():
-        if int(v["total_pacotes_filtrados"]) <= 0:
+        so_cancelados_visiveis = modo == "grupo_entregue" and bool(v["itens_cancelados"])
+        if int(v["total_pacotes_filtrados"]) <= 0 and not so_cancelados_visiveis:
             continue
         dias.append(
             ExtratoDiaItem(
@@ -1216,6 +1219,27 @@ def extrato_financeiro_motoboy(
         )
     dias.sort(key=lambda item: item.data, reverse=True)
 
+    fechamentos_periodo = run_db_query_with_retry(
+        db,
+        lambda: db.execute(
+            select(
+                EntregadorFechamento.periodo_inicio,
+                EntregadorFechamento.periodo_fim,
+                EntregadorFechamento.status,
+            ).where(
+                EntregadorFechamento.sub_base == sub_base,
+                EntregadorFechamento.id_motoboy == motoboy_id,
+                EntregadorFechamento.periodo_inicio <= periodo_fim,
+                EntregadorFechamento.periodo_fim >= periodo_inicio,
+            )
+        ).all(),
+    )
+    situacao = situacao_fechamento_periodo(
+        [(r[0], r[1], r[2]) for r in fechamentos_periodo],
+        periodo_inicio,
+        periodo_fim,
+    )
+
     return ExtratoFinanceiroOut(
         periodo_inicio=periodo_inicio.isoformat(),
         periodo_fim=periodo_fim.isoformat(),
@@ -1233,6 +1257,7 @@ def extrato_financeiro_motoboy(
         },
         dias=dias,
         itens_cancelados=itens_cancelados_periodo if modo == "grupo_entregue" else [],
+        situacao_fechamento=situacao,
     )
 
 
