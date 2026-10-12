@@ -530,6 +530,10 @@ def get_resumo_contabilidade(
     data_inicio: date = Query(..., description="Data inicial do período"),
     data_fim: date = Query(..., description="Data final do período"),
     modo_entregas: str = Query("saiu", description="Base de contagem: 'saiu'/'operacional' (status operacionais válidos) ou 'entregue' (status entregue app mobile)"),
+    comparar_anterior: bool = Query(
+        True,
+        description="Calcula o balanço do período anterior para a variação. Com false a resposta sai mais rápido e balanco.*.anterior vem nulo.",
+    ),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -868,7 +872,7 @@ def get_resumo_contabilidade(
     bal_prev_fim = data_inicio - timedelta(days=1)
     bal_prev_ini = bal_prev_fim - timedelta(days=delta_dias_bal - 1)
     anterior_bal = None
-    if bal_prev_ini >= date(2000, 1, 1):
+    if comparar_anterior and bal_prev_ini >= date(2000, 1, 1):
         try:
             anterior_bal = _lados_periodo(db, sub_base, bal_prev_ini, bal_prev_fim, modo)
         except Exception:
