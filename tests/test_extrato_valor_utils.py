@@ -1,7 +1,8 @@
 """Regra de valor do extrato (Minhas entregas) por filtro de status."""
+from datetime import date
 from decimal import Decimal
 
-from extrato_valor_utils import valor_extrato_por_filtro
+from extrato_valor_utils import situacao_fechamento_periodo, valor_extrato_por_filtro
 
 
 def test_todos_soma_entregue_mais_cancelado():
@@ -31,3 +32,27 @@ def test_mais_cancelados_que_entregues_nao_fica_negativo_no_filtro_entregue():
     # 1 feito + 2 cancelados: total a receber = só o feito (sem multa).
     assert valor_extrato_por_filtro(Decimal("4.00"), Decimal("8.00"), "grupo_entregue") == Decimal("4.00")
     assert valor_extrato_por_filtro(Decimal("4.00"), Decimal("8.00"), "todos") == Decimal("12.00")
+
+
+INICIO = date(2026, 10, 1)
+FIM = date(2026, 10, 15)
+
+
+def test_situacao_sem_fechamento_no_periodo():
+    fora = [(date(2026, 9, 16), date(2026, 9, 30), "PAGO")]
+    assert situacao_fechamento_periodo(fora, INICIO, FIM) == "sem_fechamento"
+    assert situacao_fechamento_periodo([], INICIO, FIM) == "sem_fechamento"
+
+
+def test_situacao_gerado_reajustado_e_fechado_legado():
+    for status in ("GERADO", "REAJUSTADO", "fechado"):
+        assert situacao_fechamento_periodo([(INICIO, FIM, status)], INICIO, FIM) == "gerado"
+
+
+def test_situacao_pago_cobrindo_todo_periodo():
+    assert situacao_fechamento_periodo([(INICIO, FIM, "PAGO")], INICIO, FIM) == "pago"
+
+
+def test_situacao_pago_parcial_continua_previsao():
+    parcial = [(INICIO, date(2026, 10, 7), "PAGO")]
+    assert situacao_fechamento_periodo(parcial, INICIO, FIM) == "gerado"
