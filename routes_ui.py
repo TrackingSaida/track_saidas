@@ -83,6 +83,7 @@ MENU_DEFS = [
             {"label": "Fechamento Bases", "href": "tracking-coletas-resumo.html", "roles": [0, 1], "coleta_only": True, "group": "coletas"},
             {"label": "A Receber", "href": "tracking-bases-a-receber.html", "roles": [0, 1], "coleta_only": True, "group": "coletas"},
             {"label": "Contabilidade", "href": "tracking-contabilidade.html", "roles": [0, 1]},
+            {"label": "Cobrança de Owners", "href": "tracking-cobranca-owners.html", "roles": [0]},
         ]
     },
     {
