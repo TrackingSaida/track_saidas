@@ -1,12 +1,12 @@
 from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, defer, joinedload
 
 from db import get_db
 from name_normalizer import normalize_display_name, normalize_person_name, person_name_sort_key
@@ -1020,29 +1020,67 @@ def _calcular_valor_base_motoboy_periodo(
     periodo_fim: date,
 ) -> Decimal:
     """Calcula o valor_base a partir das saídas do motoboy no período (resumo/fechamento)."""
+    return _calcular_valores_base_motoboys_periodo(
+        db, sub_base_user, [motoboy_id], periodo_inicio, periodo_fim
+    ).get(int(motoboy_id), Decimal("0.00"))
+
+
+def precos_motoboy_cache(
+    db: Session, sub_base: str, motoboy_id: int, cache: Optional[Dict[int, Dict[str, Decimal]]]
+) -> Dict[str, Decimal]:
+    if cache is None:
+        return resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
+    if int(motoboy_id) not in cache:
+        cache[int(motoboy_id)] = resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
+    return cache[int(motoboy_id)]
+
+
+def _calcular_valores_base_motoboys_periodo(
+    db: Session,
+    sub_base_user: str,
+    motoboy_ids: Iterable[int],
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    precos_cache: Optional[Dict[int, Dict[str, Decimal]]] = None,
+    saidas_periodo: Optional[List[Saida]] = None,
+) -> Dict[int, Decimal]:
+    """Valor das entregas de vários motoboys no mesmo período, carregando saídas e histórico uma única vez.
+
+    saidas_periodo: saídas já carregadas com os mesmos filtros (status válidos, código e período operacional);
+    evita recarregar quando o chamador já as tem em memória.
+    """
+    ids = sorted({int(m) for m in motoboy_ids if m is not None})
+    zero = Decimal("0.00")
+    if not ids:
+        return {}
     if periodo_inicio > periodo_fim:
-        return Decimal("0.00")
-    stmt = select(Saida).where(
-        Saida.sub_base == sub_base_user,
-        Saida.motoboy_id == motoboy_id,
-        Saida.codigo.isnot(None),
-        func.lower(Saida.status).in_(STATUS_VALOR_BASE_VALIDOS),
-    )
-    # Reduz cardinalidade para períodos grandes antes da filtragem operacional.
-    stmt = stmt.where(Saida.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()))
-    stmt = stmt.where(Saida.timestamp < datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time()))
-    rows_raw = db.scalars(stmt).all()
-    rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
-    precos = resolver_precos_motoboy(db, sub_base_user, motoboy_id=motoboy_id)
+        return {mid: zero for mid in ids}
+    if saidas_periodo is None:
+        stmt = select(Saida).options(defer(Saida.qr_payload_raw)).where(
+            Saida.sub_base == sub_base_user,
+            Saida.motoboy_id.in_(ids),
+            Saida.codigo.isnot(None),
+            func.lower(Saida.status).in_(STATUS_VALOR_BASE_VALIDOS),
+        )
+        # Reduz cardinalidade para períodos grandes antes da filtragem operacional.
+        stmt = stmt.where(Saida.timestamp >= datetime.combine(periodo_inicio, datetime.min.time()))
+        stmt = stmt.where(Saida.timestamp < datetime.combine(periodo_fim + timedelta(days=1), datetime.min.time()))
+        rows_raw = db.scalars(stmt).all()
+        saidas_periodo, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base_user)
     regras_g, padrao_g = _regras_g_motoboy(db, sub_base_user)
-    total = Decimal("0.00")
-    for saida in rows:
-        status_norm = (saida.status or "").strip().lower()
-        is_cancelado = "cancel" in status_norm
-        # Cancelado não paga e não gera multa (contribui R$ 0,00), inclusive Pacote G.
-        if is_cancelado:
+    totais = {mid: zero for mid in ids}
+    for saida in saidas_periodo:
+        mid = getattr(saida, "motoboy_id", None)
+        if mid is None or int(mid) not in totais:
             continue
+        mid = int(mid)
+        status_norm = (saida.status or "").strip().lower()
+        # Cancelado não paga e não gera multa (contribui R$ 0,00), inclusive Pacote G.
+        if "cancel" in status_norm:
+            continue
+        precos = precos_motoboy_cache(db, sub_base_user, mid, precos_cache)
         tipo = _normalizar_servico(saida.servico)
         if tipo == "shopee":
             delta = precos["shopee_valor"]
@@ -1050,10 +1088,39 @@ def _calcular_valor_base_motoboy_periodo(
             delta = precos["ml_valor"]
         else:
             delta = precos["avulso_valor"]
-        total += delta
+        total = totais[mid] + delta
         if toggle_pacote_g and bool(getattr(saida, "is_grande", False)):
             total += adicional_g(Decimal(str(delta or 0)), regras_g.get(categoria_da_saida(saida, padrao_g)))
-    return total.quantize(Decimal("0.01"))
+        totais[mid] = total
+    return {mid: v.quantize(Decimal("0.01")) for mid, v in totais.items()}
+
+
+def valores_base_atuais_motoboys(
+    db: Session,
+    sub_base: str,
+    motoboy_ids: Iterable[int],
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    precos_cache: Optional[Dict[int, Dict[str, Decimal]]] = None,
+    saidas_periodo: Optional[List[Saida]] = None,
+) -> Dict[int, Decimal]:
+    """Valor base recalculado agora (entregas + diárias de coleta) para vários motoboys do mesmo período."""
+    from entregador_fechamento_routes import calcular_diarias_coleta_motoboys
+
+    if precos_cache is None:
+        precos_cache = {}
+    entregas = _calcular_valores_base_motoboys_periodo(
+        db, sub_base, motoboy_ids, periodo_inicio, periodo_fim,
+        precos_cache=precos_cache, saidas_periodo=saidas_periodo,
+    )
+    coletas = calcular_diarias_coleta_motoboys(
+        db, sub_base, list(entregas), periodo_inicio, periodo_fim, precos_cache=precos_cache
+    )
+    return {
+        mid: (valor + coletas[mid][1]).quantize(Decimal("0.01"))
+        for mid, valor in entregas.items()
+    }
 
 
 _ORDEM_STATUS_LINHA = {"GERADO": 0, "REAJUSTADO": 1, "PAGO": 2}
@@ -1089,26 +1156,45 @@ def _motoboys_com_diarias_coleta(db: Session, sub_base: str, ini: date, fim: dat
     return sorted(int(i) for i in ids)
 
 
-def _diarias_coleta_em_aberto(db: Session, sub_base: str, motoboy_id: int, ini: date, fim: date) -> tuple:
-    """Diárias de coleta do período que ainda não pertencem a nenhum fechamento."""
-    from entregador_fechamento_routes import _calcular_diarias_coleta_motoboy
+def _diarias_coleta_em_aberto_motoboys(
+    db: Session,
+    sub_base: str,
+    motoboy_ids: List[int],
+    ini: date,
+    fim: date,
+    *,
+    precos_cache: Optional[Dict[int, Dict[str, Decimal]]] = None,
+) -> Dict[int, tuple]:
+    """Diárias de coleta do período que ainda não pertencem a nenhum fechamento, por motoboy."""
+    from entregador_fechamento_routes import calcular_diarias_coleta_motoboys
     from models import EntregadorFechamentoColetaItem
 
-    _, _, itens = _calcular_diarias_coleta_motoboy(db, sub_base, motoboy_id, ini, fim)
-    if not itens:
-        return 0, Decimal("0.00")
-    pagos = set(
-        db.scalars(
-            select(EntregadorFechamentoColetaItem.data).where(
+    por_motoboy = {
+        mid: itens
+        for mid, (_, _, itens) in calcular_diarias_coleta_motoboys(
+            db, sub_base, motoboy_ids, ini, fim, precos_cache=precos_cache
+        ).items()
+        if itens
+    }
+    if not por_motoboy:
+        return {}
+    pagos = {
+        (int(motoboy_id), data)
+        for motoboy_id, data in db.execute(
+            select(EntregadorFechamentoColetaItem.motoboy_id, EntregadorFechamentoColetaItem.data).where(
                 EntregadorFechamentoColetaItem.sub_base == sub_base,
-                EntregadorFechamentoColetaItem.motoboy_id == motoboy_id,
-                EntregadorFechamentoColetaItem.data.in_([i["data"] for i in itens]),
+                EntregadorFechamentoColetaItem.motoboy_id.in_(sorted(por_motoboy)),
+                EntregadorFechamentoColetaItem.data >= ini,
+                EntregadorFechamentoColetaItem.data <= fim,
             )
         ).all()
-    )
-    abertos = [i for i in itens if i["data"] not in pagos]
-    valor = sum((Decimal(str(i["valor_diaria"] or 0)) for i in abertos), Decimal("0.00"))
-    return len(abertos), valor.quantize(Decimal("0.01"))
+    }
+    out: Dict[int, tuple] = {}
+    for mid, itens in por_motoboy.items():
+        abertos = [i for i in itens if (mid, i["data"]) not in pagos]
+        valor = sum((Decimal(str(i["valor_diaria"] or 0)) for i in abertos), Decimal("0.00"))
+        out[mid] = (len(abertos), valor.quantize(Decimal("0.01")))
+    return out
 
 
 def _valor_base_atual_fechamento(db: Session, sub_base: str, tipo: str, xid: int, fech: EntregadorFechamento) -> Decimal:
@@ -1136,8 +1222,12 @@ def _resumo_agrupado_por_executor(
     filtro_entregador_id: Optional[int],
     page: int,
     pageSize: int,
+    cache_valor_base: Optional[Dict[tuple, Decimal]] = None,
+    precos_motoboy: Optional[Dict[int, Dict[str, Decimal]]] = None,
 ) -> ResumoExecutorResponse:
     zero = Decimal("0.00")
+    cache_valor_base = cache_valor_base if cache_valor_base is not None else {}
+    precos_motoboy = precos_motoboy if precos_motoboy is not None else {}
     linhas: Dict[tuple, Dict[str, Any]] = {}
     for it in lista:
         if it.motoboy_id is not None:
@@ -1155,6 +1245,16 @@ def _resumo_agrupado_por_executor(
             linhas.setdefault(("m", mid), {"nome": None, "dias": []})
     sem_nome = [xid for (tipo, xid), ln in linhas.items() if tipo == "m" and not ln["nome"]]
     nomes = _carregar_nomes_motoboy_ids(db, sem_nome) if sem_nome else {}
+    coletas_abertas = _diarias_coleta_em_aberto_motoboys(
+        db, sub_base_user, [xid for (tipo, xid) in linhas if tipo == "m"], data_inicio, data_fim,
+        precos_cache=precos_motoboy,
+    )
+
+    def _valor_base_atual(tipo: str, xid: int, fech: EntregadorFechamento) -> Decimal:
+        chave = ("m", xid, fech.periodo_inicio, fech.periodo_fim) if tipo == "m" else (xid, fech.periodo_inicio, fech.periodo_fim)
+        if chave not in cache_valor_base:
+            cache_valor_base[chave] = _valor_base_atual_fechamento(db, sub_base_user, tipo, xid, fech)
+        return Decimal(str(cache_valor_base[chave])).quantize(Decimal("0.01"))
 
     rows: List[ResumoExecutorItem] = []
     for (tipo, xid), ln in linhas.items():
@@ -1184,7 +1284,7 @@ def _resumo_agrupado_por_executor(
         qtd_col, val_col = 0, zero
         if tipo == "m":
             if pendente:
-                qtd_col, val_col = _diarias_coleta_em_aberto(db, sub_base_user, xid, data_inicio, data_fim)
+                qtd_col, val_col = coletas_abertas.get(xid, (0, zero))
             elif fech is not None:
                 qtd_col = int(getattr(fech, "qtd_dias_coleta", 0) or 0)
                 val_col = Decimal(str(getattr(fech, "valor_coletas", 0) or 0))
@@ -1195,7 +1295,7 @@ def _resumo_agrupado_por_executor(
         valor_base_atual = None
         pode_reajustar = alerta_pos_pago = False
         if fech is not None and not pendente:
-            valor_base_atual = _valor_base_atual_fechamento(db, sub_base_user, tipo, xid, fech)
+            valor_base_atual = _valor_base_atual(tipo, xid, fech)
             if valor_base_atual != Decimal(str(fech.valor_base or 0)).quantize(Decimal("0.01")):
                 pode_reajustar = status_linha in ("GERADO", "REAJUSTADO")
                 alerta_pos_pago = status_linha == "PAGO"
@@ -1313,7 +1413,7 @@ def resumo_entregadores(
 
     # Inclui saída e entrega; mantém consistência com STATUS_VALOR_BASE_VALIDOS.
     status_validos = STATUS_VALOR_BASE_VALIDOS
-    stmt = select(Saida).where(
+    stmt = select(Saida).options(defer(Saida.qr_payload_raw)).where(
         Saida.sub_base == sub_base_user,
         Saida.codigo.isnot(None),
         func.lower(Saida.status).in_(status_validos),
@@ -1348,6 +1448,7 @@ def resumo_entregadores(
 
     rows_raw = db.scalars(stmt).all()
     rows, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_raw, data_inicio, data_fim)
+    saidas_periodo_completo = rows if entregador_id is None and motoboy_id is None else None
     # Recorte de consulta: o valor base do fechamento oficial continua usando o período completo.
     if base_filtro_norm is not None:
         rows = [s for s in rows if saida_pertence_base(s.base, base_filtro_norm)]
@@ -1418,8 +1519,20 @@ def resumo_entregadores(
                 agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + 1
 
     cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
-    cache_fechamento: Dict[tuple, Optional[EntregadorFechamento]] = {}
-    cache_valor_base: Dict[tuple, Decimal] = {}  # (eid, periodo_inicio, periodo_fim) ou (mid,) -> valor_base
+    precos_motoboy: Dict[int, Dict[str, Decimal]] = {}
+    cache_valor_base: Dict[tuple, Decimal] = {}  # (eid, periodo_inicio, periodo_fim) ou ("m", mid, ini, fim) -> valor_base
+
+    fech_stmt = select(EntregadorFechamento).where(EntregadorFechamento.sub_base == sub_base_user)
+    if data_inicio is not None:
+        fech_stmt = fech_stmt.where(EntregadorFechamento.periodo_fim >= data_inicio)
+    if data_fim is not None:
+        fech_stmt = fech_stmt.where(EntregadorFechamento.periodo_inicio <= data_fim)
+    fechs_por_executor: Dict[tuple, List[EntregadorFechamento]] = {}
+    for f in db.scalars(fech_stmt.order_by(EntregadorFechamento.id_fechamento)).all():
+        if getattr(f, "id_motoboy", None) is not None:
+            fechs_por_executor.setdefault(("m", int(f.id_motoboy)), []).append(f)
+        if f.id_entregador is not None:
+            fechs_por_executor.setdefault(("e", int(f.id_entregador)), []).append(f)
 
     def _get_fechamento(eid: Optional[int], mid: Optional[int], data_str: str) -> tuple:
         """Retorna (status, id_fechamento, fechamento ou None). Entregador (id > 0) ou motoboy."""
@@ -1429,47 +1542,37 @@ def resumo_entregadores(
         except (ValueError, TypeError):
             return ("PENDENTE", None, None)
         if mid is not None:
-            key_cache = (sub_base_user, "m", mid, data_str)
-            if key_cache not in cache_fechamento:
-                if hasattr(EntregadorFechamento, "id_motoboy"):
-                    fech = db.scalars(
-                        select(EntregadorFechamento).where(
-                            EntregadorFechamento.sub_base == sub_base_user,
-                            EntregadorFechamento.id_motoboy == mid,
-                            EntregadorFechamento.periodo_inicio <= data_ref,
-                            EntregadorFechamento.periodo_fim >= data_ref,
-                        )
-                    ).first()
-                else:
-                    fech = None
-                cache_fechamento[key_cache] = fech
-            fech = cache_fechamento[key_cache]
-            if fech:
-                st = (fech.status or "").upper()
-                if st == "FECHADO":
-                    st = "GERADO"
-                return (st or "GERADO", fech.id_fechamento, fech)
+            chave = ("m", int(mid))
+        elif eid is not None and eid > 0:
+            chave = ("e", int(eid))
+        else:
             return ("PENDENTE", None, None)
-        if eid is None or eid <= 0:
-            return ("PENDENTE", None, None)
-        key_cache = (sub_base_user, "e", eid, data_str)
-        if key_cache not in cache_fechamento:
-            fech = db.scalars(
-                select(EntregadorFechamento).where(
-                    EntregadorFechamento.sub_base == sub_base_user,
-                    EntregadorFechamento.id_entregador == eid,
-                    EntregadorFechamento.periodo_inicio <= data_ref,
-                    EntregadorFechamento.periodo_fim >= data_ref,
-                )
-            ).first()
-            cache_fechamento[key_cache] = fech
-        fech = cache_fechamento[key_cache]
+        fech = next(
+            (f for f in fechs_por_executor.get(chave, []) if f.periodo_inicio <= data_ref <= f.periodo_fim),
+            None,
+        )
         if fech:
             st = (fech.status or "").upper()
             if st == "FECHADO":
                 st = "GERADO"
             return (st or "GERADO", fech.id_fechamento, fech)
         return ("PENDENTE", None, None)
+
+    motoboys_por_periodo: Dict[tuple, set] = {}
+    for item in agrupado.values():
+        mid = item.get("motoboy_id")
+        if mid is None:
+            continue
+        st, id_f, f = _get_fechamento(None, mid, item["data"])
+        if st in ("GERADO", "REAJUSTADO", "PAGO") and f is not None and id_f is not None:
+            motoboys_por_periodo.setdefault((f.periodo_inicio, f.periodo_fim), set()).add(int(mid))
+    for (p_ini, p_fim), mids in motoboys_por_periodo.items():
+        mesmo_periodo = (p_ini, p_fim) == (data_inicio, data_fim)
+        for mid, valor in valores_base_atuais_motoboys(
+            db, sub_base_user, mids, p_ini, p_fim, precos_cache=precos_motoboy,
+            saidas_periodo=saidas_periodo_completo if mesmo_periodo else None,
+        ).items():
+            cache_valor_base[("m", mid, p_ini, p_fim)] = valor
 
     lista: List[EntregadorResumoItem] = []
     for key, item in agrupado.items():
@@ -1478,11 +1581,7 @@ def resumo_entregadores(
         precos_key = ("m", mid) if mid is not None else ("e", eid)
         if precos_key not in cache_precos:
             if mid is not None:
-                cache_precos[precos_key] = resolver_precos_motoboy(
-                    db,
-                    sub_base_user,
-                    motoboy_id=mid,
-                )
+                cache_precos[precos_key] = precos_motoboy_cache(db, sub_base_user, mid, precos_motoboy)
             elif eid is not None and eid > 0:
                 cache_precos[precos_key] = resolver_precos_entregador(db, eid, sub_base_user)
             else:
@@ -1601,6 +1700,8 @@ def resumo_entregadores(
             filtro_entregador_id=entregador_id,
             page=page,
             pageSize=pageSize,
+            cache_valor_base=cache_valor_base,
+            precos_motoboy=precos_motoboy,
         )
 
     if fechamento_status and str(fechamento_status).strip():
