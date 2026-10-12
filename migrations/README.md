@@ -1,5 +1,20 @@
 # Migrações
 
+## pacote_g_categorias.sql
+
+**Obrigatória antes** do deploy das categorias de pacote grande (G1, G2…). Sem ela a API
+responde **500** em Registros (`/saidas/listar`), Preços de Entrega, Fechamento de Motoboys,
+A Pagar e Fechamento de Bases, porque o modelo já usa `saidas.categoria_g_id`.
+
+Cria `pacote_g_categoria` por `sub_base`, colunas `categoria_g_id` / `categoria_g_atualizado_*`
+em `saidas`, `g_categorias` em `coletas`, `coleta_execucao_participantes` e
+`base_fechamento_itens`, e `valor_g` em `base_fechamentos`. Backfill: cria a categoria "G"
+para cada `sub_base` e liga os pacotes `is_grande` existentes a ela. Aditiva e idempotente.
+
+```bash
+psql "$DATABASE_URL" -f migrations/pacote_g_categorias.sql
+```
+
 ## entregador_fechamento_unicidade.sql
 
 Obrigatória no deploy do Fechamento de Motoboys v2 (geração em lote). Cria índices únicos
