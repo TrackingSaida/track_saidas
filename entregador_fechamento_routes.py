@@ -60,7 +60,8 @@ from entregador_routes import (
     usuario_financeiro,
     STATUS_VALOR_BASE_VALIDOS,
 )
-from fechamento_valor_pure import ajustes_mudaram, contar_g
+from fechamento_valor_pure import ajustes_mudaram, contar_g, saida_cancelada
+from pacote_g_categorias import categoria_da_saida, nomes_por_categoria, padrao_id_ou_none
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,17 @@ def _contar_g_periodo(db: Session, executor_cond, sub_base: str, periodo_inicio:
     )
     rows_raw = db.scalars(stmt).all()
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
-    return contar_g(rows)
+    out = contar_g(rows)
+    nomes = nomes_por_categoria(db, sub_base)
+    padrao = padrao_id_ou_none(db, sub_base)
+    por_categoria: dict = {}
+    for s in rows:
+        if saida_cancelada(getattr(s, "status", None)):
+            continue
+        nome = nomes.get(categoria_da_saida(s, padrao)) or "G"
+        por_categoria[nome] = por_categoria.get(nome, 0) + 1
+    out["por_categoria"] = por_categoria
+    return out
 
 
 def _contar_g_por_servico_entregador(
@@ -619,6 +630,7 @@ def calcular_valor_base_preview(
             "periodo_fim": periodo_fim.isoformat(),
             "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
             "g_total": g["total"],
+            "g_por_categoria": g.get("por_categoria") or {},
             "conferencia_habilitada": conferencia_habilitada,
             "conferencia_por_dia": conferencia_por_dia,
             "avulso_valor": _resolver_avulso_valor(db, sub_base, id_motoboy=motoboy_id),
@@ -646,6 +658,7 @@ def calcular_valor_base_preview(
         "periodo_fim": periodo_fim.isoformat(),
         "g_por_servico": {"shopee": g["shopee"], "ml": g["ml"], "avulso": g["avulso"]},
         "g_total": g["total"],
+        "g_por_categoria": g.get("por_categoria") or {},
         "conferencia_habilitada": conferencia_habilitada,
         "conferencia_por_dia": [],
         "avulso_valor": _resolver_avulso_valor(db, sub_base, id_entregador=entregador_id),

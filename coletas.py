@@ -28,6 +28,7 @@ from coleta_operacional_service import (
 )
 from models import ColetaExecucaoParticipante
 from coleta_leituras_service import obter_totais_por_nome_base
+from pacote_g_categorias import garantir_categoria_padrao
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -586,6 +587,8 @@ def registrar_coleta_em_lote(
                 saida_existente.data = data_operacao
                 if getattr(item, "is_grande", False):
                     saida_existente.is_grande = True
+                    if saida_existente.categoria_g_id is None:
+                        saida_existente.categoria_g_id = garantir_categoria_padrao(db, sub_base).id
                 db.add(
                     SaidaHistorico(
                         id_saida=saida_existente.id_saida,
@@ -628,6 +631,7 @@ def registrar_coleta_em_lote(
                     admitida.data = data_operacao
                     if getattr(item, "is_grande", False):
                         admitida.is_grande = True
+                        admitida.categoria_g_id = garantir_categoria_padrao(db, sub_base).id
                     db.add(
                         OwnerCobrancaItem(
                             sub_base=sub_base,
@@ -653,6 +657,11 @@ def registrar_coleta_em_lote(
                 id_coleta=coleta.id_coleta,
                 qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
                 is_grande=getattr(item, "is_grande", False),
+                categoria_g_id=(
+                    garantir_categoria_padrao(db, sub_base).id
+                    if getattr(item, "is_grande", False)
+                    else None
+                ),
                 data=data_operacao,
             )
             db.add(saida)

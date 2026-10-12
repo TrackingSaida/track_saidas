@@ -262,6 +262,7 @@ class Coleta(Base):
     g_shopee = Column(Integer, nullable=False, server_default=text("0"))  # pacotes G da coleta manual por serviço
     g_ml = Column(Integer, nullable=False, server_default=text("0"))
     g_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    g_categorias = Column(JSON, nullable=True)  # {"<categoria_id>": {"shopee": n, "ml": n, "avulso": n}}
 
     valor_total = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     origem = Column(Text, nullable=False, server_default=text("'codigo'"))
@@ -327,6 +328,7 @@ class ColetaExecucaoParticipante(Base):
     g_shopee = Column(Integer, nullable=False, server_default=text("0"))
     g_ml = Column(Integer, nullable=False, server_default=text("0"))
     g_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    g_categorias = Column(JSON, nullable=True)
     sem_volume = Column(Boolean, nullable=False, server_default=text("false"))
     status = Column(Text, nullable=False, server_default=text("'finalizado'"))  # em_coleta | finalizado
     client_request_id = Column(Text, nullable=True)
@@ -427,7 +429,11 @@ class Saida(Base):
     qr_payload_raw = Column(Text, nullable=True)  # Payload bruto do QR (ML) para gerar etiqueta reconhecível
     ml_shipment_id = Column(BigInteger, nullable=True, index=True)  # vínculo envio ML (evita duplicata no auto-fill)
     ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
-    is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande) — única fonte da sinalização
+    is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande); espelha categoria_g_id
+    categoria_g_id = Column(BigInteger, ForeignKey("pacote_g_categoria.id", ondelete="RESTRICT"), nullable=True)
+    # Última marcação de tamanho (fora do saida_historico para não virar "última ação").
+    categoria_g_atualizado_em = Column(DateTime(timezone=False), nullable=True)
+    categoria_g_atualizado_por = Column(BigInteger, nullable=True)
     avulso_lote_id = Column(BigInteger, nullable=True, index=True)
     avulso_criado_excepcional = Column(Boolean, nullable=False, server_default=text("false"))
 
@@ -495,6 +501,34 @@ class EntregadorPrecoGlobal(Base):
 
     def __repr__(self) -> str:
         return f"<EntregadorPrecoGlobal id={self.id} sub_base={self.sub_base!r}>"
+
+
+# ==========================
+# Tabela: pacote_g_categoria
+# ==========================
+class PacoteGCategoria(Base):
+    __tablename__ = "pacote_g_categoria"
+    __table_args__ = (
+        UniqueConstraint("sub_base", "nome", name="uq_pacote_g_categoria_nome"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    nome = Column(Text, nullable=False)
+    descricao = Column(Text, nullable=True)
+    # multiplicador: adicional = preço do serviço × valor | valor_fixo: adicional = valor em R$
+    motoboy_modo = Column(Text, nullable=False, server_default=text("'multiplicador'"))
+    motoboy_valor = Column(Numeric(12, 2), nullable=False, server_default=text("1.00"))
+    base_modo = Column(Text, nullable=False, server_default=text("'valor_fixo'"))
+    base_valor = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    ordem = Column(Integer, nullable=False, server_default=text("0"))
+    ativo = Column(Boolean, nullable=False, server_default=text("true"))
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<PacoteGCategoria id={self.id} sub_base={self.sub_base!r} nome={self.nome!r}>"
 
 
 # ==========================
@@ -923,6 +957,7 @@ class BaseFechamento(Base):
 
     valor_bruto = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     valor_cancelados = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_g = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     valor_adicao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     motivo_adicao = Column(Text, nullable=True)
     valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
@@ -968,6 +1003,7 @@ class BaseFechamentoItem(Base):
     g_shopee = Column(Integer, nullable=False, server_default=text("0"))
     g_ml = Column(Integer, nullable=False, server_default=text("0"))
     g_avulso = Column(Integer, nullable=False, server_default=text("0"))
+    g_categorias = Column(JSON, nullable=True)
 
     fechamento = relationship("BaseFechamento", back_populates="itens")
 

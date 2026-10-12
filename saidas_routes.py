@@ -49,6 +49,12 @@ from saidas_exportar_service import (
 )
 from codigo_normalizer import canonicalize_servico, normalize_codigo
 from saida_historico_service import SaidaHistoricoItemOut, listar_historico_saida
+from pacote_g_categorias import (
+    aplicar_categoria_saida,
+    garantir_categoria_padrao,
+    nomes_por_categoria,
+    padrao_id_ou_none,
+)
 from saida_status_finalizado_pure import (
     aplicar_flag_cancelado_cobranca,
     mensagem_bloqueio_cancelado,
@@ -155,6 +161,7 @@ class SaidaExportarIn(BaseModel):
     codigo: Optional[str] = None
     codigo_exato: bool = False
     somente_g: Optional[bool] = None
+    categoria_g_id: Optional[int] = None
 
 
 class SaidaOut(BaseModel):
@@ -171,6 +178,7 @@ class SaidaOut(BaseModel):
     status: Optional[str]
     base: Optional[str] = None
     is_grande: bool = False
+    categoria_g_id: Optional[int] = None
     qr_atualizado: Optional[bool] = None
     qr_alerta: Optional[bool] = None
     qr_alerta_mensagem: Optional[str] = None
@@ -200,6 +208,8 @@ class SaidaUpdate(BaseModel):
     servico: Optional[str] = None
     base: Optional[str] = None
     is_grande: Optional[bool] = None  # apenas admin, root ou operador (role 0,1,2) podem alterar
+    # Categoria do pacote G; null explícito remove o G. Tem prioridade sobre is_grande.
+    categoria_g_id: Optional[int] = None
     reverter_cancelamento: Optional[bool] = False
 
 
@@ -299,6 +309,10 @@ class SaidaDetalheCompletoOut(BaseModel):
     status: Optional[str] = None
     base: Optional[str] = None
     is_grande: bool = False
+    categoria_g_id: Optional[int] = None
+    categoria_g_nome: Optional[str] = None
+    categoria_g_atualizado_em: Optional[datetime] = None
+    categoria_g_atualizado_por: Optional[str] = None
     detail: Optional[SaidaDetailOut] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -430,6 +444,7 @@ def _validar_alteracao_saida_finalizada(
                     payload.servico is not None,
                     payload.base is not None,
                     payload.is_grande is not None,
+                    "categoria_g_id" in payload.model_fields_set,
                     payload.entregador_id is not None,
                     payload.entregador is not None and (payload.entregador or "").strip(),
                     payload.motoboy_id is not None,
@@ -2025,7 +2040,31 @@ def _montar_item_listar_saida(
         "status": row.status,
         "base": row.base,
         "is_grande": getattr(row, "is_grande", False) or False,
+        "categoria_g_id": getattr(row, "categoria_g_id", None),
     }
+
+
+def _enriquecer_categoria_g_items(
+    db: Session,
+    *,
+    sub_base: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    """Preenche categoria_g_nome; G legado sem categoria aparece na categoria padrão."""
+    if not any(it.get("is_grande") for it in items):
+        for it in items:
+            it["categoria_g_id"] = None
+            it["categoria_g_nome"] = None
+        return
+    nomes = nomes_por_categoria(db, sub_base)
+    padrao_id = padrao_id_ou_none(db, sub_base)
+    for it in items:
+        if not it.get("is_grande"):
+            cid = None
+        else:
+            cid = it.get("categoria_g_id") or padrao_id
+        it["categoria_g_id"] = cid
+        it["categoria_g_nome"] = nomes.get(cid) if cid is not None else None
 
 
 def _enriquecer_codigo_exibicao_items(
@@ -2210,6 +2249,7 @@ def _listar_saidas_codigo_exato(
     somente_g: Optional[bool],
     limit: Optional[int],
     offset: int,
+    categoria_g_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     codigo_norm = _normalizar_codigo_busca_listar(codigo)
     row = _buscar_saida_codigo_exato(db, sub_base, codigo_norm)
@@ -2228,6 +2268,10 @@ def _listar_saidas_codigo_exato(
     allowed_eventos, allowed_labels = _build_acao_filter_sets(acao)
 
     if somente_g and not (getattr(row, "is_grande", False) or False):
+        return _listar_resposta_vazia()
+    if categoria_g_id is not None and not (
+        getattr(row, "is_grande", False) and row.categoria_g_id == categoria_g_id
+    ):
         return _listar_resposta_vazia()
     if not _saida_passa_filtro_base(row, base):
         return _listar_resposta_vazia()
@@ -2250,6 +2294,7 @@ def _listar_saidas_codigo_exato(
         nome_executor = _nome_executor_atual(db, row)
         items = [_montar_item_listar_saida(row, ctx, nome_executor)]
         _enriquecer_codigo_exibicao_items(db, sub_base=sub_base, items=items)
+        _enriquecer_categoria_g_items(db, sub_base=sub_base, items=items)
 
     return {
         "total": 1,
@@ -2276,6 +2321,7 @@ def _listar_saidas_codigo_parcial(
     somente_g: Optional[bool],
     limit: Optional[int],
     offset: int,
+    categoria_g_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Prefixo/contém em codigo — caminho leve para o cascade do app mobile.
 
@@ -2328,6 +2374,8 @@ def _listar_saidas_codigo_parcial(
         )
     if somente_g:
         stmt = stmt.where(Saida.is_grande.is_(True))
+    if categoria_g_id is not None:
+        stmt = stmt.where(Saida.is_grande.is_(True), Saida.categoria_g_id == categoria_g_id)
 
     stmt = stmt.order_by(Saida.timestamp.desc(), Saida.id_saida.desc())
 
@@ -2385,6 +2433,7 @@ def _listar_saidas_codigo_parcial(
         nome_executor = _nome_executor_atual(db, row)
         items.append(_montar_item_listar_saida(row, ctx, nome_executor))
     _enriquecer_codigo_exibicao_items(db, sub_base=sub_base, items=items)
+    _enriquecer_categoria_g_items(db, sub_base=sub_base, items=items)
 
     return {
         "total": int(total),
@@ -2412,6 +2461,7 @@ def listar_saidas(
     acao: Optional[List[str]] = Query(None),
     localizar: Optional[str] = Query(None),
     somente_g: Optional[bool] = Query(None),
+    categoria_g_id: Optional[int] = Query(None),
     codigo_exato: bool = Query(False),
     limit: Optional[int] = Query(None),
     offset: int = Query(0, ge=0),
@@ -2435,6 +2485,7 @@ def listar_saidas(
             servico=servico,
             acao=acao,
             somente_g=somente_g,
+            categoria_g_id=categoria_g_id,
             limit=limit,
             offset=offset,
         )
@@ -2456,6 +2507,7 @@ def listar_saidas(
             servico=servico,
             acao=acao,
             somente_g=somente_g,
+            categoria_g_id=categoria_g_id,
             limit=limit,
             offset=offset,
         )
@@ -2475,6 +2527,7 @@ def listar_saidas(
         acao=acao,
         localizar=localizar,
         somente_g=somente_g,
+        categoria_g_id=categoria_g_id,
         codigo_exato=codigo_exato,
         limit=limit,
         offset=offset,
@@ -2485,6 +2538,7 @@ def listar_saidas(
     _enriquecer_codigo_exibicao_items(
         db, sub_base=sub_base, items=result.get("items") or []
     )
+    _enriquecer_categoria_g_items(db, sub_base=sub_base, items=result.get("items") or [])
     return result
 
 
@@ -2503,6 +2557,7 @@ def _listar_saidas_para_exportar(
     localizar: Optional[str],
     somente_g: Optional[bool],
     codigo_exato: bool,
+    categoria_g_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Mesmos filtros de GET /listar, sem o teto da página da tela."""
     if codigo and codigo.strip() and codigo_exato:
@@ -2518,6 +2573,7 @@ def _listar_saidas_para_exportar(
             servico=servico,
             acao=acao,
             somente_g=somente_g,
+            categoria_g_id=categoria_g_id,
             limit=MAX_EXPORTAR_LIMIT,
             offset=0,
         )
@@ -2534,6 +2590,7 @@ def _listar_saidas_para_exportar(
         acao=acao,
         localizar=localizar,
         somente_g=somente_g,
+        categoria_g_id=categoria_g_id,
         codigo_exato=False,
         limit=MAX_EXPORTAR_LIMIT,
         offset=0,
@@ -2542,6 +2599,7 @@ def _listar_saidas_para_exportar(
         use_cache=False,
     )
     result.pop("_cache", None)
+    _enriquecer_categoria_g_items(db, sub_base=sub_base, items=result.get("items") or [])
     return result
 
 
@@ -2570,6 +2628,7 @@ def exportar_saidas(
             acao=body.acao,
             localizar=body.localizar,
             somente_g=body.somente_g,
+            categoria_g_id=body.categoria_g_id,
             codigo_exato=bool(body.codigo_exato),
         )
         validar_total_exportacao(int(listed.get("total") or 0))
@@ -2694,7 +2753,25 @@ def get_saida_detalhe(
         base=obj.base,
         is_grande=getattr(obj, "is_grande", False) or False,
         detail=detail_out,
+        **_categoria_g_detalhe(db, obj),
     )
+
+
+def _categoria_g_detalhe(db: Session, obj: Saida) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "categoria_g_atualizado_em": getattr(obj, "categoria_g_atualizado_em", None),
+        "categoria_g_atualizado_por": None,
+    }
+    por_id = getattr(obj, "categoria_g_atualizado_por", None)
+    if por_id is not None:
+        autor = db.get(User, int(por_id))
+        if autor is not None:
+            out["categoria_g_atualizado_por"] = autor.username
+    item = {"is_grande": bool(obj.is_grande), "categoria_g_id": obj.categoria_g_id}
+    _enriquecer_categoria_g_items(db, sub_base=obj.sub_base, items=[item])
+    out["categoria_g_id"] = item["categoria_g_id"]
+    out["categoria_g_nome"] = item["categoria_g_nome"]
+    return out
 
 
 # ============================================================
@@ -3120,14 +3197,23 @@ def atualizar_saida(
     if payload.base is not None:
         obj.base = payload.base.strip()
 
-    if payload.is_grande is not None:
+    if payload.is_grande is not None or "categoria_g_id" in payload.model_fields_set:
         role = getattr(current_user, "role", None)
         if role not in (0, 1, 2):
             raise HTTPException(
                 403,
                 "Apenas admin, root ou operador podem marcar ou desmarcar pacote como G (Grande).",
             )
-        obj.is_grande = bool(payload.is_grande)
+        if "categoria_g_id" in payload.model_fields_set:
+            nova_categoria = payload.categoria_g_id
+        elif payload.is_grande:
+            nova_categoria = obj.categoria_g_id or garantir_categoria_padrao(db, sub_base).id
+        else:
+            nova_categoria = None
+        if nova_categoria != obj.categoria_g_id or bool(nova_categoria) != bool(obj.is_grande):
+            aplicar_categoria_saida(db, obj, sub_base, nova_categoria)
+            obj.categoria_g_atualizado_em = datetime.now()
+            obj.categoria_g_atualizado_por = getattr(current_user, "id", None)
 
     status_novo = normalizar_status_saida(obj.status)
     status_mudou = status_novo != status_anterior

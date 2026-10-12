@@ -45,6 +45,7 @@ class SaidaListRow:
     status: Optional[str]
     base: Optional[str]
     is_grande: bool
+    categoria_g_id: Optional[int] = None
 
 
 def clamp_listar_limit(limit: Optional[int], cap: int = MAX_LISTAR_LIMIT) -> Optional[int]:
@@ -754,6 +755,7 @@ def _listar_cache_key(
     codigo_exato: bool,
     limit: Optional[int],
     offset: int,
+    categoria_g_id: Optional[int] = None,
 ) -> str:
     import json
 
@@ -769,6 +771,7 @@ def _listar_cache_key(
         "acao": sorted(_parse_multi_values(acao)),
         "localizar": (localizar or "").strip() or None,
         "somente_g": bool(somente_g),
+        "categoria_g_id": categoria_g_id,
         "codigo_exato": bool(codigo_exato),
         "limit": limit,
         "offset": int(offset or 0),
@@ -839,6 +842,7 @@ def listar_saidas_paginado(
     limit: Optional[int] = None,
     offset: int = 0,
     montar_item,
+    categoria_g_id: Optional[int] = None,
     limit_cap: int = MAX_LISTAR_LIMIT,
     use_cache: bool = True,
 ) -> Dict[str, Any]:
@@ -868,6 +872,7 @@ def listar_saidas_paginado(
         codigo_exato=codigo_exato,
         limit=limit,
         offset=offset,
+        categoria_g_id=categoria_g_id,
     )
     cached = _listar_cache_get(cache_key) if use_cache else None
     if cached is not None:
@@ -981,6 +986,9 @@ def listar_saidas_paginado(
 
     if somente_g:
         where_extra.append("s.is_grande IS TRUE")
+    if categoria_g_id is not None:
+        params["categoria_g_id"] = int(categoria_g_id)
+        where_extra.append("s.is_grande IS TRUE AND s.categoria_g_id = :categoria_g_id")
 
     if codigo and codigo.strip():
         params["codigo_trim"] = codigo.strip().upper()
@@ -1065,7 +1073,8 @@ def listar_saidas_paginado(
     WITH candidatos AS (
       SELECT
         s.id_saida, s.timestamp, s.sub_base, s.username, s.entregador,
-        s.entregador_id, s.motoboy_id, s.codigo, s.servico, s.status, s.base, s.is_grande
+        s.entregador_id, s.motoboy_id, s.codigo, s.servico, s.status, s.base, s.is_grande,
+        s.categoria_g_id
       FROM saidas s
       WHERE s.sub_base = :sub_base
       {where_sql}
@@ -1174,6 +1183,7 @@ def listar_saidas_paginado(
       p.status,
       p.base,
       p.is_grande,
+      p.categoria_g_id,
       p.operacional_ts,
       p.ult_evento,
       p.ult_ts,
@@ -1267,6 +1277,7 @@ def listar_saidas_paginado(
             status=r["status"],
             base=r["base"],
             is_grande=bool(r["is_grande"] or False),
+            categoria_g_id=r.get("categoria_g_id"),
         )
         ctx = ctx_map.get(row.id_saida)
         if row.motoboy_id is not None:

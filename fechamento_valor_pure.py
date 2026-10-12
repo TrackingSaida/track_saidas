@@ -28,24 +28,44 @@ def preco_servico(precos: Mapping[str, Any], tipo: str) -> Decimal:
         return _ZERO
 
 
+def adicional_g(preco: Decimal, regra: Optional[Mapping[str, Any]]) -> Decimal:
+    """Adicional de um pacote G. Regra {modo: multiplicador|valor_fixo, valor}; sem regra = +1x o serviço."""
+    if not regra:
+        return preco
+    try:
+        valor = Decimal(str(regra.get("valor") or 0))
+    except Exception:
+        valor = _ZERO
+    if regra.get("modo") == "valor_fixo":
+        return valor.quantize(Decimal("0.01"))
+    return (preco * valor).quantize(Decimal("0.01"))
+
+
 def valor_saida(precos: Mapping[str, Any], servico: Optional[str], status: Optional[str],
-                is_grande: bool, pacote_g_adicional: bool) -> Decimal:
-    """Cancelado vale zero. Pacote G soma o preço do serviço de novo quando o adicional está ligado."""
+                is_grande: bool, pacote_g_adicional: bool,
+                regra_g: Optional[Mapping[str, Any]] = None) -> Decimal:
+    """Cancelado vale zero. Pacote G soma o adicional da categoria quando o adicional está ligado."""
     if saida_cancelada(status):
         return _ZERO
     preco = preco_servico(precos, normalizar_servico(servico))
     if pacote_g_adicional and is_grande:
-        return preco * 2
+        return preco + adicional_g(preco, regra_g)
     return preco
 
 
-def valor_g_adicional(g_por_tipo: Mapping[str, int], precos: Mapping[str, Any], ativo: bool) -> Decimal:
-    """Valor extra dos pacotes G não cancelados ({shopee, flex, avulso} -> quantidade)."""
+def valor_g_adicional(g_por_tipo: Mapping[Any, int], precos: Mapping[str, Any], ativo: bool,
+                      regras: Optional[Mapping[Any, Mapping[str, Any]]] = None) -> Decimal:
+    """Valor extra dos pacotes G não cancelados.
+
+    Chaves: tipo ({shopee, flex, avulso}) ou (categoria_id, tipo) quando há categorias.
+    """
     if not ativo:
         return _ZERO
     total = _ZERO
-    for tipo, qtd in g_por_tipo.items():
-        total += preco_servico(precos, tipo) * int(qtd or 0)
+    for chave, qtd in g_por_tipo.items():
+        categoria, tipo = chave if isinstance(chave, tuple) else (None, chave)
+        regra = (regras or {}).get(categoria) if categoria is not None else None
+        total += adicional_g(preco_servico(precos, tipo), regra) * int(qtd or 0)
     return total.quantize(Decimal("0.01"))
 
 
