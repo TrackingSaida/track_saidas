@@ -22,6 +22,7 @@ from db import get_db
 from models import OwnerFechamento, OwnerFechamentoItem, User
 import owner_cobranca_service as svc
 from owner_cobranca_engine import (
+    EXPLICACAO_MODELO,
     MODELO_LABELS,
     MOTIVO_LABELS,
     NIVEL_ATENCAO,
@@ -69,7 +70,13 @@ STATUS_OPERACIONAL_LABELS = {
     "coletado": "Coletado",
     "na_base": "Na base",
 }
-AJUSTE_LABELS = {"acrescimo": "Acréscimo", "desconto": "Desconto", "credito": "Crédito", "correcao": "Correção"}
+AJUSTE_LABELS = {
+    "acrescimo": "Acréscimo",
+    "desconto": "Desconto",
+    "credito": "Crédito",
+    "correcao": "Correção",
+    "isencao": "Isenção",
+}
 DECISAO_LABELS = {
     "volumes_distintos": "Volumes distintos",
     "vinculo_codigos": "Códigos vinculados",
@@ -81,7 +88,9 @@ ACAO_LABELS = {
     "informar": "Marcado como informado",
     "reabrir": "Reaberto",
     "anular": "Anulado",
-    "ajuste": "Ajuste lançado",
+    "ajuste": "Ajuste lançado para o próximo período",
+    "ajuste_periodo": "Ajuste do período lançado",
+    "ajuste_removido": "Ajuste do período removido",
     "decisao": "Decisão registrada",
     "decisao_revogada": "Decisão revogada",
 }
@@ -215,12 +224,21 @@ def _fechamento_resumo(f: OwnerFechamento) -> Dict[str, Any]:
     }
 
 
-def _ajuste_dict(a) -> Dict[str, Any]:
+def _ajuste_dict(a, valor_calculado: Any = None) -> Dict[str, Any]:
+    do_periodo = getattr(a, "periodo_inicio", None) is not None
+    pct = getattr(a, "percentual", None)
+    label = AJUSTE_LABELS.get(a.tipo, a.tipo)
+    if pct is not None:
+        label = f"{label} de {format(Decimal(pct).normalize(), 'f').replace('.', ',')}%"
     return {
         "id": a.id,
         "tipo": a.tipo,
-        "tipo_label": AJUSTE_LABELS.get(a.tipo, a.tipo),
-        "valor": _money(a.valor),
+        "tipo_label": label,
+        "valor": _money(valor_calculado if valor_calculado is not None else a.valor),
+        "percentual": _money(pct),
+        "escopo": "periodo" if do_periodo else "ciclo",
+        "escopo_label": "Deste período" if do_periodo else "De período anterior",
+        "removivel": do_periodo and a.fechamento_aplicado_id is None,
         "motivo": a.motivo,
         "fechamento_origem_id": a.fechamento_origem_id,
         "fechamento_aplicado_id": a.fechamento_aplicado_id,
@@ -398,16 +416,21 @@ def _detalhe(db: Session, a: svc.ApuracaoOwner) -> Dict[str, Any]:
         lancados = [_ajuste_dict(x) for x in aj["lancados"]]
         modelo = f.modelo
         hash_ = f.hash
+        situacao = svc.situacao_fechamento(db, f)
+        cadastro = f.owner_snapshot or {}
     else:
         ap = a.apuracao
         composicao = [_composicao_dict(c.classificacao, c.quantidade, c.valor) for c in ap.composicao]
         divergencias = _divergencias_dict(a.divergencias)
         ajustes = [
-            _ajuste_dict(x) for x in svc.ajustes_pendentes(db, owner.id_owner, a.periodo_inicio)
+            _ajuste_dict(x, ap.valores_ajustes.get(x.id))
+            for x in svc.ajustes_pendentes(db, owner.id_owner, a.periodo_inicio, a.periodo_fim)
         ]
         lancados = []
         modelo = a.config.modelo
         hash_ = ap.hash
+        situacao = svc.situacao_preview(ap)
+        cadastro = svc.dados_cadastro(db, owner, a.config)
 
     decisoes = [
         {
@@ -467,9 +490,13 @@ def _detalhe(db: Session, a: svc.ApuracaoOwner) -> Dict[str, Any]:
             "valor_total": _money(tot["valor_total"]),
         },
         "composicao": composicao,
+        "explicacao_modelo": EXPLICACAO_MODELO.get(modelo, ""),
+        "situacao_pacotes": situacao,
+        "cadastro": cadastro,
         "divergencias": divergencias,
         "ajustes": ajustes,
         "ajustes_lancados": lancados,
+        "pode_ajustar": a.fechamento is None,
         "decisoes": decisoes,
         "versoes": versoes,
         "historico": historico,
@@ -709,6 +736,56 @@ def delete_decisao(
     return _detalhe(db, svc.apurar_owner(db, owner, dec.periodo_inicio, dec.periodo_fim))
 
 
+class AjustePeriodoIn(PeriodoIn):
+    tipo: Literal["desconto", "acrescimo", "isencao"]
+    valor: Optional[Decimal] = Field(None, gt=0, max_digits=14, decimal_places=2)
+    percentual: Optional[Decimal] = Field(None, gt=0, le=100, max_digits=5, decimal_places=2)
+    motivo: str = Field(..., min_length=5, max_length=500)
+    chave_idempotencia: str = Field(..., min_length=8, max_length=120)
+
+
+@router.post("/apuracoes/{owner_id}/ajustes", status_code=201)
+def post_ajuste_periodo(
+    owner_id: int,
+    body: AjustePeriodoIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_root),
+):
+    owner = svc.carregar_owner(db, owner_id)
+    ini, fim = _periodo(body.data_inicio, body.data_fim)
+    if body.tipo == "acrescimo" and body.percentual is not None:
+        raise HTTPException(422, "Acréscimo é informado em reais.")
+    if body.tipo != "isencao" and body.valor is None and body.percentual is None:
+        raise HTTPException(422, "Informe o valor ou o percentual.")
+    svc.lancar_ajuste_periodo(
+        db,
+        owner,
+        user,
+        ini=ini,
+        fim=fim,
+        tipo=body.tipo,
+        valor=body.valor,
+        percentual=body.percentual if body.tipo == "desconto" else None,
+        motivo=body.motivo,
+        chave_idempotencia=body.chave_idempotencia,
+    )
+    db.commit()
+    return _detalhe(db, svc.apurar_owner(db, owner, ini, fim))
+
+
+@router.delete("/apuracoes/{owner_id}/ajustes/{ajuste_id}")
+def delete_ajuste_periodo(
+    owner_id: int,
+    ajuste_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_root),
+):
+    owner = svc.carregar_owner(db, owner_id)
+    aj = svc.remover_ajuste_periodo(db, owner, user, ajuste_id)
+    db.commit()
+    return _detalhe(db, svc.apurar_owner(db, owner, aj.periodo_inicio, aj.periodo_fim))
+
+
 @router.post("/apuracoes/{owner_id}/conferir")
 def post_conferir(
     owner_id: int,
@@ -853,6 +930,9 @@ def post_anular(
     return _fechamento_resumo(fech)
 
 
+PDF_LIMITE_ANEXO = 3000
+
+
 @router.get("/fechamentos/{fechamento_id}/demonstrativo.pdf")
 def get_demonstrativo(fechamento_id: int, db: Session = Depends(get_db)):
     from owner_cobranca_pdf import gerar_demonstrativo_pdf, nome_arquivo_demonstrativo
@@ -864,6 +944,17 @@ def get_demonstrativo(fechamento_id: int, db: Session = Depends(get_db)):
         fech,
         composicao=svc.composicao_fechamento(db, fech),
         ajustes=svc.ajustes_do_fechamento(db, fech)["aplicados"],
+        situacao=svc.situacao_fechamento(db, fech),
+        por_dia=svc.resumo_por_dia(db, fech),
+        itens=db.scalars(
+            select(OwnerFechamentoItem)
+            .where(
+                OwnerFechamentoItem.fechamento_id == fech.id,
+                OwnerFechamentoItem.status_financeiro == "cobrado",
+            )
+            .order_by(OwnerFechamentoItem.data_competencia, OwnerFechamentoItem.codigo, OwnerFechamentoItem.id)
+            .limit(PDF_LIMITE_ANEXO + 1)
+        ).all(),
     )
     return Response(
         content=pdf,

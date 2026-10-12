@@ -773,10 +773,16 @@ class OwnerFechamentoAjuste(Base):
     sub_base = Column(Text, nullable=False)
     fechamento_origem_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="SET NULL"), nullable=True)
     fechamento_aplicado_id = Column(BigInteger, ForeignKey("owner_fechamento.id", ondelete="SET NULL"), nullable=True)
-    tipo = Column(Text, nullable=False)  # acrescimo | desconto | credito | correcao
+    tipo = Column(Text, nullable=False)  # acrescimo | desconto | credito | correcao | isencao
     valor = Column(Numeric(14, 2), nullable=False)
     motivo = Column(Text, nullable=False)
     chave_idempotencia = Column(Text, nullable=False)
+    # Ajuste do próprio período (antes do fechamento); NULL = veio de um fechamento anterior.
+    periodo_inicio = Column(Date, nullable=True)
+    periodo_fim = Column(Date, nullable=True)
+    percentual = Column(Numeric(5, 2), nullable=True)
+    removido_em = Column(DateTime(timezone=False), nullable=True)
+    removido_por_username = Column(Text, nullable=True)
     criado_por = Column(BigInteger, nullable=True)
     criado_por_username = Column(Text, nullable=True)
     criado_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
