@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session, defer, joinedload
 from db import get_db
 from name_normalizer import normalize_display_name, normalize_person_name, person_name_sort_key
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
+from conferencia_saida_pure import LABEL_CONFERENCIA_DIA, STATUS_CONFERIDA, status_conferencia_dia
+from conferencia_saida_service import owner_conferencia_habilitada, status_conferencia_registrada_motoboys
 from entregador_legado_sync import filtrar_entregadores_operacionais
 from fechamento_resumo_utils import base_filtro_ativo, saida_pertence_base
 from fechamento_valor_pure import adicional_g, valor_g_adicional, valor_saida
@@ -143,6 +145,8 @@ class EntregadorResumoItem(BaseModel):
     valor_base_fechado: Optional[Decimal] = None  # valor_base gravado no fechamento
     periodo_inicio: Optional[str] = None  # YYYY-MM-DD, quando existe fechamento
     periodo_fim: Optional[str] = None  # YYYY-MM-DD, quando existe fechamento
+    conferencia_status: Optional[str] = None  # conferida | pendente | reconferir (só com conferência habilitada)
+    conferencia_label: Optional[str] = None
 
 
 class EntregadorResumoResponse(BaseModel):
@@ -190,6 +194,8 @@ class ResumoExecutorItem(BaseModel):
     valor_base_fechado: Optional[Decimal] = None
     periodo_inicio: Optional[str] = None
     periodo_fim: Optional[str] = None
+    dias_com_entrega: int = 0
+    dias_sem_conferencia: int = 0  # pendente ou reconferir
     dias: List[EntregadorResumoItem] = Field(default_factory=list)
 
 
@@ -212,6 +218,7 @@ class ResumoExecutorResponse(BaseModel):
     items: List[ResumoExecutorItem]
     totais: ResumoExecutorTotais
     sumValor: Decimal = Decimal("0.00")
+    conferencia_habilitada: bool = False
 
 
 class PrecoGlobalOut(BaseModel):
@@ -1224,6 +1231,7 @@ def _resumo_agrupado_por_executor(
     pageSize: int,
     cache_valor_base: Optional[Dict[tuple, Decimal]] = None,
     precos_motoboy: Optional[Dict[int, Dict[str, Decimal]]] = None,
+    conferencia_habilitada: bool = False,
 ) -> ResumoExecutorResponse:
     zero = Decimal("0.00")
     cache_valor_base = cache_valor_base if cache_valor_base is not None else {}
@@ -1249,6 +1257,30 @@ def _resumo_agrupado_por_executor(
         db, sub_base_user, [xid for (tipo, xid) in linhas if tipo == "m"], data_inicio, data_fim,
         precos_cache=precos_motoboy,
     )
+    conferencia_registrada = (
+        status_conferencia_registrada_motoboys(
+            db,
+            sub_base=sub_base_user,
+            motoboy_ids=[xid for (tipo, xid) in linhas if tipo == "m"],
+            periodo_inicio=data_inicio,
+            periodo_fim=data_fim,
+        )
+        if conferencia_habilitada
+        else {}
+    )
+
+    def _aplicar_conferencia(xid: int, dias: List[EntregadorResumoItem]) -> tuple:
+        com_entrega = sem_conferencia = 0
+        for d in dias:
+            if d.total_feitos <= 0:
+                continue
+            st = status_conferencia_dia(conferencia_registrada.get((xid, date.fromisoformat(d.data))))
+            d.conferencia_status = st
+            d.conferencia_label = LABEL_CONFERENCIA_DIA[st]
+            com_entrega += 1
+            if st != STATUS_CONFERIDA:
+                sem_conferencia += 1
+        return com_entrega, sem_conferencia
 
     def _valor_base_atual(tipo: str, xid: int, fech: EntregadorFechamento) -> Decimal:
         chave = ("m", xid, fech.periodo_inicio, fech.periodo_fim) if tipo == "m" else (xid, fech.periodo_inicio, fech.periodo_fim)
@@ -1291,6 +1323,9 @@ def _resumo_agrupado_por_executor(
         if not dias and pendente and qtd_col == 0:
             continue
 
+        dias_com_entrega, dias_sem_conferencia = (
+            _aplicar_conferencia(xid, dias) if conferencia_habilitada and tipo == "m" else (0, 0)
+        )
         valor_entregas = sum((d.valor_feitos for d in dias), zero)
         valor_base_atual = None
         pode_reajustar = alerta_pos_pago = False
@@ -1330,6 +1365,8 @@ def _resumo_agrupado_por_executor(
                 valor_base_fechado=Decimal(str(fech.valor_base or 0)) if fech is not None else None,
                 periodo_inicio=_iso_ou_none(fech.periodo_inicio) if fech is not None else None,
                 periodo_fim=_iso_ou_none(fech.periodo_fim) if fech is not None else None,
+                dias_com_entrega=dias_com_entrega,
+                dias_sem_conferencia=dias_sem_conferencia,
                 dias=dias,
             )
         )
@@ -1369,6 +1406,7 @@ def _resumo_agrupado_por_executor(
             ((r.valor_base if r.fechamento_status == "PENDENTE" else (r.valor_final or zero)) for r in rows),
             zero,
         ),
+        conferencia_habilitada=conferencia_habilitada,
     )
 
 
@@ -1702,6 +1740,7 @@ def resumo_entregadores(
             pageSize=pageSize,
             cache_valor_base=cache_valor_base,
             precos_motoboy=precos_motoboy,
+            conferencia_habilitada=owner_conferencia_habilitada(db, sub_base_user, current_user),
         )
 
     if fechamento_status and str(fechamento_status).strip():

@@ -28,6 +28,22 @@ def filtrar_status_conferencia(rows: Iterable[T]) -> List[T]:
 
 
 STATUS_CONFERIDA = "conferida"
+STATUS_RECONFERIR = "reconferir"
+STATUS_PENDENTE = "pendente"
+
+LABEL_CONFERENCIA_DIA = {
+    STATUS_CONFERIDA: "Conferido",
+    STATUS_PENDENTE: "Não conferido",
+    STATUS_RECONFERIR: "Reconferir",
+}
+
+
+def status_conferencia_dia(status_registro: Optional[str]) -> str:
+    """Status de um dia com entregas; sem registro de conferência conta como pendente."""
+    s = (status_registro or "").strip().lower()
+    if s in (STATUS_CONFERIDA, STATUS_RECONFERIR):
+        return s
+    return STATUS_PENDENTE
 
 
 def montar_dias_conferencia_periodo(
