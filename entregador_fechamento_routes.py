@@ -57,6 +57,8 @@ from entregador_routes import (
     _calcular_valor_base_motoboy_periodo,
     _calcular_valor_base_periodo,
     _normalizar_servico,
+    precos_motoboy_cache,
+    valores_base_atuais_motoboys,
     usuario_financeiro,
     STATUS_VALOR_BASE_VALIDOS,
 )
@@ -221,8 +223,24 @@ def _calcular_diarias_coleta_motoboy(
     periodo_fim: date,
 ) -> tuple[int, Decimal, list[dict]]:
     """Uma diária por motoboy/data, independentemente da quantidade de bases."""
+    return calcular_diarias_coleta_motoboys(db, sub_base, [motoboy_id], periodo_inicio, periodo_fim)[int(motoboy_id)]
+
+
+def calcular_diarias_coleta_motoboys(
+    db: Session,
+    sub_base: str,
+    motoboy_ids: list[int],
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    precos_cache: Optional[dict] = None,
+) -> dict[int, tuple[int, Decimal, list[dict]]]:
+    """Diárias de coleta de vários motoboys do período numa única consulta."""
+    ids = sorted({int(m) for m in motoboy_ids if m is not None})
+    if not ids:
+        return {}
     rows = db.execute(
-        select(ColetaExecucao.data_operacao, BasePreco.base)
+        select(ColetaExecucaoParticipante.motoboy_id, ColetaExecucao.data_operacao, BasePreco.base)
         .join(
             ColetaExecucaoParticipante,
             ColetaExecucaoParticipante.execucao_id == ColetaExecucao.id_execucao,
@@ -231,24 +249,29 @@ def _calcular_diarias_coleta_motoboy(
         .where(
             ColetaExecucao.sub_base == sub_base,
             ColetaExecucaoParticipante.sub_base == sub_base,
-            ColetaExecucaoParticipante.motoboy_id == motoboy_id,
+            ColetaExecucaoParticipante.motoboy_id.in_(ids),
             ColetaExecucaoParticipante.status == "finalizado",
             ColetaExecucao.data_operacao >= periodo_inicio,
             ColetaExecucao.data_operacao <= periodo_fim,
         )
-        .order_by(ColetaExecucao.data_operacao, BasePreco.base)
     ).all()
-    bases_por_dia: dict[date, set[str]] = {}
-    for data_operacao, base_nome in rows:
-        bases_por_dia.setdefault(data_operacao, set()).add(base_nome)
-    valor_diaria = Decimal(
-        resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id).get("coleta_valor") or 0
-    ).quantize(Decimal("0.01"))
-    itens = [
-        {"data": dia, "bases": sorted(bases), "valor_diaria": valor_diaria}
-        for dia, bases in sorted(bases_por_dia.items())
-    ]
-    return len(itens), (valor_diaria * len(itens)).quantize(Decimal("0.01")), itens
+    bases_por_motoboy: dict[int, dict[date, set[str]]] = {mid: {} for mid in ids}
+    for motoboy_id, data_operacao, base_nome in rows:
+        bases_por_motoboy[int(motoboy_id)].setdefault(data_operacao, set()).add(base_nome)
+    out: dict[int, tuple[int, Decimal, list[dict]]] = {}
+    for mid, bases_por_dia in bases_por_motoboy.items():
+        if not bases_por_dia:
+            out[mid] = (0, Decimal("0.00"), [])
+            continue
+        valor_diaria = Decimal(
+            precos_motoboy_cache(db, sub_base, mid, precos_cache).get("coleta_valor") or 0
+        ).quantize(Decimal("0.01"))
+        itens = [
+            {"data": dia, "bases": sorted(bases), "valor_diaria": valor_diaria}
+            for dia, bases in sorted(bases_por_dia.items())
+        ]
+        out[mid] = (len(itens), (valor_diaria * len(itens)).quantize(Decimal("0.01")), itens)
+    return out
 
 
 def _sincronizar_itens_coleta_fechamento(
@@ -697,6 +720,7 @@ def listar_fechamentos_admin(
         if getattr(f, "id_motoboy", None) is not None
     ]
     nomes_motoboy_map = carregar_nomes_motoboy_ids(db, motoboy_ids)
+    valores_atuais = valores_base_atuais_motoboys(db, sub_base, motoboy_ids, periodo_inicio, periodo_fim)
 
     status_filtro = (status or "").strip().upper() or None
     items: List[FechamentoOut] = []
@@ -707,8 +731,13 @@ def listar_fechamentos_admin(
     qtd_pago = 0
 
     for fech in rows:
+        mid = getattr(fech, "id_motoboy", None)
         out = _fechamento_to_out(
-            db, sub_base, fech, nomes_motoboy_map=nomes_motoboy_map
+            db,
+            sub_base,
+            fech,
+            nomes_motoboy_map=nomes_motoboy_map,
+            valor_base_recalc=valores_atuais.get(int(mid)) if mid is not None else None,
         )
         st = (out.status or "").upper()
 
