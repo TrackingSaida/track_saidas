@@ -28,7 +28,7 @@ from coleta_operacional_service import (
 )
 from models import ColetaExecucaoParticipante
 from coleta_leituras_service import obter_totais_por_nome_base
-from pacote_g_categorias import garantir_categoria_padrao
+from pacote_g_categorias import garantir_categoria_padrao, normalizar_g_categorias
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -77,6 +77,13 @@ class ResumoLote(BaseModel):
     total: str
 
 
+class ColetaGCategoriaIn(BaseModel):
+    categoria_g_id: int
+    shopee: int = Field(default=0, ge=0)
+    ml: int = Field(default=0, ge=0)
+    avulso: int = Field(default=0, ge=0)
+
+
 class ColetaManualCreate(BaseModel):
     data: date
     base: str = Field(min_length=1)
@@ -87,6 +94,7 @@ class ColetaManualCreate(BaseModel):
     g_shopee: int = Field(default=0, ge=0)
     g_ml: int = Field(default=0, ge=0)
     g_avulso: int = Field(default=0, ge=0)
+    g_categorias: Optional[List[ColetaGCategoriaIn]] = None
 
 
 class ColetaManualUpdate(BaseModel):
@@ -97,6 +105,7 @@ class ColetaManualUpdate(BaseModel):
     g_shopee: Optional[int] = Field(default=None, ge=0)
     g_ml: Optional[int] = Field(default=None, ge=0)
     g_avulso: Optional[int] = Field(default=None, ge=0)
+    g_categorias: Optional[List[ColetaGCategoriaIn]] = None
 
 
 class ColetaOut(BaseModel):
@@ -114,6 +123,7 @@ class ColetaOut(BaseModel):
     g_shopee: int = 0
     g_ml: int = 0
     g_avulso: int = 0
+    g_categorias: Optional[Dict[str, Dict[str, int]]] = None
     model_config = ConfigDict(from_attributes=True)
 
 ColetaOut.model_rebuild()
@@ -1001,6 +1011,11 @@ def criar_coleta_manual(
     g_shopee_val = getattr(payload, "g_shopee", 0) or 0
     g_ml_val = getattr(payload, "g_ml", 0) or 0
     g_avulso_val = getattr(payload, "g_avulso", 0) or 0
+    g_mapa = None
+    if payload.g_categorias:
+        g_mapa, g_tot = normalizar_g_categorias(db, sub_base, [i.model_dump() for i in payload.g_categorias])
+        g_shopee_val, g_ml_val, g_avulso_val = g_tot["shopee"], g_tot["ml"], g_tot["avulso"]
+        pacotes_g_val = g_shopee_val + g_ml_val + g_avulso_val
     coleta = Coleta(
         sub_base=sub_base,
         base=base_norm,
@@ -1015,6 +1030,7 @@ def criar_coleta_manual(
         g_shopee=g_shopee_val,
         g_ml=g_ml_val,
         g_avulso=g_avulso_val,
+        g_categorias=g_mapa,
     )
     db.add(coleta)
     db.flush()
@@ -1058,6 +1074,7 @@ def criar_coleta_manual(
     participante.g_shopee = g_shopee_val
     participante.g_ml = g_ml_val
     participante.g_avulso = g_avulso_val
+    participante.g_categorias = g_mapa
     participante.sem_volume = payload.shopee + payload.mercado_livre + payload.avulso == 0
     participante.status = "finalizado"
     participante.atualizado_em = datetime.datetime.now()
@@ -1127,11 +1144,22 @@ def atualizar_coleta_manual(
         coleta.g_ml = payload.g_ml
     if payload.g_avulso is not None:
         coleta.g_avulso = payload.g_avulso
+    if "g_categorias" in payload.model_fields_set:
+        g_mapa, g_tot = normalizar_g_categorias(
+            db, sub_base, [i.model_dump() for i in (payload.g_categorias or [])]
+        )
+        coleta.g_categorias = g_mapa
+        coleta.g_shopee, coleta.g_ml, coleta.g_avulso = g_tot["shopee"], g_tot["ml"], g_tot["avulso"]
+        coleta.pacotes_g = g_tot["shopee"] + g_tot["ml"] + g_tot["avulso"]
+    elif any(v is not None for v in (payload.pacotes_g, payload.g_shopee, payload.g_ml, payload.g_avulso)):
+        # Totais sem categoria: o fechamento atribui à categoria padrão.
+        coleta.g_categorias = None
 
     participante = participante_atual
     if participante:
         for campo in ("shopee", "mercado_livre", "avulso", "pacotes_g", "g_shopee", "g_ml", "g_avulso"):
             setattr(participante, campo, getattr(coleta, campo) or 0)
+        participante.g_categorias = coleta.g_categorias
         participante.sem_volume = (
             int(coleta.shopee or 0) + int(coleta.mercado_livre or 0) + int(coleta.avulso or 0) == 0
         )

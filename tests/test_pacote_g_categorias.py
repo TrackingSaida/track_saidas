@@ -6,6 +6,7 @@ from base_fechamento_routes import (
     _qtd_g_com_cobranca,
     _valor_g_categorias,
 )
+from coletas import ColetaManualCreate, ColetaManualUpdate
 from base_fechamento_status_pure import (
     MOTIVO_PACOTES_G,
     fechamento_base_divergente,
@@ -95,3 +96,16 @@ def test_divergencia_considera_valor_g():
     assert fechamento_base_divergente(**kw) is False
     assert fechamento_base_divergente(**kw, valor_g_gravado=Decimal("0"), valor_g_atual=Decimal("0.00")) is False
     assert fechamento_base_divergente(**kw, valor_g_gravado=Decimal("5"), valor_g_atual=Decimal("6")) is True
+
+
+def test_coleta_manual_aceita_g_por_categoria():
+    body = ColetaManualCreate(
+        data="2026-09-21",
+        base="BASE1",
+        shopee=10,
+        g_categorias=[{"categoria_g_id": 4, "shopee": 2}],
+    )
+    assert body.g_categorias[0].categoria_g_id == 4
+    assert body.g_categorias[0].shopee == 2 and body.g_categorias[0].ml == 0
+    assert "g_categorias" not in ColetaManualUpdate(shopee=3).model_fields_set
+    assert "g_categorias" in ColetaManualUpdate(g_categorias=[]).model_fields_set

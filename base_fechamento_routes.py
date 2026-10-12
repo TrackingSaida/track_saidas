@@ -987,7 +987,7 @@ def _criar_fechamento_base_core(
         if ajuste_g_val != 0:
             ajuste_g_val_normalizado = ajuste_g_val
             # Texto padronizado, já incluindo o valor para aparecer claramente no relatório
-            ajuste_label = f"[Pacotes G] Motivo: {ajuste_g_motivo_norm or 'Ajuste de pacotes G'}; Valor: R$ {abs(ajuste_g_val):.2f}"
+            ajuste_label = f"[Ajuste G] Motivo: {ajuste_g_motivo_norm}; Valor: R$ {abs(ajuste_g_val):.2f}"
             if ajuste_g_val > 0:
                 motivo_ad_final = " | ".join([m for m in [motivo_ad_base, ajuste_label] if m])
             else:
@@ -1621,7 +1621,7 @@ def obter_fechamento(
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
         valor_g=getattr(fech, "valor_g", None) or Decimal("0.00"),
-        g_por_categoria=_g_por_categoria(itens, regras_g, padrao_g_id),
+        g_por_categoria=_g_por_categoria(itens, regras_g, padrao_g_id, _precos_base(db, sub_base, fech.base)),
         ajuste_g_valor=None,
         divergencia_valor=divergencia if divergencia else None,
         valor_bruto_recalculado=valor_bruto_rec if divergencia else None,
@@ -1748,7 +1748,7 @@ def atualizar_fechamento(
         total_g_avulso=total_g_avulso,
         total_pacotes_g=total_pacotes_g,
         valor_g=getattr(fech, "valor_g", None) or Decimal("0.00"),
-        g_por_categoria=_g_por_categoria(itens, regras_g, padrao_g_id),
+        g_por_categoria=_g_por_categoria(itens, regras_g, padrao_g_id, _precos_base(db, sub_base, fech.base)),
         ajuste_g_valor=None,
         emitido_por=_emitido_por(db, fech.sub_base),
     )
