@@ -173,6 +173,7 @@ app.add_middleware(EnsurePatchCorsMiddleware)
 from users_routes_updated import router as users_router
 from entregador_routes import router as entregadores_router
 from entregador_fechamento_routes import router as fechamento_router
+from pacote_g_categorias import router as pacote_g_categorias_router
 from auth import router as auth_router
 from saidas_routes import router as saidas_router, pedidos_router
 from owner_routes import router as owners_router
@@ -224,6 +225,7 @@ app.include_router(users_router,        prefix=API_PREFIX)
 # Fechamentos ANTES de entregadores: evita que GET /entregadores/{id_entregador}
 # capture /entregadores/fechamentos (id="fechamentos" → HTTP 422).
 app.include_router(fechamento_router, prefix=f"{API_PREFIX}/entregadores")
+app.include_router(pacote_g_categorias_router, prefix=API_PREFIX)
 app.include_router(entregadores_router, prefix=API_PREFIX)
 app.include_router(auth_router,         prefix=API_PREFIX)
 app.include_router(saidas_router,       prefix=API_PREFIX)

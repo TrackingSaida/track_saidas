@@ -38,10 +38,12 @@ def motivo_bloqueio_lote_base(
     qtd_dias: int,
     qtd_dias_pendentes: int,
     total_pacotes_g: int,
+    pacotes_g_com_regra: Optional[int] = None,
 ) -> Optional[str]:
     """
     Motivo pelo qual a base não pode ser gerada no lote (None = pode gerar).
-    Pacotes G exigem valor por pacote informado manualmente, então ficam fora do lote.
+    Pacotes G de categoria sem valor de cobrança para a base precisam de revisão manual,
+    então ficam fora do lote. Sem ``pacotes_g_com_regra`` todo G bloqueia.
     """
     if normalizar_status_fechamento_base(status_fechamento):
         return MOTIVO_JA_GERADO
@@ -49,7 +51,7 @@ def motivo_bloqueio_lote_base(
         return MOTIVO_DIAS_PENDENTES
     if qtd_dias <= 0:
         return MOTIVO_SEM_COLETAS
-    if total_pacotes_g > 0:
+    if total_pacotes_g > (pacotes_g_com_regra or 0):
         return MOTIVO_PACOTES_G
     return None
 
@@ -62,10 +64,13 @@ def fechamento_base_divergente(
     bruto_atual,
     cancelados_atual,
     g_atual: tuple,
+    valor_g_gravado=None,
+    valor_g_atual=None,
 ) -> bool:
-    """Coletas, cancelados ou pacotes G mudaram depois de gerar o fechamento."""
+    """Coletas, cancelados ou pacotes G (quantidade ou valor) mudaram depois de gerar o fechamento."""
     return (
         bruto_atual != bruto_gravado
         or cancelados_atual != cancelados_gravado
         or tuple(g_atual) != tuple(g_gravado)
+        or (valor_g_atual or 0) != (valor_g_gravado or 0)
     )

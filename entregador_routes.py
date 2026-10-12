@@ -13,7 +13,8 @@ from name_normalizer import normalize_display_name, normalize_person_name, perso
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
 from entregador_legado_sync import filtrar_entregadores_operacionais
 from fechamento_resumo_utils import base_filtro_ativo, saida_pertence_base
-from fechamento_valor_pure import valor_g_adicional, valor_saida
+from fechamento_valor_pure import adicional_g, valor_g_adicional, valor_saida
+from pacote_g_categorias import categoria_da_saida, padrao_id_ou_none, regras_por_categoria
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
@@ -132,6 +133,7 @@ class EntregadorResumoItem(BaseModel):
     valor_cancelados: Decimal = Decimal("0.00")
     valor_total: Decimal = Decimal("0.00")
     g_total: int = 0
+    g_por_categoria: Dict[str, int] = Field(default_factory=dict)  # nome da categoria -> quantidade
     valor_g: Decimal = Decimal("0.00")  # adicional de Pacote G já somado em valor_feitos
     fechamento_status: Optional[str] = None  # PENDENTE | GERADO | REAJUSTADO | PAGO
     id_fechamento: Optional[int] = None  # quando existe fechamento
@@ -170,6 +172,7 @@ class ResumoExecutorItem(BaseModel):
     total_feitos: int = 0
     total_cancelado: int = 0
     g_total: int = 0
+    g_por_categoria: Dict[str, int] = Field(default_factory=dict)
     valor_entregas: Decimal = Decimal("0.00")
     valor_g: Decimal = Decimal("0.00")
     valor_cancelados: Decimal = Decimal("0.00")
@@ -250,6 +253,9 @@ class PrecoEntregadorUpdate(BaseModel):
     coleta_valor: Optional[Decimal] = Field(None, ge=0)
 
 
+_CAMPOS_PRECO_EXCECAO = ("shopee_valor", "ml_valor", "avulso_valor", "coleta_valor")
+
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -278,6 +284,16 @@ def usuario_financeiro(current_user=Depends(get_current_user)):
         role = -1
     if role not in (0, 1):
         raise HTTPException(status_code=403, detail="Apenas admin/root pode acessar o fechamento de motoboys.")
+    return current_user
+
+
+def usuario_admin_precos(current_user=Depends(get_current_user)):
+    try:
+        role = int(getattr(current_user, "role", -1))
+    except (TypeError, ValueError):
+        role = -1
+    if role not in (0, 1):
+        raise HTTPException(status_code=403, detail="Apenas admin/root pode alterar preços de entrega.")
     return current_user
 
 
@@ -468,6 +484,19 @@ def _toggle_pacote_g_ativo(db: Session, sub_base: str) -> bool:
         select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
     ).first()
     return bool(getattr(row, "considerar_pacote_g_adicional", False)) if row else False
+
+
+def _somar_g_por_categoria(mapas) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for m in mapas:
+        for nome, qtd in (m or {}).items():
+            out[nome] = out.get(nome, 0) + int(qtd or 0)
+    return out
+
+
+def _regras_g_motoboy(db: Session, sub_base: str) -> tuple[Dict[int, Dict[str, Any]], Optional[int]]:
+    """Regras "Pagar ao motoboy" por categoria e a categoria padrão (pacote G legado sem categoria)."""
+    return regras_por_categoria(db, sub_base, "motoboy"), padrao_id_ou_none(db, sub_base)
 
 
 # =========================================================
@@ -973,10 +1002,12 @@ def _calcular_valor_base_periodo(
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     precos = resolver_precos_entregador(db, entregador_id, sub_base_user)
     toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base_user)
+    regras_g, padrao_g = _regras_g_motoboy(db, sub_base_user)
     total = Decimal("0.00")
     for saida in rows:
         total += valor_saida(
-            precos, saida.servico, saida.status, bool(getattr(saida, "is_grande", False)), toggle_pacote_g
+            precos, saida.servico, saida.status, bool(getattr(saida, "is_grande", False)), toggle_pacote_g,
+            regras_g.get(categoria_da_saida(saida, padrao_g)),
         )
     return total.quantize(Decimal("0.01"))
 
@@ -1004,6 +1035,7 @@ def _calcular_valor_base_motoboy_periodo(
     rows, _ = filtrar_saidas_por_periodo_operacional(db, rows_raw, periodo_inicio, periodo_fim)
     precos = resolver_precos_motoboy(db, sub_base_user, motoboy_id=motoboy_id)
     toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base_user)
+    regras_g, padrao_g = _regras_g_motoboy(db, sub_base_user)
     total = Decimal("0.00")
     for saida in rows:
         status_norm = (saida.status or "").strip().lower()
@@ -1020,7 +1052,7 @@ def _calcular_valor_base_motoboy_periodo(
             delta = precos["avulso_valor"]
         total += delta
         if toggle_pacote_g and bool(getattr(saida, "is_grande", False)):
-            total += delta
+            total += adicional_g(Decimal(str(delta or 0)), regras_g.get(categoria_da_saida(saida, padrao_g)))
     return total.quantize(Decimal("0.01"))
 
 
@@ -1180,6 +1212,7 @@ def _resumo_agrupado_por_executor(
                 total_feitos=sum(d.total_feitos for d in dias),
                 total_cancelado=sum(d.total_cancelado for d in dias),
                 g_total=sum(d.g_total for d in dias),
+                g_por_categoria=_somar_g_por_categoria(d.g_por_categoria for d in dias),
                 valor_entregas=valor_entregas.quantize(Decimal("0.01")),
                 valor_g=sum((d.valor_g for d in dias), zero).quantize(Decimal("0.01")),
                 valor_cancelados=sum((d.valor_cancelados for d in dias), zero).quantize(Decimal("0.01")),
@@ -1260,6 +1293,7 @@ def resumo_entregadores(
     if agrupar_executor and (data_inicio is None or data_fim is None):
         raise HTTPException(400, "Informe data_inicio e data_fim para agrupar por motoboy.")
     toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base_user)
+    regras_g, padrao_g = _regras_g_motoboy(db, sub_base_user)
     base_filtro_norm = base_filtro_ativo(base)
     if entregador_id is not None and motoboy_id is not None:
         raise HTTPException(400, "Informe apenas um de entregador_id ou motoboy_id.")
@@ -1378,8 +1412,9 @@ def resumo_entregadores(
             agrupado[key]["total_feitos"] = agrupado[key].get("total_feitos", 0) + 1
             agrupado[key][f"qtde_{tipo}"] += 1
             if getattr(saida, "is_grande", False):
-                g_feitos = agrupado[key].setdefault("g_feitos", {"shopee": 0, "flex": 0, "avulso": 0})
-                g_feitos[tipo] += 1
+                g_feitos = agrupado[key].setdefault("g_feitos", {})
+                chave_g = (categoria_da_saida(saida, padrao_g), tipo)
+                g_feitos[chave_g] = g_feitos.get(chave_g, 0) + 1
                 agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + 1
 
     cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
@@ -1456,7 +1491,11 @@ def resumo_entregadores(
         valor_shopee = item["qtde_shopee"] * precos["shopee_valor"]
         valor_flex = item["qtde_flex"] * precos["ml_valor"]
         valor_avulso = item["qtde_avulso"] * precos["avulso_valor"]
-        valor_g = valor_g_adicional(item.get("g_feitos") or {}, precos, toggle_pacote_g)
+        valor_g = valor_g_adicional(item.get("g_feitos") or {}, precos, toggle_pacote_g, regras_g)
+        g_por_categoria: Dict[str, int] = {}
+        for (cat_id, _tipo), qtd in (item.get("g_feitos") or {}).items():
+            nome_cat = (regras_g.get(cat_id) or {}).get("nome") or "G"
+            g_por_categoria[nome_cat] = g_por_categoria.get(nome_cat, 0) + int(qtd)
         valor_feitos = valor_shopee + valor_flex + valor_avulso + valor_g
         # valor_cancelados é informativo (o que não foi pago); não desconta de novo.
         valor_cancelados = (
@@ -1535,6 +1574,7 @@ def resumo_entregadores(
                 valor_cancelados=valor_cancelados.quantize(Decimal("0.01")),
                 valor_total=total_dia,
                 g_total=item.get("g_total", 0),
+                g_por_categoria=g_por_categoria,
                 valor_g=valor_g,
                 fechamento_status=fech_status,
                 id_fechamento=id_fech,
@@ -1634,7 +1674,7 @@ def get_preco_global(
 def patch_preco_global(
     body: PrecoGlobalUpdate,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_admin_precos),
 ):
     """Cria ou atualiza valores globais da sub_base do owner. Payload não vazio."""
     if (
@@ -1951,14 +1991,14 @@ def _salvar_preco_por_entregador(
     ).first()
     if ep:
         ep.usa_preco_global = False
-        if body.shopee_valor is not None:
-            ep.shopee_valor = body.shopee_valor
-        if body.ml_valor is not None:
-            ep.ml_valor = body.ml_valor
-        if body.avulso_valor is not None:
-            ep.avulso_valor = body.avulso_valor
-        if body.coleta_valor is not None:
-            ep.coleta_valor = body.coleta_valor
+        # null explícito volta o campo para o preço padrão
+        for campo in _CAMPOS_PRECO_EXCECAO:
+            if campo in body.model_fields_set:
+                setattr(ep, campo, getattr(body, campo))
+        if all(getattr(ep, campo) is None for campo in _CAMPOS_PRECO_EXCECAO):
+            db.delete(ep)
+            db.commit()
+            return PrecoIndividualItem(entregador_id=id_entregador, entregador_nome=ent.nome)
     else:
         ep = EntregadorPreco(
             id_entregador=id_entregador,
@@ -1986,10 +2026,10 @@ def post_entregador_precos(
     id_entregador: int,
     body: PrecoEntregadorUpdate,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_admin_precos),
 ):
     """Compatibilidade legado: salva exceção por entregador."""
-    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None and body.coleta_valor is None:
+    if not (body.model_fields_set & set(_CAMPOS_PRECO_EXCECAO)):
         raise HTTPException(status_code=422, detail="Envie ao menos um campo de preço.")
     sub_base_user = _resolve_user_base(db, current_user)
     return _salvar_preco_por_entregador(db, sub_base_user, id_entregador, body)
@@ -2000,10 +2040,10 @@ def post_motoboy_precos(
     id_motoboy: int,
     body: PrecoEntregadorUpdate,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_admin_precos),
 ):
     """Novo contrato: salva exceção selecionando motoboy ativo."""
-    if body.shopee_valor is None and body.ml_valor is None and body.avulso_valor is None and body.coleta_valor is None:
+    if not (body.model_fields_set & set(_CAMPOS_PRECO_EXCECAO)):
         raise HTTPException(status_code=422, detail="Envie ao menos um campo de preço.")
     sub_base_user = _resolve_user_base(db, current_user)
     motoboys = _carregar_motoboys_ativos_da_subbase(db, sub_base_user)
@@ -2027,7 +2067,7 @@ def post_motoboy_precos(
 def delete_entregador_precos(
     id_entregador: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_admin_precos),
 ):
     """Remove exceção de preço; entregador volta a usar valores globais."""
     sub_base_user = _resolve_user_base(db, current_user)
@@ -2045,7 +2085,7 @@ def delete_entregador_precos(
 def delete_motoboy_precos(
     id_motoboy: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(usuario_admin_precos),
 ):
     """Novo contrato: remove exceção selecionando motoboy."""
     sub_base_user = _resolve_user_base(db, current_user)

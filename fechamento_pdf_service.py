@@ -91,11 +91,13 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
         STATUS_VALOR_BASE_VALIDOS,
         _normalizar_servico,
         _resolve_executor_scope_ids,
+        _regras_g_motoboy,
         _toggle_pacote_g_ativo,
         resolver_precos_entregador,
         resolver_precos_motoboy,
     )
     from fechamento_valor_pure import valor_g_adicional
+    from pacote_g_categorias import categoria_da_saida
 
     sub_base = fech.sub_base
     data_inicio = fech.periodo_inicio
@@ -137,6 +139,7 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
 
     rows_raw = db.scalars(stmt).all()
     rows, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_raw, data_inicio, data_fim)
+    regras_g, padrao_g = _regras_g_motoboy(db, sub_base)
 
     agrupado: Dict[str, Dict[str, Any]] = {}
     for saida in rows:
@@ -158,7 +161,7 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
                 "g_shopee": 0,
                 "g_flex": 0,
                 "g_avulso": 0,
-                "g_feitos": {"shopee": 0, "flex": 0, "avulso": 0},
+                "g_feitos": {},
             }
         bucket = agrupado[dia]
         status_norm = (saida.status or "").strip().lower()
@@ -173,7 +176,8 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
         if getattr(saida, "is_grande", False):
             bucket["g_total"] += 1
             if not is_cancelado:
-                bucket["g_feitos"][tipo] += 1
+                chave_g = (categoria_da_saida(saida, padrao_g), tipo)
+                bucket["g_feitos"][chave_g] = bucket["g_feitos"].get(chave_g, 0) + 1
             if tipo == "shopee":
                 bucket["g_shopee"] += 1
             elif tipo == "flex":
@@ -195,7 +199,7 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
         valor_shopee = Decimal(item["qtde_shopee"]) * precos["shopee_valor"]
         valor_flex = Decimal(item["qtde_flex"]) * precos["ml_valor"]
         valor_avulso = Decimal(item["qtde_avulso"]) * precos["avulso_valor"]
-        valor_g = valor_g_adicional(item["g_feitos"], precos, toggle_pacote_g)
+        valor_g = valor_g_adicional(item["g_feitos"], precos, toggle_pacote_g, regras_g)
         valor_feitos = (valor_shopee + valor_flex + valor_avulso + valor_g).quantize(Decimal("0.01"))
         valor_cancel_shopee = (Decimal(item["cancel_shopee"]) * precos["shopee_valor"]).quantize(
             Decimal("0.01")

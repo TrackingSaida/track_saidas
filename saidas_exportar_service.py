@@ -26,6 +26,7 @@ EXPORT_COLUMNS: List[Dict[str, str]] = [
     {"key": "executado_por", "label": "Executado por"},
     {"key": "base", "label": "Base"},
     {"key": "is_grande", "label": "G"},
+    {"key": "categoria_g_nome", "label": "Categoria G"},
 ]
 
 EXPORT_COLUMN_KEYS = tuple(col["key"] for col in EXPORT_COLUMNS)
