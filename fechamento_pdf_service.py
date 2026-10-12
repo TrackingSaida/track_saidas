@@ -91,9 +91,11 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
         STATUS_VALOR_BASE_VALIDOS,
         _normalizar_servico,
         _resolve_executor_scope_ids,
+        _toggle_pacote_g_ativo,
         resolver_precos_entregador,
         resolver_precos_motoboy,
     )
+    from fechamento_valor_pure import valor_g_adicional
 
     sub_base = fech.sub_base
     data_inicio = fech.periodo_inicio
@@ -114,20 +116,24 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
         Saida.timestamp < datetime.combine(data_fim + timedelta(days=1), datetime.min.time()),
     )
 
-    entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
-        db=db,
-        sub_base_user=sub_base,
-        entregador_id=entregador_id,
-        motoboy_id=motoboy_id,
-    )
-    conds = []
-    if entregador_ids:
-        conds.append(Saida.entregador_id.in_(sorted(entregador_ids)))
-    if motoboy_ids:
-        conds.append(Saida.motoboy_id.in_(sorted(motoboy_ids)))
-    if not conds:
-        return []
-    stmt = stmt.where(or_(*conds))
+    if motoboy_id is not None:
+        # Mesmo recorte de _calcular_valor_base_motoboy_periodo (valor_base gravado).
+        stmt = stmt.where(Saida.motoboy_id == motoboy_id)
+    else:
+        entregador_ids, motoboy_ids = _resolve_executor_scope_ids(
+            db=db,
+            sub_base_user=sub_base,
+            entregador_id=entregador_id,
+            motoboy_id=None,
+        )
+        conds = []
+        if entregador_ids:
+            conds.append(Saida.entregador_id.in_(sorted(entregador_ids)))
+        if motoboy_ids:
+            conds.append(Saida.motoboy_id.in_(sorted(motoboy_ids)))
+        if not conds:
+            return []
+        stmt = stmt.where(or_(*conds))
 
     rows_raw = db.scalars(stmt).all()
     rows, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_raw, data_inicio, data_fim)
@@ -152,6 +158,7 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
                 "g_shopee": 0,
                 "g_flex": 0,
                 "g_avulso": 0,
+                "g_feitos": {"shopee": 0, "flex": 0, "avulso": 0},
             }
         bucket = agrupado[dia]
         status_norm = (saida.status or "").strip().lower()
@@ -165,6 +172,8 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
             bucket[f"qtde_{tipo}"] += 1
         if getattr(saida, "is_grande", False):
             bucket["g_total"] += 1
+            if not is_cancelado:
+                bucket["g_feitos"][tipo] += 1
             if tipo == "shopee":
                 bucket["g_shopee"] += 1
             elif tipo == "flex":
@@ -179,13 +188,15 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
     else:
         precos = resolver_precos_motoboy(db, sub_base)
 
+    toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base)
     out: List[Dict[str, Any]] = []
     for dia in sorted(agrupado.keys()):
         item = agrupado[dia]
         valor_shopee = Decimal(item["qtde_shopee"]) * precos["shopee_valor"]
         valor_flex = Decimal(item["qtde_flex"]) * precos["ml_valor"]
         valor_avulso = Decimal(item["qtde_avulso"]) * precos["avulso_valor"]
-        valor_feitos = (valor_shopee + valor_flex + valor_avulso).quantize(Decimal("0.01"))
+        valor_g = valor_g_adicional(item["g_feitos"], precos, toggle_pacote_g)
+        valor_feitos = (valor_shopee + valor_flex + valor_avulso + valor_g).quantize(Decimal("0.01"))
         valor_cancel_shopee = (Decimal(item["cancel_shopee"]) * precos["shopee_valor"]).quantize(
             Decimal("0.01")
         )
@@ -219,6 +230,7 @@ def _collect_itens_diarios(db: Session, fech: EntregadorFechamento) -> List[Dict
                 "valor_cancel_shopee": valor_cancel_shopee,
                 "valor_cancel_flex": valor_cancel_flex,
                 "valor_cancel_avulso": valor_cancel_avulso,
+                "valor_g": valor_g,
                 "valor_feitos": valor_feitos,
                 "valor_cancelados": valor_cancelados,
                 "valor_total": total_dia,
@@ -442,6 +454,9 @@ def _gerar_pdf_rico(
         ["Ajustes manuais", _fmt_signed(total_ajustes)],
         ["TOTAL A PAGAR", _fmt_brl(fech.valor_final)],
     ]
+    total_valor_g = sum((r.get("valor_g") or Decimal("0") for r in itens), Decimal("0"))
+    if total_valor_g > 0:
+        fin_rows.insert(2, ["   inclui adicional de Pacote G", _fmt_brl(total_valor_g)])
     usable_w = page_w - 2 * M
     y = _draw_table(c, fin_rows, M, y, [usable_w * 0.7, usable_w * 0.3])
     y -= 6 * mm

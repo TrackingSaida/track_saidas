@@ -1,5 +1,18 @@
 # Migrações
 
+## entregador_fechamento_unicidade.sql
+
+Obrigatória no deploy do Fechamento de Motoboys v2 (geração em lote). Cria índices únicos
+parciais que impedem dois fechamentos do mesmo motoboy/entregador no mesmo período
+(a constraint antiga não protegia por causa do NULL). Aditiva e idempotente.
+Se existirem duplicatas, a migration falha e lista os `id_fechamento` para correção manual.
+
+```bash
+psql "$DATABASE_URL" -f migrations/entregador_fechamento_unicidade.sql
+```
+
+Rollback (remove só os índices): `migrations/entregador_fechamento_unicidade_rollback.sql`.
+
 ## owner_cobranca_modulo.sql
 
 Obrigatória antes do deploy de **Financeiro → Cobrança de Owners** (somente root).
