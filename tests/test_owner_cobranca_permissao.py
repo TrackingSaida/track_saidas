@@ -38,7 +38,10 @@ def test_todas_as_rotas_exigem_root():
     deps = {d.dependency for d in router.dependencies}
     assert require_root in deps
     assert router.prefix == "/admin/cobranca-owners"
-    assert len(router.routes) >= 19
+    assert len(router.routes) >= 21
+    caminhos = {(m, r.path) for r in router.routes for m in r.methods}
+    assert ("POST", "/admin/cobranca-owners/apuracoes/{owner_id}/ajustes") in caminhos
+    assert ("DELETE", "/admin/cobranca-owners/apuracoes/{owner_id}/ajustes/{ajuste_id}") in caminhos
 
 
 def test_menu_so_para_root():

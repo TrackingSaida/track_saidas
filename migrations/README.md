@@ -20,6 +20,20 @@ psql "$DATABASE_URL" -f migrations/owner_cobranca_indexes.sql
 Rollback (apaga fechamentos de cobrança; só com confirmação explícita):
 `migrations/owner_cobranca_modulo_rollback.sql`.
 
+## owner_cobranca_v2.sql
+
+Obrigatória antes do deploy da Cobrança de Owners v2. Permite desconto (R$ ou %),
+acréscimo e isenção lançados dentro do período, antes do fechamento: colunas
+`periodo_inicio`, `periodo_fim`, `percentual`, `removido_em`, `removido_por_username`
+e tipo `isencao`. Aditiva e idempotente; requer `owner_cobranca_modulo.sql`.
+
+```bash
+psql "$DATABASE_URL" -f migrations/owner_cobranca_v2.sql
+```
+
+Rollback (apaga ajustes do período; só com confirmação explícita):
+`migrations/owner_cobranca_v2_rollback.sql`.
+
 ## motoboy_convite_cadastro.sql
 
 Obrigatória antes do deploy do autocadastro de motoboy por link de convite (PRD-004).

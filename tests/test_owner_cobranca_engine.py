@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from owner_cobranca_engine import (
+    EXPLICACAO_MODELO,
     Ajuste,
     Decisao,
     EventoCodigo,
@@ -21,6 +22,7 @@ from owner_cobranca_engine import (
     presets_periodo,
     proximo_periodo,
     quinzena_de,
+    situacao_pacotes,
     sugerir_modelo,
     valor_ajuste_assinado,
 )
@@ -263,6 +265,89 @@ def test_ajustes_em_dinheiro():
     assert ap.qtd_faturavel == 1
     assert ap.valor_ajustes == Decimal("7.00")
     assert ap.valor_total == Decimal("7.50")
+
+
+def _dez_pacotes():
+    return [ev(i, f"A{i}", status="saiu", data_saida=D5) for i in range(1, 11)]
+
+
+# 21. Desconto em % do período incide sobre o valor dos pacotes.
+def test_desconto_percentual_periodo():
+    ap = run("somente_saida", _dez_pacotes(), ajustes=[
+        Ajuste(id=1, tipo="desconto", valor=Decimal("0"), escopo="periodo", percentual=Decimal("10")),
+    ])
+    assert ap.valor_pacotes == Decimal("5.00")
+    assert ap.valores_ajustes[1] == Decimal("-0.50")
+    assert ap.valor_total == Decimal("4.50")
+    comp = {c.classificacao: (c.quantidade, c.valor) for c in ap.composicao}
+    assert comp["ajuste_periodo"] == (1, Decimal("-0.50"))
+
+
+# 22. Isenção zera o total, inclusive com acréscimo e ajuste de ciclo anterior.
+def test_isencao_zera_total():
+    ap = run("somente_saida", _dez_pacotes(), ajustes=[
+        Ajuste(id=1, tipo="acrescimo", valor=Decimal("2"), escopo="ciclo"),
+        Ajuste(id=2, tipo="acrescimo", valor=Decimal("1"), escopo="periodo"),
+        Ajuste(id=3, tipo="isencao", valor=Decimal("0"), escopo="periodo"),
+    ])
+    assert ap.valor_total == Decimal("0.00")
+    assert ap.valores_ajustes[3] == Decimal("-8.00")
+    classes = [c.classificacao for c in ap.composicao]
+    assert classes[-3:] == ["ajuste", "ajuste_periodo", "isencao"]
+    assert not ap.bloqueantes
+
+
+# 23. Desconto que deixa o total negativo bloqueia o fechamento.
+def test_total_negativo_bloqueia():
+    ap = run("somente_saida", _dez_pacotes(), ajustes=[
+        Ajuste(id=1, tipo="desconto", valor=Decimal("9"), escopo="periodo"),
+    ])
+    assert ap.valor_total == Decimal("-4.00")
+    assert any(d.codigo == "total_negativo" for d in ap.bloqueantes)
+
+
+# 23b. Crédito de ciclo anterior maior que o período só avisa (comportamento v1).
+def test_credito_ciclo_negativo_so_avisa():
+    ap = run("somente_saida", [ev(1, "A1", status="saiu", data_saida=D5)], ajustes=[
+        Ajuste(id=1, tipo="credito", valor=Decimal("2")),
+    ])
+    assert ap.valor_total == Decimal("-1.50")
+    assert not ap.bloqueantes
+    assert any(d.codigo == "credito_maior_que_periodo" for d in ap.divergencias)
+
+
+# 24. Ajuste do período muda o hash (conferência precisa ser refeita).
+def test_ajuste_periodo_muda_hash():
+    sem = run("somente_saida", _dez_pacotes())
+    com = run("somente_saida", _dez_pacotes(), ajustes=[
+        Ajuste(id=1, tipo="desconto", valor=Decimal("0"), escopo="periodo", percentual=Decimal("5")),
+    ])
+    assert sem.hash != com.hash
+
+
+# 25. Situação dos pacotes cobrados: entregues, em entrega, na base e manual.
+def test_situacao_pacotes():
+    from saidas_routes import normalizar_status_saida
+
+    linhas = [
+        ("codigo", "ENTREGUE", 1),
+        ("codigo", "entregue", 1),
+        ("codigo", "EM_ROTA", 1),
+        ("codigo", "ausente", 1),
+        ("codigo", "saiu", 1),
+        ("codigo", "coletado", 1),
+        ("codigo", "NA_BASE", 1),
+        ("manual", None, 5),
+    ]
+    out = {s["chave"]: s["quantidade"] for s in situacao_pacotes(linhas, normalizar_status_saida)}
+    assert out == {"entregue": 2, "em_entrega": 3, "na_base": 2, "manual": 5}
+
+
+def test_explicacao_para_todos_os_modelos():
+    from owner_cobranca_engine import MODELOS
+
+    for m in MODELOS:
+        assert EXPLICACAO_MODELO.get(m)
 
 
 def test_valor_ajuste_assinado():

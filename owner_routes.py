@@ -82,6 +82,8 @@ class OwnerOut(BaseModel):
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
     bloquear_saida_sem_coleta: bool = False
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -418,7 +420,20 @@ def list_owners(
     if current_user.role != 0:
         raise HTTPException(403, "Acesso restrito ao administrador.")
 
-    return [_owner_to_out(o) for o in db.scalars(select(Owner)).all()]
+    locais: dict[int, tuple[Optional[str], Optional[str]]] = {}
+    sellers = db.execute(
+        select(BaseSellerDados.owner_id, BaseSellerDados.cidade, BaseSellerDados.estado)
+        .order_by(BaseSellerDados.base_id.is_not(None).desc(), BaseSellerDados.id_seller.desc())
+    ).all()
+    for owner_id, cidade, estado in sellers:
+        locais[int(owner_id)] = ((cidade or "").strip() or None, (estado or "").strip() or None)
+
+    saida = []
+    for o in db.scalars(select(Owner)).all():
+        out = _owner_to_out(o)
+        out.cidade, out.estado = locais.get(int(o.id_owner), (None, None))
+        saida.append(out)
+    return saida
 
 # ============================================================
 # UPDATE (PATCH ÚNICO)

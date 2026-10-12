@@ -17,9 +17,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from owner_cobranca_engine import (
+    AJUSTE_PERIODO_TIPOS,
     AJUSTE_TIPOS,
     CLASSIFICACAO_LABELS,
     DECISAO_TIPOS,
+    ESCOPO_CICLO,
+    ESCOPO_PERIODO,
     MODELOS,
     NIVEL_ATENCAO,
     NIVEL_BLOQUEANTE,
@@ -34,13 +37,16 @@ from owner_cobranca_engine import (
     LoteAvulso,
     Remocao,
     apurar,
+    calcular_ajustes,
     normalizar_codigo,
     periodo_fechavel,
     periodos_sobrepostos,
+    situacao_pacotes,
     sugerir_modelo,
     valor_ajuste_assinado,
 )
 from models import (
+    BaseSellerDados,
     Owner,
     OwnerApuracao,
     OwnerApuracaoDecisao,
@@ -394,18 +400,54 @@ def decisoes_ativas(db: Session, owner_id: int, ini: date, fim: date) -> List[Ow
     )
 
 
-def ajustes_pendentes(db: Session, owner_id: int, ini: date) -> List[OwnerFechamentoAjuste]:
-    """Ajustes ainda não aplicados, nascidos de fechamentos anteriores a este período."""
+def ajustes_pendentes(db: Session, owner_id: int, ini: date, fim: date) -> List[OwnerFechamentoAjuste]:
+    """Ajustes ainda não aplicados: os nascidos de fechamentos anteriores a este período
+    e os lançados para este mesmo período."""
     rows = db.execute(
         select(OwnerFechamentoAjuste, OwnerFechamento.periodo_fim)
         .outerjoin(OwnerFechamento, OwnerFechamento.id == OwnerFechamentoAjuste.fechamento_origem_id)
         .where(
             OwnerFechamentoAjuste.owner_id == owner_id,
             OwnerFechamentoAjuste.fechamento_aplicado_id.is_(None),
+            OwnerFechamentoAjuste.removido_em.is_(None),
         )
         .order_by(OwnerFechamentoAjuste.id)
     ).all()
-    return [a for a, origem_fim in rows if origem_fim is None or origem_fim < ini]
+    saida: List[OwnerFechamentoAjuste] = []
+    for a, origem_fim in rows:
+        if a.periodo_inicio is not None:
+            if a.periodo_inicio == ini and a.periodo_fim == fim:
+                saida.append(a)
+        elif origem_fim is None or origem_fim < ini:
+            saida.append(a)
+    return saida
+
+
+def ajuste_para_engine(a: OwnerFechamentoAjuste) -> Ajuste:
+    return Ajuste(
+        id=a.id,
+        tipo=a.tipo,
+        valor=Decimal(a.valor),
+        motivo=a.motivo,
+        escopo=ESCOPO_PERIODO if a.periodo_inicio is not None else ESCOPO_CICLO,
+        percentual=Decimal(a.percentual) if a.percentual is not None else None,
+    )
+
+
+def ajustes_do_periodo(db: Session, owner_id: int, ini: date, fim: date) -> List[OwnerFechamentoAjuste]:
+    """Ajustes lançados para este período (ativos), aplicados ou não."""
+    return list(
+        db.scalars(
+            select(OwnerFechamentoAjuste)
+            .where(
+                OwnerFechamentoAjuste.owner_id == owner_id,
+                OwnerFechamentoAjuste.periodo_inicio == ini,
+                OwnerFechamentoAjuste.periodo_fim == fim,
+                OwnerFechamentoAjuste.removido_em.is_(None),
+            )
+            .order_by(OwnerFechamentoAjuste.id)
+        ).all()
+    )
 
 
 def fechamento_vigente(db: Session, owner_id: int, ini: date, fim: date) -> Optional[OwnerFechamento]:
@@ -547,7 +589,7 @@ def apurar_owner(
     lotes = carregar_lotes(db, sub_base, (e.avulso_lote_id for e in eventos))
     faturados = codigos_ja_faturados(db, sub_base, (e.codigo for e in eventos))
     decisoes = decisoes_ativas(db, owner.id_owner, ini, fim)
-    ajustes = ajustes_pendentes(db, owner.id_owner, ini)
+    ajustes = ajustes_pendentes(db, owner.id_owner, ini, fim)
 
     ap = apurar(
         modelo=cfg.modelo,
@@ -569,7 +611,7 @@ def apurar_owner(
         ],
         remocoes=remocoes,
         codigos_ja_faturados=faturados,
-        ajustes=[Ajuste(id=a.id, tipo=a.tipo, valor=Decimal(a.valor), motivo=a.motivo) for a in ajustes],
+        ajustes=[ajuste_para_engine(a) for a in ajustes],
         lotes_avulso=lotes,
     )
 
@@ -874,20 +916,46 @@ def conferir(db: Session, owner: Owner, user: User, ini: date, fim: date) -> Apu
     return atual
 
 
-def _owner_snapshot(owner: Owner, cfg: OwnerConfiguracaoCobranca) -> Dict[str, Any]:
+def _seller_dados(db: Session, owner_id: int) -> Optional[BaseSellerDados]:
+    """Cadastro de CNPJ/endereço do Owner; prefere o registro geral (sem base vinculada)."""
+    return db.scalar(
+        select(BaseSellerDados)
+        .where(BaseSellerDados.owner_id == owner_id)
+        .order_by(BaseSellerDados.base_id.is_not(None), BaseSellerDados.id_seller)
+        .limit(1)
+    )
+
+
+def _txt(v: Any) -> Optional[str]:
+    s = str(v or "").strip()
+    return s or None
+
+
+def dados_cadastro(db: Session, owner: Owner, cfg: OwnerConfiguracaoCobranca) -> Dict[str, Any]:
+    """Dados do Owner para o demonstrativo, lidos do cadastro. Campo sem cadastro fica vazio."""
+    from base import _format_endereco_seller
+
+    seller = _seller_dados(db, owner.id_owner)
+    endereco = _txt(_format_endereco_seller(seller)) if seller is not None else None
     return {
         "id_owner": owner.id_owner,
         "nome": nome_owner(owner),
         "username": owner.username,
         "sub_base": owner.sub_base,
-        "email": owner.email,
-        "contato": owner.contato,
-        "razao_social": cfg.razao_social,
-        "documento": cfg.documento,
-        "telefone": cfg.telefone,
-        "endereco": cfg.endereco,
-        "contato_financeiro": cfg.contato_financeiro,
+        "email": _txt(owner.email),
+        "contato": _txt(owner.contato),
+        "razao_social": _txt(cfg.razao_social),
+        "documento": _txt(seller.cnpj if seller is not None else None) or _txt(cfg.documento),
+        "telefone": _txt(owner.contato) or _txt(cfg.telefone),
+        "endereco": endereco or _txt(cfg.endereco),
+        "cidade": _txt(seller.cidade) if seller is not None else None,
+        "estado": _txt(seller.estado) if seller is not None else None,
+        "contato_financeiro": _txt(cfg.contato_financeiro),
     }
+
+
+def _owner_snapshot(db: Session, owner: Owner, cfg: OwnerConfiguracaoCobranca) -> Dict[str, Any]:
+    return dados_cadastro(db, owner, cfg)
 
 
 def fechar(
@@ -940,7 +1008,7 @@ def fechar(
         valor_ajustes=ap.valor_ajustes,
         valor_total=ap.valor_total,
         hash=ap.hash,
-        owner_snapshot=_owner_snapshot(owner, cfg),
+        owner_snapshot=_owner_snapshot(db, owner, cfg),
         config_snapshot={
             "modelo": cfg.modelo,
             "periodicidade": cfg.periodicidade,
@@ -1025,6 +1093,13 @@ def fechar(
             )
             .values(fechamento_aplicado_id=fech.id)
         )
+        for a in ap.ajustes:
+            if a.escopo == ESCOPO_PERIODO:
+                db.execute(
+                    update(OwnerFechamentoAjuste)
+                    .where(OwnerFechamentoAjuste.id == a.id)
+                    .values(valor=ap.valores_ajustes.get(a.id, a.valor))
+                )
     db.query(OwnerApuracao).filter(
         OwnerApuracao.owner_id == owner.id_owner,
         OwnerApuracao.periodo_inicio == ini,
@@ -1222,6 +1297,195 @@ def lancar_ajuste(
     )
     db.flush()
     return aj, True
+
+
+def lancar_ajuste_periodo(
+    db: Session,
+    owner: Owner,
+    user: User,
+    *,
+    ini: date,
+    fim: date,
+    tipo: str,
+    valor: Optional[Decimal],
+    percentual: Optional[Decimal],
+    motivo: str,
+    chave_idempotencia: str,
+) -> Tuple[OwnerFechamentoAjuste, bool]:
+    """Desconto (R$ ou %), acréscimo ou isenção do próprio período, antes do fechamento."""
+    if tipo not in AJUSTE_PERIODO_TIPOS:
+        raise HTTPException(422, "Tipo de ajuste inválido.")
+    motivo = (motivo or "").strip()
+    if len(motivo) < 5:
+        raise HTTPException(422, "Explique o motivo do ajuste (mínimo 5 caracteres).")
+    chave = (chave_idempotencia or "").strip()
+    if not chave or len(chave) > 120:
+        raise HTTPException(422, "Chave de idempotência inválida.")
+
+    existente = db.scalar(
+        select(OwnerFechamentoAjuste).where(OwnerFechamentoAjuste.chave_idempotencia == chave)
+    )
+    if existente is not None:
+        if (
+            existente.owner_id != owner.id_owner
+            or existente.periodo_inicio != ini
+            or existente.periodo_fim != fim
+        ):
+            raise HTTPException(409, "Chave de ajuste já usada em outro período.")
+        return existente, False
+
+    _travar_periodo(db, owner.id_owner, ini, fim)
+    if fechamento_vigente(db, owner.id_owner, ini, fim) is not None:
+        raise HTTPException(409, "Período já fechado. Use ajuste no próximo ciclo ou reabra o período.")
+
+    pct: Optional[Decimal] = None
+    valor_dec = Decimal("0.00")
+    if tipo == "isencao":
+        if any(a.tipo == "isencao" for a in ajustes_do_periodo(db, owner.id_owner, ini, fim)):
+            raise HTTPException(409, "Este período já está isento.")
+    elif tipo == "desconto" and percentual is not None:
+        try:
+            pct = Decimal(str(percentual)).quantize(Decimal("0.01"))
+        except Exception:
+            raise HTTPException(422, "Percentual inválido.")
+        if pct <= 0 or pct > 100:
+            raise HTTPException(422, "O percentual precisa estar entre 0,01 e 100.")
+    else:
+        try:
+            valor_dec = Decimal(str(valor)).quantize(Decimal("0.01"))
+        except Exception:
+            raise HTTPException(422, "Valor inválido.")
+        if valor_dec <= 0:
+            raise HTTPException(422, "Informe um valor maior que zero.")
+
+    atual = apurar_owner(db, owner, ini, fim, usar_snapshot=False)
+    novo = Ajuste(
+        id=-1,
+        tipo=tipo,
+        valor=valor_dec,
+        escopo=ESCOPO_PERIODO,
+        percentual=pct,
+    )
+    simulado = calcular_ajustes(atual.apuracao.valor_pacotes, list(atual.apuracao.ajustes) + [novo])
+    total = atual.apuracao.valor_pacotes + sum(simulado.values(), start=Decimal("0"))
+    if total < 0:
+        raise HTTPException(422, "Esse desconto deixaria o total negativo.")
+
+    aj = OwnerFechamentoAjuste(
+        owner_id=owner.id_owner,
+        sub_base=owner.sub_base,
+        periodo_inicio=ini,
+        periodo_fim=fim,
+        tipo=tipo,
+        valor=valor_ajuste_assinado(tipo, valor_dec) if tipo != "isencao" else Decimal("0.00"),
+        percentual=pct,
+        motivo=motivo,
+        chave_idempotencia=chave,
+        criado_por=user.id,
+        criado_por_username=user.username,
+    )
+    db.add(aj)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existente = db.scalar(
+            select(OwnerFechamentoAjuste).where(OwnerFechamentoAjuste.chave_idempotencia == chave)
+        )
+        if existente is None:
+            raise HTTPException(409, "Não foi possível registrar o ajuste.")
+        return existente, False
+    registrar_historico(
+        db,
+        owner_id=owner.id_owner,
+        ini=ini,
+        fim=fim,
+        acao="ajuste_periodo",
+        user=user,
+        motivo=motivo,
+        detalhes={
+            "tipo": tipo,
+            "valor": str(aj.valor),
+            "percentual": str(pct) if pct is not None else None,
+            "ajuste_id": aj.id,
+        },
+    )
+    db.flush()
+    return aj, True
+
+
+def remover_ajuste_periodo(db: Session, owner: Owner, user: User, ajuste_id: int) -> OwnerFechamentoAjuste:
+    aj = db.get(OwnerFechamentoAjuste, int(ajuste_id))
+    if (
+        aj is None
+        or aj.owner_id != owner.id_owner
+        or aj.periodo_inicio is None
+        or aj.removido_em is not None
+    ):
+        raise HTTPException(404, "Ajuste não encontrado.")
+    _travar_periodo(db, owner.id_owner, aj.periodo_inicio, aj.periodo_fim)
+    if aj.fechamento_aplicado_id is not None or fechamento_vigente(
+        db, owner.id_owner, aj.periodo_inicio, aj.periodo_fim
+    ) is not None:
+        raise HTTPException(409, "Período já fechado. Reabra o período para remover o ajuste.")
+    aj.removido_em = datetime.now()
+    aj.removido_por_username = user.username
+    registrar_historico(
+        db,
+        owner_id=owner.id_owner,
+        ini=aj.periodo_inicio,
+        fim=aj.periodo_fim,
+        acao="ajuste_removido",
+        user=user,
+        detalhes={"ajuste_id": aj.id, "tipo": aj.tipo},
+    )
+    db.flush()
+    return aj
+
+
+def _normalizar_status():
+    from saidas_routes import normalizar_status_saida
+
+    return normalizar_status_saida
+
+
+def situacao_preview(ap: Apuracao) -> List[Dict[str, Any]]:
+    return situacao_pacotes(
+        ((it.tipo, it.status_operacional, it.quantidade) for it in ap.itens if it.faturavel),
+        _normalizar_status(),
+    )
+
+
+def situacao_fechamento(db: Session, fech: OwnerFechamento) -> List[Dict[str, Any]]:
+    rows = db.execute(
+        select(
+            OwnerFechamentoItem.tipo,
+            OwnerFechamentoItem.status_operacional,
+            func.coalesce(func.sum(OwnerFechamentoItem.quantidade), 0),
+        )
+        .where(
+            OwnerFechamentoItem.fechamento_id == fech.id,
+            OwnerFechamentoItem.status_financeiro == "cobrado",
+        )
+        .group_by(OwnerFechamentoItem.tipo, OwnerFechamentoItem.status_operacional)
+    ).all()
+    return situacao_pacotes(((t, s, int(q)) for t, s, q in rows), _normalizar_status())
+
+
+def resumo_por_dia(db: Session, fech: OwnerFechamento) -> List[Tuple[date, int]]:
+    rows = db.execute(
+        select(
+            OwnerFechamentoItem.data_competencia,
+            func.coalesce(func.sum(OwnerFechamentoItem.quantidade), 0),
+        )
+        .where(
+            OwnerFechamentoItem.fechamento_id == fech.id,
+            OwnerFechamentoItem.status_financeiro == "cobrado",
+        )
+        .group_by(OwnerFechamentoItem.data_competencia)
+        .order_by(OwnerFechamentoItem.data_competencia)
+    ).all()
+    return [(d, int(q)) for d, q in rows if d is not None]
 
 
 def ajustes_do_fechamento(db: Session, fech: OwnerFechamento) -> Dict[str, List[OwnerFechamentoAjuste]]:

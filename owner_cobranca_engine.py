@@ -22,7 +22,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from dashboard_admin_cobranca import STATUS_CANCELADOS, STATUS_SAIDAS_COBRANCA
 
@@ -51,15 +51,48 @@ CLASSIFICACOES_BRUTO = (
     "avulso_adicional",
 )
 CLASSIFICACAO_LABELS = {
-    "coleta_identificada": "Coleta identificada",
-    "coleta_manual": "Coleta manual",
-    "entrada_complementar": "Entrada complementar",
-    "saida_complementar": "Saída complementar",
-    "avulso_adicional": "Avulso adicional",
+    "coleta_identificada": "Lidos na coleta",
+    "coleta_manual": "Coleta manual (quantidade informada)",
+    "entrada_complementar": "Entraram na base sem coleta",
+    "saida_complementar": "Saíram sem coleta nem entrada",
+    "avulso_adicional": "Avulsos",
     "cancelado": "Cancelados",
-    "duplicidade": "Duplicidade",
-    "ajuste": "Ajustes",
+    "duplicidade": "Leituras repetidas (não cobradas)",
+    "ajuste": "Ajustes de períodos anteriores",
+    "ajuste_periodo": "Descontos e acréscimos do período",
+    "isencao": "Isenção do período",
 }
+
+EXPLICACAO_MODELO = {
+    "coleta_saida": (
+        "Cada pacote é cobrado uma única vez, no primeiro registro: a coleta. "
+        "Pacote que sai sem ter sido coletado é cobrado na saída. "
+        "A saída de um pacote já coletado não cobra de novo."
+    ),
+    "entrada_saida": (
+        "Cada pacote é cobrado uma única vez, no primeiro registro: a entrada na base. "
+        "Pacote que sai sem entrada registrada é cobrado na saída. "
+        "A saída de um pacote que já entrou não cobra de novo. Coleta manual não entra na conta."
+    ),
+    "coleta_entrada_saida": (
+        "Cada pacote é cobrado uma única vez, no primeiro registro entre coleta, entrada e saída. "
+        "Os registros seguintes do mesmo pacote não cobram de novo."
+    ),
+    "somente_saida": "Só são cobrados os pacotes que saíram para entrega, uma vez cada.",
+}
+
+# O que aconteceu com os pacotes cobrados (status operacional já normalizado).
+SITUACOES = ("entregue", "em_entrega", "na_base", "manual")
+SITUACAO_LABELS = {
+    "entregue": "Entregues",
+    "em_entrega": "Saíram para entrega (em rota, ausente ou sem baixa)",
+    "na_base": "Ainda na base (coletados ou recebidos, sem saída)",
+    "manual": "Coleta manual (contagem sem código)",
+}
+_STATUS_ENTREGUE = frozenset({"entregue"})
+_STATUS_EM_ENTREGA = frozenset(
+    {"saiu", "saiu_para_entrega", "em_rota", "ausente", "encerrado_sistema"}
+)
 MOTIVO_LABELS = {
     "cancelado": "Cancelado",
     "duplicidade": "Leitura repetida do mesmo código",
@@ -77,6 +110,9 @@ ORIGEM_LABELS = {
 }
 
 AJUSTE_TIPOS = ("acrescimo", "desconto", "credito", "correcao")
+AJUSTE_PERIODO_TIPOS = ("desconto", "acrescimo", "isencao")
+ESCOPO_CICLO = "ciclo"
+ESCOPO_PERIODO = "periodo"
 
 NIVEL_BLOQUEANTE = "bloqueante"
 NIVEL_ATENCAO = "atencao"
@@ -142,10 +178,18 @@ class Remocao:
 
 @dataclass(frozen=True)
 class Ajuste:
+    """`ciclo`: veio de um fechamento anterior. `periodo`: lançado para este período.
+
+    Desconto do período pode ser em R$ (`valor`) ou em % (`percentual`) sobre o valor dos pacotes.
+    Isenção zera o total do período.
+    """
+
     id: int
     tipo: str
     valor: Decimal
     motivo: str = ""
+    escopo: str = ESCOPO_CICLO
+    percentual: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +265,7 @@ class Apuracao:
     divergencias: List[Divergencia]
     hash: str
     ajustes: List[Ajuste] = field(default_factory=list)
+    valores_ajustes: Dict[int, Decimal] = field(default_factory=dict)
 
     @property
     def bloqueantes(self) -> List[Divergencia]:
@@ -276,6 +321,58 @@ def valor_ajuste_assinado(tipo: str, valor: Decimal) -> Decimal:
     if tipo in ("desconto", "credito"):
         return -abs(v)
     return v
+
+
+def calcular_ajustes(valor_pacotes: Decimal, ajustes: Sequence[Ajuste]) -> Dict[int, Decimal]:
+    """Valor assinado de cada ajuste. Ordem: ciclos anteriores, descontos e acréscimos
+    do período (% sobre o valor dos pacotes) e, por último, a isenção, que zera o total."""
+    valores: Dict[int, Decimal] = {}
+    subtotal = Decimal(str(valor_pacotes))
+    ciclo = [a for a in ajustes if a.escopo != ESCOPO_PERIODO]
+    periodo = [a for a in ajustes if a.escopo == ESCOPO_PERIODO and a.tipo != "isencao"]
+    isencoes = [a for a in ajustes if a.escopo == ESCOPO_PERIODO and a.tipo == "isencao"]
+    for a in ciclo + periodo:
+        if a.escopo == ESCOPO_PERIODO and a.tipo == "desconto" and a.percentual is not None:
+            v = -(Decimal(str(valor_pacotes)) * Decimal(str(a.percentual)) / Decimal("100"))
+        else:
+            v = valor_ajuste_assinado(a.tipo, a.valor)
+        v = v.quantize(CENT)
+        valores[a.id] = v
+        subtotal += v
+    for i, a in enumerate(isencoes):
+        v = (-subtotal).quantize(CENT) if i == 0 else Decimal("0.00")
+        valores[a.id] = v
+        subtotal += v
+    return valores
+
+
+def situacao_bucket(tipo: str, status_normalizado: Optional[str]) -> str:
+    """Situação de um pacote cobrado. `status_normalizado` vem de `normalizar_status_saida`."""
+    if tipo == "manual":
+        return "manual"
+    s = (status_normalizado or "").strip().lower()
+    if s in _STATUS_ENTREGUE:
+        return "entregue"
+    if s in _STATUS_EM_ENTREGA:
+        return "em_entrega"
+    return "na_base"
+
+
+def situacao_pacotes(
+    linhas: Iterable[Tuple[str, Optional[str], int]],
+    normalizar: Callable[[Optional[str]], str],
+) -> List[Dict[str, object]]:
+    """linhas: (tipo, status_operacional, quantidade) dos pacotes cobrados."""
+    total: Dict[str, int] = {}
+    for tipo, status, qtd in linhas:
+        st = normalizar(status) if tipo != "manual" else None
+        k = situacao_bucket(tipo, st)
+        total[k] = total.get(k, 0) + int(qtd or 0)
+    return [
+        {"chave": k, "label": SITUACAO_LABELS[k], "quantidade": total[k]}
+        for k in SITUACOES
+        if total.get(k)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -692,12 +789,35 @@ def apurar(
 
     lista_ajustes = list(ajustes)
     valor_pacotes = (preco_val * qtd_faturavel).quantize(CENT)
-    valor_ajustes = sum(
-        (valor_ajuste_assinado(a.tipo, a.valor) for a in lista_ajustes), start=Decimal("0")
-    ).quantize(CENT)
-    if lista_ajustes:
-        composicao.append(LinhaComposicao("ajuste", len(lista_ajustes), valor_ajustes))
+    valores_ajustes = calcular_ajustes(valor_pacotes, lista_ajustes)
+    valor_ajustes = sum(valores_ajustes.values(), start=Decimal("0")).quantize(CENT)
+    for cls, filtro in (
+        ("ajuste", lambda a: a.escopo != ESCOPO_PERIODO),
+        ("ajuste_periodo", lambda a: a.escopo == ESCOPO_PERIODO and a.tipo != "isencao"),
+        ("isencao", lambda a: a.escopo == ESCOPO_PERIODO and a.tipo == "isencao"),
+    ):
+        grupo = [a for a in lista_ajustes if filtro(a)]
+        if grupo:
+            v = sum((valores_ajustes[a.id] for a in grupo), start=Decimal("0")).quantize(CENT)
+            composicao.append(LinhaComposicao(cls, len(grupo), v))
     valor_total = (valor_pacotes + valor_ajustes).quantize(CENT)
+    if valor_total < 0:
+        if any(a.escopo == ESCOPO_PERIODO for a in lista_ajustes):
+            divergencias.append(
+                Divergencia(
+                    NIVEL_BLOQUEANTE,
+                    "total_negativo",
+                    "Os descontos deixam o total negativo. Revise os ajustes do período.",
+                )
+            )
+        else:
+            divergencias.append(
+                Divergencia(
+                    NIVEL_ATENCAO,
+                    "credito_maior_que_periodo",
+                    "O crédito de períodos anteriores é maior que o valor deste período: o total fica negativo.",
+                )
+            )
 
     # Divergências de atenção / informativas
     for lote_id in sorted(lotes_no_periodo):
@@ -766,6 +886,7 @@ def apurar(
         divergencias=divergencias,
         hash=hash_,
         ajustes=lista_ajustes,
+        valores_ajustes=valores_ajustes,
     )
 
 
@@ -800,7 +921,9 @@ def calcular_hash(
         "fim": periodo_fim.isoformat(),
         "preco": str(Decimal(str(preco)).normalize()),
         "itens": linhas,
-        "ajustes": sorted((a.id, a.tipo, str(a.valor)) for a in ajustes),
+        "ajustes": sorted(
+            (a.id, a.tipo, str(a.valor), a.escopo, str(a.percentual or "")) for a in ajustes
+        ),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
