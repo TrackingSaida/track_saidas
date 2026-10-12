@@ -34,7 +34,12 @@ from saida_operacional_utils import (
     timestamp_operacional_saida,
     SaidaOperacionalContext,
 )
-from saidas_listar_service import invalidate_listar_cache, listar_saidas_paginado
+from saidas_listar_service import (
+    invalidate_listar_cache,
+    listar_saidas_paginado,
+    _localizar_avulso_variants,
+    _orm_localizar_avulso_exists,
+)
 from saidas_exportar_service import (
     MAX_EXPORTAR_LIMIT,
     ExportarSaidasError,
@@ -288,6 +293,8 @@ class SaidaDetalheCompletoOut(BaseModel):
     ausencias_total: int = 0
     bloqueado_ausencias: bool = False
     codigo: Optional[str] = None
+    # Identificação amigável (campos usar_na_identificacao); AVULSO-* fica em codigo.
+    codigo_exibicao: Optional[str] = None
     servico: Optional[str] = None
     status: Optional[str] = None
     base: Optional[str] = None
@@ -738,6 +745,8 @@ def _status_group_aliases(token: str) -> List[str]:
         "nao coletado": ["nao coletado", "não coletado"],
         "cancelado": ["cancelado", "cancelados"],
         "na base": ["na base", "na_base"],
+        "etiquetado": ["etiquetado"],
+        "etiqueta gerada": ["etiquetado"],
     }
     normalized = list(groups.get(key, [key]))
     out: set[str] = set()
@@ -1435,6 +1444,56 @@ def ler_saida(
         )
 
     if status_norm == STATUS_ENCERRADO_SISTEMA:
+        from avulso_campos_service import (
+            build_label_amigavel,
+            encontrar_pendentes_mesma_identificacao,
+            resolve_campos_ativos,
+            valores_por_saida,
+        )
+
+        pendentes = encontrar_pendentes_mesma_identificacao(
+            db, sub_base=sub_base, saida=existente
+        )
+        if pendentes:
+            pend = pendentes[0]
+            campos_cfg = resolve_campos_ativos(
+                db, sub_base=sub_base, contexto="TODOS_AVULSO"
+            )
+            label_pend = build_label_amigavel(
+                pend.codigo,
+                base_legado=pend.base,
+                campos_cfg=campos_cfg,
+                valores=valores_por_saida(db, int(pend.id_saida)),
+            )
+            registrar_log_leitura_critico(
+                sub_base=sub_base,
+                username=username,
+                origem="desconhecida",
+                tipo="saida",
+                codigo=existente.codigo,
+                resultado="bloqueio_encerrado_com_pendente",
+                role=role,
+                motoboy_id=motoboy_id,
+                id_saida=existente.id_saida,
+                origem_app="web",
+                endpoint="/saidas/ler",
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "AVULSO_PENDENTE_EXISTENTE",
+                    "message": (
+                        "Este pedido já foi encerrado. Há um avulso ativo com a mesma "
+                        "identificação — use o pedido novo, não o encerrado."
+                    ),
+                    "id_saida_encerrado": existente.id_saida,
+                    "codigo_encerrado": existente.codigo,
+                    "id_saida_pendente": pend.id_saida,
+                    "codigo_pendente": pend.codigo,
+                    "codigo_exibicao_pendente": label_pend,
+                    "status_pendente": pend.status,
+                },
+            )
         status_anterior = existente.status
         existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
         existente.entregador_id = entregador_id
@@ -1944,12 +2003,16 @@ def _montar_item_listar_saida(
     op_ctx: Optional[SaidaOperacionalContext],
     nome_executor: Optional[str],
 ) -> Dict[str, Any]:
+    acao = (op_ctx.acao_label if op_ctx else None) or None
+    status_up = (getattr(row, "status", None) or "").strip().upper()
+    if (not acao or acao.strip() in {"", "—", "-"}) and status_up == "ETIQUETADO":
+        acao = "Emitiu etiqueta"
     return {
         "id_saida": row.id_saida,
         "timestamp": row.timestamp,
         "data": row.data.isoformat() if getattr(row, "data", None) else None,
         "data_hora_acao": (op_ctx.ultimo_evento_ts if op_ctx else None) or row.timestamp,
-        "acao": (op_ctx.acao_label if op_ctx else None) or "Sem ação",
+        "acao": acao or "Sem ação",
         "executado_por": (op_ctx.executado_por if op_ctx else None) or "—",
         "sub_base": row.sub_base,
         "username": (op_ctx.ultimo_ator_username if op_ctx else None) or row.username,
@@ -1957,11 +2020,54 @@ def _montar_item_listar_saida(
         "entregador_id": getattr(row, "entregador_id", None),
         "motoboy_id": getattr(row, "motoboy_id", None),
         "codigo": row.codigo,
+        "codigo_exibicao": row.codigo,
         "servico": row.servico,
         "status": row.status,
         "base": row.base,
         "is_grande": getattr(row, "is_grande", False) or False,
     }
+
+
+def _enriquecer_codigo_exibicao_items(
+    db: Session,
+    *,
+    sub_base: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    """Preenche codigo_exibicao com identificação amigável nos avulsos da página."""
+    if not items:
+        return
+    from types import SimpleNamespace
+
+    from avulso_campos_service import labels_exibicao_por_saidas
+
+    row_ns = []
+    for it in items:
+        cod = str(it.get("codigo") or "")
+        srv = str(it.get("servico") or "").lower()
+        sid = it.get("id_saida")
+        if sid is None:
+            continue
+        if not (cod.upper().startswith("AVULSO-") or "avulso" in srv):
+            continue
+        row_ns.append(
+            SimpleNamespace(
+                id_saida=int(sid),
+                codigo=cod,
+                base=it.get("base"),
+            )
+        )
+    if not row_ns:
+        return
+    labels = labels_exibicao_por_saidas(db, sub_base=sub_base, rows=row_ns)
+    for it in items:
+        sid = it.get("id_saida")
+        if sid is None:
+            continue
+        label = labels.get(int(sid))
+        if label:
+            it["codigo_exibicao"] = label
+
 
 
 def _status_aliases_from_tokens(status_: Optional[List[str]]) -> List[str]:
@@ -2143,6 +2249,7 @@ def _listar_saidas_codigo_exato(
     if offset == 0 and (limit is None or limit > 0):
         nome_executor = _nome_executor_atual(db, row)
         items = [_montar_item_listar_saida(row, ctx, nome_executor)]
+        _enriquecer_codigo_exibicao_items(db, sub_base=sub_base, items=items)
 
     return {
         "total": 1,
@@ -2188,9 +2295,28 @@ def _listar_saidas_codigo_parcial(
             )
         )
     elif localizar and localizar.strip():
+        # Contém em código + campos de identificação do avulso (nome/CEP/etc.).
+        # Antes só buscava em s.codigo — nome/CEP nunca encontravam o pedido.
         q = f"%{localizar.strip()}%"
-        # Consulta mobile filtra por código no cliente; busca só em codigo.
-        stmt = stmt.where(Saida.codigo.ilike(q))
+        variants = _localizar_avulso_variants(localizar)
+
+        def _ua_ilike(col):
+            return func.unaccent(func.lower(func.coalesce(col, ""))).ilike(
+                func.unaccent(func.lower(q))
+            )
+
+        or_conds = [
+            Saida.codigo.ilike(q),
+            _ua_ilike(Saida.base),
+            _ua_ilike(Saida.username),
+            _ua_ilike(Saida.entregador),
+            _ua_ilike(Saida.servico),
+            _ua_ilike(Saida.status),
+        ]
+        avulso_ex = _orm_localizar_avulso_exists(sub_base, variants)
+        if avulso_ex is not None:
+            or_conds.append(avulso_ex)
+        stmt = stmt.where(or_(*or_conds))
     else:
         return _listar_resposta_vazia()
 
@@ -2258,6 +2384,7 @@ def _listar_saidas_codigo_parcial(
         ctx = op_ctx_map.get(int(row.id_saida))
         nome_executor = _nome_executor_atual(db, row)
         items.append(_montar_item_listar_saida(row, ctx, nome_executor))
+    _enriquecer_codigo_exibicao_items(db, sub_base=sub_base, items=items)
 
     return {
         "total": int(total),
@@ -2355,6 +2482,9 @@ def listar_saidas(
     )
     # Campo interno de diagnóstico — não faz parte do contrato da API.
     result.pop("_cache", None)
+    _enriquecer_codigo_exibicao_items(
+        db, sub_base=sub_base, items=result.get("items") or []
+    )
     return result
 
 
@@ -2529,6 +2659,23 @@ def get_saida_detalhe(
         )
     executor_nome = _nome_executor_atual(db, obj) or obj.entregador
     bloqueio = snapshot_bloqueio_ausencias(db, obj.id_saida)
+    codigo_exibicao = obj.codigo
+    cod_up = str(obj.codigo or "").upper()
+    srv_low = str(obj.servico or "").lower()
+    if cod_up.startswith("AVULSO-") or "avulso" in srv_low:
+        from avulso_campos_service import (
+            build_label_amigavel,
+            resolve_campos_ativos,
+            valores_por_saida,
+        )
+
+        campos_cfg = resolve_campos_ativos(db, sub_base=sub_base, contexto="TODOS_AVULSO")
+        codigo_exibicao = build_label_amigavel(
+            obj.codigo,
+            base_legado=obj.base,
+            campos_cfg=campos_cfg,
+            valores=valores_por_saida(db, int(obj.id_saida)),
+        )
     return SaidaDetalheCompletoOut(
         id_saida=obj.id_saida,
         timestamp=obj.timestamp,
@@ -2541,6 +2688,7 @@ def get_saida_detalhe(
         ausencias_total=bloqueio["ausencias_total"],
         bloqueado_ausencias=bloqueio["bloqueado_ausencias"],
         codigo=obj.codigo,
+        codigo_exibicao=codigo_exibicao,
         servico=obj.servico,
         status=obj.status,
         base=obj.base,

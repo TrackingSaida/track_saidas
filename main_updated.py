@@ -203,6 +203,12 @@ from conferencia_saida_routes import router as conferencia_saida_router
 from mobile_push_routes import router as mobile_push_router
 from avisos_routes import router as avisos_router, mobile_router as avisos_mobile_router
 from mobile_fechamentos_routes import router as mobile_fechamentos_router
+from mobile_app_version_routes import router as mobile_app_version_router
+from owner_cobranca_routes import router as owner_cobranca_router
+from motoboy_convite_routes import (
+    admin_router as motoboy_convite_admin_router,
+    public_router as motoboy_convite_public_router,
+)
 
 app.include_router(cep_router, prefix=API_PREFIX)
 app.include_router(ml_int_router, prefix=API_PREFIX)
@@ -230,10 +236,13 @@ app.include_router(mobile_push_router, prefix=API_PREFIX)
 app.include_router(avisos_router, prefix=API_PREFIX)
 app.include_router(avisos_mobile_router, prefix=API_PREFIX)
 app.include_router(mobile_fechamentos_router, prefix=API_PREFIX)
+app.include_router(mobile_app_version_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
 app.include_router(signup_router, prefix=API_PREFIX)
+app.include_router(motoboy_convite_public_router, prefix=API_PREFIX)
+app.include_router(motoboy_convite_admin_router, prefix=API_PREFIX)
 app.include_router(shopee_router, prefix=API_PREFIX)
 app.include_router(logs_router, prefix=API_PREFIX)
 app.include_router(config_campos_obrigatorios_router, prefix=API_PREFIX)
@@ -241,6 +250,7 @@ app.include_router(politicas_router, prefix=API_PREFIX)
 app.include_router(seller_portal_router, prefix=API_PREFIX)
 app.include_router(avulso_campos_config_router, prefix=API_PREFIX)
 app.include_router(avulsos_router, prefix=API_PREFIX)
+app.include_router(owner_cobranca_router, prefix=API_PREFIX)
 
 
 def _cors_headers_for_request(request: Request):

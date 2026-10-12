@@ -4,7 +4,7 @@ Prefixo: /acompanhamento
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time
 from typing import Optional, List, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -28,7 +28,10 @@ from saida_operacional_utils import (
     carregar_saidas_candidatas_periodo,
     filtrar_saidas_por_periodo_operacional,
 )
-from entrada_na_base_utils import listar_ainda_na_base
+from acompanhamento_volume_service import (
+    calcular_volume_que_entrou,
+    contar_saidas_como_indicadores,
+)
 
 router = APIRouter(prefix="/acompanhamento", tags=["Acompanhamento"])
 
@@ -350,36 +353,11 @@ def acompanhamento_dia(
     saidas_count: Optional[int] = None
     pct_saida: Optional[float] = None
     if entrada_habilitada:
-        ids_entrada_base = set(
-            db.scalars(
-                select(SaidaHistorico.id_saida)
-                .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
-                .where(Saida.sub_base == sub_base)
-                .where(SaidaHistorico.evento == "entrada_base")
-                .where(func.date(SaidaHistorico.timestamp) >= inicio)
-                .where(func.date(SaidaHistorico.timestamp) <= fim)
-            ).all()
+        # Volume do dia = Coletas ∪ Entradas; Saídas = mesma regra dos Indicadores.
+        entradas_count, _total_coletas, _total_entradas = calcular_volume_que_entrou(
+            db, sub_base, inicio, fim
         )
-        # Unifica com estoque dos indicadores: NA_BASE + coletado no período.
-        ids_estoque = {
-            int(s.id_saida)
-            for s in listar_ainda_na_base(
-                db, sub_base, inicio, fim, incluir_coletado=True
-            )
-            if getattr(s, "id_saida", None) is not None
-        }
-        entradas_count = len(ids_entrada_base | ids_estoque)
-        saidas_count = int(
-            db.scalar(
-                select(func.count())
-                .select_from(Saida)
-                .where(Saida.sub_base == sub_base)
-                .where(Saida.data >= inicio)
-                .where(Saida.data <= fim)
-                .where(Saida.motoboy_id.isnot(None))
-            )
-            or 0
-        )
+        saidas_count = contar_saidas_como_indicadores(db, sub_base, inicio, fim)
         if entradas_count > 0:
             pct_saida = round(100.0 * saidas_count / entradas_count, 1)
 

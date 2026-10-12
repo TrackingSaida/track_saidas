@@ -45,7 +45,74 @@ def test_por_servico_breakdown_conta_status_por_marketplace():
 
 
 def test_entradas_uniao_entrada_base_e_estoque():
-    """Simula a união usada em /acompanhamento/dia (sem DB)."""
-    ids_entrada_base = {1, 2}
-    ids_estoque = {2, 3}  # 3 = coletado sem entrada_base
-    assert len(ids_entrada_base | ids_estoque) == 3
+    """Legado: união com estoque — substituído por Coletados OU Entrada (PRD-003)."""
+    from acompanhamento_entradas_pure import volume_coletados_ou_entrada
+
+    # Só coleta por código (100 pacotes), 0 entrada, sem estoque residual
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=100,
+            ids_entrada=[],
+            ids_coleta_pacotes=range(1, 101),
+        )
+        == 100
+    )
+
+
+def test_volume_coletados_ou_entrada_casos():
+    from acompanhamento_entradas_pure import volume_coletados_ou_entrada
+
+    # Só entrada_base
+    assert volume_coletados_ou_entrada(total_coletas=0, ids_entrada={1, 2, 3}, ids_coleta_pacotes=[]) == 3
+
+    # Coleta + entrada no mesmo pacote: conta uma vez (OU)
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=2,
+            ids_entrada={1, 2},
+            ids_coleta_pacotes={2, 3},
+        )
+        == 3
+    )
+
+    # Coleta manual (sem Saida) + entradas: soma excesso agregado
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=50,
+            ids_entrada={10, 11},
+            ids_coleta_pacotes=[],
+        )
+        == 52
+    )
+
+    # Pacotes já saídos continuam no denominador (ids_coleta independe de status atual)
+    assert (
+        volume_coletados_ou_entrada(
+            total_coletas=468,
+            ids_entrada=set(),
+            ids_coleta_pacotes=range(1, 469),
+        )
+        == 468
+    )
+
+
+def test_volume_por_marketplace_aproximado():
+    from acompanhamento_volume_service import volume_por_marketplace_aproximado
+
+    assert volume_por_marketplace_aproximado(252, 0) == 252
+    assert volume_por_marketplace_aproximado(0, 10) == 10
+    assert volume_por_marketplace_aproximado(10, 5) == 15
+
+
+def test_volume_entrou_por_leitura_ignora_coleta_manual_e_nao_duplica():
+    from acompanhamento_entradas_pure import volume_entrou_por_leitura
+
+    # Só coleta manual (sem pacotes) + entradas: conta apenas as entradas.
+    assert volume_entrou_por_leitura(ids_entrada={1, 2, 3}, ids_coleta_pacotes=[]) == (3, set())
+
+    # Pacote coletado por leitura e depois com entrada conta uma vez.
+    volume, so_coleta = volume_entrou_por_leitura(ids_entrada=[1, 2, 3], ids_coleta_pacotes=[2, 3, 4, 5])
+    assert volume == 5
+    assert so_coleta == {4, 5}
+
+    assert volume_entrou_por_leitura(ids_entrada=[], ids_coleta_pacotes=[7, 7, 8]) == (2, {7, 8})

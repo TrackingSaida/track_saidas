@@ -16,6 +16,7 @@ from avulso_campos_service import (
     CONTEXTOS_META,
     TIPOS_META,
     TIPOS_RETIRADOS,
+    build_campos_exibicao,
     build_label_amigavel,
     contexto_meta,
     list_pendentes,
@@ -76,13 +77,22 @@ class CampoAvulsoOut(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class AvulsoCampoExibicaoOut(BaseModel):
+    chave: str
+    label: str
+    valor: str
+
+
 class AvulsoPendenteOut(BaseModel):
     id_saida: int
     codigo: Optional[str] = None
+    # Identificação amigável para UI (mesma regra de label); codigo permanece interno AVULSO-*.
+    codigo_exibicao: Optional[str] = None
     status: Optional[str] = None
     status_label: str = ""
     base: Optional[str] = None
     label: str
+    elegivel_saida: bool = False
     campos: Dict[str, str] = Field(default_factory=dict)
     avulso_lote_id: Optional[int] = None
     avulso_criado_excepcional: bool = False
@@ -95,6 +105,7 @@ class AvulsoDetalheOut(AvulsoPendenteOut):
     timestamp: Optional[datetime] = None
     origem: Optional[str] = None
     origem_label: Optional[str] = None
+    campos_exibicao: List[AvulsoCampoExibicaoOut] = Field(default_factory=list)
 
 
 def _assert_admin(current_user: User) -> None:
@@ -278,20 +289,25 @@ def delete_campo_avulso(
 
 
 def _saida_to_pendente(db: Session, row: Saida, campos_cfg) -> AvulsoPendenteOut:
+    from avulso_campos_service import eh_status_elegivel_saida
+
     vals = valores_por_saida(db, int(row.id_saida))
     motoboy_nome = motoboy_nome_saida(db, row)
+    label = build_label_amigavel(
+        row.codigo,
+        base_legado=row.base,
+        campos_cfg=campos_cfg,
+        valores=vals,
+    )
     return AvulsoPendenteOut(
         id_saida=int(row.id_saida),
         codigo=row.codigo,
+        codigo_exibicao=label,
         status=row.status,
         status_label=status_avulso_label(row.status),
         base=row.base,
-        label=build_label_amigavel(
-            row.codigo,
-            base_legado=row.base,
-            campos_cfg=campos_cfg,
-            valores=vals,
-        ),
+        label=label,
+        elegivel_saida=eh_status_elegivel_saida(row.status),
         campos=vals,
         avulso_lote_id=int(row.avulso_lote_id) if getattr(row, "avulso_lote_id", None) else None,
         avulso_criado_excepcional=bool(getattr(row, "avulso_criado_excepcional", False)),
@@ -375,10 +391,15 @@ def get_avulso_detalhe(
         if lote:
             origem = lote.origem
     excepcional = bool(getattr(row, "avulso_criado_excepcional", False))
+    campos_exibicao = [
+        AvulsoCampoExibicaoOut(**item)
+        for item in build_campos_exibicao(campos_cfg, base.campos)
+    ]
     return AvulsoDetalheOut(
         **base.model_dump(),
         servico=row.servico,
         timestamp=row.timestamp,
         origem=origem or ("saida_excecao" if excepcional else None),
         origem_label=origem_amigavel(origem, excepcional=excepcional),
+        campos_exibicao=campos_exibicao,
     )

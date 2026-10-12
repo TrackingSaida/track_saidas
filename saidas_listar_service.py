@@ -113,6 +113,8 @@ def _status_group_aliases(token: str) -> List[str]:
         "na base": ["na base", "na_base"],
         # Alias do card "Ainda na base": entrada sem saída + coletado sem saída
         "ainda na base": ["na base", "na_base", "coletado"],
+        "etiquetado": ["etiquetado"],
+        "etiqueta gerada": ["etiquetado"],
     }
     normalized = list(groups.get(key, [key]))
     # Sempre incluir variantes com espaço e underscore (DB usa NA_BASE → na_base).
@@ -409,10 +411,12 @@ def _load_historico_tuples(db, ids: Sequence[int]) -> List[Any]:
 
 
 def _load_user_map(db, user_ids: Sequence[int]) -> Dict[int, str]:
+    """Mapa user_id → Nome + sobrenome (fallback: username)."""
     from sqlalchemy import select
 
     from db_utils import run_db_query_with_retry
     from models import User
+    from name_normalizer import format_person_full_name
 
     if not user_ids:
         return {}
@@ -421,11 +425,18 @@ def _load_user_map(db, user_ids: Sequence[int]) -> Dict[int, str]:
         rows_lote = run_db_query_with_retry(
             db,
             lambda user_ids_lote=user_ids_lote: db.execute(
-                select(User.id, User.username).where(User.id.in_(user_ids_lote))
+                select(User.id, User.nome, User.sobrenome, User.username).where(
+                    User.id.in_(user_ids_lote)
+                )
             ).all(),
         )
         rows_user.extend(rows_lote)
-    return {int(uid): (uname or "") for uid, uname in rows_user}
+    out: Dict[int, str] = {}
+    for uid, nome, sobrenome, uname in rows_user:
+        out[int(uid)] = format_person_full_name(
+            nome, sobrenome, username=uname, fallback=uname or ""
+        )
+    return out
 
 
 def _load_motoboy_nome_map(db, motoboy_ids: Sequence[int]) -> Dict[int, str]:
@@ -476,6 +487,67 @@ def _load_motoboy_nome_map(db, motoboy_ids: Sequence[int]) -> Dict[int, str]:
             nome, sobrenome, username_val, motoboy_id=mid
         )
     return out
+
+
+def _localizar_avulso_variants(term: str) -> List[str]:
+    """Variantes de busca livre (CEP/telefone com/sem máscara), sem duplicar."""
+    from avulso_campos_service import _variantes_termo_livre
+
+    raw = (term or "").strip()
+    if not raw:
+        return []
+    out: List[str] = []
+    for v in _variantes_termo_livre(raw):
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def _sql_localizar_avulso_exists(variants: Sequence[str], params: Dict[str, Any]) -> str:
+    """EXISTS em avulso_campo_valor restrito ao sub_base (contém + unaccent)."""
+    if not variants:
+        return ""
+    likes = []
+    for i, v in enumerate(variants):
+        key = f"localizar_avulso_{i}"
+        params[key] = f"%{v}%"
+        likes.append(
+            "unaccent(lower(coalesce(acv.valor_texto, ''))) "
+            f"ILIKE unaccent(lower(:{key}))"
+        )
+    return f"""EXISTS (
+              SELECT 1
+              FROM avulso_campo_valor acv
+              JOIN avulso_campo_config acc ON acc.id = acv.campo_config_id
+              WHERE acv.id_saida = s.id_saida
+                AND acc.sub_base = :sub_base
+                AND ({' OR '.join(likes)})
+            )"""
+
+
+def _orm_localizar_avulso_exists(sub_base: str, variants: Sequence[str]):
+    from sqlalchemy import exists, func, or_, select
+
+    from models import AvulsoCampoConfig, AvulsoCampoValor, Saida
+
+    if not variants:
+        return None
+    conds = [
+        func.unaccent(func.lower(func.coalesce(AvulsoCampoValor.valor_texto, ""))).ilike(
+            func.unaccent(func.lower(f"%{v}%"))
+        )
+        for v in variants
+    ]
+    return exists(
+        select(1)
+        .select_from(AvulsoCampoValor)
+        .join(AvulsoCampoConfig, AvulsoCampoValor.campo_config_id == AvulsoCampoConfig.id)
+        .where(
+            AvulsoCampoValor.id_saida == Saida.id_saida,
+            AvulsoCampoConfig.sub_base == sub_base,
+            or_(*conds),
+        )
+    )
 
 
 def _build_candidate_stmt(
@@ -594,16 +666,26 @@ def _build_candidate_stmt(
             stmt = stmt.where(or_(Saida.codigo == codigo_trim, Saida.codigo.ilike(f"{codigo_trim}%")))
     elif localizar and localizar.strip():
         q = f"%{localizar.strip()}%"
-        stmt = stmt.where(
-            or_(
-                Saida.base.ilike(q),
-                Saida.username.ilike(q),
-                Saida.entregador.ilike(q),
-                Saida.codigo.ilike(q),
-                Saida.servico.ilike(q),
-                Saida.status.ilike(q),
+        variants = _localizar_avulso_variants(localizar)
+        from sqlalchemy import func
+
+        def _ua_ilike(col):
+            return func.unaccent(func.lower(func.coalesce(col, ""))).ilike(
+                func.unaccent(func.lower(q))
             )
-        )
+
+        or_conds = [
+            _ua_ilike(Saida.base),
+            _ua_ilike(Saida.username),
+            _ua_ilike(Saida.entregador),
+            Saida.codigo.ilike(q),
+            _ua_ilike(Saida.servico),
+            _ua_ilike(Saida.status),
+        ]
+        avulso_ex = _orm_localizar_avulso_exists(sub_base, variants)
+        if avulso_ex is not None:
+            or_conds.append(avulso_ex)
+        stmt = stmt.where(or_(*or_conds))
 
     return stmt
 
@@ -908,14 +990,20 @@ def listar_saidas_paginado(
             where_extra.append("(s.codigo = :codigo_trim OR s.codigo ILIKE :codigo_prefix)")
             params["codigo_prefix"] = params["codigo_trim"] + "%"
     elif localizar and localizar.strip():
+        variants = _localizar_avulso_variants(localizar)
         params["localizar_q"] = f"%{localizar.strip()}%"
-        where_extra.append(
-            """(
-              s.base ILIKE :localizar_q OR s.username ILIKE :localizar_q
-              OR s.entregador ILIKE :localizar_q OR s.codigo ILIKE :localizar_q
-              OR s.servico ILIKE :localizar_q OR s.status ILIKE :localizar_q
-            )"""
-        )
+        avulso_sql = _sql_localizar_avulso_exists(variants, params)
+        parts = [
+            "unaccent(lower(coalesce(s.base, ''))) ILIKE unaccent(lower(:localizar_q))",
+            "unaccent(lower(coalesce(s.username, ''))) ILIKE unaccent(lower(:localizar_q))",
+            "unaccent(lower(coalesce(s.entregador, ''))) ILIKE unaccent(lower(:localizar_q))",
+            "s.codigo ILIKE :localizar_q",
+            "unaccent(lower(coalesce(s.servico, ''))) ILIKE unaccent(lower(:localizar_q))",
+            "unaccent(lower(coalesce(s.status, ''))) ILIKE unaccent(lower(:localizar_q))",
+        ]
+        if avulso_sql:
+            parts.append(avulso_sql)
+        where_extra.append("(" + " OR ".join(parts) + ")")
 
     entregador_filter_norm = ""
     if entregador and entregador.strip() and entregador.lower() != "(todos)":

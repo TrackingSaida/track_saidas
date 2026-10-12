@@ -12,6 +12,7 @@ from db import get_db
 from name_normalizer import normalize_display_name, normalize_person_name, person_name_sort_key
 from auth import get_current_user, get_password_hash, DEFAULT_PASSWORD
 from entregador_legado_sync import filtrar_entregadores_operacionais
+from fechamento_resumo_utils import base_filtro_ativo, saida_pertence_base
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
@@ -973,12 +974,14 @@ def resumo_entregadores(
     executor_tipo: Optional[str] = Query(None),
     executor_id: Optional[int] = Query(None),
     fechamento_status: Optional[str] = Query(None),
+    base: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     pageSize: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     sub_base_user = _resolve_user_base(db, current_user)
+    base_filtro_norm = base_filtro_ativo(base)
     if entregador_id is not None and motoboy_id is not None:
         raise HTTPException(400, "Informe apenas um de entregador_id ou motoboy_id.")
 
@@ -1032,6 +1035,9 @@ def resumo_entregadores(
 
     rows_raw = db.scalars(stmt).all()
     rows, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_raw, data_inicio, data_fim)
+    # Recorte de consulta: o valor base do fechamento oficial continua usando o período completo.
+    if base_filtro_norm is not None:
+        rows = [s for s in rows if saida_pertence_base(s.base, base_filtro_norm)]
     nomes_motoboy_map = _carregar_nomes_motoboy_ids(
         db,
         [int(getattr(s, "motoboy_id")) for s in rows if getattr(s, "motoboy_id", None) is not None],
@@ -1259,7 +1265,7 @@ def resumo_entregadores(
         lista = [i for i in lista if (i.fechamento_status or "PENDENTE").upper() == status_upper]
 
     # Totalizadores globais: soma sobre TODOS os registros filtrados (lista completa).
-    # Paginação afeta APENAS o array "items". Filtros já aplicados: data_inicio, data_fim, entregador_id, fechamento_status.
+    # Paginação afeta APENAS o array "items". Filtros já aplicados: data_inicio, data_fim, entregador_id, base, fechamento_status.
     sumShopee = sum(i.shopee["qtde"] for i in lista)
     sumFlex = sum(i.flex["qtde"] for i in lista)
     sumAvulso = sum(i.avulso["qtde"] for i in lista)

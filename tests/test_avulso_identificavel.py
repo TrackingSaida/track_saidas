@@ -88,9 +88,25 @@ def test_label_amigavel_com_identificacao():
         campos_cfg=cfg,
         valores={"pedido": "99821", "dest": "Maria"},
     )
-    assert "AVULSO-000184" in label
-    assert "99821" in label
-    assert "Maria" in label
+    assert label == "99821 • Maria"
+    assert "AVULSO-000184" not in label
+
+
+def test_build_campos_exibicao_usa_label():
+    from avulso_campos_service import build_campos_exibicao
+
+    cfg = [
+        SimpleNamespace(chave="cliente_destinatario", label="Cliente destinatário"),
+        SimpleNamespace(chave="cep", label="CEP"),
+    ]
+    out = build_campos_exibicao(
+        cfg,
+        {"cliente_destinatario": "Tamires Rapozo", "cep": "06775-340"},
+    )
+    assert out == [
+        {"chave": "cliente_destinatario", "label": "Cliente destinatário", "valor": "Tamires Rapozo"},
+        {"chave": "cep", "label": "CEP", "valor": "06775-340"},
+    ]
 
 
 def test_tipo_lista_invalido():
@@ -294,3 +310,19 @@ def test_variantes_busca_telefone_sem_mascara():
 def test_variantes_termo_livre_nome_nao_inventa_mascara():
     vs = _variantes_termo_livre("Maria")
     assert vs == ["Maria"]
+
+
+def test_ordenar_avulsos_elegivel_primeiro():
+    from types import SimpleNamespace
+    from avulso_campos_service import ordenar_avulsos_elegivel_primeiro, eh_status_elegivel_saida
+
+    assert eh_status_elegivel_saida("coletado") is True
+    assert eh_status_elegivel_saida("ENCERRADO_SISTEMA") is False
+    rows = [
+        SimpleNamespace(id_saida=1, status="ENCERRADO_SISTEMA"),
+        SimpleNamespace(id_saida=3, status="coletado"),
+        SimpleNamespace(id_saida=2, status="ENTREGUE"),
+        SimpleNamespace(id_saida=4, status="NA_BASE"),
+    ]
+    ordered = ordenar_avulsos_elegivel_primeiro(rows)
+    assert [r.id_saida for r in ordered] == [4, 3, 2, 1]

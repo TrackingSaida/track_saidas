@@ -255,3 +255,52 @@ def test_status_group_alias_ainda_na_base_inclui_coletado():
     assert "na_base" in unificado or "na base" in unificado
     assert "coletado" not in so_entrada
     assert _status_group_aliases("ainda na base") == unificado
+
+
+def test_localizar_avulso_variants_cep_parcial_e_completo():
+    from saidas_listar_service import _localizar_avulso_variants
+
+    parcial = _localizar_avulso_variants("06007")
+    assert "06007" in parcial
+
+    completo = _localizar_avulso_variants("06007-290")
+    assert "06007-290" in completo
+    assert "06007290" in completo
+
+
+def test_localizar_avulso_variants_nome_preserva_termo():
+    from saidas_listar_service import _localizar_avulso_variants
+
+    vs = _localizar_avulso_variants("Leticia")
+    assert "Leticia" in vs
+    vs2 = _localizar_avulso_variants("Prudente")
+    assert "Prudente" in vs2
+
+
+def test_sql_localizar_avulso_exists_usa_unaccent_e_contem():
+    from saidas_listar_service import _sql_localizar_avulso_exists
+
+    params = {}
+    sql = _sql_localizar_avulso_exists(["Leticia", "06007"], params)
+    assert "unaccent(lower(coalesce(acv.valor_texto, '')))" in sql
+    assert "ILIKE unaccent(lower(:localizar_avulso_0))" in sql
+    assert "acc.sub_base = :sub_base" in sql
+    assert params["localizar_avulso_0"] == "%Leticia%"
+    assert params["localizar_avulso_1"] == "%06007%"
+
+
+def test_listar_codigo_parcial_localizar_inclui_avulso_exists():
+    """Regressão: localizar no caminho leve deve buscar identificação do avulso."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1].joinpath("saidas_routes.py").read_text(encoding="utf-8")
+    # Trecho do handler de localizar em _listar_saidas_codigo_parcial
+    assert "_orm_localizar_avulso_exists" in src
+    assert "_localizar_avulso_variants" in src
+    assert "Consulta mobile filtra por código no cliente; busca só em codigo." not in src
+
+
+def test_status_group_alias_etiqueta_gerada():
+    from saidas_listar_service import _status_group_aliases
+    aliases = _status_group_aliases("etiqueta gerada")
+    assert "etiquetado" in aliases

@@ -50,6 +50,8 @@ class ColetaLoteIn(BaseModel):
     base: str = Field(min_length=1)
     itens: List[ItemLote] = Field(min_length=1)
     entregador_id: Optional[int] = None
+    # Dia operacional (YYYY-MM-DD). Omitido = hoje. Passado: só roles 0–2.
+    data_operacao: Optional[date] = None
 
 
 class ColetaLancarAvulsoIn(BaseModel):
@@ -62,6 +64,7 @@ class ColetaLancarAvulsoIn(BaseModel):
     foto_object_keys: Optional[List[str]] = None
     photo_id: Optional[str] = Field(default=None, max_length=80)
     photo_ids: Optional[List[Optional[str]]] = None
+    data_operacao: Optional[date] = None
 
 
 class ResumoLote(BaseModel):
@@ -190,6 +193,45 @@ def _should_store_qr_payload_raw(servico: str, qr_raw: Optional[str]) -> bool:
 
     return should_store_qr_payload_raw(servico, qr_raw)
 
+
+def _normalize_item_coleta(item: ItemLote) -> ItemLote:
+    """
+    Revalida código/serviço com a mesma regra de entrada/saída.
+    Ignora o `servico` enviado pelo cliente (mobile antigo pode marcar
+    qualquer numérico 10+ dígitos como Mercado Livre).
+    """
+    from codigo_normalizer import canonicalize_servico, normalize_codigo
+
+    raw_codigo = (item.codigo or "").strip()
+    if not raw_codigo:
+        raise HTTPException(422, "Código inválido.")
+
+    codigo_norm, servico_norm, qr_from_norm = normalize_codigo(
+        raw_codigo, strict_qr=False
+    )
+    if codigo_norm is None or servico_norm is None:
+        qr_try = (getattr(item, "qr_payload_raw", None) or "").strip()
+        if qr_try and qr_try != raw_codigo:
+            codigo_norm, servico_norm, qr_from_norm = normalize_codigo(
+                qr_try, strict_qr=False
+            )
+
+    if codigo_norm is None or servico_norm is None:
+        raise HTTPException(
+            422,
+            f"Código inválido: '{raw_codigo}'. Use etiqueta Shopee, Mercado Livre, "
+            "telefone válido ou AVULSO-*.",
+        )
+
+    qr_raw = getattr(item, "qr_payload_raw", None) or qr_from_norm
+    qr_clean = qr_raw.strip() if isinstance(qr_raw, str) and qr_raw.strip() else None
+    return ItemLote(
+        codigo=codigo_norm,
+        servico=canonicalize_servico(servico_norm),
+        qr_payload_raw=qr_clean,
+        is_grande=bool(getattr(item, "is_grande", False)),
+    )
+
 def _sub_base_from_token_or_422(user: User) -> str:
     """
     Novo contrato: sub_base vem no JWT (auth stateless).
@@ -198,6 +240,34 @@ def _sub_base_from_token_or_422(user: User) -> str:
     if not sb:
         raise HTTPException(422, "Usuário sem sub_base definida.")
     return sb
+
+
+def _role_int(user: User) -> int:
+    try:
+        return int(getattr(user, "role", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _resolver_data_operacao_leitura(user: User, data_operacao: Optional[date]) -> date:
+    """
+    Resolve o dia de negócio da leitura por código.
+    - Omitido / hoje: qualquer perfil permitido no endpoint.
+    - Passado: somente roles 0–2.
+    - Futuro: rejeitado.
+    """
+    dia = data_operacao or date.today()
+    if dia > date.today():
+        raise HTTPException(422, "Não é permitido lançar coleta em data futura.")
+    if dia < date.today() and _role_int(user) not in (0, 1, 2):
+        raise HTTPException(403, "O usuário pode lançar coleta somente no dia atual.")
+    return dia
+
+
+def _timestamp_na_data(data_operacao: date) -> datetime.datetime:
+    """Timestamp no dia informado com a hora atual (fechamento agrupa por timestamp.date())."""
+    agora = datetime.datetime.now()
+    return datetime.datetime.combine(data_operacao, agora.time().replace(microsecond=0))
 
 
 def _resolve_entregador_info(db: Session, user: User) -> Tuple[str, str, str, Optional[int]]:
@@ -317,6 +387,7 @@ def registrar_coleta_em_lote(
     # 1) Resolve sub_base + entregador: prioriza payload.entregador_id, senão JWT
     sub_base = _sub_base_from_token_or_422(current_user)
     exigir_modo(db, sub_base, "codigo")
+    data_operacao = _resolver_data_operacao_leitura(current_user, payload.data_operacao)
     if payload.entregador_id is not None:
         ent = db.get(Entregador, payload.entregador_id)
         if not ent or ent.sub_base != sub_base:
@@ -329,6 +400,19 @@ def registrar_coleta_em_lote(
     else:
         sub_base, entregador_nome, username_entregador, entregador_id = _resolve_entregador_info(db, current_user)
 
+    # Retroativo: bloqueia se o dia já está em fechamento gerado.
+    if data_operacao < date.today():
+        from coleta_operacional_routes import _garantir_nao_fechado
+        from coleta_operacional_service import resolver_executor as _resolver_executor_op
+        _, motoboy_id_chk = _resolver_executor_op(db, current_user)
+        _garantir_nao_fechado(
+            db,
+            sub_base=sub_base,
+            base_nome=payload.base.strip(),
+            data_operacao=data_operacao,
+            motoboy_id=motoboy_id_chk,
+        )
+
     # 2) preços BasePreco para valores de entradas da coleta (valor_total e resumo)
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, payload.base)
 
@@ -336,19 +420,19 @@ def registrar_coleta_em_lote(
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     valor_cobranca_owner = _decimal(getattr(owner, "valor", 0)) if owner else Decimal("0")
 
-    # 4) Normaliza itens e detecta duplicados no próprio payload (zero DB)
-    #    (você vai tratar duplicidade no front, mas aqui evita lixo óbvio e reduz queries)
-    norm_codes: List[str] = []
+    # 4) Normaliza códigos/serviço (mesma regra de entrada/saída) e detecta
+    #    duplicados no próprio payload. Não confiar no `servico` do cliente —
+    #    mobile antigo classifica qualquer \d{10,} como Mercado Livre.
+    itens_normalizados: List[ItemLote] = []
     seen = set()
     for it in payload.itens:
-        c = (it.codigo or "").strip()
-        if not c:
-            raise HTTPException(422, "Código inválido.")
-        if c in seen:
-            # Mantém comportamento de falhar, mas agora sem DB
-            raise HTTPException(409, f"Código '{c}' duplicado no lote.")
-        seen.add(c)
-        norm_codes.append(c)
+        item_norm = _normalize_item_coleta(it)
+        if item_norm.codigo in seen:
+            raise HTTPException(409, f"Código '{item_norm.codigo}' duplicado no lote.")
+        seen.add(item_norm.codigo)
+        itens_normalizados.append(item_norm)
+
+    norm_codes = [it.codigo for it in itens_normalizados]
 
     # 5) Checagem de duplicidade / upgrade de QR no banco
     from qr_payload_utils import (
@@ -368,9 +452,7 @@ def registrar_coleta_em_lote(
     )
     existing_by_codigo = {str(s.codigo): s for s in existing_rows}
 
-    items_by_codigo = {}
-    for it in payload.itens:
-        items_by_codigo[(it.codigo or "").strip()] = it
+    items_by_codigo = {it.codigo: it for it in itens_normalizados}
 
     codigos_qr_atualizados: List[str] = []
     qr_alerta_lote = False
@@ -419,9 +501,8 @@ def registrar_coleta_em_lote(
     # Apenas upgrades (nenhum código novo no lote)
     novos_itens = [
         it
-        for it in payload.itens
-        if (it.codigo or "").strip() not in existing_by_codigo
-        or (it.codigo or "").strip() in etiquetado_codigos
+        for it in itens_normalizados
+        if it.codigo not in existing_by_codigo or it.codigo in etiquetado_codigos
     ]
 
     if truly_dup and not novos_itens and not codigos_qr_atualizados:
@@ -442,7 +523,7 @@ def registrar_coleta_em_lote(
             db,
             sub_base=sub_base,
             base_nome=payload.base,
-            data_operacao=date.today(),
+            data_operacao=data_operacao,
         )
         return LoteResponse(
             coleta=None,
@@ -469,6 +550,7 @@ def registrar_coleta_em_lote(
     created = 0
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
     saidas_criadas: List[SaidaCriadaLote] = []
+    coleta_ts = _timestamp_na_data(data_operacao)
 
     try:
         coleta = Coleta(
@@ -479,6 +561,7 @@ def registrar_coleta_em_lote(
             mercado_livre=0,
             avulso=0,
             valor_total=Decimal("0.00"),
+            timestamp=coleta_ts,
         )
         db.add(coleta)
         db.flush()
@@ -500,6 +583,7 @@ def registrar_coleta_em_lote(
                 saida_existente.id_coleta = coleta.id_coleta
                 saida_existente.entregador = entregador_nome
                 saida_existente.entregador_id = entregador_id
+                saida_existente.data = data_operacao
                 if getattr(item, "is_grande", False):
                     saida_existente.is_grande = True
                 db.add(
@@ -541,6 +625,7 @@ def registrar_coleta_em_lote(
                     admitida.entregador = entregador_nome
                     admitida.entregador_id = entregador_id
                     admitida.base = payload.base
+                    admitida.data = data_operacao
                     if getattr(item, "is_grande", False):
                         admitida.is_grande = True
                     db.add(
@@ -568,6 +653,7 @@ def registrar_coleta_em_lote(
                 id_coleta=coleta.id_coleta,
                 qr_payload_raw=qr_raw.strip() if store_qr and qr_raw else None,
                 is_grande=getattr(item, "is_grande", False),
+                data=data_operacao,
             )
             db.add(saida)
             db.flush()
@@ -611,6 +697,7 @@ def registrar_coleta_em_lote(
             current_user=current_user,
             coleta=coleta,
             base_nome=payload.base,
+            data_operacao=data_operacao,
         )
 
         db.commit()
@@ -627,7 +714,7 @@ def registrar_coleta_em_lote(
         db,
         sub_base=sub_base,
         base_nome=payload.base,
-        data_operacao=date.today(),
+        data_operacao=data_operacao,
     )
     return LoteResponse(
         coleta=ColetaOut.model_validate(coleta),
@@ -755,6 +842,7 @@ def lancar_avulso_coleta(
         ColetaLoteIn(
             base=base,
             itens=[ItemLote(codigo=codigo, servico="Avulso") for codigo in codigos],
+            data_operacao=payload.data_operacao,
         ),
         db=db,
         current_user=current_user,
