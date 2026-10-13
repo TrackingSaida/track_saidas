@@ -429,6 +429,7 @@ class Saida(Base):
     qr_payload_raw = Column(Text, nullable=True)  # Payload bruto do QR (ML) para gerar etiqueta reconhecível
     ml_shipment_id = Column(BigInteger, nullable=True, index=True)  # vínculo envio ML (evita duplicata no auto-fill)
     ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
+    ml_pack_id = Column(BigInteger, nullable=True)  # Pack ID exibido na etiqueta ML (quando a venda tem pack)
     is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande); espelha categoria_g_id
     categoria_g_id = Column(BigInteger, ForeignKey("pacote_g_categoria.id", ondelete="RESTRICT"), nullable=True)
     # Última marcação de tamanho (fora do saida_historico para não virar "última ação").
@@ -592,6 +593,8 @@ class MLConexao(Base):
     sub_base = Column(Text, nullable=False, index=True)
     user_id_ml = Column(BigInteger, nullable=False, index=True)
     user_nickname_ml = Column(Text, nullable=True)
+    # Seller cadastrado (tabela base); sem vínculo o sync não importa pedidos.
+    id_base = Column(BigInteger, ForeignKey("base.id_base", ondelete="SET NULL"), nullable=True, index=True)
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=False)
     expires_at = Column(DateTime(timezone=False), nullable=False)

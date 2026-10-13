@@ -9,23 +9,26 @@ from urllib.parse import quote, urlencode
 import requests
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from sqlalchemy import select
 
 from auth import get_current_user
 from db import get_db
-from models import MLConexao, Owner, Saida, SaidaDetail, SaidaHistorico, User
+from models import BasePreco, MLConexao, Owner, User
+from ml_int_envios_pure import ml_shipment_destinatario
 from ml_int_service import (
-    create_ml_test_user,
+    saidas_existentes_por_shipment,
     exchange_code_for_token,
-    fetch_order,
     fetch_orders_search,
     fetch_shipment,
     fetch_shipments_by_tracking,
     get_me,
     get_valid_access_token,
+    listar_envios_flex_pendentes,
     ml_conexao_status,
+    sync_envios_sub_base,
 )
 
 
@@ -184,6 +187,15 @@ def ml_int_sellers(
             continue
         vistos.add(c.user_id_ml)
         unicos.append(c)
+    ids_base = {c.id_base for c in unicos if c.id_base is not None}
+    nomes_base = {}
+    if ids_base:
+        nomes_base = {
+            b.id_base: b.base
+            for b in db.scalars(
+                select(BasePreco).where(BasePreco.id_base.in_(ids_base), BasePreco.sub_base == sub_base)
+            ).all()
+        }
     return [
         {
             "id": c.id,
@@ -192,9 +204,99 @@ def ml_int_sellers(
             "sub_base": c.sub_base,
             "status": ml_conexao_status(c),
             "criado_em": c.criado_em.isoformat() if c.criado_em else None,
+            "id_base": c.id_base if c.id_base in nomes_base else None,
+            "base_nome": nomes_base.get(c.id_base),
         }
         for c in unicos
     ]
+
+
+def _conexao_da_sub_base(db: Session, sub_base: str | None, user_id_ml: int) -> MLConexao | None:
+    return (
+        db.query(MLConexao)
+        .filter(MLConexao.sub_base == sub_base, MLConexao.user_id_ml == user_id_ml)
+        .order_by(MLConexao.criado_em.desc(), MLConexao.id.desc())
+        .first()
+    )
+
+
+def _base_vinculada(db: Session, sub_base: str | None, id_base: int | None) -> BasePreco | None:
+    if id_base is None:
+        return None
+    return db.scalar(
+        select(BasePreco).where(BasePreco.id_base == id_base, BasePreco.sub_base == sub_base)
+    )
+
+
+def _conta_ml_do_seller(
+    db: Session, sub_base: str | None, id_base: int, exceto_user_id_ml: int
+) -> MLConexao | None:
+    return (
+        db.query(MLConexao)
+        .filter(
+            MLConexao.sub_base == sub_base,
+            MLConexao.id_base == id_base,
+            MLConexao.user_id_ml != exceto_user_id_ml,
+        )
+        .order_by(MLConexao.criado_em.desc(), MLConexao.id.desc())
+        .first()
+    )
+
+
+class VinculoSellerIn(BaseModel):
+    id_base: int | None = None
+
+
+@router.patch("/sellers/{user_id_ml:int}/vinculo")
+def ml_int_vincular_seller(
+    user_id_ml: int,
+    body: VinculoSellerIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Associa (ou desassocia, com id_base=null) a conta ML a um seller cadastrado da mesma sub_base."""
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a root e admin.")
+    sub_base = getattr(user, "sub_base", None)
+    if not sub_base:
+        raise HTTPException(400, "Usuário sem sub_base.")
+    conexoes = (
+        db.query(MLConexao)
+        .filter(MLConexao.sub_base == sub_base, MLConexao.user_id_ml == user_id_ml)
+        .all()
+    )
+    if not conexoes:
+        raise HTTPException(404, "Seller ML não conectado a esta sub_base.")
+    base_row = None
+    if body.id_base is not None:
+        base_row = _base_vinculada(db, sub_base, body.id_base)
+        if base_row is None:
+            raise HTTPException(404, "Seller cadastrado não encontrado nesta sub_base.")
+        conflito = _conta_ml_do_seller(db, sub_base, body.id_base, user_id_ml)
+        if conflito is not None:
+            nick = (conflito.user_nickname_ml or "").strip() or str(conflito.user_id_ml)
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "seller_ja_vinculado",
+                    "message": (
+                        f'O seller "{base_row.base}" já está vinculado à conta {nick} do Mercado Livre. '
+                        'Desvincule essa conta (selecione "Não associado") antes de vincular a esta.'
+                    ),
+                    "user_id_ml": conflito.user_id_ml,
+                    "nickname": nick,
+                    "base_nome": base_row.base,
+                },
+            )
+    for c in conexoes:
+        c.id_base = body.id_base
+        c.atualizado_em = datetime.utcnow()
+    db.commit()
+    return {
+        "user_id_ml": user_id_ml,
+        "id_base": body.id_base,
+        "base_nome": base_row.base if base_row else None,
+    }
 
 
 # ---------- Volume pendente (auth) ----------
@@ -288,61 +390,25 @@ def ml_int_envios_seller(
     user_id_ml: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    limit: int = Query(50, le=100),
+    dias: int = Query(7, ge=1, le=30, description="Janela de vendas (dias) a considerar."),
+    max_pedidos: int = Query(300, ge=50, le=1000),
 ):
-    """Lista envios do seller com tracking e destinatário (para roteirização)."""
+    """
+    Prévia (somente leitura) dos envios Flex do seller prontos para coleta,
+    com destinatário normalizado e indicação se já existem no sistema.
+    """
     if user.role not in (0, 1):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = getattr(user, "sub_base", None)
-    try:
-        token = get_valid_access_token(db, user_id_ml, sub_base)
-    except (LookupError, RuntimeError) as e:
-        raise HTTPException(404, str(e))
-    try:
-        search = fetch_orders_search(
-            token, user_id_ml, limit=limit, db=db, sub_base=sub_base,
-        )
-    except requests.HTTPError as e:
-        raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
-    results = search.get("results") or []
-    envios = []
-    seen_shipment = set()
-    for order_id in results[:limit]:
-        try:
-            order = fetch_order(
-                token, str(order_id), db=db, user_id_ml=user_id_ml, sub_base=sub_base,
-            )
-        except Exception:
-            continue
-        shipping = order.get("shipping") or {}
-        sid = shipping.get("id")
-        if not sid or sid in seen_shipment:
-            continue
-        seen_shipment.add(sid)
-        try:
-            ship = fetch_shipment(
-                token, int(sid), db=db, user_id_ml=user_id_ml, sub_base=sub_base,
-            )
-        except Exception:
-            continue
-        dest = ship.get("destination") or {}
-        envios.append({
-            "shipment_id": sid,
-            "order_id": order.get("id"),
-            "tracking_number": ship.get("tracking_number"),
-            "status": ship.get("status"),
-            "substatus": ship.get("substatus"),
-            "destination": {
-                "address_line": dest.get("address_line"),
-                "street_name": dest.get("street_name"),
-                "street_number": dest.get("street_number"),
-                "city": dest.get("city"),
-                "state": dest.get("state"),
-                "zip_code": dest.get("zip_code"),
-                "receiver_name": dest.get("receiver_name"),
-            },
-        })
-    return {"envios": envios, "seller_id": user_id_ml}
+    data = _listar_pendentes_ou_http(db, user_id_ml, sub_base, dias=dias, max_pedidos=max_pedidos)
+    ja_registrados = saidas_existentes_por_shipment(db, sub_base, data["envios"])
+    for envio in data["envios"]:
+        envio["ja_registrado"] = envio["shipment_id"] in ja_registrados
+    conexao = _conexao_da_sub_base(db, sub_base, user_id_ml)
+    base_row = _base_vinculada(db, sub_base, conexao.id_base if conexao else None)
+    data["vinculado"] = base_row is not None
+    data["base_nome"] = base_row.base if base_row else None
+    return data
 
 
 # ---------- Detalhe envio por id ou tracking ----------
@@ -373,6 +439,7 @@ def ml_int_envio_detail(
                 "status": ship.get("status"),
                 "substatus": ship.get("substatus"),
                 "destination": dest,
+                "destinatario": ml_shipment_destinatario(ship),
                 "origin": ship.get("origin"),
             }
         except Exception as e:
@@ -413,6 +480,7 @@ def ml_int_envio_by_tracking(
                     "status": ship.get("status"),
                     "substatus": ship.get("substatus"),
                     "destination": dest,
+                    "destinatario": ml_shipment_destinatario(ship),
                 }
         except Exception:
             continue
@@ -449,114 +517,45 @@ def ml_int_etiqueta(
     raise HTTPException(404, "Envio não encontrado.")
 
 
-# ---------- Sync: preenchimento automático (saidas + saidas_detail) ----------
-def _destination_to_dest_fields(dest: dict) -> dict:
-    """Mapeia destination da API ML para campos dest_* do SaidaDetail."""
-    if not dest:
-        return {}
-    return {
-        "dest_nome": dest.get("receiver_name") or dest.get("receiver_name"),
-        "dest_rua": dest.get("street_name"),
-        "dest_numero": str(dest.get("street_number") or "") if dest.get("street_number") is not None else None,
-        "dest_bairro": dest.get("neighborhood") or dest.get("municipality"),
-        "dest_cidade": dest.get("city"),
-        "dest_estado": dest.get("state"),
-        "dest_cep": dest.get("zip_code"),
-        "dest_contato": dest.get("receiver_phone"),
-        "endereco_formatado": dest.get("address_line"),
-    }
+# ---------- Sync: envios Flex pendentes de coleta → saidas (aguardando_coleta) ----------
+def _listar_pendentes_ou_http(
+    db: Session, user_id_ml: int, sub_base: str | None, *, dias: int, max_pedidos: int,
+) -> dict:
+    try:
+        return listar_envios_flex_pendentes(
+            db, user_id_ml, sub_base or "", dias=dias, max_pedidos=max_pedidos,
+        )
+    except (LookupError, RuntimeError) as e:
+        raise HTTPException(404, str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
 
 
 @router.post("/sync-envios")
 def ml_int_sync_envios(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    user_id_ml: int | None = Query(None, description="Sincroniza só este seller; vazio = todos da sub_base."),
+    dias: int = Query(7, ge=1, le=30),
+    max_pedidos: int = Query(300, ge=50, le=1000),
 ):
     """
-    Job/endpoint: para cada seller conectado à sub_base, busca envios 'ready_to_ship'
-    ainda não registrados e cria Saida (aguardando_coleta) + SaidaDetail (dest_*).
+    Para cada seller ML vinculado a um seller cadastrado, busca envios Flex prontos para coleta
+    e cria Saida (aguardando_coleta) + SaidaDetail (destinatário). Conta sem vínculo é pulada
+    com motivo "sem_vinculo".
     """
     if user.role not in (0, 1):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = getattr(user, "sub_base", None)
     if not sub_base:
         raise HTTPException(400, "Usuário sem sub_base.")
-    conexoes = db.query(MLConexao).filter(MLConexao.sub_base == sub_base).all()
-    created = 0
-    errors = []
-    for conexao in conexoes:
-        try:
-            token = get_valid_access_token(db, conexao.user_id_ml, sub_base)
-        except Exception as e:
-            errors.append({"user_id_ml": conexao.user_id_ml, "error": str(e)})
-            continue
-        try:
-            search = fetch_orders_search(
-                token, conexao.user_id_ml, limit=50, db=db, sub_base=sub_base,
-            )
-        except requests.HTTPError as e:
-            errors.append({"user_id_ml": conexao.user_id_ml, "error": e.response.text or str(e)})
-            continue
-        results = search.get("results") or []
-        for order_id in results:
-            try:
-                order = fetch_order(
-                    token, str(order_id),
-                    db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base,
-                )
-            except Exception:
-                continue
-            shipping = order.get("shipping") or {}
-            sid = shipping.get("id")
-            if not sid:
-                continue
-            # Já registrado?
-            existing = db.scalar(select(Saida).where(Saida.ml_shipment_id == sid))
-            if existing:
-                continue
-            try:
-                ship = fetch_shipment(
-                    token, int(sid),
-                    db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base,
-                )
-            except Exception:
-                continue
-            status_ship = (ship.get("status") or "").lower()
-            substatus = (ship.get("substatus") or "").lower()
-            # Disponível para coleta: ready_to_ship ou equivalente
-            if status_ship not in ("ready_to_ship", "ready"):
-                continue
-            tracking = ship.get("tracking_number") or ""
-            dest = ship.get("destination") or {}
-            dest_fields = _destination_to_dest_fields(dest)
-            try:
-                nova = Saida(
-                    sub_base=sub_base,
-                    codigo=tracking,
-                    status="aguardando_coleta",
-                    ml_shipment_id=sid,
-                    ml_order_id=order.get("id"),
-                    base=order.get("seller", {}).get("nickname") if isinstance(order.get("seller"), dict) else None,
-                )
-                db.add(nova)
-                db.flush()
-                detail = SaidaDetail(
-                    id_saida=nova.id_saida,
-                    id_entregador=None,
-                    status="Aguardando coleta",
-                    **{k: v for k, v in dest_fields.items() if v is not None},
-                )
-                db.add(detail)
-                db.add(
-                    SaidaHistorico(
-                        id_saida=nova.id_saida,
-                        evento="ml_int_sync",
-                        status_novo="aguardando_coleta",
-                    )
-                )
-                db.commit()
-                created += 1
-            except Exception as e:
-                db.rollback()
-                errors.append({"shipment_id": sid, "error": str(e)})
-    return {"created": created, "errors": errors}
+    if user_id_ml is not None and _conexao_da_sub_base(db, sub_base, user_id_ml) is None:
+        raise HTTPException(404, "Seller não conectado a esta sub_base.")
+    return sync_envios_sub_base(
+        db,
+        sub_base,
+        user_id_ml=user_id_ml,
+        user_id=getattr(user, "id", None),
+        dias=dias,
+        max_pedidos=max_pedidos,
+    )

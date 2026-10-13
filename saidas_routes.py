@@ -39,6 +39,7 @@ from saidas_listar_service import (
     listar_saidas_paginado,
     _localizar_avulso_variants,
     _orm_localizar_avulso_exists,
+    _orm_localizar_detail_exists,
 )
 from saidas_exportar_service import (
     MAX_EXPORTAR_LIMIT,
@@ -263,7 +264,8 @@ class LancarAvulsoOut(BaseModel):
 class SaidaDetailOut(BaseModel):
     """Campos de saidas_detail para GET /saidas/{id_saida}."""
     id_saida: int
-    id_entregador: int
+    # Nulo enquanto o pacote aguarda coleta (ex.: importado do Mercado Livre).
+    id_entregador: Optional[int] = None
     status: Optional[str] = None
     tentativa: Optional[int] = None
     motivo_ocorrencia: Optional[str] = None
@@ -313,6 +315,9 @@ class SaidaDetalheCompletoOut(BaseModel):
     categoria_g_nome: Optional[str] = None
     categoria_g_atualizado_em: Optional[datetime] = None
     categoria_g_atualizado_por: Optional[str] = None
+    ml_shipment_id: Optional[int] = None
+    ml_order_id: Optional[int] = None
+    ml_pack_id: Optional[int] = None
     detail: Optional[SaidaDetailOut] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -2362,6 +2367,9 @@ def _listar_saidas_codigo_parcial(
         avulso_ex = _orm_localizar_avulso_exists(sub_base, variants)
         if avulso_ex is not None:
             or_conds.append(avulso_ex)
+        detail_ex = _orm_localizar_detail_exists(localizar, variants)
+        if detail_ex is not None:
+            or_conds.append(detail_ex)
         stmt = stmt.where(or_(*or_conds))
     else:
         return _listar_resposta_vazia()
@@ -2752,6 +2760,9 @@ def get_saida_detalhe(
         status=obj.status,
         base=obj.base,
         is_grande=getattr(obj, "is_grande", False) or False,
+        ml_shipment_id=obj.ml_shipment_id,
+        ml_order_id=obj.ml_order_id,
+        ml_pack_id=obj.ml_pack_id,
         detail=detail_out,
         **_categoria_g_detalhe(db, obj),
     )
