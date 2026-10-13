@@ -145,6 +145,13 @@ Em ambas as integrações, com cobertura de CEP configurada em "Políticas gerai
 do destinatário fora da área é rejeitado (não importado) e listado em `fora_cobertura`; sem cobertura
 configurada, importa tudo.
 
+Cobrança: pedido sincronizado só é cobrado (fechamento do seller e cobrança do owner) depois de
+**coletado** — lido na tela de Coleta (`POST /coletas/lote`), que o associa à coleta do dia, soma no
+valor do seller e lança a cobrança do owner. A coleta só aceita o pedido na base do seller dono (409
+caso contrário). Pedido nunca coletado (aguardando, não coletado) não entra em cobrança, nem como
+cancelado, G ou saída. Ler pedido "Aguardando coleta" na tela de saída (`POST /saidas/ler`) responde
+422 `AGUARDANDO_COLETA`. Regra em `pedido_sincronizado.py`.
+
 ### Shopee
 
 O mesmo cron também importa pedidos Shopee (resposta em `shopee`) das lojas vinculadas a seller.
