@@ -298,6 +298,40 @@ def test_listar_codigo_parcial_localizar_inclui_avulso_exists():
     assert "_orm_localizar_avulso_exists" in src
     assert "_localizar_avulso_variants" in src
     assert "Consulta mobile filtra por código no cliente; busca só em codigo." not in src
+    assert "_orm_localizar_detail_exists" in src
+
+
+def test_sql_localizar_detail_exists_busca_destinatario():
+    from saidas_listar_service import _sql_localizar_detail_exists
+
+    params = {}
+    sql = _sql_localizar_detail_exists("Miguel", ["Miguel"], params)
+    assert "FROM saidas_detail sd" in sql
+    assert "sd.id_saida = s.id_saida" in sql
+    assert "unaccent(lower(coalesce(sd.dest_nome, '')))" in sql
+    assert "sd.endereco_formatado" in sql
+    assert params["localizar_detail_q"] == "%Miguel%"
+    # Nome não gera busca numérica em CEP/telefone.
+    assert not any(k.startswith("localizar_detail_num_") for k in params)
+
+
+def test_sql_localizar_detail_exists_cep_com_e_sem_mascara():
+    from saidas_listar_service import _sql_localizar_detail_exists
+
+    params = {}
+    sql = _sql_localizar_detail_exists("05041-001", ["05041-001", "05041001"], params)
+    assert "sd.dest_cep" in sql and "sd.dest_contato" in sql
+    numericos = {v for k, v in params.items() if k.startswith("localizar_detail_num_")}
+    assert "%05041001%" in numericos
+    assert "%05041-001%" in numericos
+
+
+def test_localizar_detail_numero_curto_nao_varre_cep():
+    from saidas_listar_service import _localizar_detail_termos
+
+    raw, numericas = _localizar_detail_termos("Faustolo 1450", ["Faustolo 1450", "1450"])
+    assert raw == "Faustolo 1450"
+    assert numericas == []
 
 
 def test_status_group_alias_etiqueta_gerada():

@@ -361,6 +361,35 @@ def internal_refresh_tokens(request: Request):
         db.close()
 
 
+# Endpoint interno: importa envios Flex ML pendentes de coleta (Cron Render — 30 em 30 min, 6h–22h BRT)
+@app.post(f"{API_PREFIX}/internal/ml-sync-envios", tags=["Internal"])
+def internal_ml_sync_envios(request: Request):
+    """
+    Sincroniza envios Flex ML prontos para coleta de todas as sub_bases com conta ML
+    vinculada a seller cadastrado. Protegido por X-Cron-Secret
+    (CRON_ML_SYNC_SECRET, fallback CRON_REFRESH_SECRET).
+    ML_SYNC_CRON_ENABLED=false desativa (ex.: homol com cópia dos tokens de produção).
+    """
+    secret = os.getenv("CRON_ML_SYNC_SECRET") or os.getenv("CRON_REFRESH_SECRET")
+    if not secret:
+        return JSONResponse(status_code=500, content={"detail": "CRON_ML_SYNC_SECRET não configurado"})
+    received = request.headers.get("X-Cron-Secret") or request.query_params.get("key")
+    if received != secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    if os.getenv("ML_SYNC_CRON_ENABLED", "true").strip().lower() in ("0", "false", "no"):
+        return {"status": "disabled"}
+    from ml_int_service import sync_envios_todas_sub_bases
+
+    max_runtime = int(os.getenv("ML_SYNC_MAX_RUNTIME_SECONDS", "240"))
+    db = SessionLocal()
+    try:
+        return {"status": "ok", **sync_envios_todas_sub_bases(db, max_runtime_seconds=max_runtime)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    finally:
+        db.close()
+
+
 @app.post(f"{API_PREFIX}/internal/cleanup-history", tags=["Internal"])
 def internal_cleanup_history(request: Request):
     """

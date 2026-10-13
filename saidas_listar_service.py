@@ -551,6 +551,79 @@ def _orm_localizar_avulso_exists(sub_base: str, variants: Sequence[str]):
     )
 
 
+# Dados do destinatário/comprador em saidas_detail pesquisáveis no localizar.
+_DETAIL_COLUNAS_TEXTO = (
+    "dest_nome",
+    "dest_rua",
+    "dest_bairro",
+    "dest_cidade",
+    "dest_complemento",
+    "endereco_formatado",
+)
+_DETAIL_COLUNAS_DIGITOS = ("dest_cep", "dest_contato")
+
+
+def _localizar_detail_termos(term: str, variants: Sequence[str]) -> Tuple[str, List[str]]:
+    """(termo para colunas de texto, variantes numéricas ≥5 dígitos para CEP/telefone)."""
+    raw = (term or "").strip()
+    numericas = [
+        v for v in variants
+        if v and v != raw and sum(ch.isdigit() for ch in v) >= 5
+    ]
+    if raw and sum(ch.isdigit() for ch in raw) >= 5 and raw not in numericas:
+        numericas.insert(0, raw)
+    return raw, numericas
+
+
+def _sql_localizar_detail_exists(term: str, variants: Sequence[str], params: Dict[str, Any]) -> str:
+    """EXISTS em saidas_detail (destinatário) da própria saída; sub_base vem da consulta externa."""
+    raw, numericas = _localizar_detail_termos(term, variants)
+    if not raw:
+        return ""
+    params["localizar_detail_q"] = f"%{raw}%"
+    conds = [
+        f"unaccent(lower(coalesce(sd.{col}, ''))) ILIKE unaccent(lower(:localizar_detail_q))"
+        for col in _DETAIL_COLUNAS_TEXTO
+    ]
+    for i, v in enumerate(numericas):
+        key = f"localizar_detail_num_{i}"
+        params[key] = f"%{v}%"
+        conds.extend(f"coalesce(sd.{col}, '') ILIKE :{key}" for col in _DETAIL_COLUNAS_DIGITOS)
+    return f"""EXISTS (
+              SELECT 1
+              FROM saidas_detail sd
+              WHERE sd.id_saida = s.id_saida
+                AND ({' OR '.join(conds)})
+            )"""
+
+
+def _orm_localizar_detail_exists(term: str, variants: Sequence[str]):
+    from sqlalchemy import exists, func, or_, select
+
+    from models import Saida, SaidaDetail
+
+    raw, numericas = _localizar_detail_termos(term, variants)
+    if not raw:
+        return None
+    q = f"%{raw}%"
+    conds = [
+        func.unaccent(func.lower(func.coalesce(getattr(SaidaDetail, col), ""))).ilike(
+            func.unaccent(func.lower(q))
+        )
+        for col in _DETAIL_COLUNAS_TEXTO
+    ]
+    for v in numericas:
+        conds.extend(
+            func.coalesce(getattr(SaidaDetail, col), "").ilike(f"%{v}%")
+            for col in _DETAIL_COLUNAS_DIGITOS
+        )
+    return exists(
+        select(1)
+        .select_from(SaidaDetail)
+        .where(SaidaDetail.id_saida == Saida.id_saida, or_(*conds))
+    )
+
+
 def _build_candidate_stmt(
     sub_base: str,
     de: Optional[date],
@@ -686,6 +759,9 @@ def _build_candidate_stmt(
         avulso_ex = _orm_localizar_avulso_exists(sub_base, variants)
         if avulso_ex is not None:
             or_conds.append(avulso_ex)
+        detail_ex = _orm_localizar_detail_exists(localizar, variants)
+        if detail_ex is not None:
+            or_conds.append(detail_ex)
         stmt = stmt.where(or_(*or_conds))
 
     return stmt
@@ -1001,6 +1077,7 @@ def listar_saidas_paginado(
         variants = _localizar_avulso_variants(localizar)
         params["localizar_q"] = f"%{localizar.strip()}%"
         avulso_sql = _sql_localizar_avulso_exists(variants, params)
+        detail_sql = _sql_localizar_detail_exists(localizar, variants, params)
         parts = [
             "unaccent(lower(coalesce(s.base, ''))) ILIKE unaccent(lower(:localizar_q))",
             "unaccent(lower(coalesce(s.username, ''))) ILIKE unaccent(lower(:localizar_q))",
@@ -1011,6 +1088,8 @@ def listar_saidas_paginado(
         ]
         if avulso_sql:
             parts.append(avulso_sql)
+        if detail_sql:
+            parts.append(detail_sql)
         where_extra.append("(" + " OR ".join(parts) + ")")
 
     entregador_filter_norm = ""

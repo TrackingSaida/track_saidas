@@ -132,6 +132,36 @@ curl -sf -X POST \
 
 Se o job não terminar no orçamento de tempo, ele retorna `partial=true` e continua no próximo dia a partir do checkpoint salvo.
 
+## Sync automático Mercado Livre (envios Flex pendentes de coleta)
+
+Importa, para cada `sub_base`, os envios Flex (`self_service`) em `ready_to_ship` das contas ML
+**vinculadas a um seller cadastrado** (tela Autenticação → "Seller vinculado"). Cria a saída em
+`aguardando_coleta` com destinatário e coordenada do ML; contas sem vínculo são puladas
+(`motivo: "sem_vinculo"`). Mesma lógica do botão "Sincronizar agora" (`POST /api/ml-int/sync-envios`).
+
+Pré-requisitos: migrations `saidas_ml_pack_id.sql` e `ml_conexoes_id_base.sql` (ver `migrations/README.md`).
+
+### Endpoint interno
+
+- `POST /api/internal/ml-sync-envios`
+- Header obrigatório: `X-Cron-Secret: <CRON_ML_SYNC_SECRET>` (fallback `CRON_REFRESH_SECRET`)
+- Variáveis opcionais:
+  - `ML_SYNC_CRON_ENABLED` (default `true`; use `false` em homol se o banco tiver cópia dos tokens de produção — o refresh token do ML é de uso único e a renovação em homol derruba produção)
+  - `ML_SYNC_MAX_RUNTIME_SECONDS` (default `240`; sub_bases não processadas voltam em `nao_processadas` com `partial=true`)
+
+### Agendamento no Render (somente produção)
+
+A cada 30 min entre 06:00 e 22:00 BRT (UTC-3), em UTC:
+
+- Schedule: `*/30 9-23,0-1 * * *`
+- Command:
+
+```bash
+curl -sf -X POST \
+  -H "X-Cron-Secret: $CRON_ML_SYNC_SECRET" \
+  "https://track-saidas-api.onrender.com/api/internal/ml-sync-envios"
+```
+
 ## Encerramento de pendentes por quinzena (1.5.0+)
 
 Encerra automaticamente pedidos ainda abertos (`SAIU_PARA_ENTREGA` / `EM_ROTA` / legado `saiu`) cuja **data operacional** está **antes** da janela viva de **2 quinzenas** (quinzena atual + quinzena anterior).

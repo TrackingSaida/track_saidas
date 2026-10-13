@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, BasePreco, BaseSellerDados, MotoboySubBase  # classe do models.py com __tablename__ = "base"
+from models import User, BasePreco, BaseSellerDados, MLConexao, MotoboySubBase  # classe do models.py com __tablename__ = "base"
 from base_import_service import (
     MODELO_FILENAME,
     XLSX_MEDIA_TYPE,
@@ -57,6 +57,8 @@ class BaseOut(BaseModel):
     agenda_coleta_confirmada: bool
     # Endereço cadastrado em base_seller_dados (opcional; aditivo)
     endereco_completo: Optional[str] = None
+    # Contas Mercado Livre vinculadas (ml_conexoes.id_base); aditivo, só leitura
+    ml_contas: List[Dict[str, Any]] = Field(default_factory=list)
     model_config = ConfigDict(from_attributes=True)
 
 class BaseUpdate(BaseModel):
@@ -183,8 +185,13 @@ def _format_endereco_seller(seller: BaseSellerDados) -> Optional[str]:
     return texto or None
 
 
-def _base_to_out(obj: BasePreco, endereco_completo: Optional[str] = None) -> BaseOut:
+def _base_to_out(
+    obj: BasePreco,
+    endereco_completo: Optional[str] = None,
+    ml_contas: Optional[List[Dict[str, Any]]] = None,
+) -> BaseOut:
     return BaseOut(
+        ml_contas=ml_contas or [],
         id_base=obj.id_base,
         base=obj.base,
         sub_base=obj.sub_base,
@@ -212,6 +219,26 @@ def _enderecos_por_base_ids(db: Session, base_ids: List[int]) -> Dict[int, str]:
         texto = _format_endereco_seller(seller)
         if texto:
             out[int(seller.base_id)] = texto
+    return out
+
+
+def _ml_contas_por_base_ids(db: Session, sub_base: str, base_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    if not base_ids:
+        return {}
+    rows = db.scalars(
+        select(MLConexao)
+        .where(MLConexao.sub_base == sub_base, MLConexao.id_base.in_(base_ids))
+        .order_by(MLConexao.user_nickname_ml)
+    ).all()
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    vistos: set = set()
+    for c in rows:
+        if c.user_id_ml in vistos:
+            continue
+        vistos.add(c.user_id_ml)
+        out.setdefault(int(c.id_base), []).append(
+            {"user_id_ml": c.user_id_ml, "nickname": c.user_nickname_ml}
+        )
     return out
 
 # =========================
@@ -293,9 +320,11 @@ def list_bases(
 
     stmt = stmt.order_by(BasePreco.base)
     rows = db.scalars(stmt).all()
-    enderecos = _enderecos_por_base_ids(db, [int(r.id_base) for r in rows])
+    ids = [int(r.id_base) for r in rows]
+    enderecos = _enderecos_por_base_ids(db, ids)
+    ml_contas = _ml_contas_por_base_ids(db, sub_base_user, ids)
     return [
-        _base_to_out(r, enderecos.get(int(r.id_base)))
+        _base_to_out(r, enderecos.get(int(r.id_base)), ml_contas.get(int(r.id_base)))
         for r in rows
     ]
 
@@ -358,7 +387,8 @@ def get_base(
     if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(status_code=404, detail="Não encontrado")
     enderecos = _enderecos_por_base_ids(db, [int(obj.id_base)])
-    return _base_to_out(obj, enderecos.get(int(obj.id_base)))
+    ml_contas = _ml_contas_por_base_ids(db, sub_base_user, [int(obj.id_base)])
+    return _base_to_out(obj, enderecos.get(int(obj.id_base)), ml_contas.get(int(obj.id_base)))
 
 # =========================
 # PATCH /base/{id_base}

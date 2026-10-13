@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
 import requests
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session
 
 from models import MLConexao
@@ -515,6 +516,263 @@ def listar_envios_flex_pendentes(
         })
 
     return {"seller_id": user_id_ml, "dias": dias, "resumo": resumo, "envios": envios, "erros": erros}
+
+
+def _lock_sync_sub_base(db: Session, sub_base: str) -> None:
+    """Serializa syncs concorrentes (cron x botão) da mesma sub_base até o commit."""
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+            {"k": f"ml_int_sync:{sub_base}"},
+        )
+
+
+def saidas_existentes_por_shipment(db: Session, sub_base: str, envios: list[dict]) -> dict[int, Any]:
+    """shipment_id → Saida já existente na sub_base (por ml_shipment_id ou código lido no scanner)."""
+    from models import Saida
+
+    if not envios:
+        return {}
+    por_codigo = {e["codigo"]: e["shipment_id"] for e in envios}
+    sids = [e["shipment_id"] for e in envios]
+    rows = db.scalars(
+        select(Saida).where(
+            Saida.sub_base == sub_base,
+            or_(Saida.ml_shipment_id.in_(sids), Saida.codigo.in_(list(por_codigo))),
+        )
+    ).all()
+    existentes: dict[int, Any] = {}
+    for row in rows:
+        if row.ml_shipment_id in sids:
+            existentes.setdefault(row.ml_shipment_id, row)
+        elif row.codigo in por_codigo:
+            existentes.setdefault(por_codigo[row.codigo], row)
+    return existentes
+
+
+_CAMPOS_COORDENADA = ("latitude", "longitude", "coord_precision", "geocode_source", "endereco_origem", "geocoded_at")
+
+
+def _completar_saida_existente(db: Session, saida: Any, envio: dict, detail_fields: dict) -> bool:
+    """Preenche dados ML/destinatário que faltam numa saída já registrada (não sobrescreve)."""
+    from models import SaidaDetail
+    from ml_int_envios_pure import campos_faltantes
+
+    order_ids = envio.get("order_ids") or []
+    ml_novos = {
+        "ml_shipment_id": envio["shipment_id"],
+        "ml_order_id": order_ids[0] if order_ids else None,
+        "ml_pack_id": envio.get("pack_id"),
+    }
+    ml_atual = {k: getattr(saida, k) for k in ml_novos}
+    alterou = False
+    for k, v in campos_faltantes(ml_atual, {k: v for k, v in ml_novos.items() if v is not None}).items():
+        setattr(saida, k, v)
+        alterou = True
+
+    detail = db.scalar(
+        select(SaidaDetail)
+        .where(SaidaDetail.id_saida == saida.id_saida)
+        .order_by(SaidaDetail.id_detail.desc())
+        .limit(1)
+    )
+    if detail is not None:
+        novos = dict(detail_fields)
+        if detail.latitude is not None or detail.longitude is not None:
+            for k in _CAMPOS_COORDENADA:
+                novos.pop(k, None)
+        detail_atual = {k: getattr(detail, k, None) for k in novos}
+        for k, v in campos_faltantes(detail_atual, novos).items():
+            setattr(detail, k, v)
+            alterou = True
+    return alterou
+
+
+def sync_envios_sub_base(
+    db: Session,
+    sub_base: str,
+    *,
+    user_id_ml: Optional[int] = None,
+    user_id: Optional[int] = None,
+    dias: int = 7,
+    max_pedidos: int = 300,
+) -> dict[str, Any]:
+    """
+    Importa envios Flex prontos para coleta dos sellers ML vinculados da sub_base:
+    cria Saida (aguardando_coleta) + SaidaDetail (destinatário/coordenada) e completa
+    dados ML faltantes de saídas já registradas. Conta sem vínculo com seller é pulada.
+    Usado pelo POST /ml-int/sync-envios e pelo cron interno.
+    """
+    from models import BasePreco, Saida, SaidaDetail, SaidaHistorico
+    from ml_int_envios_pure import destinatario_to_saida_detail_fields
+
+    q = db.query(MLConexao).filter(MLConexao.sub_base == sub_base)
+    if user_id_ml is not None:
+        q = q.filter(MLConexao.user_id_ml == user_id_ml)
+    conexoes = q.order_by(MLConexao.criado_em.desc(), MLConexao.id.desc()).all()
+
+    vistos: set[int] = set()
+    sellers: list[dict[str, Any]] = []
+    total_criados = 0
+    for conexao in conexoes:
+        if conexao.user_id_ml in vistos:
+            continue
+        vistos.add(conexao.user_id_ml)
+        seller: dict[str, Any] = {
+            "user_id_ml": conexao.user_id_ml,
+            "nickname": conexao.user_nickname_ml,
+            "id_base": conexao.id_base,
+            "base_nome": None,
+            "motivo": None,
+            "pendentes": 0,
+            "criados": 0,
+            "ja_registrados": 0,
+            "atualizados": 0,
+            "erros": [],
+        }
+        sellers.append(seller)
+
+        base_row = None
+        if conexao.id_base is not None:
+            base_row = db.scalar(
+                select(BasePreco).where(
+                    BasePreco.id_base == conexao.id_base,
+                    BasePreco.sub_base == sub_base,
+                )
+            )
+        if base_row is None or not (base_row.base or "").strip():
+            seller["motivo"] = "sem_vinculo"
+            continue
+        base_nome = base_row.base.strip()
+        seller["base_nome"] = base_nome
+
+        try:
+            data = listar_envios_flex_pendentes(
+                db, conexao.user_id_ml, sub_base, dias=dias, max_pedidos=max_pedidos,
+            )
+        except (LookupError, RuntimeError) as e:
+            seller["motivo"] = "requer_reautorizacao" if "autoriza" in str(e) else "erro_conexao"
+            seller["erros"].append({"erro": str(e)})
+            continue
+        except requests.HTTPError as e:
+            seller["motivo"] = "erro_api_ml"
+            seller["erros"].append({"erro": f"HTTP {e.response.status_code}: {(e.response.text or '')[:200]}"})
+            continue
+        except requests.RequestException as e:
+            seller["motivo"] = "erro_api_ml"
+            seller["erros"].append({"erro": str(e)[:200]})
+            continue
+
+        seller["erros"].extend(data["erros"])
+        envios = data["envios"]
+        seller["pendentes"] = len(envios)
+        if not envios:
+            continue
+
+        agora = _utcnow()
+        try:
+            _lock_sync_sub_base(db, sub_base)
+            existentes = saidas_existentes_por_shipment(db, sub_base, envios)
+            for envio in envios:
+                sid = envio["shipment_id"]
+                detail_fields = destinatario_to_saida_detail_fields(envio["destinatario"])
+                if "latitude" in detail_fields:
+                    detail_fields["geocoded_at"] = agora
+                existente = existentes.get(sid)
+                if existente is not None:
+                    seller["ja_registrados"] += 1
+                    try:
+                        with db.begin_nested():
+                            if _completar_saida_existente(db, existente, envio, detail_fields):
+                                seller["atualizados"] += 1
+                    except Exception as e:
+                        seller["erros"].append({"shipment_id": sid, "erro": str(e)[:200]})
+                    continue
+                order_ids = envio.get("order_ids") or []
+                try:
+                    with db.begin_nested():
+                        nova = Saida(
+                            sub_base=sub_base,
+                            codigo=envio["codigo"],
+                            servico="Mercado Livre",
+                            status="aguardando_coleta",
+                            ml_shipment_id=sid,
+                            ml_order_id=order_ids[0] if order_ids else None,
+                            ml_pack_id=envio.get("pack_id"),
+                            base=base_nome,
+                        )
+                        db.add(nova)
+                        db.flush()
+                        db.add(
+                            SaidaDetail(
+                                id_saida=nova.id_saida,
+                                id_entregador=None,
+                                status="Aguardando coleta",
+                                **detail_fields,
+                            )
+                        )
+                        db.add(
+                            SaidaHistorico(
+                                id_saida=nova.id_saida,
+                                evento="ml_int_sync",
+                                status_novo="aguardando_coleta",
+                                user_id=user_id,
+                            )
+                        )
+                    seller["criados"] += 1
+                except Exception as e:
+                    seller["erros"].append({"shipment_id": sid, "erro": str(e)[:200]})
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            seller["criados"] = 0
+            seller["atualizados"] = 0
+            seller["erros"].append({"erro": f"Falha ao gravar: {str(e)[:200]}"})
+            continue
+        total_criados += seller["criados"]
+
+    return {"sub_base": sub_base, "criados": total_criados, "dias": dias, "sellers": sellers}
+
+
+def sync_envios_todas_sub_bases(
+    db: Session,
+    *,
+    dias: int = 7,
+    max_runtime_seconds: int = 240,
+) -> dict[str, Any]:
+    """Cron: sincroniza todas as sub_bases com conta ML vinculada a seller, com orçamento de tempo."""
+    import time
+
+    inicio = time.monotonic()
+    sub_bases = [
+        sb
+        for (sb,) in db.query(MLConexao.sub_base)
+        .filter(MLConexao.id_base.isnot(None))
+        .distinct()
+        .order_by(MLConexao.sub_base)
+        .all()
+        if (sb or "").strip()
+    ]
+    resultados: list[dict[str, Any]] = []
+    pendentes_tempo: list[str] = []
+    for sb in sub_bases:
+        if time.monotonic() - inicio > max_runtime_seconds:
+            pendentes_tempo.append(sb)
+            continue
+        try:
+            resultados.append(sync_envios_sub_base(db, sb, dias=dias))
+        except Exception as e:
+            db.rollback()
+            logger.warning("sync_envios_todas_sub_bases: falha sub_base=%s: %s", sb, e)
+            resultados.append({"sub_base": sb, "criados": 0, "erro": str(e)[:200]})
+    return {
+        "sub_bases": len(sub_bases),
+        "criados": sum(r.get("criados", 0) for r in resultados),
+        "partial": bool(pendentes_tempo),
+        "nao_processadas": pendentes_tempo,
+        "resultados": resultados,
+    }
 
 
 def refresh_all_ml_int_tokens(db: Session) -> dict[str, int]:
