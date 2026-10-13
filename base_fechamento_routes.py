@@ -428,10 +428,14 @@ def _build_itens_e_valores(
     )
     rows_coletas = db.scalars(stmt_coletas).all()
 
-    # Cancelados: Saidas com status cancelado, agrupar por (data, base, servico)
+    from pedido_sincronizado import sincronizado_nao_coletado
+
+    # Cancelados: Saidas com status cancelado, agrupar por (data, base, servico).
+    # Pedido sincronizado nunca coletado não foi somado, então não é descontado.
     stmt_canc = select(Saida).where(
         Saida.sub_base == sub_base,
         func.lower(Saida.status) == "cancelado",
+        ~sincronizado_nao_coletado(),
     )
     if base_norm:
         stmt_canc = stmt_canc.where(func.upper(Saida.base) == base_key)
@@ -463,10 +467,12 @@ def _build_itens_e_valores(
     regras_g, padrao_g_id = _contexto_g_base(db, sub_base)
 
     # Pacotes G: Saidas não canceladas com is_grande, por data, categoria e serviço
+    # (pedido sincronizado só depois de coletado).
     stmt_g = select(Saida).where(
         Saida.sub_base == sub_base,
         Saida.is_grande.is_(True),
         func.lower(func.coalesce(Saida.status, "")) != "cancelado",
+        ~sincronizado_nao_coletado(),
     )
     if base_norm:
         stmt_g = stmt_g.where(func.upper(Saida.base) == base_key)
@@ -1325,12 +1331,15 @@ def _linhas_resumo_por_base(
         ).distinct()
     ).all():
         _registrar(nome)
+    from pedido_sincronizado import sincronizado_nao_coletado
+
     for nome in db.scalars(
         select(Saida.base).where(
             Saida.sub_base == sub_base,
             Saida.data >= periodo_inicio,
             Saida.data <= periodo_fim,
             (func.lower(Saida.status) == "cancelado") | (Saida.is_grande.is_(True)),
+            ~sincronizado_nao_coletado(),
         ).distinct()
     ).all():
         _registrar(nome)

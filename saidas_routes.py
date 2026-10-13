@@ -318,6 +318,7 @@ class SaidaDetalheCompletoOut(BaseModel):
     ml_shipment_id: Optional[int] = None
     ml_order_id: Optional[int] = None
     ml_pack_id: Optional[int] = None
+    shopee_order_sn: Optional[str] = None
     detail: Optional[SaidaDetailOut] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -1152,46 +1153,14 @@ def ler_saida(
             raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "aguardando_coleta":
-        # Leitura em coleta: aguardando_coleta → coletado
-        status_anterior = existente.status
-        existente.status = "coletado"
-        existente.entregador_id = entregador_id
-        existente.entregador = entregador_nome
-        if motoboy_id is not None:
-            existente.motoboy_id = motoboy_id
-        detail = db.scalar(
-            select(SaidaDetail).where(SaidaDetail.id_saida == existente.id_saida).order_by(SaidaDetail.id_detail.desc()).limit(1)
+        # Pedido sincronizado (ML/Shopee) só vira Coletado pela coleta, que registra a cobrança.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "AGUARDANDO_COLETA",
+                "message": "Este pedido ainda não foi coletado. Registre a coleta na tela de Coleta antes da saída.",
+            },
         )
-        if detail:
-            detail.status = "Coletado"
-            if entregador_id is not None:
-                detail.id_entregador = entregador_id
-            elif motoboy_id is not None:
-                detail.id_entregador = motoboy_id
-        qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
-        db.add(
-            SaidaHistorico(
-                id_saida=existente.id_saida,
-                evento="lido",
-                status_anterior=status_anterior,
-                status_novo="coletado",
-                user_id=getattr(current_user, "id", None),
-            )
-        )
-        try:
-            db.commit()
-            db.refresh(existente)
-            _enqueue_atribuicao_push_externa(
-                db,
-                current_user=current_user,
-                sub_base=sub_base,
-                motoboy_id=motoboy_id,
-                codigo=existente.codigo,
-            )
-            return _saida_out_com_qr(existente, qr_result)
-        except Exception:
-            db.rollback()
-            raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == "coletado":
         gate = avaliar_prerequisito_saida(
@@ -2763,6 +2732,7 @@ def get_saida_detalhe(
         ml_shipment_id=obj.ml_shipment_id,
         ml_order_id=obj.ml_order_id,
         ml_pack_id=obj.ml_pack_id,
+        shopee_order_sn=obj.shopee_order_sn,
         detail=detail_out,
         **_categoria_g_detalhe(db, obj),
     )

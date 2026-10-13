@@ -420,12 +420,15 @@ def _lado_receber(
         if base_key and base_key not in nome_base:
             nome_base[base_key] = (c.base or "").strip()
 
+    from pedido_sincronizado import sincronizado_nao_coletado
+
     rows_canc = db.scalars(
         select(Saida).where(
             Saida.sub_base == sub_base,
             func.lower(Saida.status) == "cancelado",
             Saida.data >= data_inicio,
             Saida.data <= data_fim,
+            ~sincronizado_nao_coletado(),
         )
     ).all()
     precos_base: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}

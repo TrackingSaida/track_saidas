@@ -491,6 +491,21 @@ def registrar_coleta_em_lote(
         if st == "ETIQUETADO" and c not in codigos_qr_atualizados:
             etiquetados_adotar.append(s)
 
+    # Pedido sincronizado (ML/Shopee) aguardando coleta também é adotado — só na base do seller dono,
+    # para não cobrar o seller errado.
+    from pedido_sincronizado import aguardando_coleta
+
+    base_coleta_key = payload.base.strip().upper()
+    for c, s in existing_by_codigo.items():
+        if not aguardando_coleta(s.status):
+            continue
+        if (s.base or "").strip().upper() != base_coleta_key:
+            raise HTTPException(
+                409,
+                f'O pedido {c} é do seller "{(s.base or "").strip() or "-"}". Colete-o na base desse seller.',
+            )
+        etiquetados_adotar.append(s)
+
     etiquetado_codigos = {str(s.codigo) for s in etiquetados_adotar}
     cancelados = sorted(
         c
@@ -586,9 +601,23 @@ def registrar_coleta_em_lote(
             qr_raw = getattr(item, "qr_payload_raw", None)
             store_qr = should_store_qr_payload_raw(_servico_label_for_saida(serv_key), qr_raw)
 
-            # Adota ETIQUETADO local (mesmo tenant gerador)
+            # Adota ETIQUETADO local (mesmo tenant gerador) ou pedido sincronizado aguardando coleta
             saida_existente = existing_by_codigo.get(codigo)
-            if saida_existente is not None and (saida_existente.status or "").strip().upper() == "ETIQUETADO":
+            sincronizado = saida_existente is not None and aguardando_coleta(saida_existente.status)
+            if saida_existente is not None and (
+                sincronizado or (saida_existente.status or "").strip().upper() == "ETIQUETADO"
+            ):
+                status_anterior = "aguardando_coleta" if sincronizado else "ETIQUETADO"
+                if sincronizado:
+                    serv_key = _normalize_servico(saida_existente.servico)
+                    detail = db.scalar(
+                        select(SaidaDetail)
+                        .where(SaidaDetail.id_saida == saida_existente.id_saida)
+                        .order_by(SaidaDetail.id_detail.desc())
+                        .limit(1)
+                    )
+                    if detail is not None:
+                        detail.status = "Coletado"
                 saida_existente.status = "coletado"
                 saida_existente.base = payload.base
                 saida_existente.id_coleta = coleta.id_coleta
@@ -603,7 +632,7 @@ def registrar_coleta_em_lote(
                     SaidaHistorico(
                         id_saida=saida_existente.id_saida,
                         evento="criado_coleta",
-                        status_anterior="ETIQUETADO",
+                        status_anterior=status_anterior,
                         status_novo="coletado",
                         user_id=getattr(current_user, "id", None),
                     )
