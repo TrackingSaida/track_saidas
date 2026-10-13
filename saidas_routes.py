@@ -40,6 +40,7 @@ from saidas_listar_service import (
     _localizar_avulso_variants,
     _orm_localizar_avulso_exists,
     _orm_localizar_detail_exists,
+    _orm_localizar_ml_id,
 )
 from saidas_exportar_service import (
     MAX_EXPORTAR_LIMIT,
@@ -2370,6 +2371,9 @@ def _listar_saidas_codigo_parcial(
         detail_ex = _orm_localizar_detail_exists(localizar, variants)
         if detail_ex is not None:
             or_conds.append(detail_ex)
+        ml_id_cond = _orm_localizar_ml_id(localizar)
+        if ml_id_cond is not None:
+            or_conds.append(ml_id_cond)
         stmt = stmt.where(or_(*or_conds))
     else:
         return _listar_resposta_vazia()

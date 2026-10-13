@@ -551,6 +551,43 @@ def _orm_localizar_avulso_exists(sub_base: str, variants: Sequence[str]):
     )
 
 
+# Pack ID / número da venda do ML (16 dígitos hoje); teto de 18 cabe em BIGINT.
+_ML_ID_MIN_DIGITOS = 10
+_ML_ID_MAX_DIGITOS = 18
+
+
+def _localizar_ml_id(term: str) -> Optional[int]:
+    """Pack ID ou order ID do ML digitado no localizar (aceita espaços, pontos e hífens)."""
+    raw = (term or "").strip()
+    if not raw:
+        return None
+    compacto = "".join(ch for ch in raw if ch not in " .-")
+    if not compacto.isdigit():
+        return None
+    if not (_ML_ID_MIN_DIGITOS <= len(compacto) <= _ML_ID_MAX_DIGITOS):
+        return None
+    return int(compacto)
+
+
+def _sql_localizar_ml_id(term: str, params: Dict[str, Any]) -> str:
+    ml_id = _localizar_ml_id(term)
+    if ml_id is None:
+        return ""
+    params["localizar_ml_id"] = ml_id
+    return "(s.ml_pack_id = :localizar_ml_id OR s.ml_order_id = :localizar_ml_id)"
+
+
+def _orm_localizar_ml_id(term: str):
+    from sqlalchemy import or_
+
+    from models import Saida
+
+    ml_id = _localizar_ml_id(term)
+    if ml_id is None:
+        return None
+    return or_(Saida.ml_pack_id == ml_id, Saida.ml_order_id == ml_id)
+
+
 # Dados do destinatário/comprador em saidas_detail pesquisáveis no localizar.
 _DETAIL_COLUNAS_TEXTO = (
     "dest_nome",
@@ -762,6 +799,9 @@ def _build_candidate_stmt(
         detail_ex = _orm_localizar_detail_exists(localizar, variants)
         if detail_ex is not None:
             or_conds.append(detail_ex)
+        ml_id_cond = _orm_localizar_ml_id(localizar)
+        if ml_id_cond is not None:
+            or_conds.append(ml_id_cond)
         stmt = stmt.where(or_(*or_conds))
 
     return stmt
@@ -1078,6 +1118,7 @@ def listar_saidas_paginado(
         params["localizar_q"] = f"%{localizar.strip()}%"
         avulso_sql = _sql_localizar_avulso_exists(variants, params)
         detail_sql = _sql_localizar_detail_exists(localizar, variants, params)
+        ml_id_sql = _sql_localizar_ml_id(localizar, params)
         parts = [
             "unaccent(lower(coalesce(s.base, ''))) ILIKE unaccent(lower(:localizar_q))",
             "unaccent(lower(coalesce(s.username, ''))) ILIKE unaccent(lower(:localizar_q))",
@@ -1090,6 +1131,8 @@ def listar_saidas_paginado(
             parts.append(avulso_sql)
         if detail_sql:
             parts.append(detail_sql)
+        if ml_id_sql:
+            parts.append(ml_id_sql)
         where_extra.append("(" + " OR ".join(parts) + ")")
 
     entregador_filter_norm = ""
