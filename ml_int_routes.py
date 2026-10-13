@@ -11,20 +11,20 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from auth import get_current_user
 from db import get_db
 from models import MLConexao, Owner, Saida, SaidaDetail, SaidaHistorico, User
+from ml_int_envios_pure import destinatario_to_saida_detail_fields, ml_shipment_destinatario
 from ml_int_service import (
-    create_ml_test_user,
     exchange_code_for_token,
-    fetch_order,
     fetch_orders_search,
     fetch_shipment,
     fetch_shipments_by_tracking,
     get_me,
     get_valid_access_token,
+    listar_envios_flex_pendentes,
     ml_conexao_status,
 )
 
@@ -288,61 +288,21 @@ def ml_int_envios_seller(
     user_id_ml: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    limit: int = Query(50, le=100),
+    dias: int = Query(7, ge=1, le=30, description="Janela de vendas (dias) a considerar."),
+    max_pedidos: int = Query(300, ge=50, le=1000),
 ):
-    """Lista envios do seller com tracking e destinatário (para roteirização)."""
+    """
+    Prévia (somente leitura) dos envios Flex do seller prontos para coleta,
+    com destinatário normalizado e indicação se já existem no sistema.
+    """
     if user.role not in (0, 1):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = getattr(user, "sub_base", None)
-    try:
-        token = get_valid_access_token(db, user_id_ml, sub_base)
-    except (LookupError, RuntimeError) as e:
-        raise HTTPException(404, str(e))
-    try:
-        search = fetch_orders_search(
-            token, user_id_ml, limit=limit, db=db, sub_base=sub_base,
-        )
-    except requests.HTTPError as e:
-        raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
-    results = search.get("results") or []
-    envios = []
-    seen_shipment = set()
-    for order_id in results[:limit]:
-        try:
-            order = fetch_order(
-                token, str(order_id), db=db, user_id_ml=user_id_ml, sub_base=sub_base,
-            )
-        except Exception:
-            continue
-        shipping = order.get("shipping") or {}
-        sid = shipping.get("id")
-        if not sid or sid in seen_shipment:
-            continue
-        seen_shipment.add(sid)
-        try:
-            ship = fetch_shipment(
-                token, int(sid), db=db, user_id_ml=user_id_ml, sub_base=sub_base,
-            )
-        except Exception:
-            continue
-        dest = ship.get("destination") or {}
-        envios.append({
-            "shipment_id": sid,
-            "order_id": order.get("id"),
-            "tracking_number": ship.get("tracking_number"),
-            "status": ship.get("status"),
-            "substatus": ship.get("substatus"),
-            "destination": {
-                "address_line": dest.get("address_line"),
-                "street_name": dest.get("street_name"),
-                "street_number": dest.get("street_number"),
-                "city": dest.get("city"),
-                "state": dest.get("state"),
-                "zip_code": dest.get("zip_code"),
-                "receiver_name": dest.get("receiver_name"),
-            },
-        })
-    return {"envios": envios, "seller_id": user_id_ml}
+    data = _listar_pendentes_ou_http(db, user_id_ml, sub_base, dias=dias, max_pedidos=max_pedidos)
+    ja_registrados = _shipments_ja_registrados(db, sub_base, data["envios"])
+    for envio in data["envios"]:
+        envio["ja_registrado"] = envio["shipment_id"] in ja_registrados
+    return data
 
 
 # ---------- Detalhe envio por id ou tracking ----------
@@ -373,6 +333,7 @@ def ml_int_envio_detail(
                 "status": ship.get("status"),
                 "substatus": ship.get("substatus"),
                 "destination": dest,
+                "destinatario": ml_shipment_destinatario(ship),
                 "origin": ship.get("origin"),
             }
         except Exception as e:
@@ -413,6 +374,7 @@ def ml_int_envio_by_tracking(
                     "status": ship.get("status"),
                     "substatus": ship.get("substatus"),
                     "destination": dest,
+                    "destinatario": ml_shipment_destinatario(ship),
                 }
         except Exception:
             continue
@@ -449,114 +411,133 @@ def ml_int_etiqueta(
     raise HTTPException(404, "Envio não encontrado.")
 
 
-# ---------- Sync: preenchimento automático (saidas + saidas_detail) ----------
-def _destination_to_dest_fields(dest: dict) -> dict:
-    """Mapeia destination da API ML para campos dest_* do SaidaDetail."""
-    if not dest:
-        return {}
-    return {
-        "dest_nome": dest.get("receiver_name") or dest.get("receiver_name"),
-        "dest_rua": dest.get("street_name"),
-        "dest_numero": str(dest.get("street_number") or "") if dest.get("street_number") is not None else None,
-        "dest_bairro": dest.get("neighborhood") or dest.get("municipality"),
-        "dest_cidade": dest.get("city"),
-        "dest_estado": dest.get("state"),
-        "dest_cep": dest.get("zip_code"),
-        "dest_contato": dest.get("receiver_phone"),
-        "endereco_formatado": dest.get("address_line"),
-    }
+# ---------- Sync: envios Flex pendentes de coleta → saidas (aguardando_coleta) ----------
+def _listar_pendentes_ou_http(
+    db: Session, user_id_ml: int, sub_base: str | None, *, dias: int, max_pedidos: int,
+) -> dict:
+    try:
+        return listar_envios_flex_pendentes(
+            db, user_id_ml, sub_base or "", dias=dias, max_pedidos=max_pedidos,
+        )
+    except (LookupError, RuntimeError) as e:
+        raise HTTPException(404, str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(e.response.status_code, e.response.text or "Erro na API ML")
+
+
+def _shipments_ja_registrados(db: Session, sub_base: str | None, envios: list[dict]) -> set[int]:
+    """shipment_ids já existentes na sub_base (por ml_shipment_id ou código lido no scanner)."""
+    if not envios:
+        return set()
+    sids = [e["shipment_id"] for e in envios]
+    por_codigo = {e["codigo"]: e["shipment_id"] for e in envios}
+    rows = db.execute(
+        select(Saida.ml_shipment_id, Saida.codigo).where(
+            Saida.sub_base == sub_base,
+            or_(Saida.ml_shipment_id.in_(sids), Saida.codigo.in_(list(por_codigo))),
+        )
+    ).all()
+    encontrados: set[int] = set()
+    for ml_sid, codigo in rows:
+        if ml_sid in sids:
+            encontrados.add(ml_sid)
+        if codigo in por_codigo:
+            encontrados.add(por_codigo[codigo])
+    return encontrados
 
 
 @router.post("/sync-envios")
 def ml_int_sync_envios(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    user_id_ml: int | None = Query(None, description="Sincroniza só este seller; vazio = todos da sub_base."),
+    dias: int = Query(7, ge=1, le=30),
+    max_pedidos: int = Query(300, ge=50, le=1000),
 ):
     """
-    Job/endpoint: para cada seller conectado à sub_base, busca envios 'ready_to_ship'
-    ainda não registrados e cria Saida (aguardando_coleta) + SaidaDetail (dest_*).
+    Para cada seller conectado à sub_base, busca envios Flex prontos para coleta
+    ainda não registrados e cria Saida (aguardando_coleta) + SaidaDetail (destinatário).
     """
     if user.role not in (0, 1):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = getattr(user, "sub_base", None)
     if not sub_base:
         raise HTTPException(400, "Usuário sem sub_base.")
-    conexoes = db.query(MLConexao).filter(MLConexao.sub_base == sub_base).all()
-    created = 0
-    errors = []
+    q = db.query(MLConexao).filter(MLConexao.sub_base == sub_base)
+    if user_id_ml is not None:
+        q = q.filter(MLConexao.user_id_ml == user_id_ml)
+    conexoes = q.order_by(MLConexao.criado_em.desc(), MLConexao.id.desc()).all()
+    if user_id_ml is not None and not conexoes:
+        raise HTTPException(404, "Seller não conectado a esta sub_base.")
+
+    vistos: set[int] = set()
+    sellers = []
+    total_criados = 0
     for conexao in conexoes:
-        try:
-            token = get_valid_access_token(db, conexao.user_id_ml, sub_base)
-        except Exception as e:
-            errors.append({"user_id_ml": conexao.user_id_ml, "error": str(e)})
+        if conexao.user_id_ml in vistos:
             continue
+        vistos.add(conexao.user_id_ml)
+        seller = {
+            "user_id_ml": conexao.user_id_ml,
+            "nickname": conexao.user_nickname_ml,
+            "pendentes": 0,
+            "criados": 0,
+            "ja_registrados": 0,
+            "erros": [],
+        }
+        sellers.append(seller)
         try:
-            search = fetch_orders_search(
-                token, conexao.user_id_ml, limit=50, db=db, sub_base=sub_base,
+            data = listar_envios_flex_pendentes(
+                db, conexao.user_id_ml, sub_base, dias=dias, max_pedidos=max_pedidos,
             )
-        except requests.HTTPError as e:
-            errors.append({"user_id_ml": conexao.user_id_ml, "error": e.response.text or str(e)})
+        except (LookupError, RuntimeError) as e:
+            seller["erros"].append({"erro": str(e)})
             continue
-        results = search.get("results") or []
-        for order_id in results:
-            try:
-                order = fetch_order(
-                    token, str(order_id),
-                    db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base,
-                )
-            except Exception:
+        except requests.HTTPError as e:
+            seller["erros"].append({"erro": f"HTTP {e.response.status_code}: {(e.response.text or '')[:200]}"})
+            continue
+        seller["erros"].extend(data["erros"])
+        envios = data["envios"]
+        seller["pendentes"] = len(envios)
+        ja_registrados = _shipments_ja_registrados(db, sub_base, envios)
+        for envio in envios:
+            sid = envio["shipment_id"]
+            if sid in ja_registrados:
+                seller["ja_registrados"] += 1
                 continue
-            shipping = order.get("shipping") or {}
-            sid = shipping.get("id")
-            if not sid:
-                continue
-            # Já registrado?
-            existing = db.scalar(select(Saida).where(Saida.ml_shipment_id == sid))
-            if existing:
-                continue
-            try:
-                ship = fetch_shipment(
-                    token, int(sid),
-                    db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base,
-                )
-            except Exception:
-                continue
-            status_ship = (ship.get("status") or "").lower()
-            substatus = (ship.get("substatus") or "").lower()
-            # Disponível para coleta: ready_to_ship ou equivalente
-            if status_ship not in ("ready_to_ship", "ready"):
-                continue
-            tracking = ship.get("tracking_number") or ""
-            dest = ship.get("destination") or {}
-            dest_fields = _destination_to_dest_fields(dest)
+            order_ids = envio.get("order_ids") or []
             try:
                 nova = Saida(
                     sub_base=sub_base,
-                    codigo=tracking,
+                    codigo=envio["codigo"],
+                    servico="Mercado Livre",
                     status="aguardando_coleta",
                     ml_shipment_id=sid,
-                    ml_order_id=order.get("id"),
-                    base=order.get("seller", {}).get("nickname") if isinstance(order.get("seller"), dict) else None,
+                    ml_order_id=order_ids[0] if order_ids else None,
+                    base=conexao.user_nickname_ml,
                 )
                 db.add(nova)
                 db.flush()
-                detail = SaidaDetail(
-                    id_saida=nova.id_saida,
-                    id_entregador=None,
-                    status="Aguardando coleta",
-                    **{k: v for k, v in dest_fields.items() if v is not None},
+                db.add(
+                    SaidaDetail(
+                        id_saida=nova.id_saida,
+                        id_entregador=None,
+                        status="Aguardando coleta",
+                        **destinatario_to_saida_detail_fields(envio["destinatario"]),
+                    )
                 )
-                db.add(detail)
                 db.add(
                     SaidaHistorico(
                         id_saida=nova.id_saida,
                         evento="ml_int_sync",
                         status_novo="aguardando_coleta",
+                        user_id=getattr(user, "id", None),
                     )
                 )
                 db.commit()
-                created += 1
+                seller["criados"] += 1
+                total_criados += 1
             except Exception as e:
                 db.rollback()
-                errors.append({"shipment_id": sid, "error": str(e)})
-    return {"created": created, "errors": errors}
+                seller["erros"].append({"shipment_id": sid, "erro": str(e)[:200]})
+    return {"criados": total_criados, "dias": dias, "sellers": sellers}

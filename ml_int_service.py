@@ -22,7 +22,7 @@ ML_ME_URL = "https://api.mercadolibre.com/users/me"
 ML_ORDERS_SEARCH_URL = "https://api.mercadolibre.com/orders/search"
 ML_ORDER_URL = "https://api.mercadolibre.com/orders"
 ML_SHIPMENTS_SEARCH_URL = "https://api.mercadolibre.com/shipments/search"
-ML_MARKETPLACE_SHIPMENT_URL = "https://api.mercadolibre.com/marketplace/shipments"
+ML_SHIPMENT_URL = "https://api.mercadolibre.com/shipments"
 ML_TEST_USER_URL = "https://api.mercadolibre.com/users/test_user"
 
 # Margem operacional antes da expiração (ML recomenda renovar só após perder validade;
@@ -301,11 +301,14 @@ def fetch_orders_search(
     date_to: Optional[str] = None,
     offset: int = 0,
     limit: int = 50,
+    sort: Optional[str] = None,
     db: Optional[Session] = None,
     sub_base: Optional[str] = None,
 ) -> dict[str, Any]:
-    """GET /orders/search com seller e filtros opcionais."""
+    """GET /orders/search com seller e filtros opcionais. `results` são objetos de pedido."""
     params: dict[str, Any] = {"seller": seller_id, "offset": offset, "limit": limit}
+    if sort:
+        params["sort"] = sort
     if order_status:
         params["order.status"] = order_status
     if date_from:
@@ -340,8 +343,8 @@ def fetch_shipment(
     user_id_ml: Optional[int] = None,
     sub_base: Optional[str] = None,
 ) -> dict[str, Any]:
-    """GET /marketplace/shipments/{id} com header x-format-new."""
-    url = f"{ML_MARKETPLACE_SHIPMENT_URL}/{shipment_id}"
+    """GET /shipments/{id} com header x-format-new (destination.shipping_address)."""
+    url = f"{ML_SHIPMENT_URL}/{shipment_id}"
 
     def do_req(token: str) -> requests.Response:
         return requests.get(
@@ -416,6 +419,102 @@ def fetch_shipments_by_tracking(
     )
     r.raise_for_status()
     return r.json()
+
+
+ML_ORDERS_PAGE_SIZE = 50
+
+
+def _order_itens(order: dict) -> list[dict[str, Any]]:
+    itens = []
+    for oi in order.get("order_items") or []:
+        item = oi.get("item") or {}
+        itens.append({"titulo": item.get("title"), "quantidade": oi.get("quantity")})
+    return itens
+
+
+def listar_envios_flex_pendentes(
+    db: Session,
+    user_id_ml: int,
+    sub_base: str,
+    *,
+    dias: int = 7,
+    max_pedidos: int = 300,
+) -> dict[str, Any]:
+    """
+    Envios Flex do seller prontos para coleta (shipment ready_to_ship + self_service),
+    com destinatário normalizado. Pedidos de um mesmo pack compartilham o shipment.
+    Lança LookupError/RuntimeError (conexão) ou requests.HTTPError (busca de pedidos).
+    """
+    from codigo_normalizer import normalize_codigo
+    from ml_int_envios_pure import (
+        ml_date_from,
+        ml_order_shipment_id,
+        ml_shipment_destinatario,
+        ml_shipment_logistic_type,
+        ml_shipment_pendente_coleta,
+    )
+
+    token = get_valid_access_token(db, user_id_ml, sub_base)
+    resumo = {"pedidos_lidos": 0, "envios_consultados": 0, "pendentes": 0, "ignorados": 0}
+    erros: list[dict[str, Any]] = []
+    pedidos_por_envio: dict[int, list[dict]] = {}
+
+    offset = 0
+    date_from = ml_date_from(dias)
+    while offset < max_pedidos:
+        page = fetch_orders_search(
+            token,
+            user_id_ml,
+            order_status="paid",
+            date_from=date_from,
+            offset=offset,
+            limit=ML_ORDERS_PAGE_SIZE,
+            sort="date_desc",
+            db=db,
+            sub_base=sub_base,
+        )
+        results = page.get("results") or []
+        for order in results:
+            resumo["pedidos_lidos"] += 1
+            sid = ml_order_shipment_id(order)
+            if sid:
+                pedidos_por_envio.setdefault(sid, []).append(order)
+        total = (page.get("paging") or {}).get("total", 0)
+        offset += ML_ORDERS_PAGE_SIZE
+        if not results or offset >= total:
+            break
+
+    envios: list[dict[str, Any]] = []
+    for sid, orders in pedidos_por_envio.items():
+        resumo["envios_consultados"] += 1
+        try:
+            ship = fetch_shipment(token, sid, db=db, user_id_ml=user_id_ml, sub_base=sub_base)
+        except requests.HTTPError as e:
+            erros.append({"shipment_id": sid, "erro": f"HTTP {e.response.status_code}"})
+            continue
+        except requests.RequestException as e:
+            erros.append({"shipment_id": sid, "erro": str(e)})
+            continue
+        if not ml_shipment_pendente_coleta(ship):
+            resumo["ignorados"] += 1
+            continue
+        resumo["pendentes"] += 1
+        codigo = normalize_codigo(str(sid), strict_qr=False)[0] or str(sid)
+        envios.append({
+            "shipment_id": sid,
+            "codigo": codigo,
+            "order_ids": [o.get("id") for o in orders],
+            "pack_id": orders[0].get("pack_id"),
+            "data_venda": orders[0].get("date_created"),
+            "status": ship.get("status"),
+            "substatus": ship.get("substatus"),
+            "logistic_type": ml_shipment_logistic_type(ship),
+            "tracking_number": ship.get("tracking_number"),
+            "itens": [i for o in orders for i in _order_itens(o)],
+            "destinatario": ml_shipment_destinatario(ship),
+        })
+
+    return {"seller_id": user_id_ml, "dias": dias, "resumo": resumo, "envios": envios, "erros": erros}
 
 
 def refresh_all_ml_int_tokens(db: Session) -> dict[str, int]:
