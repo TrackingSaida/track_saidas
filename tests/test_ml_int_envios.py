@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from ml_int_envios_pure import (
     campos_faltantes,
     destinatario_to_saida_detail_fields,
+    envio_fora_cobertura_resumo,
     ml_date_from,
     ml_geolocation_precisao,
     ml_order_shipment_id,
@@ -215,3 +216,67 @@ def test_sync_cria_saida_com_nome_do_seller_cadastrado(mock_listar, _exist):
     assert detail.coord_precision == "rooftop" and detail.geocoded_at is not None
     assert adicionados[2].evento == "ml_int_sync" and adicionados[2].user_id == 5
     db.commit.assert_called_once()
+
+
+def _envio(sid, cep, nome="Maria Silva"):
+    ship = _ship_new_format(id=sid)
+    ship["destination"]["receiver_name"] = nome
+    ship["destination"]["shipping_address"]["zip_code"] = cep
+    return {
+        "shipment_id": sid,
+        "codigo": str(sid),
+        "order_ids": [sid + 1],
+        "pack_id": None,
+        "destinatario": ml_shipment_destinatario(ship),
+    }
+
+
+def test_envio_fora_cobertura_resumo_usa_order_id_sem_pack():
+    resumo = envio_fora_cobertura_resumo(_envio(45000000001, "13000000", nome="João"))
+    assert resumo == {
+        "shipment_id": 45000000001,
+        "pack_id": 45000000002,
+        "comprador": "João",
+        "cep": "13000000",
+        "cidade": "São Paulo",
+        "estado": "São Paulo",
+    }
+
+
+@patch("cobertura_cep_service.list_prefixos_ativos", return_value=["010"])
+@patch("ml_int_service.saidas_existentes_por_shipment", return_value={})
+@patch("ml_int_service.listar_envios_flex_pendentes")
+def test_sync_rejeita_envio_fora_da_cobertura(mock_listar, _exist, _prefixos):
+    conexao = MagicMock(user_id_ml=111, user_nickname_ml="NICK", id_base=7)
+    db = _db_com_conexoes([conexao], MagicMock(base="Loja"))
+    db.get_bind.return_value.dialect.name = "sqlite"
+    mock_listar.return_value = {
+        "erros": [],
+        "envios": [_envio(45000000001, "01001000"), _envio(45000000003, "13000000"), _envio(45000000005, "")],
+    }
+
+    out = sync_envios_sub_base(db, "BASE")
+
+    seller = out["sellers"][0]
+    assert seller["criados"] == 1 and out["criados"] == 1
+    assert [f["shipment_id"] for f in seller["fora_cobertura"]] == [45000000003, 45000000005]
+    saidas = [c.args[0] for c in db.add.call_args_list if hasattr(c.args[0], "ml_shipment_id")]
+    assert [s.ml_shipment_id for s in saidas] == [45000000001]
+
+
+@patch("cobertura_cep_service.list_prefixos_ativos", return_value=[])
+@patch("ml_int_service.saidas_existentes_por_shipment", return_value={})
+@patch("ml_int_service.listar_envios_flex_pendentes")
+def test_sync_sem_cobertura_configurada_importa_tudo(mock_listar, _exist, _prefixos):
+    conexao = MagicMock(user_id_ml=111, user_nickname_ml="NICK", id_base=7)
+    db = _db_com_conexoes([conexao], MagicMock(base="Loja"))
+    db.get_bind.return_value.dialect.name = "sqlite"
+    mock_listar.return_value = {
+        "erros": [],
+        "envios": [_envio(45000000001, "01001000"), _envio(45000000003, "")],
+    }
+
+    out = sync_envios_sub_base(db, "BASE")
+
+    seller = out["sellers"][0]
+    assert seller["criados"] == 2 and seller["fora_cobertura"] == []

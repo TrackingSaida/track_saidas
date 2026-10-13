@@ -214,15 +214,22 @@ def _fetch_shop_name(
     "/auth-url",
     summary="Gera a URL para o seller autorizar a Shopee",
 )
-def gerar_auth_url(state: Optional[str] = Query(None, alias="state")):
+def gerar_auth_url(
+    state: Optional[str] = Query(None, alias="state"),
+    redirect: bool = Query(
+        False,
+        description="Se true, redireciona (302) para a Shopee. O link assinado da Shopee expira em minutos; "
+        "use este modo para enviar ao seller um link que não expira.",
+    ),
+):
     host, partner_id, partner_key, redirect_url, env = _get_shopee_config()
 
     # Se state (sub_base) vier preenchido, colocamos na URL de redirect para o callback receber
     state_val = (state or "").strip()
     if state_val:
-        redirect = redirect_url + ("&" if "?" in redirect_url else "?") + "state=" + quote(state_val, safe="")
+        callback = redirect_url + ("&" if "?" in redirect_url else "?") + "state=" + quote(state_val, safe="")
     else:
-        redirect = redirect_url
+        callback = redirect_url
 
     path = "/api/v2/shop/auth_partner"
     timestamp = int(time.time())
@@ -241,8 +248,10 @@ def gerar_auth_url(state: Optional[str] = Query(None, alias="state")):
         f"?partner_id={partner_id}"
         f"&timestamp={timestamp}"
         f"&sign={sign}"
-        f"&redirect={quote(redirect, safe='')}"
+        f"&redirect={quote(callback, safe='')}"
     )
+    if redirect:
+        return RedirectResponse(auth_url, status_code=302)
     return {"auth_url": auth_url}
 
 

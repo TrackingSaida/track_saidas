@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from auth import get_current_user
+from cobertura_cep_service import cep_coberto, list_prefixos_ativos
 from db import get_db
 from models import BasePreco, MLConexao, Owner, User
 from ml_int_envios_pure import ml_shipment_destinatario
@@ -395,15 +396,18 @@ def ml_int_envios_seller(
 ):
     """
     Prévia (somente leitura) dos envios Flex do seller prontos para coleta,
-    com destinatário normalizado e indicação se já existem no sistema.
+    com destinatário normalizado, indicação se já existem no sistema e se o CEP
+    está na cobertura da sub_base (sem cobertura configurada, todos são cobertos).
     """
     if user.role not in (0, 1):
         raise HTTPException(403, "Acesso restrito.")
     sub_base = getattr(user, "sub_base", None)
     data = _listar_pendentes_ou_http(db, user_id_ml, sub_base, dias=dias, max_pedidos=max_pedidos)
     ja_registrados = saidas_existentes_por_shipment(db, sub_base, data["envios"])
+    prefixos = list_prefixos_ativos(db, sub_base) if sub_base else []
     for envio in data["envios"]:
         envio["ja_registrado"] = envio["shipment_id"] in ja_registrados
+        envio["coberto"] = cep_coberto((envio.get("destinatario") or {}).get("cep"), prefixos)
     conexao = _conexao_da_sub_base(db, sub_base, user_id_ml)
     base_row = _base_vinculada(db, sub_base, conexao.id_base if conexao else None)
     data["vinculado"] = base_row is not None

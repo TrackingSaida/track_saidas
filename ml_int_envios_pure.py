@@ -118,6 +118,20 @@ def destinatario_to_saida_detail_fields(dest: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if v is not None}
 
 
+def envio_fora_cobertura_resumo(envio: dict[str, Any]) -> dict[str, Any]:
+    """Dados mínimos de um envio rejeitado por cobertura, para o operador avisar o seller."""
+    dest = envio.get("destinatario") or {}
+    order_ids = envio.get("order_ids") or []
+    return {
+        "shipment_id": envio.get("shipment_id"),
+        "pack_id": envio.get("pack_id") or (order_ids[0] if order_ids else None),
+        "comprador": dest.get("nome"),
+        "cep": dest.get("cep"),
+        "cidade": dest.get("cidade"),
+        "estado": dest.get("estado"),
+    }
+
+
 def campos_faltantes(atual: dict[str, Any], novos: dict[str, Any]) -> dict[str, Any]:
     """Somente os campos novos cujo valor atual está vazio (não sobrescreve dado existente)."""
     return {k: v for k, v in novos.items() if atual.get(k) in (None, "")}
