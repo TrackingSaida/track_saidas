@@ -430,6 +430,7 @@ class Saida(Base):
     ml_shipment_id = Column(BigInteger, nullable=True, index=True)  # vínculo envio ML (evita duplicata no auto-fill)
     ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
     ml_pack_id = Column(BigInteger, nullable=True)  # Pack ID exibido na etiqueta ML (quando a venda tem pack)
+    shopee_order_sn = Column(Text, nullable=True)  # nº do pedido Shopee; o código do pacote é o rastreio BR…
     is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande); espelha categoria_g_id
     categoria_g_id = Column(BigInteger, ForeignKey("pacote_g_categoria.id", ondelete="RESTRICT"), nullable=True)
     # Última marcação de tamanho (fora do saida_historico para não virar "última ação").
@@ -616,6 +617,8 @@ class ShopeeToken(Base):
     main_account_id = Column(BigInteger, nullable=True)
     sub_base = Column(Text, nullable=True)
     shop_name = Column(Text, nullable=True)  # nome da loja (Get Shop Info API)
+    # Seller cadastrado (tabela base); sem vínculo o sync não importa pedidos.
+    id_base = Column(BigInteger, ForeignKey("base.id_base", ondelete="SET NULL"), nullable=True, index=True)
 
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=True)

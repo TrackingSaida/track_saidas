@@ -365,8 +365,8 @@ def internal_refresh_tokens(request: Request):
 @app.post(f"{API_PREFIX}/internal/ml-sync-envios", tags=["Internal"])
 def internal_ml_sync_envios(request: Request):
     """
-    Sincroniza envios Flex ML prontos para coleta de todas as sub_bases com conta ML
-    vinculada a seller cadastrado. Protegido por X-Cron-Secret
+    Sincroniza envios Flex ML e pedidos Shopee (canal de entrega da base) prontos para coleta
+    de todas as sub_bases com conta vinculada a seller cadastrado. Protegido por X-Cron-Secret
     (CRON_ML_SYNC_SECRET, fallback CRON_REFRESH_SECRET).
     ML_SYNC_CRON_ENABLED=false desativa (ex.: homol com cópia dos tokens de produção).
     """
@@ -378,12 +378,23 @@ def internal_ml_sync_envios(request: Request):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     if os.getenv("ML_SYNC_CRON_ENABLED", "true").strip().lower() in ("0", "false", "no"):
         return {"status": "disabled"}
+    import time as _time
+
     from ml_int_service import sync_envios_todas_sub_bases
+    from shopee_int_service import sync_envios_todas_sub_bases as shopee_sync_todas_sub_bases
 
     max_runtime = int(os.getenv("ML_SYNC_MAX_RUNTIME_SECONDS", "240"))
+    inicio = _time.monotonic()
     db = SessionLocal()
     try:
-        return {"status": "ok", **sync_envios_todas_sub_bases(db, max_runtime_seconds=max_runtime)}
+        resultado = {"status": "ok", **sync_envios_todas_sub_bases(db, max_runtime_seconds=max_runtime)}
+        restante = max(max_runtime - int(_time.monotonic() - inicio), 0)
+        try:
+            resultado["shopee"] = shopee_sync_todas_sub_bases(db, max_runtime_seconds=restante)
+        except Exception as e:
+            db.rollback()
+            resultado["shopee"] = {"erro": str(e)[:200]}
+        return resultado
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
     finally:

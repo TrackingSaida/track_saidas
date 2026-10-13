@@ -141,6 +141,22 @@ Importa, para cada `sub_base`, os envios Flex (`self_service`) em `ready_to_ship
 
 Pré-requisitos: migrations `saidas_ml_pack_id.sql` e `ml_conexoes_id_base.sql` (ver `migrations/README.md`).
 
+Em ambas as integrações, com cobertura de CEP configurada em "Políticas gerais", pedido novo com CEP
+do destinatário fora da área é rejeitado (não importado) e listado em `fora_cobertura`; sem cobertura
+configurada, importa tudo.
+
+### Shopee
+
+O mesmo cron também importa pedidos Shopee (resposta em `shopee`) das lojas vinculadas a seller.
+Só entram pedidos `READY_TO_SHIP`/`PROCESSED` do canal de entrega da base (`SHOPEE_CANAIS_ENTREGA`,
+default `Entrega Direta`, vários separados por vírgula). O código do pacote é o rastreio `BR…` da
+etiqueta; o nº do pedido fica em `shopee_order_sn`. Pedido ainda sem rastreio não é importado e volta
+no próximo sync. Botão: `POST /api/shopee/sync-envios`; prévia: `GET /api/shopee/sellers/{shop_id}/envios`
+(mostra também `canais_encontrados`, útil para conferir o nome do canal).
+
+Pré-requisito: migration `shopee_sync_pedidos.sql`. O app Shopee precisa das permissões de API
+**Order** e **Logistics** no console.
+
 ### Endpoint interno
 
 - `POST /api/internal/ml-sync-envios`

@@ -78,6 +78,7 @@ ROTULOS_ACAO = {
     "criado_coleta": "Pacote coletado",
     "coleta": "Pacote coletado",
     "ml_int_sync": "Importado do Mercado Livre",
+    "shopee_int_sync": "Importado da Shopee",
     "base_transferida": "Transferiu base da coleta",
     "etiqueta_gerada": "Emitiu etiqueta",
     "etiqueta_cancelada": "Cancelou etiqueta",
