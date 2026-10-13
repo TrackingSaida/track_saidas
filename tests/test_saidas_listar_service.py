@@ -299,6 +299,56 @@ def test_listar_codigo_parcial_localizar_inclui_avulso_exists():
     assert "_localizar_avulso_variants" in src
     assert "Consulta mobile filtra por código no cliente; busca só em codigo." not in src
     assert "_orm_localizar_detail_exists" in src
+    assert "_orm_localizar_ml_id(localizar)" in src
+
+
+def test_localizar_ml_id_aceita_pack_id_com_mascara():
+    from saidas_listar_service import _localizar_ml_id
+
+    assert _localizar_ml_id("2000018897040202") == 2000018897040202
+    assert _localizar_ml_id(" 2000 0188 9704 0202 ") == 2000018897040202
+    assert _localizar_ml_id("2000-0188.9704-0202") == 2000018897040202
+
+
+def test_localizar_ml_id_ignora_texto_e_numero_curto_ou_longo():
+    from saidas_listar_service import _localizar_ml_id
+
+    assert _localizar_ml_id("") is None
+    assert _localizar_ml_id("Miguel") is None
+    assert _localizar_ml_id("05041-001") is None
+    assert _localizar_ml_id("MLB2000018897040202") is None
+    assert _localizar_ml_id("1" * 19) is None
+
+
+def test_sql_localizar_ml_id_compara_pack_e_order():
+    from saidas_listar_service import _sql_localizar_ml_id
+
+    params = {}
+    sql = _sql_localizar_ml_id("2000018897040202", params)
+    assert "s.ml_pack_id = :localizar_ml_id" in sql
+    assert "s.ml_order_id = :localizar_ml_id" in sql
+    assert params["localizar_ml_id"] == 2000018897040202
+
+    params = {}
+    assert _sql_localizar_ml_id("Miguel", params) == ""
+    assert "localizar_ml_id" not in params
+
+
+def test_orm_localizar_ml_id_compara_pack_e_order():
+    from saidas_listar_service import _orm_localizar_ml_id
+
+    cond = _orm_localizar_ml_id("2000018897040202")
+    sql = str(cond)
+    assert "ml_pack_id" in sql and "ml_order_id" in sql
+    assert _orm_localizar_ml_id("Miguel") is None
+
+
+def test_listar_paginado_e_candidatos_incluem_ml_id():
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1].joinpath("saidas_listar_service.py").read_text(encoding="utf-8")
+    assert "ml_id_sql = _sql_localizar_ml_id(localizar, params)" in src
+    assert "ml_id_cond = _orm_localizar_ml_id(localizar)" in src
 
 
 def test_sql_localizar_detail_exists_busca_destinatario():
