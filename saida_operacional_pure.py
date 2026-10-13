@@ -77,6 +77,7 @@ ROTULOS_ACAO = {
     "saida_reconferida": "Saída reconferida",
     "criado_coleta": "Pacote coletado",
     "coleta": "Pacote coletado",
+    "ml_int_sync": "Importado do Mercado Livre",
     "base_transferida": "Transferiu base da coleta",
     "etiqueta_gerada": "Emitiu etiqueta",
     "etiqueta_cancelada": "Cancelou etiqueta",
