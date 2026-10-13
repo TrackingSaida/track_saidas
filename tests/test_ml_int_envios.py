@@ -6,13 +6,15 @@ from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 from ml_int_envios_pure import (
+    campos_faltantes,
     destinatario_to_saida_detail_fields,
     ml_date_from,
+    ml_geolocation_precisao,
     ml_order_shipment_id,
     ml_shipment_destinatario,
     ml_shipment_pendente_coleta,
 )
-from ml_int_service import listar_envios_flex_pendentes
+from ml_int_service import listar_envios_flex_pendentes, sync_envios_sub_base
 
 
 def _ship_new_format(**kwargs):
@@ -36,6 +38,7 @@ def _ship_new_format(**kwargs):
                 "neighborhood": {"id": None, "name": "Centro"},
                 "latitude": -23.55,
                 "longitude": -46.63,
+                "geolocation_type": "ROOFTOP",
             },
         },
     }
@@ -97,7 +100,24 @@ def test_saida_detail_fields_sem_coordenadas_omite_lat_lng():
     com_coord = destinatario_to_saida_detail_fields(ml_shipment_destinatario(_ship_new_format()))
     assert com_coord["latitude"] == -23.55
     assert com_coord["endereco_origem"] == "mercado_livre"
+    assert com_coord["geocode_source"] == "mercado_livre"
+    assert com_coord["coord_precision"] == "rooftop"
     assert com_coord["dest_contato"] == "11999990000"
+
+
+def test_geolocation_precisao():
+    assert ml_geolocation_precisao("ROOFTOP") == "rooftop"
+    assert ml_geolocation_precisao("range_interpolated") == "street"
+    assert ml_geolocation_precisao("GEOMETRIC_CENTER") == "street"
+    assert ml_geolocation_precisao("APPROXIMATE") == "approx"
+    assert ml_geolocation_precisao(None) is None
+    assert ml_geolocation_precisao("OUTRO") is None
+
+
+def test_campos_faltantes_nao_sobrescreve():
+    atual = {"dest_nome": "Já tinha", "dest_rua": None, "dest_cep": ""}
+    novos = {"dest_nome": "ML", "dest_rua": "Rua X", "dest_cep": "01001000"}
+    assert campos_faltantes(atual, novos) == {"dest_rua": "Rua X", "dest_cep": "01001000"}
 
 
 def test_order_shipment_id_e_date_from():
@@ -139,4 +159,59 @@ def test_listar_pendentes_agrupa_pack_e_filtra(_tok, mock_search, mock_ship):
     assert envio["codigo"] == "45123456789"
     assert envio["order_ids"] == [1, 2]
     assert envio["itens"] == [{"titulo": "Camisa", "quantidade": 2}]
+    assert envio["pack_id"] == 9
     assert envio["destinatario"]["nome"] == "Maria Silva"
+
+
+def _db_com_conexoes(conexoes, base_row):
+    db = MagicMock()
+    q = db.query.return_value
+    q.filter.return_value = q
+    q.order_by.return_value.all.return_value = conexoes
+    db.scalar.return_value = base_row
+    return db
+
+
+@patch("ml_int_service.listar_envios_flex_pendentes")
+def test_sync_pula_conta_sem_vinculo(mock_listar):
+    conexao = MagicMock(user_id_ml=111, user_nickname_ml="NICK", id_base=None)
+    db = _db_com_conexoes([conexao], None)
+
+    out = sync_envios_sub_base(db, "BASE")
+
+    mock_listar.assert_not_called()
+    assert out["criados"] == 0
+    assert out["sellers"][0]["motivo"] == "sem_vinculo"
+
+
+@patch("ml_int_service.saidas_existentes_por_shipment", return_value={})
+@patch("ml_int_service.listar_envios_flex_pendentes")
+def test_sync_cria_saida_com_nome_do_seller_cadastrado(mock_listar, _exist):
+    conexao = MagicMock(user_id_ml=111, user_nickname_ml="NICK", id_base=7)
+    base_row = MagicMock(base="Loja do Seller ")
+    db = _db_com_conexoes([conexao], base_row)
+    db.get_bind.return_value.dialect.name = "sqlite"
+    mock_listar.return_value = {
+        "erros": [],
+        "envios": [{
+            "shipment_id": 45123456789,
+            "codigo": "45123456789",
+            "order_ids": [2000],
+            "pack_id": 9,
+            "destinatario": ml_shipment_destinatario(_ship_new_format()),
+        }],
+    }
+
+    out = sync_envios_sub_base(db, "BASE", user_id=5)
+
+    seller = out["sellers"][0]
+    assert seller["criados"] == 1 and seller["base_nome"] == "Loja do Seller"
+    adicionados = [c.args[0] for c in db.add.call_args_list]
+    saida = adicionados[0]
+    assert saida.base == "Loja do Seller"
+    assert saida.ml_pack_id == 9 and saida.ml_order_id == 2000
+    assert saida.status == "aguardando_coleta"
+    detail = adicionados[1]
+    assert detail.coord_precision == "rooftop" and detail.geocoded_at is not None
+    assert adicionados[2].evento == "ml_int_sync" and adicionados[2].user_id == 5
+    db.commit.assert_called_once()

@@ -33,6 +33,19 @@ def _coord(value: Any) -> Optional[float]:
     return num if num != 0 else None
 
 
+# geolocation_type do ML → coord_precision usado pelo app (rooftop | street | approx).
+_ML_GEO_PRECISAO = {
+    "ROOFTOP": "rooftop",
+    "RANGE_INTERPOLATED": "street",
+    "GEOMETRIC_CENTER": "street",
+    "APPROXIMATE": "approx",
+}
+
+
+def ml_geolocation_precisao(geolocation_type: Any) -> Optional[str]:
+    return _ML_GEO_PRECISAO.get(str(geolocation_type or "").strip().upper())
+
+
 def ml_shipment_logistic_type(ship: dict) -> Optional[str]:
     """Tipo logístico: `logistic.type` (x-format-new) ou `logistic_type` (formato antigo)."""
     logistic = ship.get("logistic")
@@ -75,6 +88,7 @@ def ml_shipment_destinatario(ship: dict) -> dict[str, Any]:
         "endereco": _texto(addr.get("address_line")),
         "latitude": _coord(addr.get("latitude")),
         "longitude": _coord(addr.get("longitude")),
+        "precisao": ml_geolocation_precisao(addr.get("geolocation_type")),
     }
 
 
@@ -96,10 +110,17 @@ def destinatario_to_saida_detail_fields(dest: dict[str, Any]) -> dict[str, Any]:
     }
     if fields["latitude"] is not None and fields["longitude"] is not None:
         fields["endereco_origem"] = "mercado_livre"
+        fields["geocode_source"] = "mercado_livre"
+        fields["coord_precision"] = dest.get("precisao")
     else:
         fields.pop("latitude")
         fields.pop("longitude")
     return {k: v for k, v in fields.items() if v is not None}
+
+
+def campos_faltantes(atual: dict[str, Any], novos: dict[str, Any]) -> dict[str, Any]:
+    """Somente os campos novos cujo valor atual está vazio (não sobrescreve dado existente)."""
+    return {k: v for k, v in novos.items() if atual.get(k) in (None, "")}
 
 
 def ml_order_shipment_id(order: Any) -> Optional[int]:

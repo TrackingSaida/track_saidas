@@ -1,5 +1,20 @@
 # Migrações
 
+## saidas_ml_pack_id.sql e ml_conexoes_id_base.sql
+
+**Obrigatórias antes** do deploy dos ajustes da integração Mercado Livre. Sem elas a API
+responde **500** no detalhe de saídas e nas rotas `/ml-int`, porque os modelos já usam
+`saidas.ml_pack_id` e `ml_conexoes.id_base`. Aditivas e idempotentes.
+
+- `saidas_ml_pack_id.sql`: Pack ID do ML na saída importada.
+- `ml_conexoes_id_base.sql`: vínculo da conta ML com o seller cadastrado (`base.id_base`);
+  conta sem vínculo não é importada pelo sync.
+
+```bash
+psql "$DATABASE_URL" -f migrations/saidas_ml_pack_id.sql
+psql "$DATABASE_URL" -f migrations/ml_conexoes_id_base.sql
+```
+
 ## pacote_g_categorias.sql
 
 **Obrigatória antes** do deploy das categorias de pacote grande (G1, G2…). Sem ela a API
