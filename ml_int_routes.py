@@ -228,6 +228,21 @@ def _base_vinculada(db: Session, sub_base: str | None, id_base: int | None) -> B
     )
 
 
+def _conta_ml_do_seller(
+    db: Session, sub_base: str | None, id_base: int, exceto_user_id_ml: int
+) -> MLConexao | None:
+    return (
+        db.query(MLConexao)
+        .filter(
+            MLConexao.sub_base == sub_base,
+            MLConexao.id_base == id_base,
+            MLConexao.user_id_ml != exceto_user_id_ml,
+        )
+        .order_by(MLConexao.criado_em.desc(), MLConexao.id.desc())
+        .first()
+    )
+
+
 class VinculoSellerIn(BaseModel):
     id_base: int | None = None
 
@@ -257,6 +272,22 @@ def ml_int_vincular_seller(
         base_row = _base_vinculada(db, sub_base, body.id_base)
         if base_row is None:
             raise HTTPException(404, "Seller cadastrado não encontrado nesta sub_base.")
+        conflito = _conta_ml_do_seller(db, sub_base, body.id_base, user_id_ml)
+        if conflito is not None:
+            nick = (conflito.user_nickname_ml or "").strip() or str(conflito.user_id_ml)
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "seller_ja_vinculado",
+                    "message": (
+                        f'O seller "{base_row.base}" já está vinculado à conta {nick} do Mercado Livre. '
+                        'Desvincule essa conta (selecione "Não associado") antes de vincular a esta.'
+                    ),
+                    "user_id_ml": conflito.user_id_ml,
+                    "nickname": nick,
+                    "base_nome": base_row.base,
+                },
+            )
     for c in conexoes:
         c.id_base = body.id_base
         c.atualizado_em = datetime.utcnow()
