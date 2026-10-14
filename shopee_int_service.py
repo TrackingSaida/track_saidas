@@ -229,12 +229,17 @@ def saidas_existentes_por_pedido(db: Session, sub_base: str, envios: list[dict])
 def _completar_saida_existente(db: Session, saida: Any, envio: dict, detail_fields: dict) -> bool:
     """Preenche nº do pedido Shopee e destinatário que faltam numa saída já registrada (não sobrescreve)."""
     from models import SaidaDetail
-    from ml_int_envios_pure import campos_faltantes
+    from ml_int_envios_pure import campos_faltantes, data_venda_local
 
     alterou = False
     if not saida.shopee_order_sn:
         saida.shopee_order_sn = envio["order_sn"]
         alterou = True
+    if saida.data_venda is None:
+        data_venda = data_venda_local(envio.get("data_venda"))
+        if data_venda is not None:
+            saida.data_venda = data_venda
+            alterou = True
     detail = db.scalar(
         select(SaidaDetail)
         .where(SaidaDetail.id_saida == saida.id_saida)
@@ -267,7 +272,7 @@ def sync_envios_sub_base(
     """
     from cobertura_cep_service import cep_coberto, list_prefixos_ativos
     from models import BasePreco, Saida, SaidaDetail, SaidaHistorico
-    from ml_int_envios_pure import destinatario_to_saida_detail_fields
+    from ml_int_envios_pure import data_venda_local, destinatario_to_saida_detail_fields
     from shopee_envios_pure import shopee_fora_cobertura_resumo
 
     prefixos_cobertura = list_prefixos_ativos(db, sub_base)
@@ -358,6 +363,7 @@ def sync_envios_sub_base(
                             servico="Shopee",
                             status="aguardando_coleta",
                             shopee_order_sn=sn,
+                            data_venda=data_venda_local(envio.get("data_venda")),
                             base=base_nome,
                         )
                         db.add(nova)

@@ -321,6 +321,9 @@ class SaidaDetalheCompletoOut(BaseModel):
     ml_pack_id: Optional[int] = None
     shopee_order_sn: Optional[str] = None
     plataforma_cancelado_em: Optional[datetime] = None
+    data_venda: Optional[datetime] = None
+    # Conta ML/loja Shopee vinculada ao seller (base) da saída, na mesma sub_base.
+    conta_nickname: Optional[str] = None
     detail: Optional[SaidaDetailOut] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -2739,9 +2742,43 @@ def get_saida_detalhe(
         ml_pack_id=obj.ml_pack_id,
         shopee_order_sn=obj.shopee_order_sn,
         plataforma_cancelado_em=obj.plataforma_cancelado_em,
+        data_venda=obj.data_venda,
+        conta_nickname=_conta_nickname_seller(db, obj),
         detail=detail_out,
         **_categoria_g_detalhe(db, obj),
     )
+
+
+def _conta_nickname_seller(db: Session, obj: Saida) -> Optional[str]:
+    """Nickname da conta ML (ou nome da loja Shopee) vinculada ao seller da saída."""
+    from models import BasePreco, MLConexao, ShopeeToken
+
+    base_nome = (obj.base or "").strip().upper()
+    sub_base = (obj.sub_base or "").strip()
+    if not base_nome or not sub_base or not (obj.ml_shipment_id or obj.shopee_order_sn):
+        return None
+    id_base = db.scalar(
+        select(BasePreco.id_base)
+        .where(BasePreco.sub_base == sub_base, func.upper(func.trim(BasePreco.base)) == base_nome)
+        .limit(1)
+    )
+    if id_base is None:
+        return None
+    if obj.ml_shipment_id:
+        nome = db.scalar(
+            select(MLConexao.user_nickname_ml)
+            .where(MLConexao.sub_base == sub_base, MLConexao.id_base == id_base)
+            .order_by(MLConexao.criado_em.desc())
+            .limit(1)
+        )
+    else:
+        nome = db.scalar(
+            select(ShopeeToken.shop_name)
+            .where(ShopeeToken.sub_base == sub_base, ShopeeToken.id_base == id_base)
+            .order_by(ShopeeToken.criado_em.desc())
+            .limit(1)
+        )
+    return (nome or "").strip() or None
 
 
 def _categoria_g_detalhe(db: Session, obj: Saida) -> Dict[str, Any]:

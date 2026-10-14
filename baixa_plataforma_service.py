@@ -35,6 +35,13 @@ def _utcnow() -> datetime:
     return datetime.utcnow()
 
 
+def _agora_local() -> datetime:
+    """Horário de Brasília sem fuso, padrão das colunas exibidas na web."""
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
+
+
 def _contagem_vazia() -> dict[str, int]:
     return {"conferidos": 0, "entregues": 0, "cancelados": 0, "sinalizados": 0}
 
@@ -80,11 +87,11 @@ def aplicar_baixa(db: Session, saida: Saida, final: Optional[str], plataforma: s
     acao = acao_baixa(atual.status, final, ja_sinalizado=atual.plataforma_cancelado_em is not None)
     if acao is None:
         return None
-    agora = _utcnow()
+    agora = _agora_local()
     anterior = atual.status
     if acao == ACAO_ENTREGAR:
         atual.status = "entregue"
-        atual.data_hora_entrega = agora
+        atual.data_hora_entrega = _utcnow()
         evento = "entregue"
     elif acao == ACAO_CANCELAR:
         atual.status = "cancelado"

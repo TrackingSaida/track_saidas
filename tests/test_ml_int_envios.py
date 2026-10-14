@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from ml_int_envios_pure import (
     campos_faltantes,
+    data_venda_local,
     destinatario_to_saida_detail_fields,
     envio_fora_cobertura_resumo,
     ml_date_from,
@@ -280,3 +281,13 @@ def test_sync_sem_cobertura_configurada_importa_tudo(mock_listar, _exist, _prefi
 
     seller = out["sellers"][0]
     assert seller["criados"] == 2 and seller["fora_cobertura"] == []
+
+
+def test_data_venda_local_converte_para_brasilia():
+    assert data_venda_local("2026-10-13T12:42:05.000-04:00") == datetime(2026, 10, 13, 13, 42, 5)
+    assert data_venda_local("2026-10-13T15:00:00Z") == datetime(2026, 10, 13, 12, 0, 0)
+    assert data_venda_local(1791900000) == datetime(2026, 10, 13, 11, 0, 0)
+    assert data_venda_local("1791900000") == datetime(2026, 10, 13, 11, 0, 0)
+    assert data_venda_local(None) is None
+    assert data_venda_local("") is None
+    assert data_venda_local("invalida") is None
