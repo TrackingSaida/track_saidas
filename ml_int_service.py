@@ -602,10 +602,15 @@ def sync_envios_sub_base(
     Importa envios Flex prontos para coleta dos sellers ML vinculados da sub_base:
     cria Saida (aguardando_coleta) + SaidaDetail (destinatário/coordenada) e completa
     dados ML faltantes de saídas já registradas. Conta sem vínculo com seller é pulada.
+    Com cobertura de CEP configurada na sub_base, envio novo fora da área é rejeitado
+    (não importado) e listado em "fora_cobertura"; sem cobertura configurada, importa tudo.
     Usado pelo POST /ml-int/sync-envios e pelo cron interno.
     """
+    from cobertura_cep_service import cep_coberto, list_prefixos_ativos
     from models import BasePreco, Saida, SaidaDetail, SaidaHistorico
-    from ml_int_envios_pure import destinatario_to_saida_detail_fields
+    from ml_int_envios_pure import destinatario_to_saida_detail_fields, envio_fora_cobertura_resumo
+
+    prefixos_cobertura = list_prefixos_ativos(db, sub_base)
 
     q = db.query(MLConexao).filter(MLConexao.sub_base == sub_base)
     if user_id_ml is not None:
@@ -629,6 +634,7 @@ def sync_envios_sub_base(
             "criados": 0,
             "ja_registrados": 0,
             "atualizados": 0,
+            "fora_cobertura": [],
             "erros": [],
         }
         sellers.append(seller)
@@ -689,6 +695,9 @@ def sync_envios_sub_base(
                     except Exception as e:
                         seller["erros"].append({"shipment_id": sid, "erro": str(e)[:200]})
                     continue
+                if not cep_coberto((envio.get("destinatario") or {}).get("cep"), prefixos_cobertura):
+                    seller["fora_cobertura"].append(envio_fora_cobertura_resumo(envio))
+                    continue
                 order_ids = envio.get("order_ids") or []
                 try:
                     with db.begin_nested():
@@ -731,6 +740,14 @@ def sync_envios_sub_base(
             seller["erros"].append({"erro": f"Falha ao gravar: {str(e)[:200]}"})
             continue
         total_criados += seller["criados"]
+        if seller["fora_cobertura"]:
+            logger.info(
+                "ml_int_sync: sub_base=%s user_id_ml=%s rejeitados_fora_cobertura=%s shipments=%s",
+                sub_base,
+                conexao.user_id_ml,
+                len(seller["fora_cobertura"]),
+                [f["shipment_id"] for f in seller["fora_cobertura"]],
+            )
 
     return {"sub_base": sub_base, "criados": total_criados, "dias": dias, "sellers": sellers}
 

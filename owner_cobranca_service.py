@@ -16,6 +16,7 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from pedido_sincronizado import SQL_SINCRONIZADO_NAO_COLETADO
 from owner_cobranca_engine import (
     AJUSTE_PERIODO_TIPOS,
     AJUSTE_TIPOS,
@@ -260,6 +261,8 @@ _SQL_EVENTOS = text(
      WHERE s.sub_base = :sb
        AND s.codigo IN (SELECT codigo FROM codigos)
     """
+    # Pedido sincronizado (ML/Shopee) nunca coletado não é cobrado do owner.
+    + "   AND NOT " + SQL_SINCRONIZADO_NAO_COLETADO + "\n"
 )
 
 _SQL_MANUAIS = text(

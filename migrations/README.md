@@ -1,5 +1,19 @@
 # Migrações
 
+## shopee_sync_pedidos.sql
+
+**Obrigatória antes** do deploy do sync de pedidos Shopee. Sem ela a API responde **500**
+no detalhe de saídas e nas rotas `/shopee`, porque os modelos já usam `shopee_tokens.id_base`
+e `saidas.shopee_order_sn`. Aditiva e idempotente.
+
+- `shopee_tokens.id_base`: vínculo da loja Shopee com o seller cadastrado; loja sem vínculo
+  não é importada pelo sync.
+- `saidas.shopee_order_sn`: nº do pedido Shopee (o código do pacote é o rastreio `BR…`).
+
+```bash
+psql "$DATABASE_URL" -f migrations/shopee_sync_pedidos.sql
+```
+
 ## saidas_ml_pack_id.sql e ml_conexoes_id_base.sql
 
 **Obrigatórias antes** do deploy dos ajustes da integração Mercado Livre. Sem elas a API
