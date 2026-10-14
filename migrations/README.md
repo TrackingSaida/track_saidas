@@ -1,5 +1,17 @@
 # Migrações
 
+## saidas_data_venda.sql
+
+**Obrigatória antes** do deploy da data da venda no detalhe. Sem ela a API responde **500**
+nas listagens e no detalhe de saídas, porque o modelo já usa a coluna. Aditiva e idempotente.
+
+- `saidas.data_venda`: data da venda no ML/Shopee (horário de Brasília), gravada pelo sync na
+  importação e completada em pedidos pendentes já importados.
+
+```bash
+psql "$DATABASE_URL" -f migrations/saidas_data_venda.sql
+```
+
 ## saidas_plataforma_cancelado_em.sql
 
 **Obrigatória antes** do deploy da baixa automática de pedidos sincronizados. Sem ela a API

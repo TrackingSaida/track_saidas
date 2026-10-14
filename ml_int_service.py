@@ -635,11 +635,14 @@ def _completar_saida_existente(db: Session, saida: Any, envio: dict, detail_fiel
     from models import SaidaDetail
     from ml_int_envios_pure import campos_faltantes
 
+    from ml_int_envios_pure import data_venda_local
+
     order_ids = envio.get("order_ids") or []
     ml_novos = {
         "ml_shipment_id": envio["shipment_id"],
         "ml_order_id": order_ids[0] if order_ids else None,
         "ml_pack_id": envio.get("pack_id"),
+        "data_venda": data_venda_local(envio.get("data_venda")),
     }
     ml_atual = {k: getattr(saida, k) for k in ml_novos}
     alterou = False
@@ -684,7 +687,7 @@ def sync_envios_sub_base(
     """
     from cobertura_cep_service import cep_coberto, list_prefixos_ativos
     from models import BasePreco, Saida, SaidaDetail, SaidaHistorico
-    from ml_int_envios_pure import destinatario_to_saida_detail_fields, envio_fora_cobertura_resumo
+    from ml_int_envios_pure import data_venda_local, destinatario_to_saida_detail_fields, envio_fora_cobertura_resumo
 
     prefixos_cobertura = list_prefixos_ativos(db, sub_base)
 
@@ -785,6 +788,7 @@ def sync_envios_sub_base(
                             ml_shipment_id=sid,
                             ml_order_id=order_ids[0] if order_ids else None,
                             ml_pack_id=envio.get("pack_id"),
+                            data_venda=data_venda_local(envio.get("data_venda")),
                             base=base_nome,
                         )
                         db.add(nova)
