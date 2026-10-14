@@ -320,6 +320,7 @@ class SaidaDetalheCompletoOut(BaseModel):
     ml_order_id: Optional[int] = None
     ml_pack_id: Optional[int] = None
     shopee_order_sn: Optional[str] = None
+    plataforma_cancelado_em: Optional[datetime] = None
     detail: Optional[SaidaDetailOut] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -2737,6 +2738,7 @@ def get_saida_detalhe(
         ml_order_id=obj.ml_order_id,
         ml_pack_id=obj.ml_pack_id,
         shopee_order_sn=obj.shopee_order_sn,
+        plataforma_cancelado_em=obj.plataforma_cancelado_em,
         detail=detail_out,
         **_categoria_g_detalhe(db, obj),
     )

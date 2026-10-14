@@ -98,6 +98,32 @@ def apply_qr_payload_if_needed(
     return {"updated": updated, "alerta": alerta}
 
 
+_ZPL_CAMPO = re.compile(r"(\^FH[^\^]*)?\^FD(.*?)\^FS", re.DOTALL)
+_ZPL_PREFIXO_QR = re.compile(r"^[A-Z]{2},")
+def _zpl_decodificar_hex(conteudo: str, indicador: str) -> str:
+    padrao = re.escape(indicador or "_") + r"([0-9A-Fa-f]{2})"
+    return re.sub(padrao, lambda h: chr(int(h.group(1), 16)), conteudo)
+
+
+def extrair_qr_ml_de_zpl(zpl: Optional[str], shipment_id: Any) -> Optional[str]:
+    """JSON do QR da etiqueta oficial ML (^FD…^FS) do envio informado; None se não houver."""
+    import json
+
+    for m in _ZPL_CAMPO.finditer(zpl or ""):
+        conteudo = _ZPL_PREFIXO_QR.sub("", m.group(2).strip())
+        if m.group(1):
+            conteudo = _zpl_decodificar_hex(conteudo, m.group(1)[3:4])
+        if not is_ml_qr_completo(conteudo):
+            continue
+        try:
+            dados = json.loads(conteudo)
+        except ValueError:
+            continue
+        if isinstance(dados, dict) and str(dados.get("id") or "").strip() == str(shipment_id):
+            return conteudo
+    return None
+
+
 def qr_flags_for_response(result: dict) -> dict:
     """Campos opcionais backward-compatible para respostas de leitura."""
     out: dict = {}
