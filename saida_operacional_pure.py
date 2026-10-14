@@ -44,6 +44,7 @@ EVENTOS_UI_ULTIMA_ACAO = {
     "saida_reconferida",
     "criado_coleta",
     "coleta",
+    "cancelado_plataforma",
 }
 
 ROTULOS_ACAO = {
@@ -79,6 +80,7 @@ ROTULOS_ACAO = {
     "coleta": "Pacote coletado",
     "ml_int_sync": "Importado do Mercado Livre",
     "shopee_int_sync": "Importado da Shopee",
+    "cancelado_plataforma": "Cancelado na plataforma: verificar devolução",
     "base_transferida": "Transferiu base da coleta",
     "etiqueta_gerada": "Emitiu etiqueta",
     "etiqueta_cancelada": "Cancelou etiqueta",
