@@ -16,19 +16,34 @@ from typing import Any, Dict, List, Optional
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
-from reportlab.platypus import Table, TableStyle
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from models import EntregadorFechamento, EntregadorFechamentoColetaItem, Saida
+from etiqueta_identidade_service import (
+    fit_logo_image,
+    resolver_logo_owner,
+    resolver_nome_exibicao,
+    resolver_slogan,
+)
+from models import EntregadorFechamento, EntregadorFechamentoColetaItem, Owner, Saida
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 from upload_storage_utils import B2_BUCKET_NAME, b2_configured, get_s3_client_optional
 from fechamento_resumo_utils import agregar_resumo_fechamento
 
 logger = logging.getLogger(__name__)
 
-COR_HEADER = colors.Color(74 / 255, 46 / 255, 127 / 255)
+COR_FAIXA = colors.Color(27 / 255, 27 / 255, 27 / 255)
+COR_INK = colors.Color(27 / 255, 27 / 255, 27 / 255)
+COR_MUTED = colors.Color(109 / 255, 109 / 255, 109 / 255)
+COR_ZERO = colors.Color(154 / 255, 154 / 255, 154 / 255)
+COR_LINE = colors.Color(233 / 255, 233 / 255, 233 / 255)
+COR_HEADER = COR_FAIXA
+_MESES = (
+    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+)
 STATUS_LABELS = {
     "PENDENTE": "PENDENTE",
     "GERADO": "GERADO",
@@ -75,6 +90,71 @@ def _fmt_date(d) -> str:
 def _normalize_status(status: Optional[str]) -> str:
     key = (status or "PENDENTE").upper()
     return STATUS_LABELS.get(key, key)
+
+
+def _status_amigavel(status: Optional[str]) -> str:
+    key = _normalize_status(status)
+    return {
+        "PAGO": "Pago",
+        "GERADO": "Gerado",
+        "REAJUSTADO": "Reajustado",
+        "PENDENTE": "Pendente",
+    }.get(key, key[:1].upper() + key[1:].lower() if key else "Pendente")
+
+
+def _fmt_pix(chave: Optional[str]) -> str:
+    raw = (chave or "").strip()
+    if not raw:
+        return ""
+    digits = "".join(c for c in raw if c.isdigit())
+    if digits == raw and len(digits) == 11:
+        return f"{digits[:2]} {digits[2:7]}-{digits[7:]}"
+    if digits == raw and len(digits) == 10:
+        return f"{digits[:2]} {digits[2:6]}-{digits[6:]}"
+    return raw
+
+
+def _fmt_periodo(ini, fim) -> str:
+    if ini and fim and getattr(ini, "year", None) and ini.year == fim.year and ini.month == fim.month:
+        return f"{ini.day} a {fim.day} de {_MESES[ini.month - 1]} de {ini.year}"
+    return f"{_fmt_date(ini)} a {_fmt_date(fim)}"
+
+
+def _curto(txt: Optional[str], n: int = 46) -> str:
+    s = " ".join((txt or "").split())
+    if not s:
+        return ""
+    if len(s) <= n:
+        return s
+    return s[: n - 3].rstrip() + "..."
+
+
+def _identidade_sub_base(db: Optional[Session], sub_base: Optional[str]) -> Dict[str, Any]:
+    sub = (sub_base or "").strip()
+    owner = None
+    if db is not None and sub:
+        owner = db.scalar(select(Owner).where(Owner.sub_base == sub))
+    if owner is None:
+        return {"nome": sub or "ROTEVO", "slogan": "", "logo": None}
+    return {
+        "nome": resolver_nome_exibicao(owner),
+        "slogan": resolver_slogan(owner),
+        "logo": resolver_logo_owner(owner),
+    }
+
+
+def _logo_reader(logo_bytes: Optional[bytes]) -> Optional[tuple]:
+    if not logo_bytes:
+        return None
+    fitted = fit_logo_image(logo_bytes, max_width=640, max_height=240)
+    if fitted is None:
+        return None
+    buf = io.BytesIO()
+    fitted.save(buf, format="PNG")
+    buf.seek(0)
+    reader = ImageReader(buf)
+    reader._saida_buf = buf
+    return reader, fitted.width, fitted.height
 
 
 def build_fechamento_code(fech: EntregadorFechamento) -> str:
@@ -259,31 +339,329 @@ def montar_resumo_fechamento(db: Session, fech: EntregadorFechamento) -> Dict[st
     return resumo
 
 
-def _draw_table(c: canvas.Canvas, data: List[List[str]], x: float, y: float, col_widths: List[float]) -> float:
-    """Desenha tabela e retorna y final (abaixo da tabela)."""
-    table = Table(data, colWidths=col_widths, repeatRows=1)
-    table.setStyle(
-        TableStyle(
+def _render_fechamento_pdf(**p) -> bytes:
+    """Folha A4 paisagem: faixa da sub_base e cartão com o total a pagar."""
+    buf = io.BytesIO()
+    page = landscape(A4)
+    c = canvas.Canvas(buf, pagesize=page)
+    page_w, page_h = page
+    margem = 12 * mm
+    faixa_h = 20 * mm
+    rodape_h = 12 * mm
+    logo_info = _logo_reader(p.get("logo"))
+
+    def faixa(continuacao: bool = False) -> float:
+        if continuacao:
+            c.showPage()
+        c.setFillColor(COR_FAIXA)
+        c.rect(0, page_h - faixa_h, page_w, faixa_h, fill=1, stroke=0)
+        x = margem
+        if logo_info:
+            reader, iw, ih = logo_info
+            max_w, max_h = 32 * mm, 11 * mm
+            aspect = iw / float(ih or 1)
+            if (max_w / max_h) > aspect:
+                draw_h = max_h
+                draw_w = max_h * aspect
+            else:
+                draw_w = max_w
+                draw_h = max_w / aspect
+            pad = 1.1 * mm
+            chip_w = draw_w + pad * 2
+            chip_h = draw_h + pad * 2
+            chip_y = page_h - faixa_h / 2 - chip_h / 2
+            c.setFillColor(colors.white)
+            c.roundRect(x, chip_y, chip_w, chip_h, 1.3 * mm, fill=1, stroke=0)
+            c.drawImage(reader, x + pad, chip_y + pad, draw_w, draw_h, mask="auto")
+            x += chip_w + 3 * mm
+        nome = (p.get("emitente") or "ROTEVO").strip()
+        limite = page_w - margem - 72 * mm - x
+        c.setFont("Helvetica-Bold", 9)
+        while nome and c.stringWidth(nome, "Helvetica-Bold", 9) > limite and len(nome) > 12:
+            nome = nome[:-4].rstrip() + "..."
+        c.setFillColor(colors.white)
+        c.drawString(x, page_h - 8 * mm, nome)
+        slogan = (p.get("slogan") or "").strip()
+        if slogan:
+            c.setFillColor(colors.Color(0.86, 0.86, 0.86))
+            c.setFont("Helvetica", 8)
+            c.drawString(x, page_h - 12.6 * mm, _curto(slogan, 70))
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawRightString(page_w - margem, page_h - 7.4 * mm, "Fechamento de entregas")
+        c.setFont("Helvetica", 8)
+        c.drawRightString(page_w - margem, page_h - 11.4 * mm, str(p.get("codigo") or ""))
+        chip = (p.get("status_label") or "").upper()
+        c.setFont("Helvetica", 7)
+        chip_w = c.stringWidth(chip, "Helvetica", 7) + 3.4 * mm
+        chip_x = page_w - margem - chip_w
+        chip_y = page_h - 16.6 * mm
+        c.setStrokeColor(colors.white)
+        c.setLineWidth(0.6)
+        c.roundRect(chip_x, chip_y, chip_w, 3.5 * mm, 0.9 * mm, fill=0, stroke=1)
+        c.setFillColor(colors.white)
+        c.drawCentredString(chip_x + chip_w / 2, chip_y + 1.05 * mm, chip)
+        return page_h - faixa_h - 6 * mm
+
+    def rodape() -> None:
+        c.setFillColor(COR_MUTED)
+        c.setFont("Helvetica", 7.5)
+        esquerda = f"{p.get('codigo') or ''} · {p.get('status_label') or ''} · Gerado em {p.get('gerado_em') or ''}"
+        c.drawString(margem, 6 * mm, esquerda[:120])
+        direita = f"Emitido por {p.get('emitente') or 'ROTEVO'} · via ROTEVO"
+        c.drawRightString(page_w - margem, 6 * mm, direita[:88])
+
+    y = faixa(False)
+
+    def precisa(altura: float) -> bool:
+        nonlocal y
+        if y - altura >= rodape_h + 2 * mm:
+            return False
+        rodape()
+        y = faixa(True)
+        return True
+
+    card_w = 58 * mm
+    card_h = 18 * mm
+    card_x = page_w - margem - card_w
+    card_top = y
+    c.setStrokeColor(colors.Color(0.90, 0.90, 0.90))
+    c.setFillColor(colors.white)
+    c.setLineWidth(0.7)
+    c.roundRect(card_x, card_top - card_h, card_w, card_h, 4.2 * mm, fill=1, stroke=1)
+    c.setFillColor(COR_MUTED)
+    c.setFont("Helvetica", 7)
+    c.drawRightString(card_x + card_w - 4 * mm, card_top - 5.2 * mm, "TOTAL A PAGAR")
+    c.setFillColor(COR_INK)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawRightString(card_x + card_w - 4 * mm, card_top - 12 * mm, _fmt_brl(p.get("valor_final")))
+
+    c.setFillColor(COR_MUTED)
+    c.setFont("Helvetica", 7)
+    c.drawString(margem, y - 1 * mm, "ENTREGADOR")
+    c.setFillColor(COR_INK)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(margem, y - 6.2 * mm, str(p.get("entregador") or "—")[:42])
+    c.setFont("Helvetica", 8)
+    if p.get("pix"):
+        c.drawString(margem, y - 10.4 * mm, f"PIX {p['pix']}")
+    c.drawString(margem, y - 14.4 * mm, str(p.get("periodo") or ""))
+    y = card_top - card_h - 5 * mm
+
+    kpis = [
+        ("FEITOS", str(int(p.get("feitos") or 0))),
+        ("CANCELADOS", str(int(p.get("cancelados") or 0))),
+        ("PACOTES G", str(int(p.get("pacotes_g") or 0))),
+        ("AJUSTES", _fmt_signed(p.get("ajustes") or 0)),
+    ]
+    col_w = (page_w - 2 * margem) / 4
+    for i, (rotulo, valor) in enumerate(kpis):
+        x = margem + i * col_w
+        if i:
+            c.setStrokeColor(COR_LINE)
+            c.setLineWidth(0.4)
+            c.line(x, y - 8 * mm, x, y + 1.2 * mm)
+        recuo = 2.4 * mm if i else 0
+        c.setFillColor(COR_MUTED)
+        c.setFont("Helvetica", 7)
+        c.drawString(x + recuo, y, rotulo)
+        c.setFillColor(COR_ZERO if valor == "0" else COR_INK)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(x + recuo, y - 5 * mm, valor)
+    y -= 12 * mm
+
+    cabecalhos = ["DATA", "FLEX", "SHOPEE", "AVULSO", "G", "FEITOS", "CANC.", "VALOR"]
+    pesos = [1.55, 0.8, 0.95, 0.9, 0.6, 0.85, 0.8, 1.25]
+    util = page_w - 2 * margem
+    larguras = [util * peso / sum(pesos) for peso in pesos]
+
+    def linha_cabecalho() -> None:
+        nonlocal y
+        precisa(8 * mm)
+        c.setFillColor(COR_INK)
+        c.setFont("Helvetica-Bold", 7)
+        x = margem
+        for rotulo, largura in zip(cabecalhos, larguras):
+            if rotulo == "DATA":
+                c.drawString(x, y, rotulo)
+            else:
+                c.drawRightString(x + largura - 1 * mm, y, rotulo)
+            x += largura
+        y -= 1.5 * mm
+        c.setStrokeColor(COR_FAIXA)
+        c.setLineWidth(1)
+        c.line(margem, y, page_w - margem, y)
+        y -= 4 * mm
+
+    def linha_dados(celulas: List[str], negrito: bool = False) -> None:
+        nonlocal y
+        if precisa(6.5 * mm):
+            linha_cabecalho()
+        c.setFont("Helvetica-Bold" if negrito else "Helvetica", 8)
+        x = margem
+        for i, (texto, largura) in enumerate(zip(celulas, larguras)):
+            bruto = str(texto)
+            c.setFillColor(COR_ZERO if bruto == "0" else COR_INK)
+            if i == 0:
+                c.drawString(x, y, bruto)
+            else:
+                c.drawRightString(x + largura - 1 * mm, y, bruto)
+            x += largura
+        y -= 1.3 * mm
+        c.setStrokeColor(COR_LINE)
+        c.setLineWidth(0.3)
+        c.line(margem, y, page_w - margem, y)
+        y -= 3.3 * mm
+
+    linhas = list(p.get("linhas") or [])
+    linha_cabecalho()
+    if not linhas:
+        linha_dados(["—", "0", "0", "0", "0", "0", "0", _fmt_brl(0)])
+    for item in linhas:
+        linha_dados(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), COR_HEADER),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("GRID", (0, 0), (-1, -1), 0.3, colors.Color(0.7, 0.7, 0.7)),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
-                ("ALIGN", (0, 0), (0, -1), "LEFT"),
+                _fmt_date(item["data"]),
+                str(item["flex"]),
+                str(item["shopee"]),
+                str(item["avulso"]),
+                str(item["g_total"]),
+                str(item["total_feitos"]),
+                str(item["total_cancelado"]),
+                _fmt_brl(item["valor_feitos"]),
             ]
         )
+    linha_dados(
+        [
+            "Período",
+            str(sum(int(item["flex"]) for item in linhas)),
+            str(sum(int(item["shopee"]) for item in linhas)),
+            str(sum(int(item["avulso"]) for item in linhas)),
+            str(int(p.get("pacotes_g") or 0)),
+            str(int(p.get("feitos") or 0)),
+            str(int(p.get("cancelados") or 0)),
+            _fmt_brl(p.get("valor_feitos")),
+        ],
+        negrito=True,
     )
-    w, h = table.wrap(sum(col_widths), 500)
-    table.drawOn(c, x, y - h)
-    return y - h
+
+    coletas = list(p.get("coletas") or [])
+    if coletas:
+        if precisa(16 * mm):
+            pass
+        c.setFillColor(COR_INK)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(margem, y, "Diárias de coleta")
+        y -= 5 * mm
+        for item in coletas:
+            if precisa(6 * mm):
+                c.setFillColor(COR_INK)
+                c.setFont("Helvetica-Bold", 9)
+                c.drawString(margem, y, "Diárias de coleta")
+                y -= 5 * mm
+            c.setFont("Helvetica", 8)
+            c.setFillColor(COR_INK)
+            c.drawString(margem, y, _fmt_date(item["data"]))
+            bases = ", ".join(item.get("bases") or []) or "—"
+            c.drawString(margem + 28 * mm, y, _curto(bases, 70))
+            c.drawRightString(page_w - margem, y, _fmt_brl(item.get("valor")))
+            y -= 4.4 * mm
+        y -= 2 * mm
+
+    if precisa(36 * mm):
+        pass
+    c.setFillColor(COR_INK)
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(margem, y, "Composição")
+    c.drawString(margem + util * 0.56, y, "Como o valor foi fechado")
+    y -= 5 * mm
+    comp_top = y
+    comp = [("Entregas", _fmt_brl(p.get("valor_feitos")))]
+    if Decimal(str(p.get("valor_g") or 0)) > 0:
+        comp.append(("inclui adicional de pacotes grandes", _fmt_brl(p.get("valor_g"))))
+    comp.append(
+        (
+            f"Diárias de coleta ({int(p.get('qtd_dias_coleta') or 0)} dias)",
+            _fmt_brl(p.get("valor_coletas")),
+        )
+    )
+    if Decimal(str(p.get("adicao") or 0)) > 0:
+        motivo = _curto(p.get("motivo_adicao") or "", 36)
+        comp.append((f"Acréscimo · {motivo}" if motivo else "Acréscimo", _fmt_signed(p.get("adicao"))))
+    if Decimal(str(p.get("subtracao") or 0)) > 0:
+        motivo = _curto(p.get("motivo_subtracao") or "", 36)
+        comp.append(
+            (
+                f"Desconto · {motivo}" if motivo else "Desconto",
+                _fmt_signed(-abs(Decimal(str(p.get("subtracao") or 0)))),
+            )
+        )
+    comp.append(("Total a pagar", _fmt_brl(p.get("valor_final"))))
+    col_valor = margem + util * 0.50
+    for i, (rotulo, valor) in enumerate(comp):
+        ultimo = i == len(comp) - 1
+        if ultimo:
+            c.setStrokeColor(COR_INK)
+            c.setLineWidth(0.8)
+            c.line(margem, y + 3.2 * mm, col_valor, y + 3.2 * mm)
+            c.setFont("Helvetica-Bold", 8)
+        else:
+            c.setFont("Helvetica", 8)
+        c.setFillColor(COR_INK)
+        c.drawString(margem, y, rotulo[:52])
+        c.drawRightString(col_valor, y, valor)
+        y -= 4.6 * mm
+    if int(p.get("pacotes_g") or 0) > 0:
+        c.setFont("Helvetica", 8)
+        c.drawString(
+            margem,
+            y,
+            f"Pacotes grandes: Shopee {int(p.get('g_shopee') or 0)}, "
+            f"Flex {int(p.get('g_flex') or 0)}, Avulso {int(p.get('g_avulso') or 0)}.",
+        )
+        y -= 4.4 * mm
+    if int(p.get("cancelados") or 0) > 0:
+        c.setFont("Helvetica", 8)
+        c.setFillColor(COR_INK)
+        qtd_canc = int(p.get("cancelados") or 0)
+        palavra = "cancelado" if qtd_canc == 1 else "cancelados"
+        c.drawString(
+            margem,
+            y,
+            f"{qtd_canc} {palavra} ({_fmt_brl(p.get('valor_cancelados'))}) não entra no pagamento.",
+        )
+        y -= 4 * mm
+
+    c.setFillColor(COR_INK)
+    c.setFont("Helvetica", 8)
+    nota = (
+        "Entregas do período, mais diárias de coleta, mais acréscimos, menos descontos. "
+        "Pacote grande segue a regra da sub_base."
+    )
+    texto_y = comp_top
+    for pedaco in _quebrar(c, nota, "Helvetica", 8, util * 0.40):
+        c.drawString(margem + util * 0.56, texto_y, pedaco)
+        texto_y -= 3.6 * mm
+
+    rodape()
+    c.save()
+    return buf.getvalue()
+
+
+def _quebrar(c: canvas.Canvas, texto: str, fonte: str, tamanho: float, largura: float) -> List[str]:
+    palavras = (texto or "").split()
+    linhas: List[str] = []
+    atual = ""
+    for palavra in palavras:
+        tentativa = (atual + " " + palavra).strip()
+        if c.stringWidth(tentativa, fonte, tamanho) <= largura:
+            atual = tentativa
+        else:
+            if atual:
+                linhas.append(atual)
+            atual = palavra
+    if atual:
+        linhas.append(atual)
+    return linhas or [""]
 
 
 def gerar_pdf_bytes(
@@ -317,7 +695,7 @@ def _gerar_pdf_simples(fech: EntregadorFechamento, chave_pix: Optional[str] = No
         y -= gap
 
     codigo = build_fechamento_code(fech)
-    line("ROTEVO — Fechamento", 16, 8 * mm, bold=True)
+    line("Fechamento de entregas", 16, 8 * mm, bold=True)
     line(f"Código: {codigo}", 12, 6 * mm, bold=True)
     line(f"Status: {_normalize_status(fech.status)}")
     line(f"Executor: {fech.username_entregador or '—'}")
@@ -326,7 +704,7 @@ def _gerar_pdf_simples(fech: EntregadorFechamento, chave_pix: Optional[str] = No
     line(f"Período: {_fmt_date(fech.periodo_inicio)} a {_fmt_date(fech.periodo_fim)}")
     line(f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     y -= 4 * mm
-    c.setStrokeColorRGB(0.29, 0.18, 0.5)
+    c.setStrokeColor(COR_FAIXA)
     c.setLineWidth(1)
     c.line(left, y, width - left, y)
     y -= 8 * mm
@@ -344,7 +722,7 @@ def _gerar_pdf_simples(fech: EntregadorFechamento, chave_pix: Optional[str] = No
     if fech.motivo_subtracao:
         line(f"  Motivo subtração: {fech.motivo_subtracao}", 9, 5 * mm)
     y -= 2 * mm
-    line(f"TOTAL A PAGAR: {_fmt_brl(fech.valor_final)}", 14, 8 * mm, bold=True)
+    line(f"Total a pagar: {_fmt_brl(fech.valor_final)}", 14, 8 * mm, bold=True)
 
     c.setFont("Helvetica", 8)
     c.setFillColorRGB(0.4, 0.4, 0.4)
@@ -362,7 +740,6 @@ def _gerar_pdf_rico(
 ) -> bytes:
     itens = _collect_itens_diarios(db, fech)
     codigo = build_fechamento_code(fech)
-    status = _normalize_status(fech.status)
     ent_nome = fech.username_entregador or "Motoboy"
 
     sum_shopee = sum(int(r["shopee"]) for r in itens)
@@ -372,236 +749,54 @@ def _gerar_pdf_rico(
     total_cancelados = sum(int(r["total_cancelado"]) for r in itens)
     valor_feitos = sum((r["valor_feitos"] for r in itens), Decimal("0"))
     valor_cancelados = sum((r["valor_cancelados"] for r in itens), Decimal("0"))
-    # Cancelados já estão fora do bruto; valor base = feitos (sem multa).
-    valor_base_calc = valor_feitos.quantize(Decimal("0.01"))
     total_ajustes = Decimal(str(fech.valor_adicao or 0)) - Decimal(str(fech.valor_subtracao or 0))
     total_g = sum(int(r["g_total"]) for r in itens)
     total_g_shopee = sum(int(r["g_shopee"]) for r in itens)
     total_g_flex = sum(int(r["g_flex"]) for r in itens)
     total_g_avulso = sum(int(r["g_avulso"]) for r in itens)
-
-    buf = io.BytesIO()
-    page = landscape(A4)
-    c = canvas.Canvas(buf, pagesize=page)
-    page_w, page_h = page
-    M = 10 * mm
-    footer_reserved = 14 * mm
-
-    def new_page_header(continuacao: bool = False) -> float:
-        if continuacao:
-            c.showPage()
-        c.setFillColor(COR_HEADER)
-        c.rect(0, page_h - 18 * mm, page_w, 18 * mm, fill=1, stroke=0)
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 14)
-        title = "FECHAMENTO DE ENTREGAS — MOTOBOY"
-        if continuacao:
-            title += " (continuação)"
-        c.drawCentredString(page_w / 2, page_h - 11 * mm, title)
-        c.setFillColor(colors.black)
-        return page_h - 24 * mm
-
-    def ensure_space(y: float, needed: float) -> float:
-        if y - needed >= footer_reserved:
-            return y
-        return new_page_header(continuacao=True)
-
-    y = new_page_header(False)
-    c.setFont("Helvetica", 9)
-    c.drawString(
-        M,
-        y,
-        f"Código: {codigo} | Status: {status} | Entregador: {ent_nome}",
-    )
-    y -= 5 * mm
-    if chave_pix:
-        c.drawString(M, y, f"Chave PIX: {chave_pix}")
-        y -= 5 * mm
-    c.drawString(
-        M,
-        y,
-        f"Período: {_fmt_date(fech.periodo_inicio)} a {_fmt_date(fech.periodo_fim)} | "
-        f"Geração: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-    )
-    y -= 7 * mm
-
-    y = ensure_space(y, 18 * mm)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(M, y, "Resumo do fechamento")
-    y -= 5 * mm
-    c.setFont("Helvetica", 9)
-    c.drawString(
-        M,
-        y,
-        f"Feitos: {total_feitos} | Cancelados: {total_cancelados} | G: {total_g} | "
-        f"Bruto: {_fmt_brl(valor_feitos)} | Não pagos (canc.): {_fmt_brl(valor_cancelados)} | "
-        f"Ajustes: {_fmt_signed(total_ajustes)}",
-    )
-    y -= 5 * mm
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(M, y, f"TOTAL A PAGAR: {_fmt_brl(fech.valor_final)}")
-    y -= 8 * mm
-
-    y = ensure_space(y, 40 * mm)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(M, y, "Resumo Financeiro")
-    y -= 3 * mm
-    fin_rows = [
-        ["Descrição", "Valor"],
-        ["Valor bruto das entregas", _fmt_brl(valor_feitos)],
-        ["Cancelados (não pagos)", _fmt_brl(valor_cancelados)],
-        ["Valor base", _fmt_brl(valor_base_calc)],
-        [
-            f"Diárias de coleta ({int(getattr(fech, 'qtd_dias_coleta', 0) or 0)} dias)",
-            _fmt_brl(getattr(fech, "valor_coletas", 0)),
-        ],
-        ["Ajustes manuais", _fmt_signed(total_ajustes)],
-        ["TOTAL A PAGAR", _fmt_brl(fech.valor_final)],
-    ]
     total_valor_g = sum((r.get("valor_g") or Decimal("0") for r in itens), Decimal("0"))
-    if total_valor_g > 0:
-        fin_rows.insert(2, ["   inclui adicional de Pacote G", _fmt_brl(total_valor_g)])
-    usable_w = page_w - 2 * M
-    y = _draw_table(c, fin_rows, M, y, [usable_w * 0.7, usable_w * 0.3])
-    y -= 6 * mm
-
-    y = ensure_space(y, 30 * mm)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(M, y, "Detalhamento por dia")
-    y -= 3 * mm
-    diaria = [
-        [
-            "Data",
-            "Flex",
-            "Shopee",
-            "Avulso",
-            "G",
-            "Feitos",
-            "Canc.",
-            "Valor feitos",
-            "Valor canc.",
-            "Total",
-        ]
-    ]
-    for r in itens:
-        diaria.append(
-            [
-                _fmt_date(r["data"]),
-                str(r["flex"]),
-                str(r["shopee"]),
-                str(r["avulso"]),
-                str(r["g_total"]),
-                str(r["total_feitos"]),
-                str(r["total_cancelado"]),
-                _fmt_brl(r["valor_feitos"]),
-                _fmt_brl(r["valor_cancelados"]),
-                _fmt_brl(r["valor_total"]),
-            ]
-        )
-    if len(diaria) == 1:
-        diaria.append(["—", "0", "0", "0", "0", "0", "0", _fmt_brl(0), _fmt_brl(0), _fmt_brl(0)])
-    col_w = usable_w / 10
-    # Desenhar em fatias se muitas linhas
-    chunk_size = 18
-    body = diaria[1:]
-    header = diaria[0]
-    for i in range(0, max(len(body), 1), chunk_size):
-        chunk = body[i : i + chunk_size] or [["—", "0", "0", "0", "0", "0", "0", _fmt_brl(0), _fmt_brl(0), _fmt_brl(0)]]
-        needed = 8 * mm + len(chunk) * 5 * mm
-        y = ensure_space(y, needed)
-        y = _draw_table(c, [header] + chunk, M, y, [col_w] * 10)
-        y -= 5 * mm
-
     coletas_fechamento = db.scalars(
         select(EntregadorFechamentoColetaItem)
         .where(EntregadorFechamentoColetaItem.id_fechamento == fech.id_fechamento)
         .order_by(EntregadorFechamentoColetaItem.data)
     ).all()
-    if coletas_fechamento:
-        y = ensure_space(y, 20 * mm)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(M, y, "Diárias de coleta")
-        y -= 3 * mm
-        coleta_rows = [["Data", "Bases coletadas", "Valor da diária"]]
-        for item in coletas_fechamento:
-            coleta_rows.append(
-                [_fmt_date(item.data), ", ".join(item.bases or []) or "—", _fmt_brl(item.valor_diaria)]
-            )
-        y = _draw_table(c, coleta_rows, M, y, [usable_w * 0.18, usable_w * 0.57, usable_w * 0.25])
-        y -= 5 * mm
+    ident = _identidade_sub_base(db, fech.sub_base)
+    status_label = _status_amigavel(fech.status)
 
-    y = ensure_space(y, 25 * mm)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(M, y, "Ajustes Manuais")
-    y -= 3 * mm
-    ajustes: List[List[str]] = [["Tipo", "Justificativa", "Valor"]]
-    if Decimal(str(fech.valor_adicao or 0)) > 0:
-        ajustes.append(
-            ["Acréscimo", fech.motivo_adicao or "—", _fmt_signed(fech.valor_adicao)]
-        )
-    if Decimal(str(fech.valor_subtracao or 0)) > 0:
-        ajustes.append(
-            [
-                "Desconto",
-                fech.motivo_subtracao or "—",
-                _fmt_signed(-abs(Decimal(str(fech.valor_subtracao or 0)))),
-            ]
-        )
-    if len(ajustes) == 1:
-        c.setFont("Helvetica", 9)
-        c.setFillColorRGB(0.4, 0.4, 0.4)
-        c.drawString(M, y, "Nenhum ajuste manual aplicado.")
-        c.setFillColor(colors.black)
-        y -= 6 * mm
-    else:
-        y = _draw_table(c, ajustes, M, y, [usable_w * 0.2, usable_w * 0.55, usable_w * 0.25])
-        y -= 6 * mm
-
-    if total_g > 0:
-        y = ensure_space(y, 30 * mm)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(M, y, "Pacotes Grandes")
-        y -= 3 * mm
-        g_rows = [
-            ["Serviço", "Quantidade G"],
-            ["Shopee", str(total_g_shopee)],
-            ["Flex", str(total_g_flex)],
-            ["Avulso", str(total_g_avulso)],
-            ["Total", str(total_g)],
-        ]
-        y = _draw_table(c, g_rows, M, y, [usable_w * 0.7, usable_w * 0.3])
-        y -= 6 * mm
-
-    y = ensure_space(y, 22 * mm)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(M, y, "Critério de cálculo")
-    y -= 5 * mm
-    c.setFont("Helvetica", 8)
-    for txt in (
-        "Valor base = valor bruto das entregas - cancelamentos.",
-        "Total a pagar = valor base + ajustes manuais + adicionais aplicáveis.",
-        "Pacotes grandes são identificados pela coluna G e seguem a regra vigente.",
-    ):
-        c.drawString(M, y, txt)
-        y -= 4 * mm
-
-    c.setFont("Helvetica", 8)
-    c.setFillColorRGB(0.35, 0.35, 0.35)
-    c.drawCentredString(page_w / 2, 10 * mm, "Documento gerado digitalmente pelo sistema.")
-    c.drawCentredString(
-        page_w / 2,
-        6 * mm,
-        f"Código do fechamento: {codigo} · Status: {status}",
+    return _render_fechamento_pdf(
+        codigo=codigo,
+        status_label=status_label,
+        entregador=ent_nome,
+        pix=_fmt_pix(chave_pix),
+        periodo=_fmt_periodo(fech.periodo_inicio, fech.periodo_fim),
+        gerado_em=datetime.now().strftime("%d/%m/%Y %H:%M"),
+        emitente=ident["nome"],
+        slogan=ident["slogan"],
+        logo=ident["logo"],
+        feitos=total_feitos,
+        cancelados=total_cancelados,
+        pacotes_g=total_g,
+        ajustes=total_ajustes,
+        valor_final=Decimal(str(fech.valor_final or 0)),
+        valor_feitos=valor_feitos,
+        valor_cancelados=valor_cancelados,
+        valor_coletas=Decimal(str(getattr(fech, "valor_coletas", 0) or 0)),
+        qtd_dias_coleta=int(getattr(fech, "qtd_dias_coleta", 0) or 0),
+        valor_g=total_valor_g,
+        adicao=Decimal(str(fech.valor_adicao or 0)),
+        motivo_adicao=fech.motivo_adicao or "",
+        subtracao=Decimal(str(fech.valor_subtracao or 0)),
+        motivo_subtracao=fech.motivo_subtracao or "",
+        linhas=itens,
+        coletas=[
+            {"data": item.data, "bases": list(item.bases or []), "valor": item.valor_diaria}
+            for item in coletas_fechamento
+        ],
+        g_shopee=total_g_shopee,
+        g_flex=total_g_flex,
+        g_avulso=total_g_avulso,
     )
-    c.drawCentredString(
-        page_w / 2,
-        2.5 * mm,
-        f"Data de geração: {datetime.now().strftime('%d/%m/%Y %H:%M')} · "
-        f"{datetime.now().year} © ROTEVO.",
-    )
-    c.showPage()
-    c.save()
-    return buf.getvalue()
+
 
 
 def upload_fechamento_pdf(
