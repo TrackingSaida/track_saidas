@@ -12,6 +12,7 @@ from baixa_plataforma_pure import (
     FINAL_ENTREGUE,
     acao_baixa,
     ml_status_final,
+    rotulo_evento_payload,
     rotulo_evento_plataforma,
     shopee_status_final,
 )
@@ -54,6 +55,21 @@ def test_rotulos_por_plataforma():
     assert rotulo_evento_plataforma("cancelado", "Shopee") == "Cancelado pela Shopee (não coletado)"
     assert rotulo_evento_plataforma("cancelado_plataforma", "Shopee") == "Cancelado na Shopee: verificar devolução"
     assert rotulo_evento_plataforma("entregue", None) is None
+
+
+def test_rotulo_cancelado_explica_motivo():
+    assert (
+        rotulo_evento_plataforma("cancelado", "Mercado Livre", FINAL_ENTREGUE)
+        == "Entregue pelo Mercado Livre sem coleta: cancelado aqui"
+    )
+    assert (
+        rotulo_evento_plataforma("cancelado", "Shopee", FINAL_CANCELADO)
+        == "Cancelado na Shopee antes da coleta"
+    )
+    assert rotulo_evento_payload("cancelado", {"plataforma": "Mercado Livre", "status_plataforma": "cancelado"}) == (
+        "Cancelado no Mercado Livre antes da coleta"
+    )
+    assert rotulo_evento_payload("cancelado", {}) is None
 
 
 def _db():
@@ -105,7 +121,7 @@ def test_aplicar_baixa_entregue_cancelado_e_sinalizado():
             (2, "cancelado", "aguardando_coleta", "cancelado"),
             (3, "cancelado_plataforma", "coletado", "coletado"),
         ]
-        assert json.loads(hist[1].payload) == {"plataforma": "Shopee"}
+        assert json.loads(hist[1].payload) == {"plataforma": "Shopee", "status_plataforma": "entregue"}
 
 
 def test_extrair_qr_ml_de_zpl():

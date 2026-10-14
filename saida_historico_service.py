@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from baixa_plataforma_pure import rotulo_evento_plataforma
+from baixa_plataforma_pure import rotulo_evento_payload
 from models import SaidaHistorico, User
 from saida_operacional_utils import rotulo_acao_evento
 
@@ -122,7 +122,7 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
         if evento_norm == "devolucao":
             base_nome = str(data.get("sub_base_nome") or "").strip()
             acao_label = f"Devolvido à {base_nome}" if base_nome else "Devolvido à base"
-        acao_label = rotulo_evento_plataforma(evento_norm, plataforma) or acao_label
+        acao_label = rotulo_evento_payload(evento_norm, data) or acao_label
         usuario_nome = format_person_full_name(
             nome, sobrenome, username=username, fallback=username or ""
         ) or None

@@ -14,7 +14,7 @@ from saidas_listar_service import (
 )
 
 
-def _hist(id_, id_saida, evento, ts, user_id=None, motoboy_id_anterior=None, motoboy_id_novo=None):
+def _hist(id_, id_saida, evento, ts, user_id=None, motoboy_id_anterior=None, motoboy_id_novo=None, payload=None):
     return SimpleNamespace(
         id=id_,
         id_saida=id_saida,
@@ -23,7 +23,20 @@ def _hist(id_, id_saida, evento, ts, user_id=None, motoboy_id_anterior=None, mot
         user_id=user_id,
         motoboy_id_anterior=motoboy_id_anterior,
         motoboy_id_novo=motoboy_id_novo,
+        payload=payload,
     )
+
+
+def test_ultima_acao_de_baixa_da_plataforma_mostra_origem():
+    historicos = [
+        _hist(1, 30, "cancelado", datetime(2026, 10, 14, 11, 0), payload='{"plataforma": "Mercado Livre", "status_plataforma": "entregue"}'),
+        _hist(2, 31, "cancelado", datetime(2026, 10, 14, 11, 0)),
+    ]
+    ctx = build_operacional_ctx_from_historico_rows([30, 31], historicos, {})
+    assert ctx[30].acao_label == "Entregue pelo Mercado Livre sem coleta: cancelado aqui"
+    assert ctx[30].executado_por == "Mercado Livre"
+    assert ctx[31].acao_label == "Registrou cancelamento"
+    assert ctx[31].executado_por == "Sistema"
 
 
 def _row(id_saida, ts, servico="Shopee", entregador="Joao", **kwargs):
