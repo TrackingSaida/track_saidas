@@ -93,6 +93,17 @@ def _validate_image_bytes(raw: bytes) -> bool:
         return False
 
 
+def resolver_logo_owner(owner: Optional[Owner]) -> Optional[bytes]:
+    """Logo cadastrada do owner. Sem logo, retorna None — sem fallback da marca do sistema."""
+    key = (getattr(owner, "logo_object_key", None) or "").strip() if owner else ""
+    if not key:
+        return None
+    raw = _download_owner_logo_bytes(key)
+    if raw and _validate_image_bytes(raw):
+        return raw
+    return None
+
+
 def resolver_logo_etiqueta(owner: Optional[Owner]) -> Tuple[Optional[bytes], str]:
     """
     Retorna (bytes_imagem, origem).
