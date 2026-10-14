@@ -431,6 +431,9 @@ class Saida(Base):
     ml_order_id = Column(BigInteger, nullable=True)  # opcional: id do pedido no ML
     ml_pack_id = Column(BigInteger, nullable=True)  # Pack ID exibido na etiqueta ML (quando a venda tem pack)
     shopee_order_sn = Column(Text, nullable=True)  # nº do pedido Shopee; o código do pacote é o rastreio BR…
+    data_venda = Column(DateTime(timezone=False), nullable=True)  # venda no ML/Shopee (horário de Brasília)
+    # ML/Shopee cancelou o pedido já coletado: status não muda, operador verifica a devolução.
+    plataforma_cancelado_em = Column(DateTime(timezone=False), nullable=True)
     is_grande = Column(Boolean, nullable=False, server_default=text("false"))  # pacote G (Grande); espelha categoria_g_id
     categoria_g_id = Column(BigInteger, ForeignKey("pacote_g_categoria.id", ondelete="RESTRICT"), nullable=True)
     # Última marcação de tamanho (fora do saida_historico para não virar "última ação").

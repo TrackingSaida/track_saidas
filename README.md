@@ -164,6 +164,29 @@ no próximo sync. Botão: `POST /api/shopee/sync-envios`; prévia: `GET /api/sho
 Pré-requisito: migration `shopee_sync_pedidos.sql`. O app Shopee precisa das permissões de API
 **Order** e **Logistics** no console.
 
+### Baixa automática
+
+No tempo restante, o mesmo cron confere os pedidos dos sellers vinculados ainda abertos (últimos
+30 dias, com `ml_shipment_id`/`shopee_order_sn`) e espelha o status final da plataforma (resposta
+em `baixa_automatica`). Regras em `baixa_plataforma_pure.py`:
+
+- ML `delivered` / Shopee `COMPLETED`/`TO_CONFIRM_RECEIVE` → **entregue** (evento `entregue`; conta
+  para o motoboy atribuído, se houver).
+- Pedido ainda **aguardando coleta** entregue ou cancelado na plataforma → **cancelado** (nunca
+  coletado, sem cobrança).
+- ML `cancelled` / Shopee `CANCELLED` de pedido já coletado → status **não muda**; grava
+  `saidas.plataforma_cancelado_em` e o evento `cancelado_plataforma` ("verificar devolução").
+- Pedido já finalizado no sistema nunca é alterado. O histórico guarda a plataforma no `payload`.
+
+Pré-requisito: migration `saidas_plataforma_cancelado_em.sql`.
+
+### Etiqueta ML com QR oficial
+
+`POST /etiquetas/gerar` de pedido importado do ML sem o JSON completo do QR baixa a etiqueta oficial
+(`/shipment_labels`, ZPL) com a conta do seller, extrai o QR e grava em `qr_payload_raw` (uma vez).
+Sem etiqueta disponível, gera só com o número e responde `X-Etiqueta-Aviso: qr_ml_incompleto`.
+Baixar a etiqueta pela API pode marcar o envio como impresso no painel do seller.
+
 ### Endpoint interno
 
 - `POST /api/internal/ml-sync-envios`

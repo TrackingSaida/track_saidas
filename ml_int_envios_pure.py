@@ -153,3 +153,26 @@ def ml_date_from(dias: int, now: Optional[datetime] = None) -> str:
     """Data inicial no formato aceito por order.date_created.from."""
     base = (now or datetime.utcnow()) - timedelta(days=max(dias, 0))
     return base.strftime("%Y-%m-%dT00:00:00.000-00:00")
+
+
+def data_venda_local(valor: Any) -> Optional[datetime]:
+    """
+    Data da venda (ISO do ML ou epoch da Shopee) em horário de Brasília sem fuso,
+    mesmo padrão dos timestamps gravados no banco. None se ausente/inválida.
+    """
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/Sao_Paulo")
+    if valor is None or valor == "":
+        return None
+    try:
+        if isinstance(valor, (int, float)) or str(valor).strip().isdigit():
+            dt = datetime.fromtimestamp(int(valor), tz)
+        else:
+            dt = datetime.fromisoformat(str(valor).strip().replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt
+            dt = dt.astimezone(tz)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return dt.replace(tzinfo=None)

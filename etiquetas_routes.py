@@ -12,11 +12,12 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, Saida
+from models import User, Saida, SaidaHistorico
 
 router = APIRouter(prefix="/etiquetas", tags=["Etiquetas"])
 logger = logging.getLogger(__name__)
@@ -118,29 +119,71 @@ class EtiquetaGerarPayload(BaseModel):
 # ROTA
 # ============================================================
 
+AVISO_QR_ML_INCOMPLETO = "qr_ml_incompleto"
+
+
+def _saida_ml_por_codigo(db: Session, sub_base: str, codigo: str) -> Optional[Saida]:
+    """Saída ML da sub_base pelo código digitado (tela Etiquetas não envia id_saida)."""
+    if not _is_ml_codigo(codigo):
+        return None
+    return db.scalar(
+        select(Saida)
+        .where(
+            Saida.sub_base == sub_base,
+            or_(Saida.codigo == codigo, Saida.ml_shipment_id == int(codigo)),
+        )
+        .order_by(Saida.id_saida.desc())
+        .limit(1)
+    )
+
+
+def _sincronizado_ml(db: Session, saida: Saida) -> bool:
+    return bool(saida.ml_shipment_id) and db.scalar(
+        select(SaidaHistorico.id)
+        .where(SaidaHistorico.id_saida == saida.id_saida, SaidaHistorico.evento == "ml_int_sync")
+        .limit(1)
+    ) is not None
+
+
+def _completar_qr_ml_sincronizado(db: Session, saida: Saida) -> bool:
+    """
+    Saída importada do ML sem o JSON completo do QR: busca o QR na etiqueta oficial do seller
+    e grava em qr_payload_raw (uma vez). Retorna True se a saída ficou com o QR completo.
+    """
+    from ml_int_service import obter_qr_etiqueta_ml
+
+    qr = obter_qr_etiqueta_ml(db, saida)
+    if not qr:
+        return False
+    saida.qr_payload_raw = qr
+    db.commit()
+    return True
+
+
 def _resolve_qr_content(
-    codigo: str,
-    id_saida: Optional[int],
-    servico: Optional[str],
     qr_payload: Optional[str],
-    sub_base: Optional[str],
+    saida: Optional[Saida],
     db: Session,
-) -> Optional[str]:
+) -> tuple[Optional[str], Optional[str]]:
     """
-    Resolve o conteúdo do QR para etiqueta ML.
-    Ordem: 1) qr_payload explícito 2) id_saida com qr_payload_raw 3) experimental fabricado.
+    Resolve o conteúdo do QR para etiqueta ML e um aviso opcional.
+    Ordem: 1) qr_payload explícito 2) qr_payload_raw da saída, completado pela etiqueta
+    oficial do ML quando a saída foi importada do ML e ainda não tem o JSON completo.
     """
-    # 1. Payload explícito
     if qr_payload and qr_payload.strip():
-        return qr_payload.strip()
+        return qr_payload.strip(), None
+    if saida is None:
+        return None, None
+    from qr_payload_utils import is_ml_qr_completo
 
-    # 2. Buscar por id_saida (mesma sub_base)
-    if id_saida and sub_base:
-        saida = db.get(Saida, id_saida)
-        if saida and saida.sub_base == sub_base and saida.qr_payload_raw:
-            return saida.qr_payload_raw
-
-    return None
+    aviso = None
+    if (
+        not is_ml_qr_completo(saida.qr_payload_raw)
+        and _sincronizado_ml(db, saida)
+        and not _completar_qr_ml_sincronizado(db, saida)
+    ):
+        aviso = AVISO_QR_ML_INCOMPLETO
+    return (saida.qr_payload_raw or None), aviso
 
 
 @router.post("/gerar")
@@ -188,14 +231,8 @@ def gerar_etiqueta(
     elif role not in (0, 1, 2, 3):
         raise HTTPException(403, "Sem permissão para gerar etiqueta.")
 
-    qr_content = _resolve_qr_content(
-        codigo=codigo,
-        id_saida=payload.id_saida,
-        servico=payload.servico,
-        qr_payload=payload.qr_payload,
-        sub_base=sub_base,
-        db=db,
-    )
+    saida_ref = saida_autorizada or _saida_ml_por_codigo(db, sub_base, codigo)
+    qr_content, aviso = _resolve_qr_content(payload.qr_payload, saida_ref, db)
 
     modo_final = "generic"
     if _is_ml_servico(payload.servico) or (_is_ml_codigo(codigo) and qr_content):
@@ -242,10 +279,11 @@ def gerar_etiqueta(
     cod_safe = re.sub(r'[^\w\-.]', '', (codigo or "")[:40]) or "cod"
     srv_safe = re.sub(r'[^\w\-.]', '', (modo_final or "generic")[:20]) or "generic"
     filename = f"etq-tracking-{id_part}-{cod_safe}-{srv_safe}.{ext}"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if aviso:
+        headers["X-Etiqueta-Aviso"] = aviso
     return Response(
         content=content,
         media_type=media_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-        },
+        headers=headers,
     )

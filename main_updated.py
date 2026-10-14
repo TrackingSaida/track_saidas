@@ -59,7 +59,7 @@ else:
 # App
 app = FastAPI(
     title="API Saídas",
-    version="1.11.0",
+    version="1.12.0",
     openapi_url=f"{API_PREFIX}/openapi.json",
     docs_url=f"{API_PREFIX}/docs",
     redoc_url=f"{API_PREFIX}/redoc",
@@ -144,7 +144,7 @@ app.add_middleware(
         "Content-Language",
     ],
     max_age=600,  # evita preflight antigo sem PATCH cacheado por 24h
-    expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale", "X-Envio-Id", "X-Codigo", "X-Id-Saida", "X-Cobertura-Aviso"],
+    expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale", "X-Envio-Id", "X-Codigo", "X-Id-Saida", "X-Cobertura-Aviso", "X-Etiqueta-Aviso"],
 )
 
 
@@ -366,8 +366,9 @@ def internal_refresh_tokens(request: Request):
 def internal_ml_sync_envios(request: Request):
     """
     Sincroniza envios Flex ML e pedidos Shopee (canal de entrega da base) prontos para coleta
-    de todas as sub_bases com conta vinculada a seller cadastrado. Protegido por X-Cron-Secret
-    (CRON_ML_SYNC_SECRET, fallback CRON_REFRESH_SECRET).
+    de todas as sub_bases com conta vinculada a seller cadastrado e, no tempo restante, dá baixa
+    automática nos pedidos já importados que a plataforma marcou como entregues/cancelados.
+    Protegido por X-Cron-Secret (CRON_ML_SYNC_SECRET, fallback CRON_REFRESH_SECRET).
     ML_SYNC_CRON_ENABLED=false desativa (ex.: homol com cópia dos tokens de produção).
     """
     secret = os.getenv("CRON_ML_SYNC_SECRET") or os.getenv("CRON_REFRESH_SECRET")
@@ -380,6 +381,7 @@ def internal_ml_sync_envios(request: Request):
         return {"status": "disabled"}
     import time as _time
 
+    from baixa_plataforma_service import conferir_todas_sub_bases
     from ml_int_service import sync_envios_todas_sub_bases
     from shopee_int_service import sync_envios_todas_sub_bases as shopee_sync_todas_sub_bases
 
@@ -394,6 +396,12 @@ def internal_ml_sync_envios(request: Request):
         except Exception as e:
             db.rollback()
             resultado["shopee"] = {"erro": str(e)[:200]}
+        restante = max(max_runtime - int(_time.monotonic() - inicio), 0)
+        try:
+            resultado["baixa_automatica"] = conferir_todas_sub_bases(db, max_runtime_seconds=restante)
+        except Exception as e:
+            db.rollback()
+            resultado["baixa_automatica"] = {"erro": str(e)[:200]}
         return resultado
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})

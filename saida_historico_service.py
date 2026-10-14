@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from baixa_plataforma_pure import rotulo_evento_payload
 from models import SaidaHistorico, User
 from saida_operacional_utils import rotulo_acao_evento
 
@@ -30,6 +31,7 @@ class SaidaHistoricoItemOut(BaseModel):
     motivo_ocorrencia: Optional[str] = None
     observacao_ocorrencia: Optional[str] = None
     tentativa: Optional[int] = None
+    plataforma: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -115,10 +117,12 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
         evento_norm = (h.evento or "").strip().lower()
         extra = _campos_from_payload(getattr(h, "payload", None))
         acao_label = rotulo_acao_evento(evento_norm)
+        data = parse_historico_payload(getattr(h, "payload", None))
+        plataforma = str(data.get("plataforma") or "").strip() or None
         if evento_norm == "devolucao":
-            data = parse_historico_payload(getattr(h, "payload", None))
             base_nome = str(data.get("sub_base_nome") or "").strip()
             acao_label = f"Devolvido à {base_nome}" if base_nome else "Devolvido à base"
+        acao_label = rotulo_evento_payload(evento_norm, data) or acao_label
         usuario_nome = format_person_full_name(
             nome, sobrenome, username=username, fallback=username or ""
         ) or None
@@ -138,6 +142,7 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
                 motivo_ocorrencia=extra["motivo_ocorrencia"],
                 observacao_ocorrencia=extra["observacao_ocorrencia"],
                 tentativa=extra["tentativa"],
+                plataforma=plataforma,
             )
         )
     return out

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
 import requests
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
 from models import MLConexao
@@ -24,6 +24,7 @@ ML_ORDERS_SEARCH_URL = "https://api.mercadolibre.com/orders/search"
 ML_ORDER_URL = "https://api.mercadolibre.com/orders"
 ML_SHIPMENTS_SEARCH_URL = "https://api.mercadolibre.com/shipments/search"
 ML_SHIPMENT_URL = "https://api.mercadolibre.com/shipments"
+ML_SHIPMENT_LABELS_URL = "https://api.mercadolibre.com/shipment_labels"
 ML_TEST_USER_URL = "https://api.mercadolibre.com/users/test_user"
 
 # Margem operacional antes da expiração (ML recomenda renovar só após perder validade;
@@ -422,6 +423,81 @@ def fetch_shipments_by_tracking(
     return r.json()
 
 
+def fetch_shipment_label_zpl(
+    access_token: str,
+    shipment_id: int,
+    *,
+    db: Optional[Session] = None,
+    user_id_ml: Optional[int] = None,
+    sub_base: Optional[str] = None,
+) -> str:
+    """GET /shipment_labels (zpl2): ZPL da etiqueta oficial; o ML pode devolver ZIP com o .txt."""
+    import io
+    import zipfile
+
+    def do_req(token: str) -> requests.Response:
+        return requests.get(
+            ML_SHIPMENT_LABELS_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"shipment_ids": shipment_id, "response_type": "zpl2"},
+            timeout=20,
+        )
+
+    r = _ml_api_request(access_token, do_req, db=db, user_id_ml=user_id_ml, sub_base=sub_base)
+    r.raise_for_status()
+    conteudo = r.content or b""
+    if conteudo[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(conteudo)) as zf:
+            return "\n".join(zf.read(n).decode("utf-8", errors="replace") for n in zf.namelist())
+    return conteudo.decode("utf-8", errors="replace")
+
+
+def obter_qr_etiqueta_ml(db: Session, saida: Any) -> Optional[str]:
+    """
+    JSON do QR oficial do envio ML de uma saída sincronizada, lido da etiqueta do seller
+    (conta ML da sub_base vinculada à base da saída primeiro). None se indisponível.
+    Baixar a etiqueta pode marcar o envio como impresso no painel do seller.
+    """
+    from models import BasePreco
+    from qr_payload_utils import extrair_qr_ml_de_zpl
+
+    sid = getattr(saida, "ml_shipment_id", None)
+    sub_base = (getattr(saida, "sub_base", None) or "").strip()
+    if not sid or not sub_base:
+        return None
+    base_nome = (getattr(saida, "base", None) or "").strip().upper()
+    id_base_saida = None
+    if base_nome:
+        id_base_saida = db.scalar(
+            select(BasePreco.id_base).where(
+                BasePreco.sub_base == sub_base,
+                func.upper(func.trim(BasePreco.base)) == base_nome,
+            ).limit(1)
+        )
+    conexoes = (
+        db.query(MLConexao)
+        .filter(MLConexao.sub_base == sub_base, MLConexao.id_base.isnot(None))
+        .order_by(MLConexao.criado_em.desc(), MLConexao.id.desc())
+        .all()
+    )
+    conexoes.sort(key=lambda c: c.id_base != id_base_saida)
+    vistos: set[int] = set()
+    for conexao in conexoes:
+        if conexao.user_id_ml in vistos:
+            continue
+        vistos.add(conexao.user_id_ml)
+        try:
+            token = get_valid_access_token(db, conexao.user_id_ml, sub_base)
+            zpl = fetch_shipment_label_zpl(token, int(sid), db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base)
+        except Exception as e:
+            logger.info("obter_qr_etiqueta_ml: shipment=%s user_id_ml=%s indisponível: %s", sid, conexao.user_id_ml, e)
+            continue
+        qr = extrair_qr_ml_de_zpl(zpl, sid)
+        if qr:
+            return qr
+    return None
+
+
 ML_ORDERS_PAGE_SIZE = 50
 
 
@@ -559,11 +635,14 @@ def _completar_saida_existente(db: Session, saida: Any, envio: dict, detail_fiel
     from models import SaidaDetail
     from ml_int_envios_pure import campos_faltantes
 
+    from ml_int_envios_pure import data_venda_local
+
     order_ids = envio.get("order_ids") or []
     ml_novos = {
         "ml_shipment_id": envio["shipment_id"],
         "ml_order_id": order_ids[0] if order_ids else None,
         "ml_pack_id": envio.get("pack_id"),
+        "data_venda": data_venda_local(envio.get("data_venda")),
     }
     ml_atual = {k: getattr(saida, k) for k in ml_novos}
     alterou = False
@@ -608,7 +687,7 @@ def sync_envios_sub_base(
     """
     from cobertura_cep_service import cep_coberto, list_prefixos_ativos
     from models import BasePreco, Saida, SaidaDetail, SaidaHistorico
-    from ml_int_envios_pure import destinatario_to_saida_detail_fields, envio_fora_cobertura_resumo
+    from ml_int_envios_pure import data_venda_local, destinatario_to_saida_detail_fields, envio_fora_cobertura_resumo
 
     prefixos_cobertura = list_prefixos_ativos(db, sub_base)
 
@@ -709,6 +788,7 @@ def sync_envios_sub_base(
                             ml_shipment_id=sid,
                             ml_order_id=order_ids[0] if order_ids else None,
                             ml_pack_id=envio.get("pack_id"),
+                            data_venda=data_venda_local(envio.get("data_venda")),
                             base=base_nome,
                         )
                         db.add(nova)

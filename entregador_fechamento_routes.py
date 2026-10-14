@@ -14,14 +14,14 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from db import get_db
+from db import SessionLocal, get_db
 from auth import get_current_user
 from models import (
     BasePreco,
@@ -213,6 +213,62 @@ def _recalcular_valor_base_fechamento(
         db, sub_base, fech.id_entregador,
         fech.periodo_inicio, fech.periodo_fim,
     )
+
+
+def _valores_base_recalculados(
+    db: Session,
+    sub_base: str,
+    alvos: List[EntregadorFechamento],
+) -> dict:
+    """Recalcula o valor base do lote numa consulta por período.
+
+    Entregador legado (sem motoboy) continua no cálculo individual.
+    """
+    out: dict = {}
+    motoboys = [f for f in alvos if getattr(f, "id_motoboy", None) is not None]
+    grupos: dict = {}
+    for fech in motoboys:
+        grupos.setdefault((fech.periodo_inicio, fech.periodo_fim), []).append(fech)
+    for (inicio, fim), grupo in grupos.items():
+        valores = valores_base_atuais_motoboys(
+            db,
+            sub_base,
+            [int(f.id_motoboy) for f in grupo],
+            inicio,
+            fim,
+        )
+        for fech in grupo:
+            out[int(fech.id_fechamento)] = valores.get(int(fech.id_motoboy), Decimal("0.00"))
+    for fech in alvos:
+        if getattr(fech, "id_motoboy", None) is None:
+            out[int(fech.id_fechamento)] = _recalcular_valor_base_fechamento(db, sub_base, fech)
+    return out
+
+
+def _notificar_pagamentos(sub_base: str, ids_fechamento: List[int]) -> None:
+    """Envia o push depois da resposta HTTP, em sessão própria."""
+    if not ids_fechamento:
+        return
+    db = SessionLocal()
+    try:
+        rows = list(
+            db.scalars(
+                select(EntregadorFechamento).where(
+                    EntregadorFechamento.sub_base == sub_base,
+                    EntregadorFechamento.id_fechamento.in_(ids_fechamento),
+                )
+            ).all()
+        )
+        for fech in rows:
+            _enviar_push_fechamento_pago(db, fech)
+    except Exception:
+        logger.exception(
+            "fechamento_pago_push_lote_failed sub_base=%s qtd=%s",
+            sub_base,
+            len(ids_fechamento),
+        )
+    finally:
+        db.close()
 
 
 def _calcular_diarias_coleta_motoboy(
@@ -783,6 +839,7 @@ def listar_fechamentos_admin(
 @router.post("/fechamentos/marcar-pago", response_model=MarcarPagoResponse)
 def marcar_fechamentos_pagos(
     payload: MarcarPagoRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user=Depends(usuario_financeiro),
 ):
@@ -822,34 +879,41 @@ def marcar_fechamentos_pagos(
     if not alvos:
         raise HTTPException(400, "Nenhum fechamento elegível para marcar como pago.")
 
-    divergentes: List[MarcarPagoDivergenteItem] = []
-    recalc_cache: dict = {}
-    for fech in alvos:
-        valor_recalc = _recalcular_valor_base_fechamento(db, sub_base, fech)
-        recalc_cache[int(fech.id_fechamento)] = valor_recalc
-        if valor_recalc != fech.valor_base:
-            divergentes.append(
-                MarcarPagoDivergenteItem(
-                    id_fechamento=int(fech.id_fechamento),
-                    username_entregador=fech.username_entregador,
-                    nome_exibicao=_resolver_nome_exibicao_fechamento(db, fech),
-                    valor_final=fech.valor_final,
-                    valor_base=fech.valor_base,
-                    valor_base_recalculado=valor_recalc,
-                )
-            )
+    # A tela já confirma o valor gerado. Recalcular o período aqui varre saídas
+    # e histórico de novo e segura o registro por minutos, mesmo com 1 motoboy.
+    if not payload.confirmar_com_divergencia:
+        valores = _valores_base_recalculados(db, sub_base, alvos)
+        divergentes_fech = [f for f in alvos if valores.get(int(f.id_fechamento)) != f.valor_base]
+        divergentes: List[MarcarPagoDivergenteItem] = []
+        if divergentes_fech:
+            from motoboy_nome_utils import carregar_nomes_motoboy_ids
 
-    if divergentes and not payload.confirmar_com_divergencia:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": (
-                    "Há fechamentos com divergência de valor base. "
-                    "Confirme explicitamente para marcar como pago mesmo assim."
-                ),
-                "divergentes": [d.model_dump(mode="json") for d in divergentes],
-            },
-        )
+            nomes = carregar_nomes_motoboy_ids(
+                db,
+                [int(f.id_motoboy) for f in divergentes_fech if getattr(f, "id_motoboy", None) is not None],
+            )
+            for fech in divergentes_fech:
+                divergentes.append(
+                    MarcarPagoDivergenteItem(
+                        id_fechamento=int(fech.id_fechamento),
+                        username_entregador=fech.username_entregador,
+                        nome_exibicao=_resolver_nome_exibicao_fechamento(db, fech, nomes_motoboy_map=nomes),
+                        valor_final=fech.valor_final,
+                        valor_base=fech.valor_base,
+                        valor_base_recalculado=valores[int(fech.id_fechamento)],
+                    )
+                )
+        if divergentes:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "Há fechamentos com divergência de valor base. "
+                        "Confirme explicitamente para marcar como pago mesmo assim."
+                    ),
+                    "divergentes": [d.model_dump(mode="json") for d in divergentes],
+                },
+            )
 
     agora = datetime.utcnow()
     ids_marcados: List[int] = []
@@ -860,10 +924,8 @@ def marcar_fechamentos_pagos(
         ids_marcados.append(int(fech.id_fechamento))
 
     db.commit()
-
-    for fech in alvos:
-        db.refresh(fech)
-        _enviar_push_fechamento_pago(db, fech)
+    background_tasks.add_task(_notificar_pagamentos, sub_base, ids_marcados)
+    logger.info("fechamento_pago_agendado sub_base=%s qtd=%s", sub_base, len(ids_marcados))
 
     return MarcarPagoResponse(marcados=len(ids_marcados), ids_fechamento=ids_marcados)
 
