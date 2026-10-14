@@ -95,11 +95,12 @@ def test_legado_sem_motoboy_continua_individual(monkeypatch):
 
 def test_marcar_pago_grava_e_deixa_push_para_depois(monkeypatch):
     pushes = []
+    recalculos = []
     monkeypatch.setattr(routes, "_resolve_user_base", lambda db, user: "base-a")
     monkeypatch.setattr(
         routes,
         "_valores_base_recalculados",
-        lambda db, sb, alvos: {int(f.id_fechamento): f.valor_base for f in alvos},
+        lambda db, sb, alvos: recalculos.append(len(alvos)) or {},
     )
     monkeypatch.setattr(routes, "_enviar_push_fechamento_pago", lambda *a, **k: pushes.append("push"))
 
@@ -114,6 +115,7 @@ def test_marcar_pago_grava_e_deixa_push_para_depois(monkeypatch):
     assert [f.status for f in fechs] == ["PAGO", "PAGO"]
     assert fechs[0].pago_por == "ana"
     assert pushes == []
+    assert recalculos == []
     assert bg.tasks[0][0] is routes._notificar_pagamentos
     assert bg.tasks[0][1] == ("base-a", [1, 2])
 

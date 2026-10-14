@@ -879,39 +879,41 @@ def marcar_fechamentos_pagos(
     if not alvos:
         raise HTTPException(400, "Nenhum fechamento elegível para marcar como pago.")
 
-    valores = _valores_base_recalculados(db, sub_base, alvos)
-    divergentes_fech = [f for f in alvos if valores.get(int(f.id_fechamento)) != f.valor_base]
-    divergentes: List[MarcarPagoDivergenteItem] = []
-    if divergentes_fech:
-        from motoboy_nome_utils import carregar_nomes_motoboy_ids
+    # A tela já confirma o valor gerado. Recalcular o período aqui varre saídas
+    # e histórico de novo e segura o registro por minutos, mesmo com 1 motoboy.
+    if not payload.confirmar_com_divergencia:
+        valores = _valores_base_recalculados(db, sub_base, alvos)
+        divergentes_fech = [f for f in alvos if valores.get(int(f.id_fechamento)) != f.valor_base]
+        divergentes: List[MarcarPagoDivergenteItem] = []
+        if divergentes_fech:
+            from motoboy_nome_utils import carregar_nomes_motoboy_ids
 
-        nomes = carregar_nomes_motoboy_ids(
-            db,
-            [int(f.id_motoboy) for f in divergentes_fech if getattr(f, "id_motoboy", None) is not None],
-        )
-        for fech in divergentes_fech:
-            divergentes.append(
-                MarcarPagoDivergenteItem(
-                    id_fechamento=int(fech.id_fechamento),
-                    username_entregador=fech.username_entregador,
-                    nome_exibicao=_resolver_nome_exibicao_fechamento(db, fech, nomes_motoboy_map=nomes),
-                    valor_final=fech.valor_final,
-                    valor_base=fech.valor_base,
-                    valor_base_recalculado=valores[int(fech.id_fechamento)],
-                )
+            nomes = carregar_nomes_motoboy_ids(
+                db,
+                [int(f.id_motoboy) for f in divergentes_fech if getattr(f, "id_motoboy", None) is not None],
             )
-
-    if divergentes and not payload.confirmar_com_divergencia:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": (
-                    "Há fechamentos com divergência de valor base. "
-                    "Confirme explicitamente para marcar como pago mesmo assim."
-                ),
-                "divergentes": [d.model_dump(mode="json") for d in divergentes],
-            },
-        )
+            for fech in divergentes_fech:
+                divergentes.append(
+                    MarcarPagoDivergenteItem(
+                        id_fechamento=int(fech.id_fechamento),
+                        username_entregador=fech.username_entregador,
+                        nome_exibicao=_resolver_nome_exibicao_fechamento(db, fech, nomes_motoboy_map=nomes),
+                        valor_final=fech.valor_final,
+                        valor_base=fech.valor_base,
+                        valor_base_recalculado=valores[int(fech.id_fechamento)],
+                    )
+                )
+        if divergentes:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "Há fechamentos com divergência de valor base. "
+                        "Confirme explicitamente para marcar como pago mesmo assim."
+                    ),
+                    "divergentes": [d.model_dump(mode="json") for d in divergentes],
+                },
+            )
 
     agora = datetime.utcnow()
     ids_marcados: List[int] = []
