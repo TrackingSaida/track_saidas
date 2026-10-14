@@ -7,10 +7,12 @@ Objetivos:
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from baixa_plataforma_pure import rotulo_evento_payload
 from saida_operacional_pure import (
     EVENTOS_ATRIBUICAO_VALIDOS,
     EVENTOS_INVALIDANTES,
@@ -157,6 +159,17 @@ def _acao_equivalente(evento_norm: str) -> str:
     return resolver_chave_acao(evento_norm) or ""
 
 
+def _payload_dict(raw: Any) -> Dict[str, Any]:
+    text = (raw or "").strip() if isinstance(raw, str) else ""
+    if not text.startswith("{"):
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def build_operacional_ctx_from_historico_rows(
     saida_ids: Sequence[int],
     historicos: Sequence[Any],
@@ -236,15 +249,23 @@ def build_operacional_ctx_from_historico_rows(
             ultimo_evento, motoboy_id_anterior=ultimo_motoboy_ant
         )
 
+        acao_label = rotulo_acao_evento(
+            ultimo_evento,
+            houve_reatribuicao=houve_reatribuicao,
+            motoboy_id_anterior=ultimo_motoboy_ant,
+        )
+        payload = _payload_dict(getattr(ultimo, "payload", None)) if ultimo is not None else {}
+        rotulo_plataforma = rotulo_evento_payload((ultimo_evento or "").strip().lower(), payload)
+        if rotulo_plataforma:
+            acao_label = rotulo_plataforma
+            if ultimo_user_id is None:
+                executado_por = str(payload.get("plataforma") or "").strip() or executado_por
+
         out[sid] = SaidaOperacionalContext(
             id_saida=sid,
             ultimo_evento=ultimo_evento_ui or ultimo_evento,
             ultimo_evento_ts=getattr(ultimo, "timestamp", None) if ultimo is not None else None,
-            acao_label=rotulo_acao_evento(
-                ultimo_evento,
-                houve_reatribuicao=houve_reatribuicao,
-                motoboy_id_anterior=ultimo_motoboy_ant,
-            ),
+            acao_label=acao_label,
             executado_por=executado_por,
             ultimo_ator_username=user_map.get(op_user_id) if op_user_id is not None else None,
             ultimo_ator_user_id=op_user_id,
@@ -395,6 +416,7 @@ def _load_historico_tuples(db, ids: Sequence[int]) -> List[Any]:
                     SaidaHistorico.user_id,
                     SaidaHistorico.motoboy_id_anterior,
                     SaidaHistorico.motoboy_id_novo,
+                    SaidaHistorico.payload,
                 )
                 .where(
                     SaidaHistorico.id_saida.in_(ids_lote),

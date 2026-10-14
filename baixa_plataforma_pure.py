@@ -62,11 +62,18 @@ def acao_baixa(status_sistema: Optional[str], final: Optional[str], *, ja_sinali
     return None if ja_sinalizado else ACAO_SINALIZAR_CANCELADO
 
 
-def payload_historico(plataforma: str) -> str:
-    return json.dumps({"plataforma": plataforma}, ensure_ascii=False)
+def payload_historico(plataforma: str, status_plataforma: Optional[str] = None) -> str:
+    data: dict[str, str] = {"plataforma": plataforma}
+    if status_plataforma:
+        data["status_plataforma"] = status_plataforma
+    return json.dumps(data, ensure_ascii=False)
 
 
-def rotulo_evento_plataforma(evento: Optional[str], plataforma: Optional[str]) -> Optional[str]:
+def rotulo_evento_plataforma(
+    evento: Optional[str],
+    plataforma: Optional[str],
+    status_plataforma: Optional[str] = None,
+) -> Optional[str]:
     """Rótulo amigável para eventos gerados pela baixa automática; None se não for o caso."""
     nome = (plataforma or "").strip()
     if not nome:
@@ -74,10 +81,21 @@ def rotulo_evento_plataforma(evento: Optional[str], plataforma: Optional[str]) -
     feminino = nome == PLATAFORMA_SHOPEE
     pelo, no = ("pela", "na") if feminino else ("pelo", "no")
     ev = (evento or "").strip().lower()
+    st = (status_plataforma or "").strip().lower()
     if ev == "entregue":
         return f"Entrega confirmada {pelo} {nome}"
     if ev == "cancelado":
+        if st == FINAL_ENTREGUE:
+            return f"Entregue {pelo} {nome} sem coleta: cancelado aqui"
+        if st == FINAL_CANCELADO:
+            return f"Cancelado {no} {nome} antes da coleta"
         return f"Cancelado {pelo} {nome} (não coletado)"
     if ev == EVENTO_CANCELADO_PLATAFORMA:
         return f"Cancelado {no} {nome}: verificar devolução"
     return None
+
+
+def rotulo_evento_payload(evento: Optional[str], data: dict[str, Any]) -> Optional[str]:
+    return rotulo_evento_plataforma(
+        evento, str(data.get("plataforma") or ""), str(data.get("status_plataforma") or ""),
+    )

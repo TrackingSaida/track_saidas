@@ -105,7 +105,7 @@ def aplicar_baixa(db: Session, saida: Saida, final: Optional[str], plataforma: s
             evento=evento,
             status_anterior=anterior,
             status_novo=atual.status,
-            payload=payload_historico(plataforma),
+            payload=payload_historico(plataforma, final),
         )
     )
     return acao
@@ -131,7 +131,15 @@ def _aplicar_lote(
             continue
         try:
             with db.begin_nested():
-                _contabilizar(seller, aplicar_baixa(db, saida, final, plataforma))
+                acao = aplicar_baixa(db, saida, final, plataforma)
+            _contabilizar(seller, acao)
+            if acao is not None:
+                seller["baixas"].append({
+                    "id_saida": saida.id_saida,
+                    "codigo": saida.codigo,
+                    "acao": acao,
+                    "status_plataforma": final,
+                })
         except Exception as e:
             seller["erros"].append({"id_saida": saida.id_saida, "erro": str(e)[:200]})
     db.commit()
@@ -162,7 +170,9 @@ def conferir_ml_sub_base(
         base_nome = _base_vinculada(db, sub_base, conexao.id_base)
         if not base_nome:
             continue
-        seller: dict[str, Any] = {"user_id_ml": conexao.user_id_ml, "base_nome": base_nome, **_contagem_vazia(), "erros": []}
+        seller: dict[str, Any] = {
+            "user_id_ml": conexao.user_id_ml, "base_nome": base_nome, **_contagem_vazia(), "baixas": [], "erros": [],
+        }
         sellers.append(seller)
         saidas = _saidas_abertas(db, sub_base, base_nome, Saida.ml_shipment_id, dias=dias, limite=limite)
         if not saidas:
@@ -218,7 +228,9 @@ def conferir_shopee_sub_base(
         base_nome = _base_vinculada(db, sub_base, token.id_base)
         if not base_nome:
             continue
-        seller: dict[str, Any] = {"shop_id": token.shop_id, "base_nome": base_nome, **_contagem_vazia(), "erros": []}
+        seller: dict[str, Any] = {
+            "shop_id": token.shop_id, "base_nome": base_nome, **_contagem_vazia(), "baixas": [], "erros": [],
+        }
         sellers.append(seller)
         saidas = _saidas_abertas(db, sub_base, base_nome, Saida.shopee_order_sn, dias=dias, limite=limite)
         pares: list[tuple[Saida, Optional[str]]] = []
