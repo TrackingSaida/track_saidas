@@ -138,3 +138,44 @@ def test_detalhe_404_quando_nao_visivel(monkeypatch):
         detalhe_pedido_seller(db, _seller(), 1)
     assert exc.value.status_code == 404
     assert "não encontrado" in str(exc.value.detail).lower()
+
+
+def _saida_datas(**kwargs):
+    defaults = {
+        "servico": "Mercado Livre",
+        "status": "COLETADO",
+        "timestamp": datetime(2026, 10, 2, 21, 0),
+        "data_venda": None,
+        "data_hora_entrega": None,
+    }
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def test_data_venda_marketplace_e_site():
+    from seller_portal_pedidos_service import _data_venda
+
+    venda = datetime(2026, 10, 1, 9, 30)
+    assert _data_venda(_saida_datas(data_venda=venda)) == venda
+    assert _data_venda(_saida_datas()) is None
+    site = _saida_datas(servico="Avulso")
+    assert _data_venda(site) == site.timestamp
+
+
+def test_data_entrega_so_quando_entregue():
+    from seller_portal_pedidos_service import _data_entrega
+
+    quando = datetime(2026, 10, 3, 14, 0)
+    assert _data_entrega(_saida_datas(status="ENTREGUE", data_hora_entrega=quando)) == quando
+    assert _data_entrega(_saida_datas(status="AUSENTE", data_hora_entrega=quando)) is None
+
+
+def test_atualizado_em_usa_ultimo_evento_ou_entrega():
+    from seller_portal_pedidos_service import _atualizado_em
+
+    base = _saida_datas()
+    assert _atualizado_em(base, None) == base.timestamp
+    evento = datetime(2026, 10, 3, 8, 0)
+    assert _atualizado_em(base, evento) == evento
+    entregue = _saida_datas(status="ENTREGUE", data_hora_entrega=datetime(2026, 10, 3, 15, 0))
+    assert _atualizado_em(entregue, evento) == entregue.data_hora_entrega
