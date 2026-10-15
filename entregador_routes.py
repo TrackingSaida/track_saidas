@@ -1217,6 +1217,98 @@ def _valor_base_atual_fechamento(db: Session, sub_base: str, tipo: str, xid: int
     )
 
 
+def _juntar_legado_ao_motoboy(
+    db: Session,
+    sub_base: str,
+    linhas: Dict[tuple, Dict[str, Any]],
+    nomes_motoboy: Dict[int, str],
+) -> None:
+    """Soma o entregador antigo na linha do motoboy da mesma pessoa.
+
+    O vínculo é usuário/documento. Se não houver, o nome exibido igual ao do
+    motoboy já listado também junta. Linha antiga que já tem fechamento fica separada.
+    """
+    motoboy_ids = {xid for (tipo, xid) in linhas if tipo == "m"}
+    if not motoboy_ids:
+        return
+
+    def _nome_motoboy(xid: int) -> str:
+        ln = linhas.get(("m", xid)) or {}
+        return (ln.get("nome") or nomes_motoboy.get(xid) or "").strip()
+
+    nome_para_motoboy: Dict[str, int] = {}
+    nomes_ambiguos: set[str] = set()
+    for mid in motoboy_ids:
+        chave = person_name_sort_key(_nome_motoboy(mid))
+        if not chave:
+            continue
+        if chave in nome_para_motoboy and nome_para_motoboy[chave] != mid:
+            nomes_ambiguos.add(chave)
+        else:
+            nome_para_motoboy[chave] = mid
+
+    fechs_cache: Dict[int, list] = {}
+
+    def _fechs(mid: int) -> list:
+        if mid not in fechs_cache:
+            fechs_cache[mid] = list(
+                db.scalars(
+                    select(EntregadorFechamento).where(
+                        EntregadorFechamento.sub_base == sub_base,
+                        EntregadorFechamento.id_motoboy == mid,
+                    )
+                ).all()
+            )
+        return fechs_cache[mid]
+
+    remover: List[tuple] = []
+    for (tipo, xid), ln in list(linhas.items()):
+        if tipo != "e":
+            continue
+        dias = ln.get("dias") or []
+        if any(getattr(d, "id_fechamento", None) for d in dias):
+            continue
+        comuns: set[int] = set()
+        if xid > 0:
+            _, mids = _resolve_executor_scope_ids(db, sub_base, entregador_id=xid)
+            comuns = {int(m) for m in mids if int(m) in motoboy_ids}
+        destino = next(iter(comuns)) if len(comuns) == 1 else None
+        if destino is None:
+            chave = person_name_sort_key((ln.get("nome") or "").strip())
+            if chave and chave not in nomes_ambiguos:
+                destino = nome_para_motoboy.get(chave)
+        if destino is None:
+            continue
+        alvo = linhas[("m", destino)]
+        for dia in dias:
+            dia.motoboy_id = destino
+            try:
+                data_ref = date.fromisoformat(str(dia.data)[:10])
+            except ValueError:
+                data_ref = None
+            fech = None
+            if data_ref is not None:
+                fech = next(
+                    (
+                        f for f in _fechs(destino)
+                        if f.periodo_inicio <= data_ref <= f.periodo_fim
+                    ),
+                    None,
+                )
+            if fech is not None:
+                st = (fech.status or "").strip().upper()
+                dia.fechamento_status = "GERADO" if st in ("", "FECHADO") else st
+                dia.id_fechamento = fech.id_fechamento
+                dia.periodo_inicio = fech.periodo_inicio.isoformat()
+                dia.periodo_fim = fech.periodo_fim.isoformat()
+            alvo["dias"].append(dia)
+        if not (alvo.get("nome") or "").strip() and (ln.get("nome") or "").strip():
+            alvo["nome"] = ln["nome"]
+        remover.append(("e", xid))
+    for chave in remover:
+        linhas.pop(chave, None)
+
+
 def _resumo_agrupado_por_executor(
     db: Session,
     sub_base_user: str,
@@ -1253,6 +1345,7 @@ def _resumo_agrupado_por_executor(
             linhas.setdefault(("m", mid), {"nome": None, "dias": []})
     sem_nome = [xid for (tipo, xid), ln in linhas.items() if tipo == "m" and not ln["nome"]]
     nomes = _carregar_nomes_motoboy_ids(db, sem_nome) if sem_nome else {}
+    _juntar_legado_ao_motoboy(db, sub_base_user, linhas, nomes)
     coletas_abertas = _diarias_coleta_em_aberto_motoboys(
         db, sub_base_user, [xid for (tipo, xid) in linhas if tipo == "m"], data_inicio, data_fim,
         precos_cache=precos_motoboy,
