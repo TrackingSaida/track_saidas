@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -12,7 +13,7 @@ from sqlalchemy import select
 from db import get_db
 from auth import _coerce_role_int, get_current_user
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
-from etiqueta_identidade_service import resolver_nome_exibicao
+from etiqueta_identidade_service import resolver_logo_owner, resolver_nome_exibicao
 from upload_storage_utils import B2_BUCKET_NAME, get_s3_client_optional, purge_b2_keys
 
 logger = logging.getLogger(__name__)
@@ -723,6 +724,21 @@ def delete_logo_me(
     db.commit()
     db.refresh(owner)
     return _identidade_out(owner)
+
+
+@router.get("/me/logo")
+def get_logo_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bytes da logo da sub_base, no mesmo host da API, para o PDF de fechamento."""
+    _assert_role_01(current_user)
+    owner = _owner_for_me(db, current_user)
+    raw = resolver_logo_owner(owner)
+    if not raw:
+        raise HTTPException(404, "Logo não cadastrada.")
+    media = (getattr(owner, "logo_content_type", None) or "image/png").strip() or "image/png"
+    return Response(content=raw, media_type=media, headers={"Cache-Control": "private, max-age=60"})
 
 
 @router.post("/me/logo/presign-get", response_model=LogoPresignGetOut)

@@ -13,6 +13,14 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from base import _resolve_user_sub_base
+from coleta_a_coletar_service import (
+    a_coletar_item,
+    chave_base,
+    contagem_a_coletar,
+    contas_por_base,
+    hoje_operacao,
+    resumo_a_coletar,
+)
 from coleta_operacional_service import (
     atualizar_status_execucao,
     combinar_modo_execucao,
@@ -472,6 +480,9 @@ def consultar_situacao_bases(
     ).all()
     por_base = {item.base_id: item for item in execucoes}
     is_root = _root_admin(current_user)
+    eh_hoje = data_operacao == hoje_operacao()
+    contas = contas_por_base(db, sub_base)
+    contagem = contagem_a_coletar(db, sub_base) if eh_hoje else {}
     itens = []
     for base in bases:
         execucao = por_base.get(base.id_base)
@@ -516,8 +527,15 @@ def consultar_situacao_bases(
                 ),
                 "pode_corrigir": pode_corrigir,
                 "atualizado_em": execucao.atualizado_em if execucao else None,
+                "contas": contas.get(int(base.id_base), []),
+                "a_coletar": (
+                    a_coletar_item(contas.get(int(base.id_base), []), contagem.get(chave_base(base.base)))
+                    if eh_hoje else None
+                ),
             }
         )
+    if eh_hoje:
+        itens.sort(key=lambda item: -((item["a_coletar"] or {}).get("total") or 0))
     return {
         "data_operacao": data_operacao,
         "pode_corrigir_quantidades": is_root,
@@ -526,6 +544,7 @@ def consultar_situacao_bases(
             "em_coleta": sum(item["status"] == "em_coleta" for item in itens),
             "sem_volume": sum(item["status"] == "sem_volume" for item in itens),
             "coletadas": sum(item["status"] == "coletado" for item in itens),
+            "a_coletar": resumo_a_coletar(itens) if eh_hoje else None,
         },
         "itens": itens,
     }
