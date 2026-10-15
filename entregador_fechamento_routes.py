@@ -1113,6 +1113,25 @@ def _criar_fechamento_core(
     return fech, chave_pix
 
 
+def _pos_criar_em_background(sub_base: str, fech_id: int, chave_pix: Optional[str]) -> None:
+    """PDF e push depois da resposta, para o botão Gerar não esperar essa etapa."""
+    db = SessionLocal()
+    try:
+        fech = db.scalar(
+            select(EntregadorFechamento).where(
+                EntregadorFechamento.id_fechamento == int(fech_id),
+                EntregadorFechamento.sub_base == sub_base,
+            )
+        )
+        if fech is None:
+            return
+        _pos_criar_fechamento(db, fech, chave_pix)
+    except Exception:
+        logger.exception("fechamento_pos_criar_background_failed id=%s", fech_id)
+    finally:
+        db.close()
+
+
 def _pos_criar_fechamento(
     db: Session,
     fech: EntregadorFechamento,
@@ -1187,6 +1206,7 @@ def _commit_criacao(db: Session) -> None:
 @router.post("/fechamentos", response_model=FechamentoOut, status_code=201)
 def criar_fechamento(
     payload: FechamentoCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user=Depends(usuario_financeiro),
 ):
@@ -1194,7 +1214,7 @@ def criar_fechamento(
     fech, chave_pix = _criar_fechamento_core(db, sub_base, payload)
     _commit_criacao(db)
     db.refresh(fech)
-    fech = _pos_criar_fechamento(db, fech, chave_pix)
+    background_tasks.add_task(_pos_criar_em_background, sub_base, int(fech.id_fechamento), chave_pix)
 
     return FechamentoOut(
         id_fechamento=fech.id_fechamento,
@@ -1249,6 +1269,7 @@ class FechamentoLoteResponse(BaseModel):
 @router.post("/fechamentos/lote", response_model=FechamentoLoteResponse)
 def gerar_fechamentos_lote(
     payload: FechamentoLoteRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user=Depends(usuario_financeiro),
 ):
@@ -1343,9 +1364,7 @@ def gerar_fechamentos_lote(
         pos_criacao.append((int(fech.id_fechamento), chave_pix))
 
     for fech_id, chave_pix in pos_criacao:
-        fech = db.get(EntregadorFechamento, fech_id)
-        if fech is not None:
-            _pos_criar_fechamento(db, fech, chave_pix)
+        background_tasks.add_task(_pos_criar_em_background, sub_base, fech_id, chave_pix)
 
     out.total_gerado = out.total_gerado.quantize(Decimal("0.01"))
     logger.info(
