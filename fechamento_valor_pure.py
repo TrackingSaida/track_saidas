@@ -81,12 +81,62 @@ def contar_g(saidas: Iterable[Any]) -> Dict[str, int]:
     return out
 
 
+CANAIS_APP = ("flex", "shopee")
+
+
+def acerto_canal(qtd_app: Optional[int], qtd_sistema: int, preco: Any) -> Decimal:
+    """(app − sistema) × preço. Sem quantidade no app, não há acerto."""
+    if qtd_app is None:
+        return _ZERO
+    try:
+        unit = Decimal(str(preco or 0))
+    except Exception:
+        unit = _ZERO
+    return (Decimal(int(qtd_app) - int(qtd_sistema or 0)) * unit).quantize(Decimal("0.01"))
+
+
+def snapshot_canal(canal: str, qtd_app: Optional[int], qtd_sistema: int, precos: Mapping[str, Any]) -> Dict[str, Any]:
+    """Colunas gravadas de um canal. Sem quantidade no app, o canal fica vazio."""
+    if qtd_app is None:
+        return {f"qtd_app_{canal}": None, f"qtd_sistema_{canal}": None, f"preco_acerto_{canal}": None}
+    return {
+        f"qtd_app_{canal}": int(qtd_app),
+        f"qtd_sistema_{canal}": int(qtd_sistema or 0),
+        f"preco_acerto_{canal}": preco_servico(precos, canal).quantize(Decimal("0.01")),
+    }
+
+
+def valor_acerto_apps(colunas: Mapping[str, Any]) -> Decimal:
+    total = _ZERO
+    for canal in CANAIS_APP:
+        total += acerto_canal(
+            colunas.get(f"qtd_app_{canal}"),
+            colunas.get(f"qtd_sistema_{canal}") or 0,
+            colunas.get(f"preco_acerto_{canal}"),
+        )
+    return total.quantize(Decimal("0.01"))
+
+
+def valor_final_fechamento(valor_base: Any, acerto_apps: Any, adicao: Any, subtracao: Any) -> Decimal:
+    return (
+        Decimal(str(valor_base or 0)) + Decimal(str(acerto_apps or 0))
+        + Decimal(str(adicao or 0)) - Decimal(str(subtracao or 0))
+    ).quantize(Decimal("0.01"))
+
+
 def ajustes_mudaram(atual: Mapping[str, Any], novo: Mapping[str, Any]) -> bool:
-    """True quando algum valor/motivo do reajuste difere do gravado."""
+    """True quando algum valor/motivo do reajuste difere do gravado.
+
+    Quantidade do app só é comparada quando a chave veio; ali None significa limpar o canal.
+    """
     for k in ("valor_base", "valor_adicao", "valor_subtracao"):
         if k in novo and novo[k] is not None and Decimal(str(novo[k])) != Decimal(str(atual.get(k) or 0)):
             return True
     for k in ("motivo_adicao", "motivo_subtracao"):
         if k in novo and novo[k] is not None and ((novo[k] or "").strip() or None) != (atual.get(k) or None):
+            return True
+    for canal in CANAIS_APP:
+        k = f"qtd_app_{canal}"
+        if k in novo and novo[k] != atual.get(k):
             return True
     return False

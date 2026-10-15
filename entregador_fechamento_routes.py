@@ -62,7 +62,15 @@ from entregador_routes import (
     usuario_financeiro,
     STATUS_VALOR_BASE_VALIDOS,
 )
-from fechamento_valor_pure import ajustes_mudaram, contar_g, saida_cancelada
+from fechamento_valor_pure import (
+    CANAIS_APP,
+    ajustes_mudaram,
+    contar_g,
+    saida_cancelada,
+    snapshot_canal,
+    valor_acerto_apps,
+    valor_final_fechamento,
+)
 from pacote_g_categorias import categoria_da_saida, nomes_por_categoria, padrao_id_ou_none
 
 logger = logging.getLogger(__name__)
@@ -199,11 +207,13 @@ def _recalcular_valor_base_fechamento(
     db: Session,
     sub_base: str,
     fech: EntregadorFechamento,
+    contagem: Optional[dict] = None,
 ) -> Decimal:
     if getattr(fech, "id_motoboy", None) is not None:
         valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
+            contagem=contagem,
         )
         _, valor_coletas, _ = _calcular_diarias_coleta_motoboy(
             db, sub_base, fech.id_motoboy, fech.periodo_inicio, fech.periodo_fim
@@ -212,7 +222,30 @@ def _recalcular_valor_base_fechamento(
     return _calcular_valor_base_periodo(
         db, sub_base, fech.id_entregador,
         fech.periodo_inicio, fech.periodo_fim,
+        contagem=contagem,
     )
+
+
+def _contagem_vazia() -> dict:
+    return {canal: 0 for canal in CANAIS_APP}
+
+
+def _precos_executor(
+    db: Session, sub_base: str, *, id_motoboy: Optional[int], id_entregador: Optional[int]
+) -> dict:
+    if id_motoboy is not None:
+        return resolver_precos_motoboy(db, sub_base, id_motoboy)
+    if id_entregador is not None:
+        return resolver_precos_entregador(db, id_entregador, sub_base)
+    return {}
+
+
+def _colunas_acerto(fech: EntregadorFechamento) -> dict:
+    return {
+        f"{campo}_{canal}": getattr(fech, f"{campo}_{canal}", None)
+        for canal in CANAIS_APP
+        for campo in ("qtd_app", "qtd_sistema", "preco_acerto")
+    }
 
 
 def _valores_base_recalculados(
@@ -460,6 +493,8 @@ class FechamentoCreate(BaseModel):
     motivo_adicao: Optional[str] = None
     valor_subtracao: Optional[Decimal] = Decimal("0.00")
     motivo_subtracao: Optional[str] = None
+    qtd_app_flex: Optional[int] = Field(None, ge=0)
+    qtd_app_shopee: Optional[int] = Field(None, ge=0)
 
     @model_validator(mode="after")
     def check_actor(self):
@@ -474,6 +509,9 @@ class FechamentoUpdate(BaseModel):
     valor_subtracao: Optional[Decimal] = None
     motivo_subtracao: Optional[str] = None
     atualizar_valor_base: Optional[bool] = None  # True = usar valor_base recalculado
+    # Só mudam quando a chave vem no JSON; null limpa o canal.
+    qtd_app_flex: Optional[int] = Field(None, ge=0)
+    qtd_app_shopee: Optional[int] = Field(None, ge=0)
 
 
 class FechamentoOut(BaseModel):
@@ -506,6 +544,15 @@ class FechamentoOut(BaseModel):
     tem_pdf: Optional[bool] = None
     codigo: Optional[str] = None
     avulso_valor: Optional[Decimal] = None
+    qtd_app_flex: Optional[int] = None
+    qtd_app_shopee: Optional[int] = None
+    qtd_sistema_flex: Optional[int] = None
+    qtd_sistema_shopee: Optional[int] = None
+    preco_acerto_flex: Optional[Decimal] = None
+    preco_acerto_shopee: Optional[Decimal] = None
+    valor_acerto_apps: Decimal = Decimal("0.00")
+    qtd_sistema_atual_flex: Optional[int] = None  # só no GET de um fechamento
+    qtd_sistema_atual_shopee: Optional[int] = None
 
 
 class FechamentoListaTotais(BaseModel):
@@ -587,7 +634,9 @@ def _fechamento_to_out(
     valor_base_recalc: Optional[Decimal] = None,
     incluir_divergencia: bool = True,
     nomes_motoboy_map: Optional[dict] = None,
+    contar_sistema: bool = False,
 ) -> FechamentoOut:
+    """contar_sistema: aproveita o recálculo do valor base para devolver a contagem atual de Flex e Shopee."""
     st = _status_norm(fech)
     chave_pix: Optional[str] = None
     if getattr(fech, "id_motoboy", None) is not None:
@@ -597,9 +646,14 @@ def _fechamento_to_out(
     valor_recalc = None
     precisa_reajuste = None
     alerta_pos_pago = None
+    contagem_atual: Optional[dict] = None
     if incluir_divergencia:
         if valor_base_recalc is None:
-            valor_base_recalc = _recalcular_valor_base_fechamento(db, sub_base, fech)
+            if contar_sistema:
+                contagem_atual = _contagem_vazia()
+                valor_base_recalc = _recalcular_valor_base_fechamento(db, sub_base, fech, contagem=contagem_atual)
+            else:
+                valor_base_recalc = _recalcular_valor_base_fechamento(db, sub_base, fech)
         divergencia = valor_base_recalc != fech.valor_base
         if divergencia:
             valor_recalc = valor_base_recalc
@@ -641,6 +695,10 @@ def _fechamento_to_out(
         alerta_pos_pago=alerta_pos_pago,
         tem_pdf=bool(getattr(fech, "pdf_object_key", None)),
         codigo=build_fechamento_code(fech),
+        **_colunas_acerto(fech),
+        valor_acerto_apps=Decimal(str(getattr(fech, "valor_acerto_apps", None) or 0)),
+        qtd_sistema_atual_flex=contagem_atual["flex"] if contagem_atual is not None else None,
+        qtd_sistema_atual_shopee=contagem_atual["shopee"] if contagem_atual is not None else None,
     )
 
 # =========================================================
@@ -1007,6 +1065,7 @@ def _criar_fechamento_core(
     """
     _validar_periodo_fechado(payload.periodo_inicio, payload.periodo_fim)
 
+    contagem = _contagem_vazia()
     chave_pix: Optional[str] = None
     if payload.id_motoboy is not None:
         motoboy = _resolve_motoboy_subbase(db, sub_base, payload.id_motoboy)
@@ -1022,6 +1081,7 @@ def _criar_fechamento_core(
         valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, payload.id_motoboy,
             payload.periodo_inicio, payload.periodo_fim,
+            contagem=contagem,
         )
         qtd_dias_coleta, valor_coletas, dias_coleta = _calcular_diarias_coleta_motoboy(
             db, sub_base, payload.id_motoboy,
@@ -1043,6 +1103,7 @@ def _criar_fechamento_core(
         valor_entregas = _calcular_valor_base_periodo(
             db, sub_base, payload.id_entregador,
             payload.periodo_inicio, payload.periodo_fim,
+            contagem=contagem,
         )
         valor_coletas = Decimal("0.00")
         qtd_dias_coleta = 0
@@ -1069,8 +1130,15 @@ def _criar_fechamento_core(
 
     valor_ad = Decimal(str(payload.valor_adicao or 0)).quantize(Decimal("0.01"))
     valor_sub = Decimal(str(payload.valor_subtracao or 0)).quantize(Decimal("0.01"))
-    valor_final = (valor_base + valor_ad - valor_sub).quantize(Decimal("0.01"))
-    if pular_sem_valor and valor_base == 0 and valor_ad == 0 and valor_sub == 0:
+    acerto: dict = {}
+    qtds_app = {canal: getattr(payload, f"qtd_app_{canal}", None) for canal in CANAIS_APP}
+    if any(q is not None for q in qtds_app.values()):
+        precos = _precos_executor(db, sub_base, id_motoboy=id_motoboy_val, id_entregador=id_entregador_val)
+        for canal in CANAIS_APP:
+            acerto.update(snapshot_canal(canal, qtds_app[canal], contagem[canal], precos))
+    valor_acerto = valor_acerto_apps(acerto)
+    valor_final = valor_final_fechamento(valor_base, valor_acerto, valor_ad, valor_sub)
+    if pular_sem_valor and valor_base == 0 and valor_ad == 0 and valor_sub == 0 and valor_acerto == 0:
         return None
 
     fech = EntregadorFechamento(
@@ -1088,6 +1156,8 @@ def _criar_fechamento_core(
         motivo_adicao=(payload.motivo_adicao or "").strip() or None,
         valor_subtracao=valor_sub,
         motivo_subtracao=(payload.motivo_subtracao or "").strip() or None,
+        **acerto,
+        valor_acerto_apps=valor_acerto,
         valor_final=valor_final,
         status=STATUS_GERADO,
     )
@@ -1236,6 +1306,8 @@ def criar_fechamento(
         valor_final=fech.valor_final,
         status=fech.status,
         criado_em=fech.criado_em,
+        **_colunas_acerto(fech),
+        valor_acerto_apps=Decimal(str(fech.valor_acerto_apps or 0)),
     )
 
 
@@ -1390,7 +1462,7 @@ def obter_fechamento(
     if not fech or fech.sub_base != sub_base:
         raise HTTPException(404, "Fechamento não encontrado.")
 
-    out = _fechamento_to_out(db, sub_base, fech)
+    out = _fechamento_to_out(db, sub_base, fech, contar_sistema=True)
     out.avulso_valor = _resolver_avulso_valor(
         db,
         sub_base,
@@ -1431,11 +1503,13 @@ def atualizar_fechamento(
 
     chave_pix: Optional[str] = None
     dias_coleta: list[dict] = []
+    contagem = _contagem_vazia()
     if getattr(fech, "id_motoboy", None) is not None:
         chave_pix = _get_motoboy_chave_pix(db, fech.id_motoboy)
         valor_entregas = _calcular_valor_base_motoboy_periodo(
             db, sub_base, fech.id_motoboy,
             fech.periodo_inicio, fech.periodo_fim,
+            contagem=contagem,
         )
         qtd_dias_coleta, valor_coletas, dias_coleta = _calcular_diarias_coleta_motoboy(
             db, sub_base, fech.id_motoboy,
@@ -1446,6 +1520,7 @@ def atualizar_fechamento(
         valor_entregas = _calcular_valor_base_periodo(
             db, sub_base, fech.id_entregador,
             fech.periodo_inicio, fech.periodo_fim,
+            contagem=contagem,
         )
         valor_coletas = Decimal("0.00")
         qtd_dias_coleta = 0
@@ -1457,6 +1532,9 @@ def atualizar_fechamento(
         "valor_subtracao": payload.valor_subtracao,
         "motivo_subtracao": payload.motivo_subtracao,
     }
+    for canal in CANAIS_APP:
+        if f"qtd_app_{canal}" in payload.model_fields_set:
+            novos_valores[f"qtd_app_{canal}"] = getattr(payload, f"qtd_app_{canal}")
     if payload.atualizar_valor_base is True:
         novos_valores["valor_base"] = valor_base_recalc
     valores_atuais = {
@@ -1465,9 +1543,22 @@ def atualizar_fechamento(
         "motivo_adicao": fech.motivo_adicao,
         "valor_subtracao": fech.valor_subtracao,
         "motivo_subtracao": fech.motivo_subtracao,
+        "qtd_app_flex": fech.qtd_app_flex,
+        "qtd_app_shopee": fech.qtd_app_shopee,
     }
     if not ajustes_mudaram(valores_atuais, novos_valores):
         return _fechamento_to_out(db, sub_base, fech)
+
+    canais_mudados = [
+        canal for canal in CANAIS_APP
+        if f"qtd_app_{canal}" in novos_valores and novos_valores[f"qtd_app_{canal}"] != valores_atuais[f"qtd_app_{canal}"]
+    ]
+    if canais_mudados:
+        precos = _precos_executor(db, sub_base, id_motoboy=fech.id_motoboy, id_entregador=fech.id_entregador)
+        for canal in canais_mudados:
+            for coluna, valor in snapshot_canal(canal, novos_valores[f"qtd_app_{canal}"], contagem[canal], precos).items():
+                setattr(fech, coluna, valor)
+        fech.valor_acerto_apps = valor_acerto_apps(_colunas_acerto(fech))
 
     if payload.atualizar_valor_base is True:
         if getattr(fech, "id_motoboy", None) is not None:
@@ -1487,10 +1578,9 @@ def atualizar_fechamento(
     if payload.motivo_subtracao is not None:
         fech.motivo_subtracao = (payload.motivo_subtracao or "").strip() or None
 
-    # Recalcular valor_final
-    fech.valor_final = (
-        fech.valor_base + fech.valor_adicao - fech.valor_subtracao
-    ).quantize(Decimal("0.01"))
+    fech.valor_final = valor_final_fechamento(
+        fech.valor_base, fech.valor_acerto_apps, fech.valor_adicao, fech.valor_subtracao,
+    )
 
     fech.status = STATUS_REAJUSTADO
 

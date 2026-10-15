@@ -1,5 +1,19 @@
 # Migrações
 
+## entregador_fechamento_contagem_apps.sql
+
+**Obrigatória antes** do deploy da contagem nos apps no fechamento do motoboy. Sem ela a API
+responde **500** no fechamento, no A Pagar e no resumo, porque o modelo já usa as colunas.
+Aditiva e idempotente.
+
+- `qtd_app_flex`, `qtd_app_shopee`: quantidade que o app mostra no período (nulo = não informado).
+- `qtd_sistema_*`, `preco_acerto_*`: quantidade do sistema e preço usados quando o operador salvou.
+- `valor_acerto_apps`: diferença em reais, com sinal, somada ao valor final.
+
+```bash
+psql "$DATABASE_URL" -f migrations/entregador_fechamento_contagem_apps.sql
+```
+
 ## saidas_data_venda.sql
 
 **Obrigatória antes** do deploy da data da venda no detalhe. Sem ela a API responde **500**
