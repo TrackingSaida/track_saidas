@@ -9,7 +9,7 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from codigo_normalizer import canonicalize_servico
-from models import BasePreco, EnvioProprio, Motoboy, Saida, SaidaDetail
+from models import BasePreco, EnvioProprio, Motoboy, Saida, SaidaDetail, SaidaHistorico
 from motoboy_nome_utils import get_motoboy_display_name
 from saida_historico_service import listar_historico_saida
 
@@ -354,6 +354,45 @@ def _load_details_map(db: Session, saida_ids: List[int]) -> Dict[int, SaidaDetai
     return {int(r.id_saida): r for r in rows}
 
 
+def _load_ultimo_evento_map(db: Session, saida_ids: List[int]) -> Dict[int, datetime]:
+    """Timestamp do último evento visível ao seller, por saída (uma consulta para a página)."""
+    if not saida_ids:
+        return {}
+    visiveis = [k for k in _ROTULOS_SELLER if k not in _EVENTOS_OCULTOS]
+    rows = db.execute(
+        select(SaidaHistorico.id_saida, func.max(SaidaHistorico.timestamp))
+        .where(
+            SaidaHistorico.id_saida.in_(saida_ids),
+            func.lower(func.trim(SaidaHistorico.evento)).in_(visiveis),
+        )
+        .group_by(SaidaHistorico.id_saida)
+    ).all()
+    return {int(r[0]): r[1] for r in rows if r[1] is not None}
+
+
+def _data_venda(saida: Saida) -> Optional[datetime]:
+    venda = getattr(saida, "data_venda", None)
+    if venda:
+        return venda
+    if canal_venda_chave(saida.servico) == CANAL_SITE:
+        return getattr(saida, "timestamp", None)
+    return None
+
+
+def _data_entrega(saida: Saida) -> Optional[datetime]:
+    st = (getattr(saida, "status", None) or "").strip().upper().replace(" ", "_")
+    if st != "ENTREGUE":
+        return None
+    return getattr(saida, "data_hora_entrega", None)
+
+
+def _atualizado_em(saida: Saida, ultimo_evento: Optional[datetime]) -> Optional[datetime]:
+    candidatos = [d for d in (ultimo_evento, _data_entrega(saida)) if d is not None]
+    if candidatos:
+        return max(candidatos)
+    return getattr(saida, "timestamp", None)
+
+
 def _load_envios_map(db: Session, saida_ids: List[int]) -> Dict[int, EnvioProprio]:
     if not saida_ids:
         return {}
@@ -371,6 +410,7 @@ def _item_resumo(
     saida: Saida,
     envio: Optional[EnvioProprio],
     detail: Optional[SaidaDetail],
+    ultimo_evento: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     dest = _merge_dest(_dest_from_detail(detail), _dest_from_envio(envio))
     st = getattr(saida, "status", None)
@@ -387,6 +427,9 @@ def _item_resumo(
         "dest_cidade": dest.get("cidade"),
         "dest_uf": dest.get("uf"),
         "created_at": _iso(getattr(saida, "timestamp", None)),
+        "data_venda": _iso(_data_venda(saida)),
+        "data_entrega": _iso(_data_entrega(saida)),
+        "atualizado_em": _iso(_atualizado_em(saida, ultimo_evento)),
         "pode_cancelar": (st or "").strip().upper() == STATUS_ETIQUETADO and envio is not None,
     }
 
@@ -581,7 +624,16 @@ def listar_pedidos_seller(
     ids = [int(r.id_saida) for r in rows]
     envios = _load_envios_map(db, ids)
     details = _load_details_map(db, ids)
-    items = [_item_resumo(s, envios.get(int(s.id_saida)), details.get(int(s.id_saida))) for s in rows]
+    ultimos = _load_ultimo_evento_map(db, ids)
+    items = [
+        _item_resumo(
+            s,
+            envios.get(int(s.id_saida)),
+            details.get(int(s.id_saida)),
+            ultimos.get(int(s.id_saida)),
+        )
+        for s in rows
+    ]
     return {"total": total, "page": page, "per_page": per_page, "items": items}
 
 
