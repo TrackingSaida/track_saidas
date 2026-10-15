@@ -147,6 +147,7 @@ class EntregadorResumoItem(BaseModel):
     periodo_fim: Optional[str] = None  # YYYY-MM-DD, quando existe fechamento
     conferencia_status: Optional[str] = None  # conferida | pendente | reconferir (só com conferência habilitada)
     conferencia_label: Optional[str] = None
+    preco_origem: Optional[Dict[str, str]] = None  # {"flex"|"shopee": "motoboy"|"global"}
 
 
 class EntregadorResumoResponse(BaseModel):
@@ -326,10 +327,33 @@ def _find_matching_user(db: Session, sub_base: str, username_ent: Optional[str])
     return db.scalars(stmt).first()
 
 
+ORIGEM_GLOBAL = {"flex": "global", "shopee": "global"}
+
+
+def precos_e_origem_entregador(
+    db: Session,
+    id_entregador: int,
+    sub_base: str,
+) -> tuple[Dict[str, Decimal], Dict[str, str]]:
+    """Preços do entregador e, para Flex e Shopee, se vieram da exceção ("motoboy") ou do global."""
+    preco = db.scalars(
+        select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
+    ).first()
+    precos = resolver_precos_entregador(db, id_entregador, sub_base, preco_row=preco)
+    if preco and preco.usa_preco_global is False:
+        return precos, {
+            "flex": "motoboy" if preco.ml_valor is not None else "global",
+            "shopee": "motoboy" if preco.shopee_valor is not None else "global",
+        }
+    return precos, dict(ORIGEM_GLOBAL)
+
+
 def resolver_precos_entregador(
     db: Session,
     id_entregador: int,
     sub_base: str,
+    *,
+    preco_row: Optional[EntregadorPreco] = None,
 ) -> Dict[str, Decimal]:
     """
     Retorna {shopee_valor, ml_valor, avulso_valor} para o entregador.
@@ -342,10 +366,12 @@ def resolver_precos_entregador(
        usar EntregadorPrecoGlobal da sub_base
     """
     zero = Decimal("0.00")
-
-    preco = db.scalars(
-        select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
-    ).first()
+    if preco_row is not None:
+        preco = preco_row
+    else:
+        preco = db.scalars(
+            select(EntregadorPreco).where(EntregadorPreco.id_entregador == id_entregador)
+        ).first()
 
     global_row = db.scalars(
         select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
@@ -459,6 +485,15 @@ def resolver_precos_motoboy(
     1) quando houver motoboy_id, tenta mapear para entregador e usar exceção de entregador;
     2) fallback para preço global da sub_base.
     """
+    return precos_e_origem_motoboy(db, sub_base, motoboy_id)[0]
+
+
+def precos_e_origem_motoboy(
+    db: Session,
+    sub_base: str,
+    motoboy_id: Optional[int] = None,
+) -> tuple[Dict[str, Decimal], Dict[str, str]]:
+    """Mesmo preço de resolver_precos_motoboy, com a origem de Flex e Shopee."""
     zero = Decimal("0.00")
     if motoboy_id is not None:
         entregador_id = _resolver_entregador_principal_do_motoboy_robusto(
@@ -467,12 +502,12 @@ def resolver_precos_motoboy(
             motoboy_id=motoboy_id,
         )
         if entregador_id is not None:
-            return resolver_precos_entregador(
-                db=db,
-                id_entregador=entregador_id,
-                sub_base=sub_base,
-            )
+            return precos_e_origem_entregador(db, entregador_id, sub_base)
 
+    return _precos_globais(db, sub_base, zero), dict(ORIGEM_GLOBAL)
+
+
+def _precos_globais(db: Session, sub_base: str, zero: Decimal) -> Dict[str, Decimal]:
     global_row = db.scalars(
         select(EntregadorPrecoGlobal).where(EntregadorPrecoGlobal.sub_base == sub_base)
     ).first()
@@ -978,8 +1013,12 @@ def _calcular_valor_base_periodo(
     entregador_id: int,
     periodo_inicio: date,
     periodo_fim: date,
+    contagem: Optional[Dict[str, int]] = None,
 ) -> Decimal:
-    """Calcula valor_base por escopo equivalente do entregador (legacy + motoboy vinculado)."""
+    """Calcula valor_base por escopo equivalente do entregador (legacy + motoboy vinculado).
+
+    contagem: quando informado ({"flex": 0, "shopee": 0}), recebe as saídas pagas de cada canal.
+    """
     if periodo_inicio > periodo_fim:
         return Decimal("0.00")
 
@@ -1016,6 +1055,10 @@ def _calcular_valor_base_periodo(
             precos, saida.servico, saida.status, bool(getattr(saida, "is_grande", False)), toggle_pacote_g,
             regras_g.get(categoria_da_saida(saida, padrao_g)),
         )
+        if contagem is not None and "cancel" not in (saida.status or "").strip().lower():
+            tipo = _normalizar_servico(saida.servico)
+            if tipo in contagem:
+                contagem[tipo] += 1
     return total.quantize(Decimal("0.01"))
 
 
@@ -1025,21 +1068,44 @@ def _calcular_valor_base_motoboy_periodo(
     motoboy_id: int,
     periodo_inicio: date,
     periodo_fim: date,
+    contagem: Optional[Dict[str, int]] = None,
 ) -> Decimal:
-    """Calcula o valor_base a partir das saídas do motoboy no período (resumo/fechamento)."""
-    return _calcular_valores_base_motoboys_periodo(
-        db, sub_base_user, [motoboy_id], periodo_inicio, periodo_fim
+    """Calcula o valor_base a partir das saídas do motoboy no período (resumo/fechamento).
+
+    contagem: quando informado ({"flex": 0, "shopee": 0}), recebe as saídas pagas de cada canal.
+    """
+    por_motoboy: Optional[Dict[int, Dict[str, int]]] = {} if contagem is not None else None
+    valor = _calcular_valores_base_motoboys_periodo(
+        db, sub_base_user, [motoboy_id], periodo_inicio, periodo_fim, contagem=por_motoboy,
     ).get(int(motoboy_id), Decimal("0.00"))
+    if contagem is not None:
+        for tipo, qtd in (por_motoboy or {}).get(int(motoboy_id), {}).items():
+            if tipo in contagem:
+                contagem[tipo] += qtd
+    return valor
 
 
 def precos_motoboy_cache(
-    db: Session, sub_base: str, motoboy_id: int, cache: Optional[Dict[int, Dict[str, Decimal]]]
+    db: Session,
+    sub_base: str,
+    motoboy_id: int,
+    cache: Optional[Dict[int, Dict[str, Decimal]]],
+    origens: Optional[Dict[int, Dict[str, str]]] = None,
 ) -> Dict[str, Decimal]:
-    if cache is None:
-        return resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
-    if int(motoboy_id) not in cache:
-        cache[int(motoboy_id)] = resolver_precos_motoboy(db, sub_base, motoboy_id=motoboy_id)
-    return cache[int(motoboy_id)]
+    """origens: quando informado, também guarda de onde veio o preço de Flex e Shopee."""
+    mid = int(motoboy_id)
+    if origens is None:
+        if cache is None:
+            return resolver_precos_motoboy(db, sub_base, motoboy_id=mid)
+        if mid not in cache:
+            cache[mid] = resolver_precos_motoboy(db, sub_base, motoboy_id=mid)
+        return cache[mid]
+    if cache is None or mid not in cache or mid not in origens:
+        precos, origens[mid] = precos_e_origem_motoboy(db, sub_base, motoboy_id=mid)
+        if cache is None:
+            return precos
+        cache[mid] = precos
+    return cache[mid]
 
 
 def _calcular_valores_base_motoboys_periodo(
@@ -1051,11 +1117,13 @@ def _calcular_valores_base_motoboys_periodo(
     *,
     precos_cache: Optional[Dict[int, Dict[str, Decimal]]] = None,
     saidas_periodo: Optional[List[Saida]] = None,
+    contagem: Optional[Dict[int, Dict[str, int]]] = None,
 ) -> Dict[int, Decimal]:
     """Valor das entregas de vários motoboys no mesmo período, carregando saídas e histórico uma única vez.
 
     saidas_periodo: saídas já carregadas com os mesmos filtros (status válidos, código e período operacional);
     evita recarregar quando o chamador já as tem em memória.
+    contagem: quando informado, recebe {motoboy_id: {"flex": n, "shopee": n}} das saídas pagas.
     """
     ids = sorted({int(m) for m in motoboy_ids if m is not None})
     zero = Decimal("0.00")
@@ -1089,6 +1157,8 @@ def _calcular_valores_base_motoboys_periodo(
             continue
         precos = precos_motoboy_cache(db, sub_base_user, mid, precos_cache)
         tipo = _normalizar_servico(saida.servico)
+        if contagem is not None and tipo in ("flex", "shopee"):
+            contagem.setdefault(mid, {"flex": 0, "shopee": 0})[tipo] += 1
         if tipo == "shopee":
             delta = precos["shopee_valor"]
         elif tipo == "flex":
@@ -1650,7 +1720,9 @@ def resumo_entregadores(
                 agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + 1
 
     cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
+    cache_origem: Dict[tuple, Dict[str, str]] = {}
     precos_motoboy: Dict[int, Dict[str, Decimal]] = {}
+    origens_motoboy: Dict[int, Dict[str, str]] = {}
     cache_valor_base: Dict[tuple, Decimal] = {}  # (eid, periodo_inicio, periodo_fim) ou ("m", mid, ini, fim) -> valor_base
 
     fech_stmt = select(EntregadorFechamento).where(EntregadorFechamento.sub_base == sub_base_user)
@@ -1712,11 +1784,17 @@ def resumo_entregadores(
         precos_key = ("m", mid) if mid is not None else ("e", eid)
         if precos_key not in cache_precos:
             if mid is not None:
-                cache_precos[precos_key] = precos_motoboy_cache(db, sub_base_user, mid, precos_motoboy)
+                cache_precos[precos_key] = precos_motoboy_cache(
+                    db, sub_base_user, mid, precos_motoboy, origens_motoboy,
+                )
+                cache_origem[precos_key] = origens_motoboy.get(int(mid), dict(ORIGEM_GLOBAL))
             elif eid is not None and eid > 0:
-                cache_precos[precos_key] = resolver_precos_entregador(db, eid, sub_base_user)
+                cache_precos[precos_key], cache_origem[precos_key] = precos_e_origem_entregador(
+                    db, eid, sub_base_user,
+                )
             else:
                 cache_precos[precos_key] = resolver_precos_motoboy(db, sub_base_user)
+                cache_origem[precos_key] = dict(ORIGEM_GLOBAL)
         precos = cache_precos[precos_key]
         valor_shopee = item["qtde_shopee"] * precos["shopee_valor"]
         valor_flex = item["qtde_flex"] * precos["ml_valor"]
@@ -1814,6 +1892,7 @@ def resumo_entregadores(
                 valor_base_fechado=valor_base_fechado,
                 periodo_inicio=periodo_inicio_str,
                 periodo_fim=periodo_fim_str,
+                preco_origem=cache_origem.get(precos_key),
             )
         )
 
