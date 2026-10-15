@@ -120,6 +120,33 @@ def _fmt_periodo(ini, fim) -> str:
     return f"{_fmt_date(ini)} a {_fmt_date(fim)}"
 
 
+_NOME_CANAL_APP = {"flex": "Mercado Livre", "shopee": "Shopee"}
+
+
+def linhas_contagem_apps(fech: Any) -> List[tuple]:
+    """(rótulo, valor com sinal) de cada canal cuja contagem no app difere do sistema."""
+    from fechamento_valor_pure import CANAIS_APP, acerto_canal
+
+    linhas: List[tuple] = []
+    for canal in CANAIS_APP:
+        qtd_app = getattr(fech, f"qtd_app_{canal}", None)
+        if qtd_app is None:
+            continue
+        qtd_sistema = int(getattr(fech, f"qtd_sistema_{canal}", None) or 0)
+        diferenca = int(qtd_app) - qtd_sistema
+        if diferenca == 0:
+            continue
+        preco = getattr(fech, f"preco_acerto_{canal}", None) or 0
+        texto = f"{diferenca} a mais no app" if diferenca > 0 else f"{abs(diferenca)} a menos no app"
+        linhas.append(
+            (
+                f"{_NOME_CANAL_APP[canal]} · {texto} × {_fmt_brl(preco)}",
+                acerto_canal(qtd_app, qtd_sistema, preco),
+            )
+        )
+    return linhas
+
+
 def _curto(txt: Optional[str], n: int = 46) -> str:
     s = " ".join((txt or "").split())
     if not s:
@@ -595,6 +622,8 @@ def _render_fechamento_pdf(**p) -> bytes:
                 _fmt_signed(-abs(Decimal(str(p.get("subtracao") or 0)))),
             )
         )
+    for rotulo, valor in p.get("contagem_apps") or []:
+        comp.append((rotulo, _fmt_signed(valor)))
     comp.append(("Total a pagar", _fmt_brl(p.get("valor_final"))))
     col_valor = margem + util * 0.50
     for i, (rotulo, valor) in enumerate(comp):
@@ -721,6 +750,11 @@ def _gerar_pdf_simples(fech: EntregadorFechamento, chave_pix: Optional[str] = No
     line(f"Subtrações: {_fmt_brl(fech.valor_subtracao)}")
     if fech.motivo_subtracao:
         line(f"  Motivo subtração: {fech.motivo_subtracao}", 9, 5 * mm)
+    contagem = linhas_contagem_apps(fech)
+    if contagem:
+        line("Contagem nos apps:")
+        for rotulo, valor in contagem:
+            line(f"  {rotulo}: {_fmt_signed(valor)}", 9, 5 * mm)
     y -= 2 * mm
     line(f"Total a pagar: {_fmt_brl(fech.valor_final)}", 14, 8 * mm, bold=True)
 
@@ -749,7 +783,10 @@ def _gerar_pdf_rico(
     total_cancelados = sum(int(r["total_cancelado"]) for r in itens)
     valor_feitos = sum((r["valor_feitos"] for r in itens), Decimal("0"))
     valor_cancelados = sum((r["valor_cancelados"] for r in itens), Decimal("0"))
-    total_ajustes = Decimal(str(fech.valor_adicao or 0)) - Decimal(str(fech.valor_subtracao or 0))
+    total_ajustes = (
+        Decimal(str(fech.valor_adicao or 0)) - Decimal(str(fech.valor_subtracao or 0))
+        + Decimal(str(getattr(fech, "valor_acerto_apps", None) or 0))
+    )
     total_g = sum(int(r["g_total"]) for r in itens)
     total_g_shopee = sum(int(r["g_shopee"]) for r in itens)
     total_g_flex = sum(int(r["g_flex"]) for r in itens)
@@ -787,6 +824,7 @@ def _gerar_pdf_rico(
         motivo_adicao=fech.motivo_adicao or "",
         subtracao=Decimal(str(fech.valor_subtracao or 0)),
         motivo_subtracao=fech.motivo_subtracao or "",
+        contagem_apps=linhas_contagem_apps(fech),
         linhas=itens,
         coletas=[
             {"data": item.data, "bases": list(item.bases or []), "valor": item.valor_diaria}

@@ -908,6 +908,15 @@ class EntregadorFechamento(Base):
     valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     motivo_subtracao = Column(Text, nullable=True)
 
+    # Contagem nos apps: só a diferença para o sistema entra no valor final; o valor base não muda.
+    qtd_app_flex = Column(Integer, nullable=True)
+    qtd_app_shopee = Column(Integer, nullable=True)
+    qtd_sistema_flex = Column(Integer, nullable=True)
+    qtd_sistema_shopee = Column(Integer, nullable=True)
+    preco_acerto_flex = Column(Numeric(12, 2), nullable=True)
+    preco_acerto_shopee = Column(Numeric(12, 2), nullable=True)
+    valor_acerto_apps = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+
     valor_final = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     status = Column(Text, nullable=False, server_default=text("'fechado'::text"))
 
