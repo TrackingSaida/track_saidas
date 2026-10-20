@@ -1620,6 +1620,8 @@ def resumo_entregadores(
         if not entregador_ids_filtro and not motoboy_ids_filtro:
             entregador_ids_filtro, motoboy_ids_filtro = set(), set()
 
+    # Pré-filtro de base no SQL (acento/caixa); o valor oficial do fechamento não usa esse recorte.
+    base_prefiltro = base if base_filtro_norm is not None else None
     rows, marcos_map = carregar_saidas_fechamento_leve(
         db,
         sub_base=sub_base_user,
@@ -1629,9 +1631,12 @@ def resumo_entregadores(
         motoboy_ids=sorted(motoboy_ids_filtro) if motoboy_ids_filtro is not None else None,
         entregador_ids=sorted(entregador_ids_filtro) if entregador_ids_filtro is not None else None,
         exigir_executor=True,
+        base_prefiltro=base_prefiltro,
     )
-    saidas_periodo_completo = rows if entregador_id is None and motoboy_id is None else None
-    # Recorte de consulta: o valor base do fechamento oficial continua usando o período completo.
+    # Só reaproveita saídas em memória no recálculo quando a lista é o período inteiro (sem base).
+    saidas_periodo_completo = (
+        rows if entregador_id is None and motoboy_id is None and base_filtro_norm is None else None
+    )
     if base_filtro_norm is not None:
         rows = [s for s in rows if saida_pertence_base(s.base, base_filtro_norm)]
     nomes_motoboy_map = _carregar_nomes_motoboy_ids(
