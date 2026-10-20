@@ -383,12 +383,16 @@ def carregar_saidas_fechamento_leve(
     motoboy_ids: Optional[Sequence[int]] = None,
     entregador_ids: Optional[Sequence[int]] = None,
     exigir_executor: bool = True,
+    base_prefiltro: Optional[str] = None,
 ) -> Tuple[List[SaidaFechamentoLeve], Dict[int, MarcosOperacionaisFechamento]]:
     """Candidatas do fechamento com marcos via DISTINCT ON (sem varrer o histórico).
 
     A janela de candidatos continua sendo `sub_base` + `timestamp` (igual ao resumo atual).
     O join no histórico traz só o último atrib/inv e o último marco por saída.
+    `base_prefiltro` reduz candidatos no SQL; a filtragem final de acento fica no chamador.
     """
+    from fechamento_resumo_utils import base_prefiltro_sql_valores
+
     conds = [
         Saida.sub_base == sub_base,
         Saida.codigo.isnot(None),
@@ -411,6 +415,10 @@ def carregar_saidas_fechamento_leve(
     elif periodo_fim is not None:
         _, ts_fim_excl = janela_timestamp_periodo(periodo_fim, periodo_fim)
         conds.append(Saida.timestamp < ts_fim_excl)
+
+    base_vals = base_prefiltro_sql_valores(base_prefiltro)
+    if base_vals:
+        conds.append(func.lower(func.trim(Saida.base)).in_(base_vals))
 
     if motoboy_ids is not None or entregador_ids is not None:
         mids = [int(m) for m in (motoboy_ids or []) if m is not None]
