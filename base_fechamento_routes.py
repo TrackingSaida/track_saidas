@@ -397,55 +397,16 @@ def _g_por_categoria(
     return out
 
 
-def _build_itens_e_valores(
-    db: Session,
-    sub_base: str,
-    base: str,
-    periodo_inicio: date,
-    periodo_fim: date,
+def _itens_e_valores_de_rows(
+    rows_coletas: List[Any],
+    rows_canc: List[Any],
+    rows_g: List[Any],
+    *,
+    precos: Dict[str, Decimal],
+    regras_g: Dict[int, Dict[str, Any]],
+    padrao_g_id: Optional[int],
 ) -> tuple[List[dict], Decimal, Decimal, Decimal]:
-    """
-    Retorna (itens, valor_bruto, valor_cancelados, valor_final), com valor_final já somando o G.
-    itens: lista de {data, shopee, mercado_livre, avulso, cancelados_*, g_*, g_categorias, valor_g}
-    """
-    base_norm = base.strip()
-    base_key = base_norm.upper()
-    from datetime import time as dt_time
-    dt_start = datetime.combine(periodo_inicio, dt_time.min)
-    dt_end = datetime.combine(periodo_fim, dt_time(23, 59, 59))
-
-    # Coletas: agrupar por (data, base). Inclui ajustes (origem=ajuste) com delta negativo.
-    stmt_coletas = select(Coleta).where(
-        Coleta.sub_base == sub_base,
-        func.upper(Coleta.base) == base_key,
-        Coleta.timestamp >= dt_start,
-        Coleta.timestamp <= dt_end,
-    ).where(
-        (Coleta.shopee != 0)
-        | (Coleta.mercado_livre != 0)
-        | (Coleta.avulso != 0)
-        | (Coleta.valor_total != 0)
-    )
-    rows_coletas = db.scalars(stmt_coletas).all()
-
-    from pedido_sincronizado import sincronizado_nao_coletado
-
-    # Cancelados: Saidas com status cancelado, agrupar por (data, base, servico).
-    # Pedido sincronizado nunca coletado não foi somado, então não é descontado.
-    stmt_canc = select(Saida).where(
-        Saida.sub_base == sub_base,
-        func.lower(Saida.status) == "cancelado",
-        ~sincronizado_nao_coletado(),
-    )
-    if base_norm:
-        stmt_canc = stmt_canc.where(func.upper(Saida.base) == base_key)
-    stmt_canc = stmt_canc.where(
-        Saida.data >= periodo_inicio,
-        Saida.data <= periodo_fim,
-    )
-    rows_canc = db.scalars(stmt_canc).all()
-
-    # Mapa coletas por data (agrupar manuais e codigo)
+    """Agrega coletas/cancelados/G já filtrados de uma base em itens diários."""
     mapa_coletas: dict[str, dict] = {}
     for r in rows_coletas:
         dia = r.timestamp.date().isoformat()
@@ -455,7 +416,6 @@ def _build_itens_e_valores(
         mapa_coletas[dia]["mercado_livre"] += r.mercado_livre or 0
         mapa_coletas[dia]["avulso"] += r.avulso or 0
 
-    # Mapa cancelados por data e tipo
     mapa_canc: dict[str, dict] = {}
     for c in rows_canc:
         dia = (c.data or c.timestamp.date()).isoformat()
@@ -464,23 +424,6 @@ def _build_itens_e_valores(
             mapa_canc[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
         mapa_canc[dia][tipo] = mapa_canc[dia].get(tipo, 0) + 1
 
-    regras_g, padrao_g_id = _contexto_g_base(db, sub_base)
-
-    # Pacotes G: Saidas não canceladas com is_grande, por data, categoria e serviço
-    # (pedido sincronizado só depois de coletado).
-    stmt_g = select(Saida).where(
-        Saida.sub_base == sub_base,
-        Saida.is_grande.is_(True),
-        func.lower(func.coalesce(Saida.status, "")) != "cancelado",
-        ~sincronizado_nao_coletado(),
-    )
-    if base_norm:
-        stmt_g = stmt_g.where(func.upper(Saida.base) == base_key)
-    stmt_g = stmt_g.where(
-        Saida.data >= periodo_inicio,
-        Saida.data <= periodo_fim,
-    )
-    rows_g = db.scalars(stmt_g).all()
     mapa_g: dict[str, Dict[str, Dict[str, int]]] = {}
 
     def _somar_g(dia: str, cid: Any, tipo: str, qtd: int) -> None:
@@ -494,7 +437,6 @@ def _build_itens_e_valores(
         tipo = _normalizar_servico_saida(g.servico or "")
         _somar_g(dia, categoria_da_saida(g, padrao_g_id), tipo, 1)
 
-    # G informado em coleta manual/ajuste. Coletas por código já contam pelas saídas G acima.
     for r in rows_coletas:
         if (getattr(r, "origem", None) or "codigo") not in ORIGENS_COLETA_G_MANUAL:
             continue
@@ -509,14 +451,11 @@ def _build_itens_e_valores(
             for tipo in SERVICOS_G:
                 _somar_g(dia, cid, tipo, qtds.get(tipo, 0))
 
-    # Dias únicos (coletas + cancelados + G)
     dias_set = set(mapa_coletas.keys()) | set(mapa_canc.keys()) | set(mapa_g.keys())
     if not dias_set:
         return [], Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
 
-    precos = _precos_base(db, sub_base, base_norm)
     p_shopee, p_ml, p_avulso = precos["shopee"], precos["ml"], precos["avulso"]
-
     itens = []
     valor_bruto = Decimal("0.00")
     valor_cancelados = Decimal("0.00")
@@ -564,6 +503,73 @@ def _build_itens_e_valores(
 
     valor_final = (valor_bruto - valor_cancelados + valor_g_total).quantize(Decimal("0.01"))
     return itens, valor_bruto, valor_cancelados, valor_final
+
+
+def _build_itens_e_valores(
+    db: Session,
+    sub_base: str,
+    base: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> tuple[List[dict], Decimal, Decimal, Decimal]:
+    """
+    Retorna (itens, valor_bruto, valor_cancelados, valor_final), com valor_final já somando o G.
+    itens: lista de {data, shopee, mercado_livre, avulso, cancelados_*, g_*, g_categorias, valor_g}
+    """
+    base_norm = base.strip()
+    base_key = base_norm.upper()
+    from datetime import time as dt_time
+    dt_start = datetime.combine(periodo_inicio, dt_time.min)
+    dt_end = datetime.combine(periodo_fim, dt_time(23, 59, 59))
+
+    stmt_coletas = select(Coleta).where(
+        Coleta.sub_base == sub_base,
+        func.upper(Coleta.base) == base_key,
+        Coleta.timestamp >= dt_start,
+        Coleta.timestamp <= dt_end,
+    ).where(
+        (Coleta.shopee != 0)
+        | (Coleta.mercado_livre != 0)
+        | (Coleta.avulso != 0)
+        | (Coleta.valor_total != 0)
+    )
+    rows_coletas = list(db.scalars(stmt_coletas).all())
+
+    from pedido_sincronizado import sincronizado_nao_coletado
+
+    stmt_canc = select(Saida).where(
+        Saida.sub_base == sub_base,
+        func.lower(Saida.status) == "cancelado",
+        ~sincronizado_nao_coletado(),
+        Saida.data >= periodo_inicio,
+        Saida.data <= periodo_fim,
+    )
+    if base_norm:
+        stmt_canc = stmt_canc.where(func.upper(Saida.base) == base_key)
+    rows_canc = list(db.scalars(stmt_canc).all())
+
+    regras_g, padrao_g_id = _contexto_g_base(db, sub_base)
+
+    stmt_g = select(Saida).where(
+        Saida.sub_base == sub_base,
+        Saida.is_grande.is_(True),
+        func.lower(func.coalesce(Saida.status, "")) != "cancelado",
+        ~sincronizado_nao_coletado(),
+        Saida.data >= periodo_inicio,
+        Saida.data <= periodo_fim,
+    )
+    if base_norm:
+        stmt_g = stmt_g.where(func.upper(Saida.base) == base_key)
+    rows_g = list(db.scalars(stmt_g).all())
+
+    return _itens_e_valores_de_rows(
+        rows_coletas,
+        rows_canc,
+        rows_g,
+        precos=_precos_base(db, sub_base, base_norm),
+        regras_g=regras_g,
+        padrao_g_id=padrao_g_id,
+    )
 
 
 # =========================================================
@@ -1302,6 +1308,107 @@ def marcar_fechamentos_recebidos(
 # GET — Resumo por base / POST — Lote
 # =========================================================
 
+def _dias_pendentes_calendario_em_memoria(
+    *,
+    ignorar_coleta: bool,
+    preco: Optional[BasePreco],
+    periodo_inicio: date,
+    periodo_fim: date,
+    excecoes: List[ColetaCalendarioExcecao],
+    execucoes_datas: set,
+    lancamentos_legados: set,
+) -> List[str]:
+    """Mesma regra de `_resumo_calendario_fechamento`, sem novas consultas."""
+    if ignorar_coleta:
+        return []
+    if not preco or not bool(preco.agenda_coleta_confirmada):
+        return []
+    base_id = getattr(preco, "id_base", None)
+    globais = {item.data: item for item in excecoes if item.base_id is None}
+    por_base = {
+        item.data: item for item in excecoes if base_id is not None and item.base_id == base_id
+    }
+    dias_configurados = set(preco.dias_coleta or [])
+    pendentes: List[str] = []
+    cursor = periodo_inicio
+    while cursor <= periodo_fim:
+        excecao = por_base.get(cursor) or globais.get(cursor)
+        programado = cursor.isoweekday() in dias_configurados
+        coleta_extra = bool(excecao and excecao.tipo == "COLETA_EXTRA")
+        if not programado and not coleta_extra:
+            cursor += timedelta(days=1)
+            continue
+        if cursor in execucoes_datas or cursor in lancamentos_legados:
+            pass
+        elif excecao and excecao.tipo in ("FERIADO", "SEM_COLETA", "JUSTIFICADO"):
+            pass
+        else:
+            pendentes.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return pendentes
+
+
+def _cnpj_por_base_precos(
+    db: Session,
+    sub_base: str,
+    precos_por_chave: Dict[str, BasePreco],
+) -> Dict[str, Optional[str]]:
+    """CNPJ de cada base a partir dos BasePreco já carregados (uma ou poucas consultas)."""
+    out: Dict[str, Optional[str]] = {chave: None for chave in precos_por_chave}
+    base_ids = [
+        int(p.id_base)
+        for p in precos_por_chave.values()
+        if getattr(p, "id_base", None) is not None
+    ]
+    sellers_por_base_id: Dict[int, BaseSellerDados] = {}
+    if base_ids:
+        for seller in db.scalars(
+            select(BaseSellerDados).where(BaseSellerDados.base_id.in_(base_ids))
+        ).all():
+            if seller.base_id is not None:
+                sellers_por_base_id[int(seller.base_id)] = seller
+
+    usernames_legado = {
+        (p.username or "").strip()
+        for p in precos_por_chave.values()
+        if getattr(p, "id_base", None) is None and (getattr(p, "username", None) or "").strip()
+    }
+    owners_por_user: Dict[str, Owner] = {}
+    sellers_por_owner: Dict[int, BaseSellerDados] = {}
+    if usernames_legado:
+        for owner in db.scalars(
+            select(Owner).where(Owner.sub_base == sub_base, Owner.username.in_(sorted(usernames_legado)))
+        ).all():
+            owners_por_user[(owner.username or "").strip()] = owner
+        owner_ids = [int(o.id_owner) for o in owners_por_user.values()]
+        if owner_ids:
+            for seller in db.scalars(
+                select(BaseSellerDados).where(BaseSellerDados.owner_id.in_(owner_ids))
+            ).all():
+                if seller.owner_id is not None:
+                    sellers_por_owner[int(seller.owner_id)] = seller
+
+    def _fmt_cnpj(raw: Optional[str]) -> Optional[str]:
+        cnpj_raw = (raw or "").strip() or None
+        if not cnpj_raw:
+            return None
+        digits = "".join(c for c in cnpj_raw if c.isdigit())
+        if len(digits) == 14:
+            return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+        return cnpj_raw
+
+    for chave, preco in precos_por_chave.items():
+        seller = None
+        if getattr(preco, "id_base", None) is not None:
+            seller = sellers_por_base_id.get(int(preco.id_base))
+        elif (getattr(preco, "username", None) or "").strip():
+            owner = owners_por_user.get((preco.username or "").strip())
+            if owner:
+                seller = sellers_por_owner.get(int(owner.id_owner))
+        out[chave] = _fmt_cnpj(getattr(seller, "cnpj", None) if seller else None)
+    return out
+
+
 def _linhas_resumo_por_base(
     db: Session,
     sub_base: str,
@@ -1310,6 +1417,7 @@ def _linhas_resumo_por_base(
 ) -> List[ResumoBaseLinha]:
     """Uma linha por base com movimento, agenda confirmada ou fechamento no período."""
     from datetime import time as dt_time
+    from pedido_sincronizado import sincronizado_nao_coletado
 
     dt_start = datetime.combine(periodo_inicio, dt_time.min)
     dt_end = datetime.combine(periodo_fim, dt_time(23, 59, 59))
@@ -1323,26 +1431,78 @@ def _linhas_resumo_por_base(
         if prioritario or chave not in nomes:
             nomes[chave] = nome_norm
 
-    for nome in db.scalars(
-        select(Coleta.base).where(
-            Coleta.sub_base == sub_base,
-            Coleta.timestamp >= dt_start,
-            Coleta.timestamp <= dt_end,
-        ).distinct()
-    ).all():
-        _registrar(nome)
-    from pedido_sincronizado import sincronizado_nao_coletado
+    # Uma leitura por tipo de movimento no período da sub_base.
+    rows_coletas_todas = list(
+        db.scalars(
+            select(Coleta).where(
+                Coleta.sub_base == sub_base,
+                Coleta.timestamp >= dt_start,
+                Coleta.timestamp <= dt_end,
+            )
+        ).all()
+    )
+    rows_coletas_valor = [
+        r
+        for r in rows_coletas_todas
+        if (r.shopee or 0) != 0
+        or (r.mercado_livre or 0) != 0
+        or (r.avulso or 0) != 0
+        or (r.valor_total or 0) != 0
+    ]
+    rows_canc_todas = list(
+        db.scalars(
+            select(Saida).where(
+                Saida.sub_base == sub_base,
+                func.lower(Saida.status) == "cancelado",
+                ~sincronizado_nao_coletado(),
+                Saida.data >= periodo_inicio,
+                Saida.data <= periodo_fim,
+            )
+        ).all()
+    )
+    rows_g_todas = list(
+        db.scalars(
+            select(Saida).where(
+                Saida.sub_base == sub_base,
+                Saida.is_grande.is_(True),
+                func.lower(func.coalesce(Saida.status, "")) != "cancelado",
+                ~sincronizado_nao_coletado(),
+                Saida.data >= periodo_inicio,
+                Saida.data <= periodo_fim,
+            )
+        ).all()
+    )
 
-    for nome in db.scalars(
-        select(Saida.base).where(
-            Saida.sub_base == sub_base,
-            Saida.data >= periodo_inicio,
-            Saida.data <= periodo_fim,
-            (func.lower(Saida.status) == "cancelado") | (Saida.is_grande.is_(True)),
-            ~sincronizado_nao_coletado(),
-        ).distinct()
-    ).all():
-        _registrar(nome)
+    coletas_por_base: Dict[str, List[Any]] = {}
+    for r in rows_coletas_valor:
+        chave = (r.base or "").strip().upper()
+        if not chave:
+            continue
+        coletas_por_base.setdefault(chave, []).append(r)
+        _registrar(r.base)
+
+    canc_por_base: Dict[str, List[Any]] = {}
+    for r in rows_canc_todas:
+        chave = (r.base or "").strip().upper()
+        if not chave:
+            continue
+        canc_por_base.setdefault(chave, []).append(r)
+        _registrar(r.base)
+
+    g_por_base: Dict[str, List[Any]] = {}
+    for r in rows_g_todas:
+        chave = (r.base or "").strip().upper()
+        if not chave:
+            continue
+        g_por_base.setdefault(chave, []).append(r)
+        _registrar(r.base)
+
+    lancamentos_por_base: Dict[str, set] = {}
+    for r in rows_coletas_todas:
+        chave = (r.base or "").strip().upper()
+        if not chave:
+            continue
+        lancamentos_por_base.setdefault(chave, set()).add(r.timestamp.date())
 
     precos_por_chave: Dict[str, BasePreco] = {}
     for preco in db.scalars(select(BasePreco).where(BasePreco.sub_base == sub_base)).all():
@@ -1367,17 +1527,57 @@ def _linhas_resumo_por_base(
         fechamentos[chave] = fech
         _registrar(fech.base, prioritario=chave not in precos_por_chave)
 
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    ignorar_coleta = bool(owner and owner.ignorar_coleta)
+    excecoes = list(
+        db.scalars(
+            select(ColetaCalendarioExcecao).where(
+                ColetaCalendarioExcecao.sub_base == sub_base,
+                ColetaCalendarioExcecao.data >= periodo_inicio,
+                ColetaCalendarioExcecao.data <= periodo_fim,
+            )
+        ).all()
+    )
+    execucoes_por_base_id: Dict[int, set] = {}
+    for item in db.scalars(
+        select(ColetaExecucao).where(
+            ColetaExecucao.sub_base == sub_base,
+            ColetaExecucao.data_operacao >= periodo_inicio,
+            ColetaExecucao.data_operacao <= periodo_fim,
+        )
+    ).all():
+        if item.base_id is None:
+            continue
+        execucoes_por_base_id.setdefault(int(item.base_id), set()).add(item.data_operacao)
+
+    cnpj_por_chave = _cnpj_por_base_precos(db, sub_base, precos_por_chave)
+    regras_g, padrao_g_id = _contexto_g_base(db, sub_base)
+
     linhas: List[ResumoBaseLinha] = []
     for chave, nome in nomes.items():
-        recalculo = _build_itens_e_valores(db, sub_base, nome, periodo_inicio, periodo_fim)
+        precos = _precos_base(db, sub_base, nome)
+        recalculo = _itens_e_valores_de_rows(
+            coletas_por_base.get(chave) or [],
+            canc_por_base.get(chave) or [],
+            g_por_base.get(chave) or [],
+            precos=precos,
+            regras_g=regras_g,
+            padrao_g_id=padrao_g_id,
+        )
         itens, bruto, canc, valor_atual = recalculo
         pendentes: List[str] = []
-        if chave in precos_por_chave:
-            try:
-                cal = _resumo_calendario_fechamento(db, sub_base, nome, periodo_inicio, periodo_fim)
-                pendentes = [d["data"] for d in cal.get("dias_pendentes") or []]
-            except HTTPException:
-                pendentes = []
+        preco = precos_por_chave.get(chave)
+        if preco is not None:
+            base_id = getattr(preco, "id_base", None)
+            pendentes = _dias_pendentes_calendario_em_memoria(
+                ignorar_coleta=ignorar_coleta,
+                preco=preco,
+                periodo_inicio=periodo_inicio,
+                periodo_fim=periodo_fim,
+                excecoes=excecoes,
+                execucoes_datas=execucoes_por_base_id.get(int(base_id), set()) if base_id is not None else set(),
+                lancamentos_legados=lancamentos_por_base.get(chave) or set(),
+            )
         fech = fechamentos.get(chave)
         if not itens and not fech and not pendentes:
             continue
@@ -1422,7 +1622,7 @@ def _linhas_resumo_por_base(
         linhas.append(
             ResumoBaseLinha(
                 base=nome,
-                cnpj=(_montar_seller_info(db, sub_base, nome) or {}).get("cnpj"),
+                cnpj=cnpj_por_chave.get(chave),
                 dias=dias,
                 shopee=sum(d.shopee for d in dias),
                 mercado_livre=sum(d.mercado_livre for d in dias),
