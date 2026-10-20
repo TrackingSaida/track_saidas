@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, cast, func, or_, select, Date
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import ColumnElement
 
 from db_utils import run_db_query_with_retry
 from models import Saida, SaidaHistorico, User
@@ -59,7 +60,9 @@ __all__ = [
     "filtrar_saidas_por_periodo_operacional_leve",
     "carregar_saidas_candidatas_periodo",
     "carregar_saidas_fechamento_leve",
+    "agregar_saidas_fechamento_resumo",
     "SaidaFechamentoLeve",
+    "SaidaFechamentoAgregado",
     "marcos_de_ultimos_eventos",
     "janela_timestamp_periodo",
 ]
@@ -373,27 +376,37 @@ class SaidaFechamentoLeve:
     codigo: Optional[str]
 
 
-def carregar_saidas_fechamento_leve(
-    db: Session,
+@dataclass(frozen=True)
+class SaidaFechamentoAgregado:
+    """Contagem agregada por dia operacional / executor / serviço (sem linha a linha)."""
+
+    data: date
+    base: Optional[str]
+    motoboy_id: Optional[int]
+    entregador_id: Optional[int]
+    entregador: Optional[str]
+    tipo_servico: str  # shopee | flex | avulso
+    is_cancelado: bool
+    is_grande: bool
+    categoria_g_id: Optional[int]
+    qtd: int
+
+
+def _conds_saidas_fechamento(
     *,
     sub_base: str,
     status_validos: Sequence[str],
     periodo_inicio: Optional[date],
     periodo_fim: Optional[date],
-    motoboy_ids: Optional[Sequence[int]] = None,
-    entregador_ids: Optional[Sequence[int]] = None,
-    exigir_executor: bool = True,
-    base_prefiltro: Optional[str] = None,
-) -> Tuple[List[SaidaFechamentoLeve], Dict[int, MarcosOperacionaisFechamento]]:
-    """Candidatas do fechamento com marcos via DISTINCT ON (sem varrer o histórico).
-
-    A janela de candidatos continua sendo `sub_base` + `timestamp` (igual ao resumo atual).
-    O join no histórico traz só o último atrib/inv e o último marco por saída.
-    `base_prefiltro` reduz candidatos no SQL; a filtragem final de acento fica no chamador.
-    """
+    motoboy_ids: Optional[Sequence[int]],
+    entregador_ids: Optional[Sequence[int]],
+    exigir_executor: bool,
+    base_prefiltro: Optional[str],
+) -> Optional[List[ColumnElement]]:
+    """None = resultado vazio (executor sem ids)."""
     from fechamento_resumo_utils import base_prefiltro_sql_valores
 
-    conds = [
+    conds: List[ColumnElement] = [
         Saida.sub_base == sub_base,
         Saida.codigo.isnot(None),
         func.lower(Saida.status).in_(list(status_validos)),
@@ -429,9 +442,12 @@ def carregar_saidas_fechamento_leve(
         if mids:
             exec_conds.append(Saida.motoboy_id.in_(mids))
         if not exec_conds:
-            return [], {}
+            return None
         conds.append(or_(*exec_conds))
+    return conds
 
+
+def _cte_saidas_com_marcos(conds: Sequence[ColumnElement]):
     candidatas = (
         select(
             Saida.id_saida.label("id_saida"),
@@ -450,7 +466,6 @@ def carregar_saidas_fechamento_leve(
         .where(*conds)
         .cte("fechamento_candidatas")
     )
-
     ult_ai = (
         select(
             SaidaHistorico.id_saida.label("id_saida"),
@@ -467,7 +482,6 @@ def carregar_saidas_fechamento_leve(
         )
         .cte("fechamento_ult_ai")
     )
-
     ult_marco = (
         select(
             SaidaHistorico.id_saida.label("id_saida"),
@@ -483,7 +497,60 @@ def carregar_saidas_fechamento_leve(
         )
         .cte("fechamento_ult_marco")
     )
+    return candidatas, ult_ai, ult_marco
 
+
+def _expr_operacional_ts(candidatas, ult_ai, ult_marco):
+    invalidantes = tuple(sorted(EVENTOS_INVALIDANTES))
+    return case(
+        (ult_ai.c.evento.in_(invalidantes), None),
+        (ult_ai.c.timestamp.isnot(None), ult_ai.c.timestamp),
+        else_=func.coalesce(ult_marco.c.timestamp, candidatas.c.timestamp),
+    )
+
+
+def _expr_tipo_servico(servico_col):
+    """Espelha `_normalizar_servico` / `normalizar_servico` (shopee → ml/mercado → avulso)."""
+    s = func.lower(func.coalesce(servico_col, ""))
+    return case(
+        (s.like("%shopee%"), "shopee"),
+        (or_(s.like("%ml%"), s.like("%mercado%")), "flex"),
+        else_="avulso",
+    )
+
+
+def carregar_saidas_fechamento_leve(
+    db: Session,
+    *,
+    sub_base: str,
+    status_validos: Sequence[str],
+    periodo_inicio: Optional[date],
+    periodo_fim: Optional[date],
+    motoboy_ids: Optional[Sequence[int]] = None,
+    entregador_ids: Optional[Sequence[int]] = None,
+    exigir_executor: bool = True,
+    base_prefiltro: Optional[str] = None,
+) -> Tuple[List[SaidaFechamentoLeve], Dict[int, MarcosOperacionaisFechamento]]:
+    """Candidatas do fechamento com marcos via DISTINCT ON (sem varrer o histórico).
+
+    A janela de candidatos continua sendo `sub_base` + `timestamp` (igual ao resumo atual).
+    O join no histórico traz só o último atrib/inv e o último marco por saída.
+    `base_prefiltro` reduz candidatos no SQL; a filtragem final de acento fica no chamador.
+    """
+    conds = _conds_saidas_fechamento(
+        sub_base=sub_base,
+        status_validos=status_validos,
+        periodo_inicio=periodo_inicio,
+        periodo_fim=periodo_fim,
+        motoboy_ids=motoboy_ids,
+        entregador_ids=entregador_ids,
+        exigir_executor=exigir_executor,
+        base_prefiltro=base_prefiltro,
+    )
+    if conds is None:
+        return [], {}
+
+    candidatas, ult_ai, ult_marco = _cte_saidas_com_marcos(conds)
     stmt = (
         select(
             candidatas.c.id_saida,
@@ -543,6 +610,102 @@ def carregar_saidas_fechamento_leve(
             )
         )
     return filtradas, marcos_map
+
+
+def agregar_saidas_fechamento_resumo(
+    db: Session,
+    *,
+    sub_base: str,
+    status_validos: Sequence[str],
+    periodo_inicio: date,
+    periodo_fim: date,
+    motoboy_ids: Optional[Sequence[int]] = None,
+    entregador_ids: Optional[Sequence[int]] = None,
+    exigir_executor: bool = True,
+    base_prefiltro: Optional[str] = None,
+) -> List[SaidaFechamentoAgregado]:
+    """Agrega no SQL por dia operacional / executor / serviço — sem trazer pacote a pacote."""
+    conds = _conds_saidas_fechamento(
+        sub_base=sub_base,
+        status_validos=status_validos,
+        periodo_inicio=periodo_inicio,
+        periodo_fim=periodo_fim,
+        motoboy_ids=motoboy_ids,
+        entregador_ids=entregador_ids,
+        exigir_executor=exigir_executor,
+        base_prefiltro=base_prefiltro,
+    )
+    if conds is None:
+        return []
+
+    candidatas, ult_ai, ult_marco = _cte_saidas_com_marcos(conds)
+    op_ts = _expr_operacional_ts(candidatas, ult_ai, ult_marco)
+    is_grande = func.coalesce(candidatas.c.is_grande, False)
+    com_data = (
+        select(
+            candidatas.c.base.label("base"),
+            candidatas.c.motoboy_id.label("motoboy_id"),
+            candidatas.c.entregador_id.label("entregador_id"),
+            candidatas.c.entregador.label("entregador"),
+            candidatas.c.status.label("status"),
+            candidatas.c.servico.label("servico"),
+            is_grande.label("is_grande"),
+            candidatas.c.categoria_g_id.label("categoria_g_id"),
+            op_ts.label("operacional_ts"),
+        )
+        .select_from(candidatas)
+        .outerjoin(ult_ai, ult_ai.c.id_saida == candidatas.c.id_saida)
+        .outerjoin(ult_marco, ult_marco.c.id_saida == candidatas.c.id_saida)
+        .where(op_ts.isnot(None))
+        .cte("fechamento_com_data")
+    )
+    dia = cast(com_data.c.operacional_ts, Date)
+    tipo = _expr_tipo_servico(com_data.c.servico)
+    is_cancel = func.lower(func.coalesce(com_data.c.status, "")).like("%cancel%")
+    stmt = (
+        select(
+            dia.label("data"),
+            com_data.c.base,
+            com_data.c.motoboy_id,
+            com_data.c.entregador_id,
+            com_data.c.entregador,
+            tipo.label("tipo_servico"),
+            is_cancel.label("is_cancelado"),
+            com_data.c.is_grande,
+            com_data.c.categoria_g_id,
+            func.count().label("qtd"),
+        )
+        .where(dia >= periodo_inicio, dia <= periodo_fim)
+        .group_by(
+            dia,
+            com_data.c.base,
+            com_data.c.motoboy_id,
+            com_data.c.entregador_id,
+            com_data.c.entregador,
+            tipo,
+            is_cancel,
+            com_data.c.is_grande,
+            com_data.c.categoria_g_id,
+        )
+    )
+    rows = run_db_query_with_retry(db, lambda: db.execute(stmt).all())
+    out: List[SaidaFechamentoAgregado] = []
+    for row in rows:
+        out.append(
+            SaidaFechamentoAgregado(
+                data=row.data,
+                base=row.base,
+                motoboy_id=int(row.motoboy_id) if row.motoboy_id is not None else None,
+                entregador_id=int(row.entregador_id) if row.entregador_id is not None else None,
+                entregador=row.entregador,
+                tipo_servico=str(row.tipo_servico or "avulso"),
+                is_cancelado=bool(row.is_cancelado),
+                is_grande=bool(row.is_grande),
+                categoria_g_id=int(row.categoria_g_id) if row.categoria_g_id is not None else None,
+                qtd=int(row.qtd or 0),
+            )
+        )
+    return out
 
 
 def carregar_saidas_candidatas_periodo(
