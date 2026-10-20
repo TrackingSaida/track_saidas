@@ -7,6 +7,40 @@ from fechamento_resumo_utils import (
     base_prefiltro_sql_valores,
     saida_pertence_base,
 )
+from fechamento_valor_pure import normalizar_servico, saida_cancelada
+
+
+def _tipo_servico_sql_espelho(servico: str | None) -> str:
+    """Mesma regra do CASE em `_expr_tipo_servico` (sem dependência de banco)."""
+    s = (servico or "").lower()
+    if "shopee" in s:
+        return "shopee"
+    if "ml" in s or "mercado" in s:
+        return "flex"
+    return "avulso"
+
+
+def test_tipo_servico_sql_bate_com_normalizar_python():
+    amostras = [
+        None,
+        "",
+        "Shopee",
+        "ML Flex",
+        "Mercado Livre",
+        "Avulso",
+        "flex only",
+        "email",
+        "SHOPEE Express",
+    ]
+    for s in amostras:
+        assert _tipo_servico_sql_espelho(s) == normalizar_servico(s)
+
+
+def test_cancelado_sql_like_bate_com_python():
+    for status in (None, "", "entregue", "Cancelado", "CANCELADO_CLIENTE", "em_rota"):
+        py = saida_cancelada(status)
+        sql = "cancel" in (status or "").lower()
+        assert py is sql
 
 
 def test_resumo_exemplo_relatorio():

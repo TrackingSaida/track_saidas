@@ -19,6 +19,7 @@ from fechamento_valor_pure import adicional_g, valor_g_adicional, valor_saida
 from pacote_g_categorias import categoria_da_saida, padrao_id_ou_none, regras_por_categoria
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import (
+    agregar_saidas_fechamento_resumo,
     carregar_saidas_fechamento_leve,
     timestamp_operacional_marcos,
 )
@@ -1620,91 +1621,147 @@ def resumo_entregadores(
         if not entregador_ids_filtro and not motoboy_ids_filtro:
             entregador_ids_filtro, motoboy_ids_filtro = set(), set()
 
-    # Pré-filtro de base no SQL (acento/caixa); o valor oficial do fechamento não usa esse recorte.
+    # Pré-filtro de base no SQL; com período usa agregação SQL (sem pacote a pacote).
     base_prefiltro = base if base_filtro_norm is not None else None
-    rows, marcos_map = carregar_saidas_fechamento_leve(
-        db,
-        sub_base=sub_base_user,
-        status_validos=status_validos,
-        periodo_inicio=data_inicio,
-        periodo_fim=data_fim,
-        motoboy_ids=sorted(motoboy_ids_filtro) if motoboy_ids_filtro is not None else None,
-        entregador_ids=sorted(entregador_ids_filtro) if entregador_ids_filtro is not None else None,
-        exigir_executor=True,
-        base_prefiltro=base_prefiltro,
-    )
-    # Só reaproveita saídas em memória no recálculo quando a lista é o período inteiro (sem base).
-    saidas_periodo_completo = (
-        rows if entregador_id is None and motoboy_id is None and base_filtro_norm is None else None
-    )
-    if base_filtro_norm is not None:
-        rows = [s for s in rows if saida_pertence_base(s.base, base_filtro_norm)]
-    nomes_motoboy_map = _carregar_nomes_motoboy_ids(
-        db,
-        [int(getattr(s, "motoboy_id")) for s in rows if getattr(s, "motoboy_id", None) is not None],
-    )
-
     agrupado: Dict[str, Dict[str, Any]] = {}
-    for saida in rows:
-        op_ts = timestamp_operacional_marcos(marcos_map.get(int(saida.id_saida)), saida.timestamp)
-        if op_ts is None:
-            continue
-        dia = op_ts.date().isoformat()
-        if getattr(saida, "motoboy_id", None) is not None:
-            mid = saida.motoboy_id
-            key = f"{dia}_m_{mid}"
-            if key not in agrupado:
-                agrupado[key] = {
-                    "data": dia,
-                    "entregador_id": None,
-                    "motoboy_id": mid,
-                    "entregador_nome": nomes_motoboy_map.get(int(mid), f"Motoboy {mid}"),
-                    "qtde_shopee": 0,
-                    "qtde_flex": 0,
-                    "qtde_avulso": 0,
-                    "cancel_shopee": 0,
-                    "cancel_flex": 0,
-                    "cancel_avulso": 0,
-                    "total_feitos": 0,
-                    "total_cancelado": 0,
-                    "g_total": 0,
-                }
-        else:
-            ent_id = saida.entregador_id
-            ent_nome = saida.entregador or "Sem nome"
-            if ent_id is None:
-                ent_id = -abs(hash(ent_nome))
-            key = f"{dia}_{ent_id}"
-            if key not in agrupado:
-                agrupado[key] = {
-                    "data": dia,
-                    "entregador_id": ent_id,
-                    "motoboy_id": None,
-                    "entregador_nome": ent_nome,
-                    "qtde_shopee": 0,
-                    "qtde_flex": 0,
-                    "qtde_avulso": 0,
-                    "cancel_shopee": 0,
-                    "cancel_flex": 0,
-                    "cancel_avulso": 0,
-                    "total_feitos": 0,
-                    "total_cancelado": 0,
-                    "g_total": 0,
-                }
-        status_norm = (saida.status or "").strip().lower()
-        is_cancelado = "cancel" in status_norm
-        tipo = _normalizar_servico(saida.servico)
-        if is_cancelado:
-            agrupado[key]["total_cancelado"] = agrupado[key].get("total_cancelado", 0) + 1
-            agrupado[key][f"cancel_{tipo}"] += 1
-        else:
-            agrupado[key]["total_feitos"] = agrupado[key].get("total_feitos", 0) + 1
-            agrupado[key][f"qtde_{tipo}"] += 1
-            if getattr(saida, "is_grande", False):
-                g_feitos = agrupado[key].setdefault("g_feitos", {})
-                chave_g = (categoria_da_saida(saida, padrao_g), tipo)
-                g_feitos[chave_g] = g_feitos.get(chave_g, 0) + 1
-                agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + 1
+
+    def _ensure_grupo(key: str, *, dia: str, entregador_id, motoboy_id, entregador_nome: str) -> Dict[str, Any]:
+        if key not in agrupado:
+            agrupado[key] = {
+                "data": dia,
+                "entregador_id": entregador_id,
+                "motoboy_id": motoboy_id,
+                "entregador_nome": entregador_nome,
+                "qtde_shopee": 0,
+                "qtde_flex": 0,
+                "qtde_avulso": 0,
+                "cancel_shopee": 0,
+                "cancel_flex": 0,
+                "cancel_avulso": 0,
+                "total_feitos": 0,
+                "total_cancelado": 0,
+                "g_total": 0,
+            }
+        return agrupado[key]
+
+    if data_inicio is not None and data_fim is not None:
+        agregados = agregar_saidas_fechamento_resumo(
+            db,
+            sub_base=sub_base_user,
+            status_validos=status_validos,
+            periodo_inicio=data_inicio,
+            periodo_fim=data_fim,
+            motoboy_ids=sorted(motoboy_ids_filtro) if motoboy_ids_filtro is not None else None,
+            entregador_ids=sorted(entregador_ids_filtro) if entregador_ids_filtro is not None else None,
+            exigir_executor=True,
+            base_prefiltro=base_prefiltro,
+        )
+        if base_filtro_norm is not None:
+            agregados = [a for a in agregados if saida_pertence_base(a.base, base_filtro_norm)]
+
+        nomes_motoboy_map = _carregar_nomes_motoboy_ids(
+            db,
+            [int(a.motoboy_id) for a in agregados if a.motoboy_id is not None],
+        )
+        for agg in agregados:
+            dia = agg.data.isoformat()
+            if agg.motoboy_id is not None:
+                mid = agg.motoboy_id
+                key = f"{dia}_m_{mid}"
+                _ensure_grupo(
+                    key,
+                    dia=dia,
+                    entregador_id=None,
+                    motoboy_id=mid,
+                    entregador_nome=nomes_motoboy_map.get(int(mid), f"Motoboy {mid}"),
+                )
+            else:
+                ent_id = agg.entregador_id
+                ent_nome = agg.entregador or "Sem nome"
+                if ent_id is None:
+                    ent_id = -abs(hash(ent_nome))
+                key = f"{dia}_{ent_id}"
+                _ensure_grupo(
+                    key,
+                    dia=dia,
+                    entregador_id=ent_id,
+                    motoboy_id=None,
+                    entregador_nome=ent_nome,
+                )
+            tipo = agg.tipo_servico if agg.tipo_servico in ("shopee", "flex", "avulso") else "avulso"
+            qtd = int(agg.qtd or 0)
+            if agg.is_cancelado:
+                agrupado[key]["total_cancelado"] = agrupado[key].get("total_cancelado", 0) + qtd
+                agrupado[key][f"cancel_{tipo}"] += qtd
+            else:
+                agrupado[key]["total_feitos"] = agrupado[key].get("total_feitos", 0) + qtd
+                agrupado[key][f"qtde_{tipo}"] += qtd
+                if agg.is_grande:
+                    g_feitos = agrupado[key].setdefault("g_feitos", {})
+                    cat_id = agg.categoria_g_id if agg.categoria_g_id is not None else padrao_g
+                    chave_g = (cat_id, tipo)
+                    g_feitos[chave_g] = g_feitos.get(chave_g, 0) + qtd
+                    agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + qtd
+    else:
+        rows, marcos_map = carregar_saidas_fechamento_leve(
+            db,
+            sub_base=sub_base_user,
+            status_validos=status_validos,
+            periodo_inicio=data_inicio,
+            periodo_fim=data_fim,
+            motoboy_ids=sorted(motoboy_ids_filtro) if motoboy_ids_filtro is not None else None,
+            entregador_ids=sorted(entregador_ids_filtro) if entregador_ids_filtro is not None else None,
+            exigir_executor=True,
+            base_prefiltro=base_prefiltro,
+        )
+        if base_filtro_norm is not None:
+            rows = [s for s in rows if saida_pertence_base(s.base, base_filtro_norm)]
+        nomes_motoboy_map = _carregar_nomes_motoboy_ids(
+            db,
+            [int(getattr(s, "motoboy_id")) for s in rows if getattr(s, "motoboy_id", None) is not None],
+        )
+        for saida in rows:
+            op_ts = timestamp_operacional_marcos(marcos_map.get(int(saida.id_saida)), saida.timestamp)
+            if op_ts is None:
+                continue
+            dia = op_ts.date().isoformat()
+            if getattr(saida, "motoboy_id", None) is not None:
+                mid = saida.motoboy_id
+                key = f"{dia}_m_{mid}"
+                _ensure_grupo(
+                    key,
+                    dia=dia,
+                    entregador_id=None,
+                    motoboy_id=mid,
+                    entregador_nome=nomes_motoboy_map.get(int(mid), f"Motoboy {mid}"),
+                )
+            else:
+                ent_id = saida.entregador_id
+                ent_nome = saida.entregador or "Sem nome"
+                if ent_id is None:
+                    ent_id = -abs(hash(ent_nome))
+                key = f"{dia}_{ent_id}"
+                _ensure_grupo(
+                    key,
+                    dia=dia,
+                    entregador_id=ent_id,
+                    motoboy_id=None,
+                    entregador_nome=ent_nome,
+                )
+            status_norm = (saida.status or "").strip().lower()
+            is_cancelado = "cancel" in status_norm
+            tipo = _normalizar_servico(saida.servico)
+            if is_cancelado:
+                agrupado[key]["total_cancelado"] = agrupado[key].get("total_cancelado", 0) + 1
+                agrupado[key][f"cancel_{tipo}"] += 1
+            else:
+                agrupado[key]["total_feitos"] = agrupado[key].get("total_feitos", 0) + 1
+                agrupado[key][f"qtde_{tipo}"] += 1
+                if getattr(saida, "is_grande", False):
+                    g_feitos = agrupado[key].setdefault("g_feitos", {})
+                    chave_g = (categoria_da_saida(saida, padrao_g), tipo)
+                    g_feitos[chave_g] = g_feitos.get(chave_g, 0) + 1
+                    agrupado[key]["g_total"] = agrupado[key].get("g_total", 0) + 1
 
     cache_precos: Dict[tuple, Dict[str, Decimal]] = {}  # ("e", eid) ou ("m", mid) -> precos
     cache_origem: Dict[tuple, Dict[str, str]] = {}
@@ -1750,6 +1807,7 @@ def resumo_entregadores(
             return (st or "GERADO", fech.id_fechamento, fech)
         return ("PENDENTE", None, None)
 
+    # Recálculo de valor oficial: uma carga por período de fechamento, só dos motoboys afetados.
     motoboys_por_periodo: Dict[tuple, set] = {}
     for item in agrupado.values():
         mid = item.get("motoboy_id")
@@ -1759,10 +1817,8 @@ def resumo_entregadores(
         if st in ("GERADO", "REAJUSTADO", "PAGO") and f is not None and id_f is not None:
             motoboys_por_periodo.setdefault((f.periodo_inicio, f.periodo_fim), set()).add(int(mid))
     for (p_ini, p_fim), mids in motoboys_por_periodo.items():
-        mesmo_periodo = (p_ini, p_fim) == (data_inicio, data_fim)
         for mid, valor in valores_base_atuais_motoboys(
             db, sub_base_user, mids, p_ini, p_fim, precos_cache=precos_motoboy,
-            saidas_periodo=saidas_periodo_completo if mesmo_periodo else None,
         ).items():
             cache_valor_base[("m", mid, p_ini, p_fim)] = valor
 
@@ -1813,16 +1869,6 @@ def resumo_entregadores(
         if fech_status in ("GERADO", "REAJUSTADO", "PAGO") and fech is not None and id_fech is not None:
             if mid is not None:
                 key_vb = ("m", mid, fech.periodo_inicio, fech.periodo_fim)
-                if key_vb not in cache_valor_base and hasattr(EntregadorFechamento, "id_motoboy"):
-                    from entregador_fechamento_routes import _calcular_diarias_coleta_motoboy
-
-                    valor_entregas_vb = _calcular_valor_base_motoboy_periodo(
-                        db, sub_base_user, mid, fech.periodo_inicio, fech.periodo_fim
-                    )
-                    _, valor_coletas_vb, _ = _calcular_diarias_coleta_motoboy(
-                        db, sub_base_user, mid, fech.periodo_inicio, fech.periodo_fim
-                    )
-                    cache_valor_base[key_vb] = (valor_entregas_vb + valor_coletas_vb).quantize(Decimal("0.01"))
                 valor_base_atual = cache_valor_base.get(key_vb)
             else:
                 key_vb = (eid, fech.periodo_inicio, fech.periodo_fim)
