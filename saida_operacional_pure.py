@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 EVENTOS_ATRIBUICAO_VALIDOS = {
     "lido",
@@ -101,6 +101,60 @@ class SaidaOperacionalContext:
     operacional_ts: Optional[datetime]
     leitura_valida: bool
     removido_sem_inicio_ativo: bool
+
+
+@dataclass(frozen=True)
+class MarcosOperacionaisFechamento:
+    """Marcos usados no fechamento: data operacional e exclusão por remoção."""
+
+    operacional_ts: Optional[datetime]
+    ultimo_evento_ts: Optional[datetime]
+    removido_sem_inicio_ativo: bool
+
+
+EVENTOS_FECHAMENTO_MARCOS = frozenset(
+    EVENTOS_ATRIBUICAO_VALIDOS | EVENTOS_INVALIDANTES | EVENTOS_UI_ULTIMA_ACAO
+)
+
+
+def resolver_marcos_operacionais_fechamento(
+    eventos: Sequence[Tuple[str, datetime]],
+) -> MarcosOperacionaisFechamento:
+    """Mesma máquina de estados do contexto operacional, só com timestamps.
+
+    `eventos` deve estar ordenado por (timestamp, id), como o histórico no banco.
+    """
+    ultimo_ts: Optional[datetime] = None
+    op_ts: Optional[datetime] = None
+    removido = False
+    for evento_raw, ts in eventos:
+        evento = (evento_raw or "").strip().lower()
+        if evento not in EVENTOS_FECHAMENTO_MARCOS:
+            continue
+        ultimo_ts = ts
+        if evento in EVENTOS_INVALIDANTES:
+            op_ts = None
+            removido = True
+            continue
+        if evento in EVENTOS_ATRIBUICAO_VALIDOS:
+            op_ts = ts
+            removido = False
+    return MarcosOperacionaisFechamento(
+        operacional_ts=op_ts,
+        ultimo_evento_ts=ultimo_ts,
+        removido_sem_inicio_ativo=removido,
+    )
+
+
+def timestamp_operacional_marcos(
+    marcos: Optional[MarcosOperacionaisFechamento],
+    saida_ts: Optional[datetime],
+) -> Optional[datetime]:
+    if marcos and marcos.removido_sem_inicio_ativo:
+        return None
+    if marcos:
+        return marcos.operacional_ts or marcos.ultimo_evento_ts or saida_ts
+    return saida_ts
 
 
 def _normalizar_evento(evento: Optional[str]) -> str:

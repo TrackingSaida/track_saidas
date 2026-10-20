@@ -4,16 +4,18 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
-from sqlalchemy import and_, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import Session, load_only
 
 from db_utils import run_db_query_with_retry
 from models import Saida, SaidaHistorico, User
 from saida_operacional_pure import (
     EVENTOS_ATRIBUICAO_VALIDOS,
+    EVENTOS_FECHAMENTO_MARCOS,
     EVENTOS_INVALIDANTES,
     EVENTOS_REATRIBUICAO,
     EVENTOS_UI_ULTIMA_ACAO,
+    MarcosOperacionaisFechamento,
     ROTULOS_ACAO,
     SaidaOperacionalContext,
     deve_excluir_saida_operacional,
@@ -21,7 +23,9 @@ from saida_operacional_pure import (
     janela_timestamp_periodo,
     normalizar_evento_atribuicao,
     resolver_chave_acao,
+    resolver_marcos_operacionais_fechamento,
     rotulo_acao_evento,
+    timestamp_operacional_marcos,
     timestamp_operacional_saida,
 )
 
@@ -36,15 +40,21 @@ __all__ = [
     "EVENTOS_UI_ULTIMA_ACAO",
     "ROTULOS_ACAO",
     "SaidaOperacionalContext",
+    "MarcosOperacionaisFechamento",
     "resolver_chave_acao",
     "rotulo_acao_evento",
     "eh_reatribuicao_real",
     "normalizar_evento_atribuicao",
+    "resolver_marcos_operacionais_fechamento",
     "carregar_contexto_operacional",
+    "carregar_marcos_operacionais_fechamento",
     "deve_excluir_saida_operacional",
     "timestamp_operacional_saida",
+    "timestamp_operacional_marcos",
     "filtrar_saidas_por_periodo_operacional",
+    "filtrar_saidas_por_periodo_operacional_leve",
     "carregar_saidas_candidatas_periodo",
+    "carregar_saidas_fechamento_leve",
     "janela_timestamp_periodo",
 ]
 
@@ -209,6 +219,51 @@ def carregar_contexto_operacional(
     return out
 
 
+def carregar_marcos_operacionais_fechamento(
+    db: Session,
+    saida_ids: Iterable[int],
+) -> Dict[int, MarcosOperacionaisFechamento]:
+    """Marcos de data operacional sem carregar usuários nem rótulos de tela."""
+    ids = list(dict.fromkeys(int(i) for i in saida_ids if i is not None))
+    if not ids:
+        return {}
+
+    eventos_filtro = tuple(EVENTOS_FECHAMENTO_MARCOS)
+    historicos: List[Any] = []
+    for ids_lote in _chunked(ids, MAX_IDS_POR_LOTE):
+        rows_lote = run_db_query_with_retry(
+            db,
+            lambda ids_lote=ids_lote: db.execute(
+                select(
+                    SaidaHistorico.id_saida,
+                    SaidaHistorico.evento,
+                    SaidaHistorico.timestamp,
+                    SaidaHistorico.id,
+                )
+                .where(
+                    SaidaHistorico.id_saida.in_(ids_lote),
+                    SaidaHistorico.evento.in_(eventos_filtro),
+                )
+                .order_by(
+                    SaidaHistorico.id_saida.asc(),
+                    SaidaHistorico.timestamp.asc(),
+                    SaidaHistorico.id.asc(),
+                )
+            ).all(),
+        )
+        historicos.extend(rows_lote)
+
+    por_saida: Dict[int, List[Tuple[str, datetime]]] = {}
+    for h in historicos:
+        sid = int(h.id_saida)
+        por_saida.setdefault(sid, []).append((h.evento or "", h.timestamp))
+
+    out: Dict[int, MarcosOperacionaisFechamento] = {}
+    for sid in ids:
+        out[sid] = resolver_marcos_operacionais_fechamento(por_saida.get(sid) or [])
+    return out
+
+
 def filtrar_saidas_por_periodo_operacional(
     db: Session,
     saidas: Sequence[object],
@@ -237,6 +292,103 @@ def filtrar_saidas_por_periodo_operacional(
             continue
         filtradas.append(s)
     return filtradas, ctx_map
+
+
+def filtrar_saidas_por_periodo_operacional_leve(
+    db: Session,
+    saidas: Sequence[object],
+    periodo_inicio: Optional[date],
+    periodo_fim: Optional[date],
+) -> Tuple[List[object], Dict[int, MarcosOperacionaisFechamento]]:
+    """Filtra pelo período operacional sem carregar usuários (caminho do fechamento)."""
+    if not saidas:
+        return [], {}
+    ids = [int(getattr(s, "id_saida")) for s in saidas if getattr(s, "id_saida", None) is not None]
+    marcos_map = carregar_marcos_operacionais_fechamento(db, ids)
+    filtradas: List[object] = []
+    for s in saidas:
+        sid = getattr(s, "id_saida", None)
+        if sid is None:
+            continue
+        marcos = marcos_map.get(int(sid))
+        ts = timestamp_operacional_marcos(marcos, getattr(s, "timestamp", None))
+        if ts is None:
+            continue
+        dia = ts.date()
+        if periodo_inicio is not None and dia < periodo_inicio:
+            continue
+        if periodo_fim is not None and dia > periodo_fim:
+            continue
+        filtradas.append(s)
+    return filtradas, marcos_map
+
+
+def carregar_saidas_fechamento_leve(
+    db: Session,
+    *,
+    sub_base: str,
+    status_validos: Sequence[str],
+    periodo_inicio: Optional[date],
+    periodo_fim: Optional[date],
+    motoboy_ids: Optional[Sequence[int]] = None,
+    entregador_ids: Optional[Sequence[int]] = None,
+    exigir_executor: bool = True,
+) -> Tuple[List[Saida], Dict[int, MarcosOperacionaisFechamento]]:
+    """Candidatas do fechamento: só colunas usadas + marcos operacionais leves.
+
+    A janela de candidatos continua sendo `sub_base` + `timestamp` (igual ao resumo atual).
+    """
+    cols = load_only(
+        Saida.id_saida,
+        Saida.timestamp,
+        Saida.sub_base,
+        Saida.base,
+        Saida.status,
+        Saida.servico,
+        Saida.is_grande,
+        Saida.categoria_g_id,
+        Saida.motoboy_id,
+        Saida.entregador_id,
+        Saida.entregador,
+        Saida.codigo,
+    )
+    stmt = select(Saida).options(cols).where(
+        Saida.sub_base == sub_base,
+        Saida.codigo.isnot(None),
+        func.lower(Saida.status).in_(list(status_validos)),
+    )
+    if exigir_executor:
+        stmt = stmt.where(
+            or_(
+                Saida.entregador_id.isnot(None),
+                Saida.entregador.isnot(None),
+                Saida.motoboy_id.isnot(None),
+            )
+        )
+    if periodo_inicio is not None and periodo_fim is not None:
+        ts_ini, ts_fim_excl = janela_timestamp_periodo(periodo_inicio, periodo_fim)
+        stmt = stmt.where(Saida.timestamp >= ts_ini, Saida.timestamp < ts_fim_excl)
+    elif periodo_inicio is not None:
+        ts_ini, _ = janela_timestamp_periodo(periodo_inicio, periodo_inicio)
+        stmt = stmt.where(Saida.timestamp >= ts_ini)
+    elif periodo_fim is not None:
+        _, ts_fim_excl = janela_timestamp_periodo(periodo_fim, periodo_fim)
+        stmt = stmt.where(Saida.timestamp < ts_fim_excl)
+
+    if motoboy_ids is not None or entregador_ids is not None:
+        mids = [int(m) for m in (motoboy_ids or []) if m is not None]
+        eids = [int(e) for e in (entregador_ids or []) if e is not None]
+        conds = []
+        if eids:
+            conds.append(Saida.entregador_id.in_(eids))
+        if mids:
+            conds.append(Saida.motoboy_id.in_(mids))
+        if not conds:
+            return [], {}
+        stmt = stmt.where(or_(*conds))
+
+    rows_raw = list(db.scalars(stmt).all())
+    return filtrar_saidas_por_periodo_operacional_leve(db, rows_raw, periodo_inicio, periodo_fim)
 
 
 def carregar_saidas_candidatas_periodo(
