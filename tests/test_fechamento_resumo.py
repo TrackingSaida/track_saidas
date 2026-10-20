@@ -7,7 +7,9 @@ from fechamento_resumo_utils import (
     base_prefiltro_sql_valores,
     saida_pertence_base,
 )
-from fechamento_valor_pure import normalizar_servico, saida_cancelada
+from types import SimpleNamespace
+
+from fechamento_valor_pure import normalizar_servico, saida_cancelada, valor_entregas_agregadas
 
 
 def _tipo_servico_sql_espelho(servico: str | None) -> str:
@@ -34,6 +36,24 @@ def test_tipo_servico_sql_bate_com_normalizar_python():
     ]
     for s in amostras:
         assert _tipo_servico_sql_espelho(s) == normalizar_servico(s)
+
+
+def test_valor_agregado_soma_quantidade_e_ignora_cancelado():
+    linhas = [
+        SimpleNamespace(motoboy_id=7, tipo_servico="shopee", qtd=3, is_cancelado=False, is_grande=True, categoria_g_id=None),
+        SimpleNamespace(motoboy_id=7, tipo_servico="shopee", qtd=2, is_cancelado=True, is_grande=False, categoria_g_id=None),
+        SimpleNamespace(motoboy_id=8, tipo_servico="flex", qtd=1, is_cancelado=False, is_grande=False, categoria_g_id=None),
+    ]
+    precos = {
+        7: {"shopee_valor": Decimal("4.00"), "ml_valor": Decimal("5.00"), "avulso_valor": Decimal("6.00")},
+        8: {"shopee_valor": Decimal("4.00"), "ml_valor": Decimal("5.00"), "avulso_valor": Decimal("6.00")},
+    }
+    totais = valor_entregas_agregadas(
+        linhas, precos, toggle_pacote_g=True, regras_g={}, padrao_g=1,
+    )
+    # 3 shopee + 3 adicionais G (sem regra = +1x) ; cancelados fora
+    assert totais[7] == Decimal("24.00")
+    assert totais[8] == Decimal("5.00")
 
 
 def test_cancelado_sql_like_bate_com_python():
