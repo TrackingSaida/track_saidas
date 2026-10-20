@@ -15,7 +15,7 @@ from conferencia_saida_pure import LABEL_CONFERENCIA_DIA, STATUS_CONFERIDA, stat
 from conferencia_saida_service import owner_conferencia_habilitada, status_conferencia_registrada_motoboys
 from entregador_legado_sync import filtrar_entregadores_operacionais
 from fechamento_resumo_utils import base_filtro_ativo, saida_pertence_base
-from fechamento_valor_pure import adicional_g, valor_g_adicional, valor_saida
+from fechamento_valor_pure import adicional_g, valor_entregas_agregadas, valor_g_adicional, valor_saida
 from pacote_g_categorias import categoria_da_saida, padrao_id_ou_none, regras_por_categoria
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import (
@@ -1623,6 +1623,7 @@ def resumo_entregadores(
 
     # Pré-filtro de base no SQL; com período usa agregação SQL (sem pacote a pacote).
     base_prefiltro = base if base_filtro_norm is not None else None
+    agregados_periodo = None
     agrupado: Dict[str, Dict[str, Any]] = {}
 
     def _ensure_grupo(key: str, *, dia: str, entregador_id, motoboy_id, entregador_nome: str) -> Dict[str, Any]:
@@ -1645,7 +1646,7 @@ def resumo_entregadores(
         return agrupado[key]
 
     if data_inicio is not None and data_fim is not None:
-        agregados = agregar_saidas_fechamento_resumo(
+        agregados_periodo = agregar_saidas_fechamento_resumo(
             db,
             sub_base=sub_base_user,
             status_validos=status_validos,
@@ -1656,6 +1657,7 @@ def resumo_entregadores(
             exigir_executor=True,
             base_prefiltro=base_prefiltro,
         )
+        agregados = agregados_periodo
         if base_filtro_norm is not None:
             agregados = [a for a in agregados if saida_pertence_base(a.base, base_filtro_norm)]
 
@@ -1807,7 +1809,10 @@ def resumo_entregadores(
             return (st or "GERADO", fech.id_fechamento, fech)
         return ("PENDENTE", None, None)
 
-    # Recálculo de valor oficial: uma carga por período de fechamento, só dos motoboys afetados.
+    # Valor oficial a partir das contagens. Sem filtro de base e no mesmo período,
+    # reaproveita a agregação da lista. Com base, recalcula só os motoboys afetados.
+    from entregador_fechamento_routes import calcular_diarias_coleta_motoboys
+
     motoboys_por_periodo: Dict[tuple, set] = {}
     for item in agrupado.values():
         mid = item.get("motoboy_id")
@@ -1817,10 +1822,39 @@ def resumo_entregadores(
         if st in ("GERADO", "REAJUSTADO", "PAGO") and f is not None and id_f is not None:
             motoboys_por_periodo.setdefault((f.periodo_inicio, f.periodo_fim), set()).add(int(mid))
     for (p_ini, p_fim), mids in motoboys_por_periodo.items():
-        for mid, valor in valores_base_atuais_motoboys(
-            db, sub_base_user, mids, p_ini, p_fim, precos_cache=precos_motoboy,
-        ).items():
-            cache_valor_base[("m", mid, p_ini, p_fim)] = valor
+        mesmo_recorte = (
+            agregados_periodo is not None
+            and base_filtro_norm is None
+            and p_ini == data_inicio
+            and p_fim == data_fim
+        )
+        fonte = agregados_periodo if mesmo_recorte else agregar_saidas_fechamento_resumo(
+            db,
+            sub_base=sub_base_user,
+            status_validos=status_validos,
+            periodo_inicio=p_ini,
+            periodo_fim=p_fim,
+            motoboy_ids=sorted(mids),
+            exigir_executor=False,
+        )
+        for mid in mids:
+            precos_motoboy_cache(db, sub_base_user, int(mid), precos_motoboy)
+        entregas = valor_entregas_agregadas(
+            fonte,
+            precos_motoboy,
+            toggle_pacote_g=toggle_pacote_g,
+            regras_g=regras_g,
+            padrao_g=padrao_g,
+        )
+        coletas = calcular_diarias_coleta_motoboys(
+            db, sub_base_user, sorted(mids), p_ini, p_fim, precos_cache=precos_motoboy,
+        )
+        for mid in mids:
+            mid = int(mid)
+            valor_coletas = coletas.get(mid, (0, Decimal("0.00")))[1]
+            cache_valor_base[("m", mid, p_ini, p_fim)] = (
+                entregas.get(mid, Decimal("0.00")) + valor_coletas
+            ).quantize(Decimal("0.01"))
 
     lista: List[EntregadorResumoItem] = []
     for key, item in agrupado.items():

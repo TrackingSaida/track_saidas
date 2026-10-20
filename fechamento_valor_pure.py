@@ -21,6 +21,35 @@ def saida_cancelada(status: Optional[str]) -> bool:
     return "cancel" in (status or "").strip().lower()
 
 
+def valor_entregas_agregadas(
+    agregados: Iterable[Any],
+    precos_por_motoboy: Mapping[int, Mapping[str, Any]],
+    *,
+    toggle_pacote_g: bool,
+    regras_g: Mapping[int, Mapping[str, Any]],
+    padrao_g: Optional[int],
+) -> Dict[int, Decimal]:
+    """Soma o valor das entregas a partir de contagens já agregadas (cancelado = 0)."""
+    totais: Dict[int, Decimal] = {}
+    for agg in agregados:
+        if getattr(agg, "is_cancelado", False):
+            continue
+        mid = getattr(agg, "motoboy_id", None)
+        if mid is None:
+            continue
+        mid = int(mid)
+        tipo = getattr(agg, "tipo_servico", None) or "avulso"
+        qtd = int(getattr(agg, "qtd", 0) or 0)
+        unit = preco_servico(precos_por_motoboy.get(mid) or {}, tipo)
+        total = totais.get(mid, _ZERO) + (unit * qtd)
+        if toggle_pacote_g and getattr(agg, "is_grande", False):
+            cat = getattr(agg, "categoria_g_id", None)
+            cat_id = int(cat) if cat is not None else padrao_g
+            total += adicional_g(unit, regras_g.get(cat_id) if cat_id is not None else None) * qtd
+        totais[mid] = total
+    return {mid: v.quantize(Decimal("0.01")) for mid, v in totais.items()}
+
+
 def preco_servico(precos: Mapping[str, Any], tipo: str) -> Decimal:
     try:
         return Decimal(str(precos.get(_CHAVE_PRECO.get(tipo, "avulso_valor")) or 0))
