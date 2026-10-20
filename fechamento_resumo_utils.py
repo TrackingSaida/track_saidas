@@ -20,6 +20,18 @@ def base_filtro_ativo(base: Optional[str]) -> Optional[str]:
     return alvo
 
 
+def base_prefiltro_sql_valores(base: Optional[str]) -> List[str]:
+    """Valores para pré-filtro SQL (lower/trim), sem excluir variantes com/sem acento.
+
+    A filtragem final continua em `saida_pertence_base` (acento, caixa e espaço).
+    """
+    raw = (base or "").strip()
+    if not raw or raw.lower() == "(todas)":
+        return []
+    vals = {raw.lower(), _norm_base(raw)}
+    return sorted(v for v in vals if v)
+
+
 def saida_pertence_base(base_saida: Optional[str], base_filtro_norm: Optional[str]) -> bool:
     if base_filtro_norm is None:
         return True

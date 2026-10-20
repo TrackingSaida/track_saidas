@@ -1,7 +1,12 @@
 """Agregação do resumo de fechamento (mesmo recorte do relatório)."""
 from decimal import Decimal
 
-from fechamento_resumo_utils import agregar_resumo_fechamento, base_filtro_ativo, saida_pertence_base
+from fechamento_resumo_utils import (
+    agregar_resumo_fechamento,
+    base_filtro_ativo,
+    base_prefiltro_sql_valores,
+    saida_pertence_base,
+)
 
 
 def test_resumo_exemplo_relatorio():
@@ -95,3 +100,11 @@ def test_base_filtro_exclui_outra_base_e_sem_base():
     assert saida_pertence_base("Centro Sul", alvo) is False
     assert saida_pertence_base(None, alvo) is False
     assert saida_pertence_base("", alvo) is False
+
+
+def test_base_prefiltro_sql_inclui_variante_sem_acento():
+    vals = base_prefiltro_sql_valores("  São José ")
+    assert "são josé" in vals
+    assert "sao jose" in vals
+    assert base_prefiltro_sql_valores("(Todas)") == []
+    assert base_prefiltro_sql_valores("CLEBER - GABRIEL") == ["cleber - gabriel"]

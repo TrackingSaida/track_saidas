@@ -55,7 +55,13 @@ def test_junta_pelo_vinculo_de_usuario(monkeypatch):
         periodo_fim=date(2026, 6, 30),
     )
     linhas = _linhas()
-    er._juntar_legado_ao_motoboy(_DB([fech]), "sb", linhas, {})
+    er._juntar_legado_ao_motoboy(
+        _DB([]),
+        "sb",
+        linhas,
+        {},
+        fechs_por_executor={("m", 10): [fech]},
+    )
 
     assert ("e", 7) not in linhas
     dias = linhas[("m", 10)]["dias"]
