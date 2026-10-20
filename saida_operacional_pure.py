@@ -157,6 +157,36 @@ def timestamp_operacional_marcos(
     return saida_ts
 
 
+def marcos_de_ultimos_eventos(
+    *,
+    ultimo_atrib_ou_inv_evento: Optional[str],
+    ultimo_atrib_ou_inv_ts: Optional[datetime],
+    ultimo_marco_ts: Optional[datetime],
+) -> MarcosOperacionaisFechamento:
+    """Equivalente ao resolver completo usando só o último atrib/inv e o último marco.
+
+    O estado final da máquina só depende desses dois marcos (não da sequência inteira).
+    """
+    evento = (ultimo_atrib_ou_inv_evento or "").strip().lower()
+    if evento in EVENTOS_INVALIDANTES:
+        return MarcosOperacionaisFechamento(
+            operacional_ts=None,
+            ultimo_evento_ts=ultimo_marco_ts,
+            removido_sem_inicio_ativo=True,
+        )
+    if evento in EVENTOS_ATRIBUICAO_VALIDOS:
+        return MarcosOperacionaisFechamento(
+            operacional_ts=ultimo_atrib_ou_inv_ts,
+            ultimo_evento_ts=ultimo_marco_ts,
+            removido_sem_inicio_ativo=False,
+        )
+    return MarcosOperacionaisFechamento(
+        operacional_ts=None,
+        ultimo_evento_ts=ultimo_marco_ts,
+        removido_sem_inicio_ativo=False,
+    )
+
+
 def _normalizar_evento(evento: Optional[str]) -> str:
     return (evento or "").strip().lower().replace(" ", "_")
 
