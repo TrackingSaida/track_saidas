@@ -1008,6 +1008,11 @@ STATUS_VALOR_BASE_VALIDOS = [
     "ausente",
     "cancelado",
     "cancelados",
+    "encerrado",
+    "encerrado_sistema",
+    "encerrado sistema",
+    "encerrado pelo sistema",
+    "encerrado_pelo_sistema",
 ]
 
 
