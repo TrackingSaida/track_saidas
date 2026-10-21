@@ -169,3 +169,21 @@ def test_base_prefiltro_sql_usa_chave_normalizada():
     assert base_prefiltro_sql_valores("(Todas)") == []
     assert base_prefiltro_sql_valores("CLEBER - GABRIEL") == ["cleber gabriel"]
     assert base_prefiltro_sql_valores("CLEBER  GABRIEL") == ["cleber gabriel"]
+
+
+def test_encerrado_pelo_sistema_entra_no_fechamento_e_nao_e_cancelado():
+    import ast
+    from pathlib import Path
+
+    arvore = ast.parse(Path(__file__).resolve().parents[1].joinpath("entregador_routes.py").read_text())
+    lista = None
+    for no in arvore.body:
+        if isinstance(no, ast.Assign):
+            for alvo in no.targets:
+                if isinstance(alvo, ast.Name) and alvo.id == "STATUS_VALOR_BASE_VALIDOS":
+                    lista = ast.literal_eval(no.value)
+    assert lista is not None
+    for status in ("encerrado_sistema", "encerrado pelo sistema"):
+        assert status in lista
+        assert saida_cancelada(status) is False
+        assert saida_cancelada(status.upper()) is False
