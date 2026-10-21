@@ -1,35 +1,50 @@
 """Agregação do resumo de fechamento (mesmo recorte do relatório)."""
 from __future__ import annotations
 
+import re
 import unicodedata
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 _ZERO = Decimal("0.00")
+_NAO_ALNUM = re.compile(r"[^a-z0-9]+")
+_ACENTOS = "áàâãäéèêëíìîïóòôõöúùûüç"
+_SEM_ACENTO = "aaaaaeeeeiiiiooooouuuuc"
 
 
 def _norm_base(value: Optional[str]) -> str:
-    return unicodedata.normalize("NFD", (value or "").strip().lower()).encode("ascii", "ignore").decode("ascii")
+    """Minúsculas, sem acento, hífen e espaços repetidos viram um espaço."""
+    folded = (
+        unicodedata.normalize("NFD", (value or "").strip().lower())
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    return _NAO_ALNUM.sub(" ", folded).strip()
 
 
 def base_filtro_ativo(base: Optional[str]) -> Optional[str]:
     """Retorna a base normalizada do filtro, ou None quando o filtro abrange todas."""
+    raw = (base or "").strip().lower()
+    if not raw or raw == "(todas)":
+        return None
     alvo = _norm_base(base)
-    if not alvo or alvo == "(todas)":
+    if not alvo:
         return None
     return alvo
 
 
 def base_prefiltro_sql_valores(base: Optional[str]) -> List[str]:
-    """Valores para pré-filtro SQL (lower/trim), sem excluir variantes com/sem acento.
+    """Chave única para o pré-filtro SQL. A coluna usa `expr_base_normalizada`."""
+    chave = base_filtro_ativo(base)
+    return [chave] if chave else []
 
-    A filtragem final continua em `saida_pertence_base` (acento, caixa e espaço).
-    """
-    raw = (base or "").strip()
-    if not raw or raw.lower() == "(todas)":
-        return []
-    vals = {raw.lower(), _norm_base(raw)}
-    return sorted(v for v in vals if v)
+
+def expr_base_normalizada(coluna):
+    """Mesma chave de `_norm_base` no PostgreSQL (sem a extensão unaccent)."""
+    from sqlalchemy import func
+
+    sem_acento = func.translate(func.lower(func.trim(coluna)), _ACENTOS, _SEM_ACENTO)
+    return func.trim(func.regexp_replace(sem_acento, "[^a-z0-9]+", " ", "g"))
 
 
 def saida_pertence_base(base_saida: Optional[str], base_filtro_norm: Optional[str]) -> bool:

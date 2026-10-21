@@ -156,9 +156,16 @@ def test_base_filtro_exclui_outra_base_e_sem_base():
     assert saida_pertence_base("", alvo) is False
 
 
-def test_base_prefiltro_sql_inclui_variante_sem_acento():
-    vals = base_prefiltro_sql_valores("  São José ")
-    assert "são josé" in vals
-    assert "sao jose" in vals
+def test_base_filtro_hifen_e_espacos_repetidos_sao_o_mesmo_nome():
+    alvo = base_filtro_ativo("CLEBER  GABRIEL")
+    assert alvo == "cleber gabriel"
+    assert saida_pertence_base("CLEBER - GABRIEL", alvo) is True
+    assert saida_pertence_base("CLEBER GABRIEL", alvo) is True
+    assert saida_pertence_base("cleber-gabriel", alvo) is True
+
+
+def test_base_prefiltro_sql_usa_chave_normalizada():
+    assert base_prefiltro_sql_valores("  São José ") == ["sao jose"]
     assert base_prefiltro_sql_valores("(Todas)") == []
-    assert base_prefiltro_sql_valores("CLEBER - GABRIEL") == ["cleber - gabriel"]
+    assert base_prefiltro_sql_valores("CLEBER - GABRIEL") == ["cleber gabriel"]
+    assert base_prefiltro_sql_valores("CLEBER  GABRIEL") == ["cleber gabriel"]
