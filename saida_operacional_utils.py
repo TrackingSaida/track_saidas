@@ -404,7 +404,7 @@ def _conds_saidas_fechamento(
     base_prefiltro: Optional[str],
 ) -> Optional[List[ColumnElement]]:
     """None = resultado vazio (executor sem ids)."""
-    from fechamento_resumo_utils import base_prefiltro_sql_valores
+    from fechamento_resumo_utils import base_filtro_ativo, expr_base_normalizada
 
     conds: List[ColumnElement] = [
         Saida.sub_base == sub_base,
@@ -429,9 +429,9 @@ def _conds_saidas_fechamento(
         _, ts_fim_excl = janela_timestamp_periodo(periodo_fim, periodo_fim)
         conds.append(Saida.timestamp < ts_fim_excl)
 
-    base_vals = base_prefiltro_sql_valores(base_prefiltro)
-    if base_vals:
-        conds.append(func.lower(func.trim(Saida.base)).in_(base_vals))
+    chave_base = base_filtro_ativo(base_prefiltro)
+    if chave_base:
+        conds.append(expr_base_normalizada(Saida.base) == chave_base)
 
     if motoboy_ids is not None or entregador_ids is not None:
         mids = [int(m) for m in (motoboy_ids or []) if m is not None]
