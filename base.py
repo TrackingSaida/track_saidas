@@ -18,6 +18,7 @@ from base_import_service import (
     gerar_modelo_xlsx,
     preview_importacao,
 )
+from fechamento_base_ciclo_pure import normalizar_periodo_fechamento
 
 router = APIRouter(prefix="/base", tags=["Base"])
 
@@ -33,6 +34,7 @@ class BaseCreate(BaseModel):
     ativo: Optional[bool] = None
     dias_coleta: List[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5, 6])
     agenda_coleta_confirmada: bool = False
+    periodo_fechamento: Optional[str] = None
 
     @field_validator("dias_coleta")
     @classmethod
@@ -41,6 +43,15 @@ class BaseCreate(BaseModel):
         if not dias or any(dia < 1 or dia > 7 for dia in dias):
             raise ValueError("dias_coleta deve conter dias ISO entre 1 e 7")
         return dias
+
+    @field_validator("periodo_fechamento")
+    @classmethod
+    def validar_periodo_fechamento(cls, value: Optional[str]) -> Optional[str]:
+        try:
+            return normalizar_periodo_fechamento(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
     model_config = ConfigDict(from_attributes=True)
 
 class BaseOut(BaseModel):
@@ -55,6 +66,7 @@ class BaseOut(BaseModel):
     ativo: bool
     dias_coleta: List[int]
     agenda_coleta_confirmada: bool
+    periodo_fechamento: Optional[str] = None
     # Endereço cadastrado em base_seller_dados (opcional; aditivo)
     endereco_completo: Optional[str] = None
     # Contas Mercado Livre vinculadas (ml_conexoes.id_base); aditivo, só leitura
@@ -70,6 +82,7 @@ class BaseUpdate(BaseModel):
     ativo: Optional[bool]   = None
     dias_coleta: Optional[List[int]] = None
     agenda_coleta_confirmada: Optional[bool] = None
+    periodo_fechamento: Optional[str] = None
 
     @field_validator("dias_coleta")
     @classmethod
@@ -80,6 +93,15 @@ class BaseUpdate(BaseModel):
         if not dias or any(dia < 1 or dia > 7 for dia in dias):
             raise ValueError("dias_coleta deve conter dias ISO entre 1 e 7")
         return dias
+
+    @field_validator("periodo_fechamento")
+    @classmethod
+    def validar_periodo_fechamento(cls, value: Optional[str]) -> Optional[str]:
+        try:
+            return normalizar_periodo_fechamento(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -185,6 +207,13 @@ def _format_endereco_seller(seller: BaseSellerDados) -> Optional[str]:
     return texto or None
 
 
+def _periodo_lido(valor: Optional[str]) -> Optional[str]:
+    try:
+        return normalizar_periodo_fechamento(valor)
+    except ValueError:
+        return None
+
+
 def _base_to_out(
     obj: BasePreco,
     endereco_completo: Optional[str] = None,
@@ -202,6 +231,7 @@ def _base_to_out(
         ativo=bool(obj.ativo),
         dias_coleta=list(obj.dias_coleta or []),
         agenda_coleta_confirmada=bool(obj.agenda_coleta_confirmada),
+        periodo_fechamento=_periodo_lido(getattr(obj, "periodo_fechamento", None)),
         endereco_completo=endereco_completo,
     )
 
@@ -282,6 +312,7 @@ def criar_precos_base(
         ativo=bool(payload.ativo) if payload.ativo is not None else True,
         dias_coleta=payload.dias_coleta,
         agenda_coleta_confirmada=bool(payload.agenda_coleta_confirmada),
+        periodo_fechamento=payload.periodo_fechamento,
     )
 
     db.add(obj)
@@ -441,6 +472,8 @@ def patch_base(
         obj.dias_coleta = body.dias_coleta
     if body.agenda_coleta_confirmada is not None:
         obj.agenda_coleta_confirmada = bool(body.agenda_coleta_confirmada)
+    if "periodo_fechamento" in body.model_fields_set:
+        obj.periodo_fechamento = body.periodo_fechamento
 
     db.commit()
     db.refresh(obj)

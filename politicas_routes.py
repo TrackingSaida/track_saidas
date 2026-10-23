@@ -35,6 +35,7 @@ class OperacaoPoliticas(BaseModel):
     entrada_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
     devolucao_sub_base_habilitada: bool = False
+    pix_receber: Optional[str] = None
 
 
 class PadroesMotoboyPoliticas(BaseModel):
@@ -78,6 +79,7 @@ class OperacaoPoliticasPatch(BaseModel):
     entrada_habilitada: Optional[bool] = None
     conferencia_saida_habilitada: Optional[bool] = None
     devolucao_sub_base_habilitada: Optional[bool] = None
+    pix_receber: Optional[str] = Field(default=None, max_length=140)
 
 
 class PadroesMotoboyPatch(BaseModel):
@@ -156,6 +158,7 @@ def _owner_to_out(
             entrada_habilitada=bool(getattr(owner, "entrada_obrigatoria_habilitada", False)),
             conferencia_saida_habilitada=bool(getattr(owner, "conferencia_saida_habilitada", False)),
             devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
+            pix_receber=(getattr(owner, "pix_receber", None) or "").strip() or None,
         ),
         padroes_motoboy=padroes,
         cobertura=CoberturaPoliticas(
@@ -251,6 +254,8 @@ def patch_politicas(
         if op.devolucao_sub_base_habilitada is not None:
             owner.devolucao_sub_base_habilitada = bool(op.devolucao_sub_base_habilitada)
             operacao_changed = True
+        if "pix_receber" in op.model_fields_set:
+            owner.pix_receber = (op.pix_receber or "").strip() or None
 
     if body.padroes_motoboy:
         p = body.padroes_motoboy

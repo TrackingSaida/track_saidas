@@ -1,5 +1,18 @@
 # Migrações
 
+## pix_receber_e_periodo_fechamento_base.sql
+
+**Obrigatória antes** do deploy do PIX a receber e do período de fechamento da base (PRD-009).
+Sem ela a API responde **500** em Políticas gerais, no cadastro da base e no fechamento de coletas,
+porque o modelo já usa as colunas. Aditiva e idempotente.
+
+- `owner.pix_receber`: chave global impressa no PDF de coletas quando a base não tem PIX.
+- `base.periodo_fechamento`: `semanal`, `quinzenal`, `mensal` ou nulo (Nenhum).
+
+```bash
+psql "$DATABASE_URL" -f migrations/pix_receber_e_periodo_fechamento_base.sql
+```
+
 ## entregador_fechamento_contagem_apps.sql
 
 **Obrigatória antes** do deploy da contagem nos apps no fechamento do motoboy. Sem ela a API
