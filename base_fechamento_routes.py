@@ -41,6 +41,12 @@ from base_fechamento_status_pure import (
     motivo_bloqueio_lote_base,
     status_base_permite_reajuste,
 )
+from fechamento_base_ciclo_pure import (
+    MOTIVO_PERIODO_FECHAMENTO,
+    aviso_ciclo_fechamento,
+    normalizar_periodo_fechamento,
+    resolver_chave_pix,
+)
 from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
 from fechamento_valor_pure import adicional_g
 from pacote_g_categorias import (
@@ -219,7 +225,15 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
             )
 
     if not seller:
-        return None
+        chave = _chave_pix_resolvida(db, sub_base, None)
+        if not chave:
+            return None
+        return {
+            "nome_base": base_norm,
+            "cnpj": None,
+            "endereco_completo": None,
+            "chave_pix": chave,
+        }
 
     # Monta endereço completo de forma resiliente a campos vazios
     partes_endereco: List[str] = []
@@ -257,7 +271,7 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
         except Exception:
             cnpj_fmt = cnpj_raw
 
-    chave_pix = (getattr(seller, "chave_pix", None) or "").strip() or None
+    chave_pix = _chave_pix_resolvida(db, sub_base, getattr(seller, "chave_pix", None))
 
     info: Dict[str, Any] = {
         "nome_base": base_norm,
@@ -266,6 +280,39 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
         "chave_pix": chave_pix,
     }
     return info
+
+
+def _chave_pix_resolvida(db: Session, sub_base: str, chave_base: Optional[str]) -> Optional[str]:
+    sub = (sub_base or "").strip()
+    owner = db.scalar(select(Owner).where(Owner.sub_base == sub)) if sub else None
+    global_pix = getattr(owner, "pix_receber", None) if owner else None
+    return resolver_chave_pix(chave_base, global_pix)
+
+
+def _ciclo_da_base(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> tuple[Optional[str], Optional[str]]:
+    """(código do período, aviso se o intervalo não corresponde)."""
+    nome = (base_nome or "").strip()
+    preco = db.scalar(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base,
+            func.upper(BasePreco.base) == nome.upper(),
+        )
+    )
+    codigo = None
+    if preco is not None:
+        try:
+            codigo = normalizar_periodo_fechamento(getattr(preco, "periodo_fechamento", None))
+        except ValueError:
+            codigo = None
+        nome = (preco.base or nome).strip() or nome
+    aviso = aviso_ciclo_fechamento(nome, codigo, periodo_inicio, periodo_fim)
+    return codigo, aviso
 
 
 def _emitido_por(db: Session, sub_base: str) -> str:
@@ -656,6 +703,8 @@ class CalcularOut(BaseModel):
     seller_info: Optional[Dict[str, Any]] = None
     emitido_por: Optional[str] = None
     calendario: dict
+    periodo_fechamento: Optional[str] = None
+    aviso_ciclo: Optional[str] = None
 
 
 class FechamentoOut(BaseModel):
@@ -753,6 +802,8 @@ class ResumoBaseLinha(BaseModel):
     valor_final_recalculado: Optional[Decimal] = None
     pode_gerar_lote: bool = False
     motivo_bloqueio: Optional[str] = None
+    periodo_fechamento: Optional[str] = None
+    aviso_ciclo: Optional[str] = None
 
 
 class ResumoBaseSituacao(BaseModel):
@@ -895,6 +946,7 @@ def calcular_fechamento(
     calendario = _resumo_calendario_fechamento(
         db, sub_base, base, periodo_inicio, periodo_fim
     )
+    periodo_codigo, aviso_ciclo = _ciclo_da_base(db, sub_base, base, periodo_inicio, periodo_fim)
 
     return CalcularOut(
         base=base.strip(),
@@ -917,6 +969,8 @@ def calcular_fechamento(
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
         calendario=calendario,
+        periodo_fechamento=periodo_codigo,
+        aviso_ciclo=aviso_ciclo,
     )
 
 
@@ -940,6 +994,11 @@ def _criar_fechamento_base_core(
         )
 
     base_norm = payload.base.strip()
+    _, aviso_ciclo = _ciclo_da_base(
+        db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
+    )
+    if aviso_ciclo:
+        raise HTTPException(422, aviso_ciclo)
     calendario = _resumo_calendario_fechamento(
         db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
     )
@@ -1619,6 +1678,16 @@ def _linhas_resumo_por_base(
             total_pacotes_g=total_g,
             pacotes_g_com_regra=sum(x.get("pacotes_g_com_cobranca", 0) for x in itens),
         )
+        periodo_codigo = None
+        aviso_ciclo = None
+        if preco is not None:
+            try:
+                periodo_codigo = normalizar_periodo_fechamento(getattr(preco, "periodo_fechamento", None))
+            except ValueError:
+                periodo_codigo = None
+            aviso_ciclo = aviso_ciclo_fechamento(nome, periodo_codigo, periodo_inicio, periodo_fim)
+        if motivo is None and aviso_ciclo:
+            motivo = MOTIVO_PERIODO_FECHAMENTO
         linhas.append(
             ResumoBaseLinha(
                 base=nome,
@@ -1641,6 +1710,8 @@ def _linhas_resumo_por_base(
                 valor_final_recalculado=valor_final_rec,
                 pode_gerar_lote=motivo is None,
                 motivo_bloqueio=motivo,
+                periodo_fechamento=periodo_codigo,
+                aviso_ciclo=aviso_ciclo,
             )
         )
     linhas.sort(key=lambda linha: linha.base.casefold())
@@ -1725,7 +1796,10 @@ def criar_fechamentos_lote(
             )
             continue
         if not linha.pode_gerar_lote:
-            resultado.ignorados.append(FechamentoLoteItem(base=linha.base, motivo=linha.motivo_bloqueio))
+            motivo = linha.motivo_bloqueio
+            if motivo == MOTIVO_PERIODO_FECHAMENTO and linha.aviso_ciclo:
+                motivo = linha.aviso_ciclo
+            resultado.ignorados.append(FechamentoLoteItem(base=linha.base, motivo=motivo))
             continue
         try:
             with db.begin_nested():
