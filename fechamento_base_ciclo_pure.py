@@ -74,3 +74,15 @@ def aviso_ciclo_fechamento(
         f"O período {inicio:%d/%m/%Y} a {fim:%d/%m/%Y} não corresponde. "
         "Ajuste o período para gerar o fechamento."
     )
+
+
+def renome_fechamento_bloqueado(periodos_antigos: list, periodos_novos: list, mesma_chave: bool) -> bool:
+    """Dois fechamentos no mesmo período não podem ficar com o mesmo nome."""
+    vistos = set()
+    for periodo in periodos_antigos:
+        if periodo in vistos:
+            return True
+        vistos.add(periodo)
+    if mesma_chave:
+        return False
+    return bool(vistos & set(periodos_novos))
