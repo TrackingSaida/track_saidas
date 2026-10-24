@@ -119,6 +119,8 @@ class Owner(Base):
     etiqueta_expiracao_dias = Column(Integer, nullable=False, server_default=text("30"))
     # PIX a receber impresso no fechamento de coletas quando a base não tem chave própria
     pix_receber = Column(Text, nullable=True)
+    # cpf | cnpj | telefone | email | aleatoria. Nulo em chave antiga, sem tipo.
+    pix_receber_tipo = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -143,6 +145,8 @@ class BaseSellerDados(Base):
     estado = Column(Text, nullable=True)
     cep = Column(Text, nullable=False)
     chave_pix = Column(Text, nullable=True)
+    # cpf | cnpj | telefone | email | aleatoria. Nulo em chave antiga, sem tipo.
+    chave_pix_tipo = Column(Text, nullable=True)
 
     owner = relationship("Owner", backref="seller_dados")
     base = relationship("BasePreco", backref="seller_dados", uselist=False)

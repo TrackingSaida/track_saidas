@@ -1,5 +1,17 @@
 # Migrações
 
+## pix_receber_tipo_chave.sql
+
+**Obrigatória antes** do deploy do tipo da chave PIX a receber. Sem ela a API responde **500**
+em Políticas gerais, no cadastro da base e no fechamento de coletas, porque o modelo já usa
+as colunas. Aditiva e idempotente.
+
+- `owner.pix_receber_tipo` e `base_seller_dados.chave_pix_tipo`: `cpf`, `cnpj`, `telefone`, `email`, `aleatoria` ou nulo.
+
+```bash
+psql "$DATABASE_URL" -f migrations/pix_receber_tipo_chave.sql
+```
+
 ## pix_receber_e_periodo_fechamento_base.sql
 
 **Obrigatória antes** do deploy do PIX a receber e do período de fechamento da base (PRD-009).

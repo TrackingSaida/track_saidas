@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from db import get_db
 from auth import _coerce_role_int, get_current_user
+from fechamento_base_ciclo_pure import aplicar_chave_pix
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
 from etiqueta_identidade_service import resolver_logo_owner, resolver_nome_exibicao
 from upload_storage_utils import B2_BUCKET_NAME, get_s3_client_optional, purge_b2_keys
@@ -524,6 +525,7 @@ class SellerDadosBase(BaseModel):
     estado: Optional[str] = None
     cep: Optional[str] = None
     chave_pix: Optional[str] = None
+    chave_pix_tipo: Optional[str] = None
     base_id: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -577,6 +579,17 @@ def upsert_seller_dados(
         stmt = stmt.where(BaseSellerDados.base_id == base_id)
     seller = db.scalar(stmt)
 
+    definir_pix = "chave_pix" in data or "chave_pix_tipo" in data
+    pix_tipo = getattr(seller, "chave_pix_tipo", None) if seller else None
+    pix_chave = getattr(seller, "chave_pix", None) if seller else None
+    if definir_pix:
+        tipo_in = data["chave_pix_tipo"] if "chave_pix_tipo" in data else pix_tipo
+        chave_in = data["chave_pix"] if "chave_pix" in data else pix_chave
+        try:
+            pix_tipo, pix_chave = aplicar_chave_pix(tipo_in, chave_in, pix_tipo, pix_chave)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
     if not seller:
         cnpj = (data.get("cnpj") or "").strip()
         rua = (data.get("rua") or "").strip()
@@ -584,7 +597,6 @@ def upsert_seller_dados(
         bairro = (data.get("bairro") or "").strip()
         cidade = (data.get("cidade") or "").strip()
         cep = (data.get("cep") or "").strip()
-        chave_pix = (data.get("chave_pix") or "").strip() or None
         tipo_owner = (getattr(owner, "tipo_owner", None) or "subbase").strip().lower()
         # Owner tipo Base (Seller) exige CNPJ e endereço. Subbase: todos opcionais, inclusive PIX.
         if tipo_owner == "base" and not all([cnpj, rua, numero, bairro, cidade, cep]):
@@ -604,7 +616,8 @@ def upsert_seller_dados(
             cidade=cidade,
             estado=(data.get("estado") or "").strip() or None,
             cep=cep,
-            chave_pix=chave_pix,
+            chave_pix=pix_chave,
+            chave_pix_tipo=pix_tipo,
         )
         db.add(seller)
 
@@ -628,8 +641,9 @@ def upsert_seller_dados(
             seller.estado = (data["estado"] or "").strip() or None
         if "cep" in data:
             seller.cep = (data["cep"] or "").strip() or seller.cep
-        if "chave_pix" in data:
-            seller.chave_pix = (data["chave_pix"] or "").strip() or None
+        if definir_pix:
+            seller.chave_pix = pix_chave
+            seller.chave_pix_tipo = pix_tipo
 
     db.commit()
     db.refresh(seller)

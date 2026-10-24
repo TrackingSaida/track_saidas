@@ -45,7 +45,7 @@ from fechamento_base_ciclo_pure import (
     MOTIVO_PERIODO_FECHAMENTO,
     aviso_ciclo_fechamento,
     normalizar_periodo_fechamento,
-    resolver_chave_pix,
+    resolver_pix_receber,
 )
 from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
 from fechamento_valor_pure import adicional_g
@@ -225,7 +225,7 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
             )
 
     if not seller:
-        chave = _chave_pix_resolvida(db, sub_base, None)
+        chave, tipo = _pix_resolvido(db, sub_base, None, None)
         if not chave:
             return None
         return {
@@ -233,6 +233,7 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
             "cnpj": None,
             "endereco_completo": None,
             "chave_pix": chave,
+            "chave_pix_tipo": tipo,
         }
 
     # Monta endereço completo de forma resiliente a campos vazios
@@ -271,22 +272,37 @@ def _montar_seller_info(db: Session, sub_base: str, base: str) -> Optional[Dict[
         except Exception:
             cnpj_fmt = cnpj_raw
 
-    chave_pix = _chave_pix_resolvida(db, sub_base, getattr(seller, "chave_pix", None))
+    chave_pix, tipo_pix = _pix_resolvido(
+        db,
+        sub_base,
+        getattr(seller, "chave_pix", None),
+        getattr(seller, "chave_pix_tipo", None),
+    )
 
     info: Dict[str, Any] = {
         "nome_base": base_norm,
         "cnpj": cnpj_fmt,
         "endereco_completo": endereco_completo or None,
         "chave_pix": chave_pix,
+        "chave_pix_tipo": tipo_pix,
     }
     return info
 
 
-def _chave_pix_resolvida(db: Session, sub_base: str, chave_base: Optional[str]) -> Optional[str]:
+def _pix_resolvido(
+    db: Session,
+    sub_base: str,
+    chave_base: Optional[str],
+    tipo_base: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
     sub = (sub_base or "").strip()
     owner = db.scalar(select(Owner).where(Owner.sub_base == sub)) if sub else None
-    global_pix = getattr(owner, "pix_receber", None) if owner else None
-    return resolver_chave_pix(chave_base, global_pix)
+    return resolver_pix_receber(
+        chave_base,
+        tipo_base,
+        getattr(owner, "pix_receber", None) if owner else None,
+        getattr(owner, "pix_receber_tipo", None) if owner else None,
+    )
 
 
 def _ciclo_da_base(
