@@ -117,6 +117,10 @@ class Owner(Base):
     slogan = Column(Text, nullable=True)
     etiqueta_limite_diario_default = Column(Integer, nullable=False, server_default=text("50"))
     etiqueta_expiracao_dias = Column(Integer, nullable=False, server_default=text("30"))
+    # PIX a receber impresso no fechamento de coletas quando a base não tem chave própria
+    pix_receber = Column(Text, nullable=True)
+    # cpf | cnpj | telefone | email | aleatoria. Nulo em chave antiga, sem tipo.
+    pix_receber_tipo = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -141,6 +145,8 @@ class BaseSellerDados(Base):
     estado = Column(Text, nullable=True)
     cep = Column(Text, nullable=False)
     chave_pix = Column(Text, nullable=True)
+    # cpf | cnpj | telefone | email | aleatoria. Nulo em chave antiga, sem tipo.
+    chave_pix_tipo = Column(Text, nullable=True)
 
     owner = relationship("Owner", backref="seller_dados")
     base = relationship("BasePreco", backref="seller_dados", uselist=False)
@@ -397,6 +403,8 @@ class BasePreco(Base):
     # mas só passa a bloquear alertas/fechamentos após confirmação do admin.
     dias_coleta = Column(JSON, nullable=False, server_default=text("'[1,2,3,4,5,6]'::json"))
     agenda_coleta_confirmada = Column(Boolean, nullable=False, server_default=text("false"))
+    # semanal | quinzenal | mensal. Nulo = Nenhum, sem validação de ciclo no fechamento.
+    periodo_fechamento = Column(Text, nullable=True)
     etiqueta_limite_diario = Column(Integer, nullable=True)
 
     def __repr__(self) -> str:

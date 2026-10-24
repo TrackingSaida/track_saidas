@@ -21,6 +21,7 @@ from leitura_manual_auth import (
     list_users_role4_da_sub_base,
     resolve_owner_avulso_defaults,
 )
+from fechamento_base_ciclo_pure import aplicar_chave_pix
 from models import Owner, User
 
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
@@ -35,6 +36,8 @@ class OperacaoPoliticas(BaseModel):
     entrada_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
     devolucao_sub_base_habilitada: bool = False
+    pix_receber: Optional[str] = None
+    pix_receber_tipo: Optional[str] = None
 
 
 class PadroesMotoboyPoliticas(BaseModel):
@@ -78,6 +81,8 @@ class OperacaoPoliticasPatch(BaseModel):
     entrada_habilitada: Optional[bool] = None
     conferencia_saida_habilitada: Optional[bool] = None
     devolucao_sub_base_habilitada: Optional[bool] = None
+    pix_receber: Optional[str] = Field(default=None, max_length=140)
+    pix_receber_tipo: Optional[str] = Field(default=None, max_length=20)
 
 
 class PadroesMotoboyPatch(BaseModel):
@@ -156,6 +161,8 @@ def _owner_to_out(
             entrada_habilitada=bool(getattr(owner, "entrada_obrigatoria_habilitada", False)),
             conferencia_saida_habilitada=bool(getattr(owner, "conferencia_saida_habilitada", False)),
             devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
+            pix_receber=(getattr(owner, "pix_receber", None) or "").strip() or None,
+            pix_receber_tipo=(getattr(owner, "pix_receber_tipo", None) or "").strip() or None,
         ),
         padroes_motoboy=padroes,
         cobertura=CoberturaPoliticas(
@@ -251,6 +258,15 @@ def patch_politicas(
         if op.devolucao_sub_base_habilitada is not None:
             owner.devolucao_sub_base_habilitada = bool(op.devolucao_sub_base_habilitada)
             operacao_changed = True
+        if "pix_receber" in op.model_fields_set or "pix_receber_tipo" in op.model_fields_set:
+            tipo_in = op.pix_receber_tipo if "pix_receber_tipo" in op.model_fields_set else owner.pix_receber_tipo
+            chave_in = op.pix_receber if "pix_receber" in op.model_fields_set else owner.pix_receber
+            try:
+                tipo, chave = aplicar_chave_pix(tipo_in, chave_in, owner.pix_receber_tipo, owner.pix_receber)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            owner.pix_receber_tipo = tipo
+            owner.pix_receber = chave
 
     if body.padroes_motoboy:
         p = body.padroes_motoboy

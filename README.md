@@ -182,9 +182,14 @@ Pré-requisito: migration `saidas_plataforma_cancelado_em.sql`.
 
 ### Etiqueta ML com QR oficial
 
-`POST /etiquetas/gerar` de pedido importado do ML sem o JSON completo do QR baixa a etiqueta oficial
-(`/shipment_labels`, ZPL) com a conta do seller, extrai o QR e grava em `qr_payload_raw` (uma vez).
-Sem etiqueta disponível, gera só com o número e responde `X-Etiqueta-Aviso: qr_ml_incompleto`.
+`POST /etiquetas/gerar` em PDF, para saída com `ml_shipment_id` e conta ML da mesma sub_base,
+devolve o PDF oficial do Mercado Livre (`/shipment_labels`, `response_type=pdf`). A conta
+vinculada à base do pedido é tentada primeiro. Se o Mercado Livre não devolver um PDF, cai no
+gerador próprio.
+
+Pedido importado sem o JSON completo do QR também baixa a etiqueta em ZPL, extrai o QR e grava
+em `qr_payload_raw` (uma vez), inclusive depois de entregar o PDF oficial. Sem etiqueta
+disponível, gera só com o número e responde `X-Etiqueta-Aviso: qr_ml_incompleto`.
 Baixar a etiqueta pela API pode marcar o envio como impresso no painel do seller.
 
 ### Endpoint interno
