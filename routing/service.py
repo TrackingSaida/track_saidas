@@ -21,11 +21,12 @@ def optimize_route_order(
 ) -> OptimizeRouteResult:
     """
     Ramifica:
-    - (a) stop_penalties → priority_soft (deliberado, local)
-    - (b) ROUTING_OPTIMIZATION_PROVIDER=osrm → OSRM (+ NN fallback legado)
-    - (c) ROUTING_OPTIMIZATION_PROVIDER=google → só Google; erro propaga
+    - (a) stop_penalties sem destino final → priority_soft (deliberado, local)
+    - (b) destino final → motor de estrada com início e fim; a prioridade não troca o motor
+    - (c) ROUTING_OPTIMIZATION_PROVIDER=osrm → OSRM (+ NN fallback legado)
+    - (d) ROUTING_OPTIMIZATION_PROVIDER=google → só Google; erro propaga
     """
-    if stop_penalties:
+    if stop_penalties and end is None:
         result = optimize_osrm(
             points, start=start, end=end, stop_penalties=stop_penalties
         )

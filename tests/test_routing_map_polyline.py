@@ -1,4 +1,4 @@
-"""Geometria persistida após optimize: só paradas, sem tour do veículo."""
+"""Geometria persistida após optimize, inclusive o trecho até a casa."""
 from routing.google_route_optimization import (
     polyline_exceeds_stops_bbox,
     resolve_map_polyline_after_optimize,
@@ -64,71 +64,51 @@ def test_sem_endpoints_reusa_polyline_do_optimize():
     assert geom.distancia_total_m == 100
 
 
-def test_com_endpoints_refresh_sem_start_end_e_descarta_tour():
+def test_com_endpoints_mantem_tour_ate_a_casa():
     stops = [(1, -23.55, -46.63), (2, -23.56, -46.64)]
-    stop_poly = _encode_polyline([(-23.55, -46.63), (-23.56, -46.64)])
-    called = {}
 
-    def fake_refresh(points, **kwargs):
-        called["points"] = list(points)
-        called["kwargs"] = kwargs
-        return GeometryResult(
-            polyline_encoded=stop_poly,
-            distancia_total_m=50,
-            duracao_total_s=20,
-            geometry_provider="google",
-            ok=True,
-        )
+    def fake_refresh(*_a, **_k):
+        raise AssertionError("não deveria redesenhar só as paradas")
 
     geom = resolve_map_polyline_after_optimize(
         stops,
         had_vehicle_endpoints=True,
         optimize_polyline="TOUR_VEICULO",
+        optimize_dist_m=1200,
+        optimize_dur_s=400,
         refresh_fn=fake_refresh,
     )
-    assert called["points"] == stops
-    assert called["kwargs"] == {}
     assert geom.ok is True
-    assert geom.polyline_encoded == stop_poly
-    assert geom.polyline_encoded != "TOUR_VEICULO"
+    assert geom.polyline_encoded == "TOUR_VEICULO"
+    assert geom.distancia_total_m == 1200
+    assert geom.duracao_total_s == 400
 
 
-def test_com_endpoints_refresh_falha_nao_persiste_tour():
+def test_com_endpoints_sem_linha_nao_inventa_trecho():
     stops = [(1, -23.55, -46.63), (2, -23.56, -46.64)]
-
-    def boom(*_a, **_k):
-        raise RoutingError("ROUTING_TIMEOUT", "timeout", http_status=504)
 
     geom = resolve_map_polyline_after_optimize(
         stops,
         had_vehicle_endpoints=True,
-        optimize_polyline="TOUR_VEICULO",
-        refresh_fn=boom,
+        optimize_polyline=None,
+        refresh_fn=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("não deveria refresh")),
     )
     assert geom.ok is False
     assert geom.polyline_encoded is None
-    assert geom.error_code == "ROUTING_TIMEOUT"
+    assert geom.error_code == "ROUTING_NO_POLYLINE"
 
 
-def test_com_endpoints_bbox_estoura_nao_serve_tour():
+def test_com_endpoints_linha_ate_a_casa_permanece():
     stops = [(1, -23.55, -46.63), (2, -23.56, -46.64)]
     tour = _encode_polyline([(-23.55, -46.63), (-23.56, -46.64), (-23.40, -46.90)])
-
-    def fake_refresh(*_a, **_k):
-        return GeometryResult(
-            polyline_encoded=tour,
-            distancia_total_m=90000,
-            duracao_total_s=3600,
-            geometry_provider="google",
-            ok=True,
-        )
 
     geom = resolve_map_polyline_after_optimize(
         stops,
         had_vehicle_endpoints=True,
         optimize_polyline=tour,
-        refresh_fn=fake_refresh,
+        optimize_dist_m=90000,
+        optimize_dur_s=3600,
     )
-    assert geom.ok is False
-    assert geom.polyline_encoded is None
-    assert geom.error_code == "ROUTING_POLYLINE_BBOX"
+    assert geom.ok is True
+    assert geom.polyline_encoded == tour
+    assert geom.distancia_total_m == 90000

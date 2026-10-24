@@ -777,21 +777,48 @@ def soft_priority_effective_cost(
     return dist_m + penalty
 
 
-def _split_forced_last_near_end(
+def _order_progressing_to_end(
     points: List[RoutePoint],
+    start: Optional[StartPoint],
     end: StartPoint,
-) -> Tuple[List[RoutePoint], RoutePoint]:
-    """Separa a parada mais próxima do destino final para ser a última da rota."""
-    best_idx = 0
-    best_dist = float("inf")
-    for i, (_, lat, lon) in enumerate(points):
-        d = haversine_m(lat, lon, end[0], end[1])
-        if d < best_dist:
-            best_dist = d
-            best_idx = i
-    forced_last = points[best_idx]
-    remaining = [p for i, p in enumerate(points) if i != best_idx]
-    return remaining, forced_last
+    stop_penalties: Optional[Dict[int, float]] = None,
+) -> List[int]:
+    """
+    Próxima parada: distância até ela e o quanto o trecho caminha para o destino.
+    No começo prefere o lado oposto à casa; no fim prefere a parada perto da casa.
+    """
+    if not points:
+        return []
+    if len(points) == 1:
+        return [points[0][0]]
+
+    remaining = list(points)
+    ordered_ids: List[int] = []
+    if start is not None:
+        cur_lat, cur_lon = start
+    else:
+        first = remaining.pop(0)
+        ordered_ids.append(first[0])
+        cur_lat, cur_lon = first[1], first[2]
+
+    total = len(points)
+    while remaining:
+        progress = len(ordered_ids) / max(total - 1, 1)
+        factor = (2.0 * progress) - 1.0
+        best_idx = 0
+        best_cost = float("inf")
+        for i, (sid, lat, lon) in enumerate(remaining):
+            dist = haversine_m(cur_lat, cur_lon, lat, lon)
+            to_end = haversine_m(lat, lon, end[0], end[1])
+            penalty = float((stop_penalties or {}).get(sid, 0.0) or 0.0)
+            cost = dist + (0.55 * to_end * factor) + penalty
+            if cost < best_cost:
+                best_cost = cost
+                best_idx = i
+        nxt = remaining.pop(best_idx)
+        ordered_ids.append(nxt[0])
+        cur_lat, cur_lon = nxt[1], nxt[2]
+    return ordered_ids
 
 
 def nearest_neighbor_soft_priority(
@@ -805,22 +832,17 @@ def nearest_neighbor_soft_priority(
     """
     Vizinho mais próximo com penalidade suave por parada.
     Pacotes já próximos (≤ nearby) competem só por distância.
-    Com end, a parada mais próxima do destino fica por último.
+    Com end, a ordem caminha da origem até a casa.
     """
+    if end is not None:
+        return _order_progressing_to_end(points, start, end, stop_penalties)
     if not points:
         return []
     if len(points) == 1:
         return [points[0][0]]
 
-    forced_last: Optional[RoutePoint] = None
     remaining = list(points)
-    if end is not None and len(remaining) >= 2:
-        remaining, forced_last = _split_forced_last_near_end(remaining, end)
-
     ordered_ids: List[int] = []
-
-    if not remaining:
-        return [forced_last[0]] if forced_last is not None else []
 
     if start is not None:
         cur_lat, cur_lon = start[0], start[1]
@@ -843,9 +865,6 @@ def nearest_neighbor_soft_priority(
         ordered_ids.append(next_pt[0])
         cur_lat, cur_lon = next_pt[1], next_pt[2]
 
-    if forced_last is not None:
-        ordered_ids.append(forced_last[0])
-
     return ordered_ids
 
 
@@ -857,22 +876,17 @@ def nearest_neighbor_order(
     """
     Ordena entregas por vizinho mais próximo (Haversine).
     points: lista (id_saida, lat, lon) na ordem original de referência.
-    Com end, a parada mais próxima do destino fica por último.
+    Com end, a ordem caminha da origem até a casa.
     """
+    if end is not None:
+        return _order_progressing_to_end(points, start, end)
     if not points:
         return []
     if len(points) == 1:
         return [points[0][0]]
 
-    forced_last: Optional[RoutePoint] = None
     remaining = list(points)
-    if end is not None and len(remaining) >= 2:
-        remaining, forced_last = _split_forced_last_near_end(remaining, end)
-
     ordered_ids: List[int] = []
-
-    if not remaining:
-        return [forced_last[0]] if forced_last is not None else []
 
     if start is not None:
         cur_lat, cur_lon = start[0], start[1]
@@ -892,9 +906,6 @@ def nearest_neighbor_order(
         next_pt = remaining.pop(best_idx)
         ordered_ids.append(next_pt[0])
         cur_lat, cur_lon = next_pt[1], next_pt[2]
-
-    if forced_last is not None:
-        ordered_ids.append(forced_last[0])
 
     return ordered_ids
 

@@ -541,61 +541,25 @@ def resolve_map_polyline_after_optimize(
     optimize_dur_s: Optional[int] = None,
     refresh_fn=None,
 ) -> GeometryResult:
-    """Geometria persistida no mapa: só paradas 1→N.
+    """Geometria do mapa.
 
-    `optimizeTours` com start/end devolve o tour do veículo (GPS→paradas→casa).
-    Esse blob não deve ir para o mapa; após a ordem, dá refresh sem endpoints.
+    A linha do optimize já inclui a casa quando há origem e destino.
+    Sem essa linha, não inventa um trecho só entre paradas.
     """
-    refresh = refresh_fn or refresh_geometry_google
-    if not had_vehicle_endpoints:
-        if optimize_polyline:
-            return GeometryResult(
-                polyline_encoded=optimize_polyline,
-                distancia_total_m=optimize_dist_m,
-                duracao_total_s=optimize_dur_s,
-                geometry_provider="google",
-                ok=True,
-            )
+    del points_in_visit_order, refresh_fn
+    if optimize_polyline:
         return GeometryResult(
-            polyline_encoded=None,
-            distancia_total_m=None,
-            duracao_total_s=None,
+            polyline_encoded=optimize_polyline,
+            distancia_total_m=optimize_dist_m,
+            duracao_total_s=optimize_dur_s,
             geometry_provider="google",
-            ok=False,
-            error_code="ROUTING_NO_POLYLINE",
+            ok=True,
         )
-
-    try:
-        geom = refresh(points_in_visit_order)
-    except RoutingError as err:
-        logger.warning("refresh stop-to-stop após optimize falhou: %s", err.code)
-        return GeometryResult(
-            polyline_encoded=None,
-            distancia_total_m=None,
-            duracao_total_s=None,
-            geometry_provider="google",
-            ok=False,
-            error_code=err.code,
-        )
-
-    if not geom.ok or not geom.polyline_encoded:
-        return GeometryResult(
-            polyline_encoded=None,
-            distancia_total_m=None,
-            duracao_total_s=None,
-            geometry_provider="google",
-            ok=False,
-            error_code=geom.error_code or "ROUTING_NO_POLYLINE",
-        )
-
-    if polyline_exceeds_stops_bbox(geom.polyline_encoded, points_in_visit_order):
-        logger.warning("polyline Google expandiu bbox das paradas; descartada")
-        return GeometryResult(
-            polyline_encoded=None,
-            distancia_total_m=None,
-            duracao_total_s=None,
-            geometry_provider="google",
-            ok=False,
-            error_code="ROUTING_POLYLINE_BBOX",
-        )
-    return geom
+    return GeometryResult(
+        polyline_encoded=None,
+        distancia_total_m=None,
+        duracao_total_s=None,
+        geometry_provider="google",
+        ok=False,
+        error_code="ROUTING_NO_POLYLINE" if not had_vehicle_endpoints else "ROUTING_NO_POLYLINE",
+    )
