@@ -186,6 +186,31 @@ def _resolve_qr_content(
     return (saida.qr_payload_raw or None), aviso
 
 
+def _pdf_oficial_ml(db: Session, saida: Optional[Saida], formato: str) -> Optional[bytes]:
+    """PDF oficial do Mercado Livre, ou None para cair no gerador próprio."""
+    if formato != "pdf" or saida is None or not getattr(saida, "ml_shipment_id", None):
+        return None
+    from ml_int_service import obter_pdf_etiqueta_ml
+
+    try:
+        return obter_pdf_etiqueta_ml(db, saida)
+    except Exception as e:
+        logger.info("PDF oficial ML indisponível para saída %s: %s", getattr(saida, "id_saida", None), e)
+        return None
+
+
+def _gravar_qr_ml_se_faltar(db: Session, saida: Saida) -> None:
+    """Completa qr_payload_raw depois do PDF oficial. Falha aqui não troca o arquivo entregue."""
+    from qr_payload_utils import is_ml_qr_completo
+
+    if is_ml_qr_completo(getattr(saida, "qr_payload_raw", None)):
+        return
+    try:
+        _completar_qr_ml_sincronizado(db, saida)
+    except Exception as e:
+        logger.info("QR oficial não gravado na saída %s: %s", getattr(saida, "id_saida", None), e)
+
+
 @router.post("/gerar")
 def gerar_etiqueta(
     payload: EtiquetaGerarPayload,
@@ -194,7 +219,7 @@ def gerar_etiqueta(
 ):
     """
     Gera etiqueta 100x150mm.
-    Para ML: usa qr_payload_raw se disponível; senão cai para o código.
+    Pedido ML com conta da sub_base devolve o PDF oficial; senão usa o gerador próprio.
     """
     codigo = (payload.codigo or "").strip()
     if not codigo:
@@ -232,6 +257,23 @@ def gerar_etiqueta(
         raise HTTPException(403, "Sem permissão para gerar etiqueta.")
 
     saida_ref = saida_autorizada or _saida_ml_por_codigo(db, sub_base, codigo)
+
+    formato = (payload.formato or "pdf").strip().lower()
+    if formato not in ("pdf", "png"):
+        raise HTTPException(400, "Formato inválido. Use 'pdf' ou 'png'.")
+
+    pdf_oficial = _pdf_oficial_ml(db, saida_ref, formato)
+    if pdf_oficial and saida_ref is not None:
+        _gravar_qr_ml_se_faltar(db, saida_ref)
+        id_part = str(payload.id_saida) if payload.id_saida else "0"
+        cod_safe = re.sub(r'[^\w\-.]', '', (codigo or "")[:40]) or "cod"
+        filename = f"etq-tracking-{id_part}-{cod_safe}-ml.pdf"
+        return Response(
+            content=pdf_oficial,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     qr_content, aviso = _resolve_qr_content(payload.qr_payload, saida_ref, db)
 
     modo_final = "generic"
@@ -241,10 +283,6 @@ def gerar_etiqueta(
         modo_final = "shopee"
 
     dados_extras: Optional[Dict[str, Any]] = None
-
-    formato = (payload.formato or "pdf").strip().lower()
-    if formato not in ("pdf", "png"):
-        raise HTTPException(400, "Formato inválido. Use 'pdf' ou 'png'.")
 
     try:
         from etiqueta_pdf_service import gerar_etiqueta

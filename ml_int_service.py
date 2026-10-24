@@ -423,6 +423,52 @@ def fetch_shipments_by_tracking(
     return r.json()
 
 
+def _pdf_de_conteudo_ml(conteudo: bytes) -> Optional[bytes]:
+    """PDF cru ou o primeiro PDF dentro do ZIP que o Mercado Livre devolve."""
+    import io
+    import zipfile
+
+    if conteudo.startswith(b"%PDF"):
+        return conteudo
+    if conteudo[:2] != b"PK":
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(conteudo)) as zf:
+            for nome in zf.namelist():
+                dados = zf.read(nome)
+                if dados.startswith(b"%PDF"):
+                    return dados
+    except zipfile.BadZipFile:
+        return None
+    return None
+
+
+def fetch_shipment_label_pdf(
+    access_token: str,
+    shipment_id: int,
+    *,
+    db: Optional[Session] = None,
+    user_id_ml: Optional[int] = None,
+    sub_base: Optional[str] = None,
+) -> bytes:
+    """GET /shipment_labels (pdf): PDF oficial da etiqueta Flex. Erra se o corpo não for PDF."""
+
+    def do_req(token: str) -> requests.Response:
+        return requests.get(
+            ML_SHIPMENT_LABELS_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"shipment_ids": shipment_id, "response_type": "pdf"},
+            timeout=20,
+        )
+
+    r = _ml_api_request(access_token, do_req, db=db, user_id_ml=user_id_ml, sub_base=sub_base)
+    r.raise_for_status()
+    pdf = _pdf_de_conteudo_ml(r.content or b"")
+    if not pdf:
+        raise ValueError(f"shipment_labels sem PDF para shipment {shipment_id}")
+    return pdf
+
+
 def fetch_shipment_label_zpl(
     access_token: str,
     shipment_id: int,
@@ -452,19 +498,13 @@ def fetch_shipment_label_zpl(
     return conteudo.decode("utf-8", errors="replace")
 
 
-def obter_qr_etiqueta_ml(db: Session, saida: Any) -> Optional[str]:
-    """
-    JSON do QR oficial do envio ML de uma saída sincronizada, lido da etiqueta do seller
-    (conta ML da sub_base vinculada à base da saída primeiro). None se indisponível.
-    Baixar a etiqueta pode marcar o envio como impresso no painel do seller.
-    """
+def _conexoes_etiqueta_ml(db: Session, saida: Any) -> list[MLConexao]:
+    """Contas ML da sub_base do pedido, vinculadas a um seller. A da base do pedido vem primeiro."""
     from models import BasePreco
-    from qr_payload_utils import extrair_qr_ml_de_zpl
 
-    sid = getattr(saida, "ml_shipment_id", None)
     sub_base = (getattr(saida, "sub_base", None) or "").strip()
-    if not sid or not sub_base:
-        return None
+    if not sub_base or not getattr(saida, "ml_shipment_id", None):
+        return []
     base_nome = (getattr(saida, "base", None) or "").strip().upper()
     id_base_saida = None
     if base_nome:
@@ -482,20 +522,59 @@ def obter_qr_etiqueta_ml(db: Session, saida: Any) -> Optional[str]:
     )
     conexoes.sort(key=lambda c: c.id_base != id_base_saida)
     vistos: set[int] = set()
+    unicas: list[MLConexao] = []
     for conexao in conexoes:
         if conexao.user_id_ml in vistos:
             continue
         vistos.add(conexao.user_id_ml)
+        unicas.append(conexao)
+    return unicas
+
+
+def _baixar_da_conta_ml(db: Session, saida: Any, baixar: Callable[[str, MLConexao, int], Any], origem: str) -> Any:
+    """Tenta cada conta da sub_base até a primeira resposta útil. None se nenhuma servir."""
+    sid = getattr(saida, "ml_shipment_id", None)
+    sub_base = (getattr(saida, "sub_base", None) or "").strip()
+    if not sid or not sub_base:
+        return None
+    for conexao in _conexoes_etiqueta_ml(db, saida):
         try:
             token = get_valid_access_token(db, conexao.user_id_ml, sub_base)
-            zpl = fetch_shipment_label_zpl(token, int(sid), db=db, user_id_ml=conexao.user_id_ml, sub_base=sub_base)
+            valor = baixar(token, conexao, int(sid))
         except Exception as e:
-            logger.info("obter_qr_etiqueta_ml: shipment=%s user_id_ml=%s indisponível: %s", sid, conexao.user_id_ml, e)
+            logger.info("%s: shipment=%s user_id_ml=%s indisponível: %s", origem, sid, conexao.user_id_ml, e)
             continue
-        qr = extrair_qr_ml_de_zpl(zpl, sid)
-        if qr:
-            return qr
+        if valor:
+            return valor
     return None
+
+
+def obter_pdf_etiqueta_ml(db: Session, saida: Any) -> Optional[bytes]:
+    """PDF oficial do envio. None se não houver conta da sub_base ou o Mercado Livre não devolver PDF."""
+
+    def baixar(token: str, conexao: MLConexao, sid: int) -> bytes:
+        return fetch_shipment_label_pdf(
+            token, sid, db=db, user_id_ml=conexao.user_id_ml, sub_base=conexao.sub_base,
+        )
+
+    return _baixar_da_conta_ml(db, saida, baixar, "obter_pdf_etiqueta_ml")
+
+
+def obter_qr_etiqueta_ml(db: Session, saida: Any) -> Optional[str]:
+    """
+    JSON do QR oficial do envio ML de uma saída sincronizada, lido da etiqueta do seller
+    (conta ML da sub_base vinculada à base da saída primeiro). None se indisponível.
+    Baixar a etiqueta pode marcar o envio como impresso no painel do seller.
+    """
+    from qr_payload_utils import extrair_qr_ml_de_zpl
+
+    def baixar(token: str, conexao: MLConexao, sid: int) -> Optional[str]:
+        zpl = fetch_shipment_label_zpl(
+            token, sid, db=db, user_id_ml=conexao.user_id_ml, sub_base=conexao.sub_base,
+        )
+        return extrair_qr_ml_de_zpl(zpl, sid)
+
+    return _baixar_da_conta_ml(db, saida, baixar, "obter_qr_etiqueta_ml")
 
 
 ML_ORDERS_PAGE_SIZE = 50
