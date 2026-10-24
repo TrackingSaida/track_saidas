@@ -24,6 +24,7 @@ from address_search_logging import (
 from address_providers.google_places_provider import (
     GooglePlacesClient,
     _record_session_google_call,
+    google_direct_available,
     prediction_to_provisional_score,
     should_auto_invoke_google_places,
 )
@@ -416,16 +417,45 @@ class SmartAddressSearch:
 
         providers_timed_out = False
         per_provider_stats: Dict[str, ProviderSearchStats] = {}
+        google_first_outcome = None
+        google_first_reason = "known_address"
+        google_first_guard = False
+        google_attempted = False
         if not skip_providers:
-            provider_hits, providers_timed_out, per_provider_stats = _fetch_provider_hits(
-                self.providers,
-                search_query,
-                latitude,
-                longitude,
-                limit,
-            )
-            for hit in provider_hits:
-                all_hits.append((hit, 0))
+            allowed, google_first_reason, google_first_guard = google_direct_available(session_token)
+            if google_first_guard:
+                log_address_event(
+                    db,
+                    "google_places_cost_guard",
+                    sub_base,
+                    motoboy_id,
+                    search_query,
+                    {
+                        "google_places_called": False,
+                        "google_places_cost_guard_hit": True,
+                        "session_token_prefix": (session_token or "")[:8],
+                    },
+                )
+            elif allowed:
+                google_attempted = True
+                _record_session_google_call(session_token)
+                google_first_outcome = GooglePlacesClient().autocomplete(
+                    search_query,
+                    latitude=latitude,
+                    longitude=longitude,
+                    session_token=session_token,
+                    limit=limit,
+                )
+            if google_first_outcome is None or not google_first_outcome.predictions:
+                provider_hits, providers_timed_out, per_provider_stats = _fetch_provider_hits(
+                    self.providers,
+                    search_query,
+                    latitude,
+                    longitude,
+                    limit,
+                )
+                for hit in provider_hits:
+                    all_hits.append((hit, 0))
 
         raw_count = len(all_hits)
         scored, below_threshold = _score_all_hits(
@@ -479,19 +509,32 @@ class SmartAddressSearch:
                     },
                 )
 
-        invoke_google, google_reason, cost_guard_hit = should_auto_invoke_google_places(
-            suggestions,
-            search_query,
-            hints=hints,
-            providers_timed_out=providers_timed_out,
-            session_token=session_token,
-        )
+        if skip_providers:
+            invoke_google = False
+            google_reason = "known_address"
+            cost_guard_hit = False
+        elif google_first_guard:
+            invoke_google = False
+            google_reason = google_first_reason
+            cost_guard_hit = True
+        elif google_attempted:
+            invoke_google = bool(google_first_outcome and google_first_outcome.predictions)
+            google_reason = google_first_reason
+            cost_guard_hit = False
+        else:
+            invoke_google, google_reason, cost_guard_hit = should_auto_invoke_google_places(
+                suggestions,
+                search_query,
+                hints=hints,
+                providers_timed_out=providers_timed_out,
+                session_token=session_token,
+            )
         google_stats = GooglePlacesSearchStats(
             called=False,
             reason=google_reason,
             cost_guard_hit=cost_guard_hit,
         )
-        if cost_guard_hit:
+        if cost_guard_hit and not google_first_guard:
             log_address_event(
                 db,
                 "google_places_cost_guard",
@@ -505,15 +548,16 @@ class SmartAddressSearch:
                 },
             )
         elif invoke_google:
-            _record_session_google_call(session_token)
-            client = GooglePlacesClient()
-            outcome = client.autocomplete(
-                search_query,
-                latitude=latitude,
-                longitude=longitude,
-                session_token=session_token,
-                limit=limit,
-            )
+            outcome = google_first_outcome
+            if outcome is None:
+                _record_session_google_call(session_token)
+                outcome = GooglePlacesClient().autocomplete(
+                    search_query,
+                    latitude=latitude,
+                    longitude=longitude,
+                    session_token=session_token,
+                    limit=limit,
+                )
             google_stats = GooglePlacesSearchStats(
                 called=True,
                 reason=google_reason,

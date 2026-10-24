@@ -396,6 +396,22 @@ def should_auto_invoke_google_places(
     return False, "score_above_threshold", False
 
 
+def google_direct_available(
+    session_token: Optional[str] = None,
+) -> Tuple[bool, str, bool]:
+    """Google direto quando o endereço ainda não está no cadastro.
+
+    Retorna (allowed, reason, cost_guard_hit).
+    """
+    if not is_google_places_enabled() or not get_google_places_api_key():
+        return False, "google_disabled", False
+    if not is_google_places_auto_fallback():
+        return False, "auto_fallback_off", False
+    if not _session_cost_guard_allows(session_token):
+        return False, "session_limit", True
+    return True, "unknown_address", False
+
+
 class GooglePlacesProvider(AddressProvider):
     """Mantido por compatibilidade; use GooglePlacesClient para fallback controlado."""
 
