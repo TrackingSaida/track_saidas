@@ -160,7 +160,7 @@ def resolver_pix_receber(
 
 
 def texto_pix_relatorio(tipo: Optional[str], chave: Optional[str]) -> Optional[str]:
-    """Linha do PDF. Com tipo: PIX CPF {chave}. Sem tipo, só a chave já gravada."""
+    """Instrução de pagamento. Com tipo: Pague no PIX · Chave CPF · {chave}."""
     valor = (chave or "").strip()
     if not valor:
         return None
@@ -170,8 +170,8 @@ def texto_pix_relatorio(tipo: Optional[str], chave: Optional[str]) -> Optional[s
         codigo = None
     rotulo = ROTULO_TIPO_PIX.get(codigo or "", "")
     if rotulo:
-        return f"PIX {rotulo} {valor}"
-    return f"PIX {valor}"
+        return f"Pague no PIX · Chave {rotulo} · {valor}"
+    return f"Pague no PIX · {valor}"
 
 
 def resolver_chave_pix(chave_base: Optional[str], chave_global: Optional[str]) -> Optional[str]:
