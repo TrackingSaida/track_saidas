@@ -7,6 +7,7 @@ from fechamento_base_ciclo_pure import (
     aviso_ciclo_fechamento,
     ciclo_corresponde,
     normalizar_periodo_fechamento,
+    renome_fechamento_bloqueado,
     resolver_chave_pix,
 )
 
@@ -46,6 +47,15 @@ def test_mes_civil():
 def test_periodo_invalido():
     with pytest.raises(ValueError):
         normalizar_periodo_fechamento("bimestral")
+
+
+def test_renome_nao_junta_fechamentos_do_mesmo_periodo():
+    outubro = (date(2026, 10, 1), date(2026, 10, 31))
+    novembro = (date(2026, 11, 1), date(2026, 11, 30))
+    assert renome_fechamento_bloqueado([outubro], [outubro], False)
+    assert not renome_fechamento_bloqueado([outubro], [novembro], False)
+    assert not renome_fechamento_bloqueado([outubro], [], True)
+    assert renome_fechamento_bloqueado([outubro, outubro], [], True)
 
 
 def test_pix_da_base_prevalece_sobre_o_global():

@@ -5,12 +5,23 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import User, BasePreco, BaseSellerDados, MLConexao, MotoboySubBase  # classe do models.py com __tablename__ = "base"
+from models import (  # classe do models.py com __tablename__ = "base"
+    BaseFechamento,
+    BasePreco,
+    BaseSellerDados,
+    Coleta,
+    ColetaLeituraRemocao,
+    MLConexao,
+    MotoboySubBase,
+    Saida,
+    User,
+)
 from base_import_service import (
     MODELO_FILENAME,
     XLSX_MEDIA_TYPE,
@@ -18,9 +29,60 @@ from base_import_service import (
     gerar_modelo_xlsx,
     preview_importacao,
 )
-from fechamento_base_ciclo_pure import normalizar_periodo_fechamento
+from fechamento_base_ciclo_pure import normalizar_periodo_fechamento, renome_fechamento_bloqueado
 
 router = APIRouter(prefix="/base", tags=["Base"])
+
+_TABELAS_NOME_BASE = (Coleta, Saida, BaseFechamento, ColetaLeituraRemocao)
+
+
+def _chave_nome_base(nome: Optional[str]) -> str:
+    return (nome or "").strip().upper()
+
+
+def _bloquear_se_fechamento_coincide(db: Session, sub_base: str, nome_antigo: str, nome_novo: str) -> None:
+    """O nome novo já tem fechamento no mesmo período do nome antigo."""
+    chave_antiga = _chave_nome_base(nome_antigo)
+    chave_nova = _chave_nome_base(nome_novo)
+    if not chave_antiga:
+        return
+
+    def _periodos(chave: str) -> list:
+        linhas = db.execute(
+            select(BaseFechamento.periodo_inicio, BaseFechamento.periodo_fim).where(
+                BaseFechamento.sub_base == sub_base,
+                func.upper(func.trim(BaseFechamento.base)) == chave,
+            )
+        ).all()
+        return [(inicio, fim) for inicio, fim in linhas]
+
+    if renome_fechamento_bloqueado(
+        _periodos(chave_antiga),
+        [] if chave_antiga == chave_nova else _periodos(chave_nova),
+        chave_antiga == chave_nova,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Já existe fechamento com esse nome neste período. Escolha outro nome.",
+        )
+
+
+def _propagar_nome_base(db: Session, sub_base: str, nome_antigo: str, nome_novo: str) -> None:
+    """Coletas, saídas e fechamentos guardam o nome em texto. Sem isso a tela mostra as duas linhas."""
+    antigo = (nome_antigo or "").strip()
+    novo = (nome_novo or "").strip()
+    if not antigo or not novo or antigo == novo:
+        return
+    chave = antigo.upper()
+    for model in _TABELAS_NOME_BASE:
+        db.execute(
+            update(model)
+            .where(
+                model.sub_base == sub_base,
+                func.upper(func.trim(model.base)) == chave,
+            )
+            .values(base=novo)
+        )
 
 # =========================
 # Schemas
@@ -436,17 +498,18 @@ def patch_base(
     if not obj or obj.sub_base != sub_base_user:
         raise HTTPException(status_code=404, detail="Não encontrado")
 
-    # Renomear "base" (opcional)
+    # Renomear "base" (opcional). O nome também vive nas coletas e nos fechamentos.
     if body.base is not None:
         new_base = (body.base or "").strip()
         if not new_base:
             raise HTTPException(status_code=400, detail="O campo 'base' não pode ficar vazio.")
-        if new_base != obj.base:
+        old_base = (obj.base or "").strip()
+        if new_base != old_base:
             dup = db.scalars(
                 select(BasePreco).where(
                     BasePreco.sub_base == sub_base_user,
-                    BasePreco.base == new_base,
-                    BasePreco.id_base != obj.id_base
+                    func.upper(func.trim(BasePreco.base)) == new_base.upper(),
+                    BasePreco.id_base != obj.id_base,
                 )
             ).first()
             if dup:
@@ -454,7 +517,9 @@ def patch_base(
                     status_code=409,
                     detail="Já existe um registro de preços para essa 'base' nesta sub_base."
                 )
+            _bloquear_se_fechamento_coincide(db, sub_base_user, old_base, new_base)
             obj.base = new_base
+            _propagar_nome_base(db, sub_base_user, old_base, new_base)
 
     # Atualizações parciais de preço
     if body.shopee is not None:
@@ -475,7 +540,14 @@ def patch_base(
     if "periodo_fechamento" in body.model_fields_set:
         obj.periodo_fechamento = body.periodo_fechamento
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Já existe fechamento com esse nome neste período. Escolha outro nome.",
+        )
     db.refresh(obj)
     enderecos = _enderecos_por_base_ids(db, [int(obj.id_base)])
     return _base_to_out(obj, enderecos.get(int(obj.id_base)))
