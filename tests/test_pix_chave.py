@@ -56,7 +56,7 @@ def test_relatorio_imprime_tipo_e_chave_da_base():
     assert resolver_pix_receber(CPF, "cpf", "+5511987654321", "telefone") == (CPF, "cpf")
     assert resolver_pix_receber("  ", None, "+5511987654321", "telefone") == ("+5511987654321", "telefone")
     assert resolver_pix_receber(None, None, None, None) == (None, None)
-    assert texto_pix_relatorio("cpf", CPF) == f"PIX CPF {CPF}"
-    assert texto_pix_relatorio("telefone", "+5511987654321") == "PIX Celular +5511987654321"
-    assert texto_pix_relatorio(None, "chave-antiga") == "PIX chave-antiga"
+    assert texto_pix_relatorio("cpf", CPF) == f"Pague no PIX · Chave CPF · {CPF}"
+    assert texto_pix_relatorio("telefone", "+5511987654321") == "Pague no PIX · Chave Celular · +5511987654321"
+    assert texto_pix_relatorio(None, "chave-antiga") == "Pague no PIX · chave-antiga"
     assert texto_pix_relatorio("cpf", "  ") is None
