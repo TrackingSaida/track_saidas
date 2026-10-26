@@ -4,6 +4,7 @@ GET  /entregadores/fechamentos — listar (visão A Pagar)
 POST /entregadores/fechamentos/marcar-pago — marcar como pago (lote)
 POST /entregadores/fechamentos — criar
 PATCH /entregadores/fechamentos/{id_fechamento} — editar/reajustar
+DELETE /entregadores/fechamentos/{id_fechamento} — excluir gerado ou reajustado
 GET /entregadores/fechamentos/{id_fechamento} — obter um (para modal)
 GET /entregadores/fechamentos/calcular — preview valor base
 """
@@ -1470,6 +1471,29 @@ def obter_fechamento(
         id_motoboy=out.id_motoboy,
     )
     return out
+
+
+# =========================================================
+# DELETE — Excluir fechamento ainda não pago
+# =========================================================
+
+@router.delete("/fechamentos/{id_fechamento}", status_code=204)
+def excluir_fechamento(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(usuario_financeiro),
+):
+    """Apaga um fechamento GERADO ou REAJUSTADO. Pago não entra. As entregas permanecem."""
+    sub_base = _resolve_user_base(db, current_user)
+    fech = db.get(EntregadorFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+    if _status_norm(fech) == STATUS_PAGO:
+        raise HTTPException(400, "Fechamento pago não pode ser excluído.")
+    if not status_permite_reajuste(_status_norm(fech)):
+        raise HTTPException(400, "Só é possível excluir um fechamento gerado ou reajustado.")
+    db.delete(fech)
+    db.commit()
 
 
 # =========================================================
