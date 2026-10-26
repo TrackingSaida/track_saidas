@@ -15,7 +15,13 @@ from conferencia_saida_pure import LABEL_CONFERENCIA_DIA, STATUS_CONFERIDA, stat
 from conferencia_saida_service import owner_conferencia_habilitada, status_conferencia_registrada_motoboys
 from entregador_legado_sync import filtrar_entregadores_operacionais
 from fechamento_resumo_utils import base_filtro_ativo, saida_pertence_base
-from fechamento_valor_pure import adicional_g, valor_entregas_agregadas, valor_g_adicional, valor_saida
+from fechamento_valor_pure import (
+    adicional_g,
+    contagem_canais_agregada,
+    valor_entregas_agregadas,
+    valor_g_adicional,
+    valor_saida,
+)
 from pacote_g_categorias import categoria_da_saida, padrao_id_ou_none, regras_por_categoria
 from models import Entregador, EntregadorFechamento, EntregadorPreco, EntregadorPrecoGlobal, Motoboy, MotoboySubBase, Saida, User
 from saida_operacional_utils import (
@@ -1116,6 +1122,53 @@ def precos_motoboy_cache(
     return cache[mid]
 
 
+def _valores_base_motoboys_agregados(
+    db: Session,
+    sub_base_user: str,
+    ids: List[int],
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    precos_cache: Optional[Dict[int, Dict[str, Decimal]]],
+    contagem: Optional[Dict[int, Dict[str, int]]],
+) -> Dict[int, Decimal]:
+    """Soma entregas pela agregação do período, só dos motoboys pedidos nesta sub_base."""
+    zero = Decimal("0.00")
+    agregados = agregar_saidas_fechamento_resumo(
+        db,
+        sub_base=sub_base_user,
+        status_validos=STATUS_VALOR_BASE_VALIDOS,
+        periodo_inicio=periodo_inicio,
+        periodo_fim=periodo_fim,
+        motoboy_ids=ids,
+        exigir_executor=False,
+    )
+    pedidos = set(ids)
+    if contagem is not None:
+        for mid, canais in contagem_canais_agregada(agregados).items():
+            if mid in pedidos:
+                contagem[mid] = canais
+    precos = precos_cache if precos_cache is not None else {}
+    presentes = {
+        int(getattr(agg, "motoboy_id"))
+        for agg in agregados
+        if getattr(agg, "motoboy_id", None) is not None and not getattr(agg, "is_cancelado", False)
+    }
+    for mid in presentes:
+        if mid in pedidos:
+            precos_motoboy_cache(db, sub_base_user, mid, precos)
+    toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base_user)
+    regras_g, padrao_g = _regras_g_motoboy(db, sub_base_user)
+    valores = valor_entregas_agregadas(
+        agregados,
+        precos,
+        toggle_pacote_g=toggle_pacote_g,
+        regras_g=regras_g,
+        padrao_g=padrao_g,
+    )
+    return {mid: valores.get(mid, zero).quantize(Decimal("0.01")) for mid in ids}
+
+
 def _calcular_valores_base_motoboys_periodo(
     db: Session,
     sub_base_user: str,
@@ -1127,10 +1180,10 @@ def _calcular_valores_base_motoboys_periodo(
     saidas_periodo: Optional[List[Saida]] = None,
     contagem: Optional[Dict[int, Dict[str, int]]] = None,
 ) -> Dict[int, Decimal]:
-    """Valor das entregas de vários motoboys no mesmo período, carregando saídas e histórico uma única vez.
+    """Valor das entregas de vários motoboys no mesmo período.
 
-    saidas_periodo: saídas já carregadas com os mesmos filtros (status válidos, código e período operacional);
-    evita recarregar quando o chamador já as tem em memória.
+    Sem saídas pré-carregadas, soma a agregação SQL do período (mesmo caminho da lista).
+    saidas_periodo: saídas já filtradas; evita nova consulta quando o chamador já as tem.
     contagem: quando informado, recebe {motoboy_id: {"flex": n, "shopee": n}} das saídas pagas.
     """
     ids = sorted({int(m) for m in motoboy_ids if m is not None})
@@ -1140,14 +1193,14 @@ def _calcular_valores_base_motoboys_periodo(
     if periodo_inicio > periodo_fim:
         return {mid: zero for mid in ids}
     if saidas_periodo is None:
-        saidas_periodo, _ = carregar_saidas_fechamento_leve(
+        return _valores_base_motoboys_agregados(
             db,
-            sub_base=sub_base_user,
-            status_validos=STATUS_VALOR_BASE_VALIDOS,
-            periodo_inicio=periodo_inicio,
-            periodo_fim=periodo_fim,
-            motoboy_ids=ids,
-            exigir_executor=False,
+            sub_base_user,
+            ids,
+            periodo_inicio,
+            periodo_fim,
+            precos_cache=precos_cache,
+            contagem=contagem,
         )
     toggle_pacote_g = _toggle_pacote_g_ativo(db, sub_base_user)
     regras_g, padrao_g = _regras_g_motoboy(db, sub_base_user)

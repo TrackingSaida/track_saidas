@@ -1,7 +1,11 @@
 """Valor base em lote (resumo/A Pagar): mesmo resultado do cálculo por motoboy."""
+import os
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
+
+os.environ.setdefault("DATABASE_URL", "postgresql://pytest:pytest@localhost/pytest")
+os.environ.setdefault("SECRET_KEY", "pytest-secret-key")
 
 import entregador_routes as er
 
@@ -64,6 +68,34 @@ def test_lote_igual_ao_calculo_individual(monkeypatch):
             None, "sb", [mid], INI, FIM, saidas_periodo=[s for s in saidas if s.motoboy_id == mid]
         )
         assert individual[mid] == lote[mid]
+
+
+def test_agregacao_nao_carrega_pacote_a_pacote(monkeypatch):
+    chamadas = []
+    _preparar(monkeypatch, chamadas)
+
+    def agregar(db, **kwargs):
+        chamadas.append(("agregar", kwargs["sub_base"], kwargs["motoboy_ids"]))
+        return [
+            SimpleNamespace(motoboy_id=1, tipo_servico="shopee", is_cancelado=False, is_grande=False, categoria_g_id=None, qtd=2),
+            SimpleNamespace(motoboy_id=1, tipo_servico="flex", is_cancelado=True, is_grande=True, categoria_g_id=10, qtd=4),
+            SimpleNamespace(motoboy_id=1, tipo_servico="flex", is_cancelado=False, is_grande=True, categoria_g_id=None, qtd=1),
+        ]
+
+    monkeypatch.setattr(er, "agregar_saidas_fechamento_resumo", agregar)
+    def nao_carregar(*args, **kwargs):
+        raise AssertionError("não deve carregar pacote a pacote")
+
+    monkeypatch.setattr(er, "carregar_saidas_fechamento_leve", nao_carregar)
+    contagem = {}
+    valores = er._calcular_valores_base_motoboys_periodo(
+        None, "sb", [1, 2], INI, FIM, precos_cache={}, contagem=contagem
+    )
+
+    # 2 shopee a 2,50 e 1 flex G a 3,00 + adicional padrão 1,50. Cancelado não entra.
+    assert valores == {1: Decimal("9.50"), 2: Decimal("0.00")}
+    assert contagem == {1: {"flex": 1, "shopee": 2}}
+    assert ("agregar", "sb", [1, 2]) in chamadas
 
 
 def test_precos_cache_resolve_uma_vez(monkeypatch):
