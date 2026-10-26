@@ -21,6 +21,24 @@ def saida_cancelada(status: Optional[str]) -> bool:
     return "cancel" in (status or "").strip().lower()
 
 
+def contagem_canais_agregada(agregados: Iterable[Any]) -> Dict[int, Dict[str, int]]:
+    """Quantidade paga de Flex e Shopee por motoboy. Cancelado e avulso ficam de fora."""
+    out: Dict[int, Dict[str, int]] = {}
+    for agg in agregados:
+        if getattr(agg, "is_cancelado", False):
+            continue
+        mid = getattr(agg, "motoboy_id", None)
+        tipo = getattr(agg, "tipo_servico", None)
+        if mid is None or tipo not in ("flex", "shopee"):
+            continue
+        qtd = int(getattr(agg, "qtd", 0) or 0)
+        if qtd <= 0:
+            continue
+        bucket = out.setdefault(int(mid), {"flex": 0, "shopee": 0})
+        bucket[tipo] += qtd
+    return out
+
+
 def valor_entregas_agregadas(
     agregados: Iterable[Any],
     precos_por_motoboy: Mapping[int, Mapping[str, Any]],
