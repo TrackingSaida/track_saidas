@@ -4,7 +4,7 @@ import os
 
 os.environ.setdefault("DATABASE_URL", "postgresql://pytest:pytest@localhost/pytest")
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -209,10 +209,13 @@ def test_transferir_fluxo_feliz_usa_core_update_e_ledger():
          ), \
          patch("coleta_leituras_service.invalidate_listar_cache"), \
          patch("coleta_leituras_service.resolver_executor", return_value=(_user(), None)):
+        coletas_criadas = []
+
         def add_side_effect(obj):
             if getattr(obj, "base", None) == "FABFLAY LOGISTICA" and not hasattr(obj, "id_saida"):
                 obj.id_coleta = 99
                 gets[99] = obj
+                coletas_criadas.append(obj)
 
         db.add.side_effect = add_side_effect
 
@@ -230,6 +233,7 @@ def test_transferir_fluxo_feliz_usa_core_update_e_ledger():
     assert result["status_origem"] == "pendente"
     assert result["status_destino"] == "coletado"
     assert result["contagem"]["mercado_livre"] == 1
+    assert coletas_criadas[0].timestamp == datetime.combine(hoje, time.min)
     assert part_origem.mercado_livre == 0
     assert part_dest.mercado_livre == 1
     # Sem atribuição ORM em Saida (evita saida_after_update / commit aninhado).

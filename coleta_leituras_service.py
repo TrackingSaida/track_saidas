@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -744,6 +744,8 @@ def transferir_base_coleta(
         current_user=current_user,
     )
 
+    # Fechamento filtra coletas.timestamp. A consulta usa o dia operacional.
+    # Sem esta data, a transferência cai no dia de hoje e some da quinzena.
     coleta_dest = Coleta(
         sub_base=sub_base,
         base=base_dest.base,
@@ -754,6 +756,7 @@ def transferir_base_coleta(
         pacotes_g=0,
         valor_total=Decimal("0.00"),
         origem="codigo",
+        timestamp=datetime.combine(data_operacao, time.min),
         execucao_id=execucao_dest.id_execucao,
         participante_id=participante_dest.id_participante,
     )

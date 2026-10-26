@@ -1,5 +1,19 @@
 # Migrações
 
+## coleta_transferida_data_operacional.sql
+
+Correção de dados, não de estrutura. Rode no banco que já teve transferência de base
+antes do ajuste de `coletas.timestamp`. Sem ela, o fechamento da quinzena continua
+sem o volume transferido. Idempotente. Não altera quantidade nem valor.
+
+```bash
+psql "$DATABASE_URL" -f migrations/coleta_transferida_data_operacional.sql
+```
+
+O primeiro SELECT lista o que será corrigido. O UPDATE recoloca a coleta no dia
+operacional dos pacotes. O último SELECT lista coleta com pacotes de mais de um dia,
+que o script não mexe.
+
 ## pix_receber_tipo_chave.sql
 
 **Obrigatória antes** do deploy do tipo da chave PIX a receber. Sem ela a API responde **500**
