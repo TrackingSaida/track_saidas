@@ -24,6 +24,7 @@ from coleta_a_coletar_service import (
 from coleta_operacional_service import (
     atualizar_status_execucao,
     combinar_modo_execucao,
+    encerrar_coletas_dias_anteriores,
     exigir_modo,
     liberar_participacao_vazia,
     liberar_participacoes_vazias_do_usuario,
@@ -472,12 +473,17 @@ def consultar_situacao_bases(
             BasePreco.ativo.is_(True),
         ).order_by(BasePreco.base)
     ).all()
-    execucoes = db.scalars(
-        select(ColetaExecucao).where(
-            ColetaExecucao.sub_base == sub_base,
-            ColetaExecucao.data_operacao == data_operacao,
-        )
-    ).all()
+    execucoes = encerrar_coletas_dias_anteriores(
+        db,
+        list(
+            db.scalars(
+                select(ColetaExecucao).where(
+                    ColetaExecucao.sub_base == sub_base,
+                    ColetaExecucao.data_operacao == data_operacao,
+                )
+            ).all()
+        ),
+    )
     por_base = {item.base_id: item for item in execucoes}
     is_root = _root_admin(current_user)
     eh_hoje = data_operacao == hoje_operacao()
@@ -1206,7 +1212,7 @@ def listar_execucoes(
         )
         .order_by(ColetaExecucao.data_operacao.desc(), ColetaExecucao.base_id)
     )
-    rows = db.scalars(stmt).all()
+    rows = encerrar_coletas_dias_anteriores(db, list(db.scalars(stmt).all()))
     if somente_minhas or not _admin(current_user):
         rows = [e for e in rows if any(p.user_id == current_user.id for p in e.participantes)]
     return [_serializar_execucao(e, current_user, e.participantes) for e in rows]
@@ -1328,13 +1334,18 @@ def consultar_pendencias(
             ColetaCalendarioExcecao.data <= data_fim,
         )
     ).all()
-    execucoes = db.scalars(
-        select(ColetaExecucao).where(
-            ColetaExecucao.sub_base == sub_base,
-            ColetaExecucao.data_operacao >= data_inicio,
-            ColetaExecucao.data_operacao <= data_fim,
-        )
-    ).all()
+    execucoes = encerrar_coletas_dias_anteriores(
+        db,
+        list(
+            db.scalars(
+                select(ColetaExecucao).where(
+                    ColetaExecucao.sub_base == sub_base,
+                    ColetaExecucao.data_operacao >= data_inicio,
+                    ColetaExecucao.data_operacao <= data_fim,
+                )
+            ).all()
+        ),
+    )
     coletas_legadas = db.scalars(
         select(Coleta).where(
             Coleta.sub_base == sub_base,

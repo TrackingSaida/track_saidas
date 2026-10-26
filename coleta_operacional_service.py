@@ -50,6 +50,92 @@ def atualizar_status_execucao(execucao: ColetaExecucao) -> None:
     execucao.atualizado_em = datetime.now()
 
 
+def _participacao_aberta_hoje(participante: ColetaExecucaoParticipante, hoje: date) -> bool:
+    """Lançamento retroativo feito hoje continua Em coleta até finalizar."""
+    if getattr(participante, "status", "finalizado") != "em_coleta":
+        return False
+    momento = getattr(participante, "atualizado_em", None)
+    return bool(momento) and momento.date() == hoje
+
+
+def _recarregar_participantes(db: Session, execucao: ColetaExecucao) -> list[ColetaExecucaoParticipante]:
+    db.flush()
+    db.expire(execucao, ["participantes"])
+    return list(execucao.participantes or [])
+
+
+def _encerrar_execucao_dia_anterior(db: Session, execucao: ColetaExecucao, hoje: date) -> str:
+    """
+    Dia passado não fica Em coleta.
+
+    Com volume → finaliza e a execução vira coletado.
+    Sem volume marcado → finaliza e a execução vira sem_volume.
+    Aberta sem lançamento → remove a participação; sem ninguém, apaga a execução.
+    Participação alterada hoje permanece aberta.
+
+    Retorna removida, alterada ou igual.
+    """
+    participantes = list(execucao.participantes or [])
+    if any(_participacao_aberta_hoje(item, hoje) for item in participantes):
+        return "igual"
+
+    alterou = False
+    for participante in participantes:
+        if getattr(participante, "status", "finalizado") != "em_coleta":
+            continue
+        if participante_sem_lancamento(participante):
+            db.delete(participante)
+        else:
+            participante.status = "finalizado"
+            participante.versao = int(participante.versao or 1) + 1
+            participante.atualizado_em = datetime.now()
+        alterou = True
+
+    if not alterou and execucao.status != "em_coleta":
+        return "igual"
+
+    vivos = _recarregar_participantes(db, execucao) if alterou else participantes
+    if not vivos:
+        db.delete(execucao)
+        db.flush()
+        return "removida"
+
+    antes = execucao.status
+    atualizar_status_execucao(execucao)
+    if alterou or execucao.status != antes:
+        return "alterada"
+    return "igual"
+
+
+def encerrar_coletas_dias_anteriores(
+    db: Session,
+    execucoes: list[ColetaExecucao],
+    *,
+    hoje: Optional[date] = None,
+) -> list[ColetaExecucao]:
+    """Grava o status de dias anteriores que ficaram Em coleta. O dia de hoje não muda."""
+    if hoje is None:
+        from coleta_a_coletar_service import hoje_operacao
+
+        hoje = hoje_operacao()
+    alterou = False
+    restantes: list[ColetaExecucao] = []
+    for execucao in list(execucoes or []):
+        if execucao.data_operacao >= hoje:
+            restantes.append(execucao)
+            continue
+        resultado = _encerrar_execucao_dia_anterior(db, execucao, hoje)
+        if resultado == "removida":
+            alterou = True
+            continue
+        if resultado == "alterada":
+            alterou = True
+        restantes.append(execucao)
+    if alterou:
+        db.commit()
+    return restantes
+
+
 def participante_sem_lancamento(participante: ColetaExecucaoParticipante) -> bool:
     """True quando o usuário só selecionou a base, sem volume/leitura/sem_volume."""
     return _quantidade_participante(participante) == 0 and not bool(participante.sem_volume)
