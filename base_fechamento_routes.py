@@ -8,6 +8,7 @@ POST /coletas/fechamentos/marcar-recebido — baixar recebimentos
 POST /coletas/fechamentos — criar
 GET /coletas/fechamentos/{id_fechamento} — obter (para modal)
 PATCH /coletas/fechamentos/{id_fechamento} — reajustar
+DELETE /coletas/fechamentos/{id_fechamento} — excluir gerado ou reajustado
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ from base_fechamento_status_pure import (
     MOTIVO_JA_GERADO,
     fechamento_base_divergente,
     motivo_bloqueio_lote_base,
+    normalizar_status_fechamento_base,
     status_base_permite_reajuste,
 )
 from fechamento_base_ciclo_pure import (
@@ -1929,6 +1931,31 @@ def obter_fechamento(
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
     )
+
+
+# =========================================================
+# DELETE — Excluir fechamento ainda não recebido
+# =========================================================
+
+@router.delete("/{id_fechamento}", status_code=204)
+def excluir_fechamento(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Apaga um fechamento GERADO ou REAJUSTADO. Recebido não entra. As coletas permanecem."""
+    _exigir_admin_financeiro(current_user)
+    sub_base = _sub_base_from_token_or_422(current_user)
+    fech = db.get(BaseFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+    status = normalizar_status_fechamento_base(fech.status)
+    if status == STATUS_RECEBIDO:
+        raise HTTPException(400, "Fechamento recebido não pode ser excluído.")
+    if not status_base_permite_reajuste(fech.status):
+        raise HTTPException(400, "Só é possível excluir um fechamento gerado ou reajustado.")
+    db.delete(fech)
+    db.commit()
 
 
 # =========================================================
