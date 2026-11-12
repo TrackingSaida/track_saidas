@@ -66,7 +66,22 @@ def _ensure_motoboy_owns_saida(current_user: User, saida: Saida) -> None:
         return
     motoboy_id = getattr(current_user, "motoboy_id", None)
     if not motoboy_id or int(saida.motoboy_id or 0) != int(motoboy_id):
-        raise HTTPException(status_code=404, detail="Saída não encontrada.")
+        status = str(saida.status or "").strip().upper()
+        motivo = (
+            "CANCELADO"
+            if status == "CANCELADO"
+            else "DESATRIBUIDO"
+            if saida.motoboy_id is None
+            else "REATRIBUIDO"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACAO_PEDIDO_OBSOLETA",
+                "reason": motivo,
+                "message": "O pedido não pertence mais a este motoboy.",
+            },
+        )
 
 
 def _is_pending_object_key(object_key: str) -> bool:

@@ -98,6 +98,9 @@ class Owner(Base):
     entrada_obrigatoria_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
     # Conferência de saída após Começar Entrega
     conferencia_saida_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
+    # Fluxo PRD-012: leitura por sessão e confirmação real pelo motoboy.
+    # Não faz parte dos claims/JWT; o backend é a fonte autoritativa.
+    confirmacao_saida_sessoes_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
     # Com coleta ativa: true = impede saída sem coleta; false = avisa e permite registrar
     bloquear_saida_sem_coleta = Column(Boolean, nullable=False, server_default=text("false"))
     # Defaults Motoboy (Políticas gerais) — novos cadastros
@@ -1214,15 +1217,67 @@ class SaidaHistorico(Base):
 
 
 # ==========================
+# Tabelas: saida_sessoes / saida_sessao_itens
+# ==========================
+class SaidaSessao(Base):
+    __tablename__ = "saida_sessoes"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="SET NULL"), nullable=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    data_ref = Column(Date, nullable=False)
+    estado = Column(Text, nullable=False, server_default=text("'ABERTA'"))
+    versao = Column(Integer, nullable=False, server_default=text("1"))
+    aberta_por_user_id = Column(BigInteger, nullable=True)
+    finalizada_por_user_id = Column(BigInteger, nullable=True)
+    cancelada_por_user_id = Column(BigInteger, nullable=True)
+    confirmada_por_user_id = Column(BigInteger, nullable=True)
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+    finalizada_em = Column(DateTime(timezone=False), nullable=True)
+    cancelada_em = Column(DateTime(timezone=False), nullable=True)
+    confirmada_em = Column(DateTime(timezone=False), nullable=True)
+    motivo_cancelamento = Column(Text, nullable=True)
+    total_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+    total_shopee_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+    total_ml_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+    total_avulso_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+
+    itens = relationship("SaidaSessaoItem", back_populates="sessao", cascade="all, delete-orphan")
+
+
+class SaidaSessaoItem(Base):
+    __tablename__ = "saida_sessao_itens"
+    __table_args__ = (
+        UniqueConstraint("sessao_id", "id_saida", name="uq_saida_sessao_item_sessao_saida"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sessao_id = Column(BigInteger, ForeignKey("saida_sessoes.id", ondelete="CASCADE"), nullable=False)
+    # Sem FK destrutiva: o snapshot deve sobreviver à exclusão operacional da saída.
+    id_saida = Column(BigInteger, nullable=False)
+    codigo_snapshot = Column(Text, nullable=True)
+    servico_snapshot = Column(Text, nullable=True)
+    status_snapshot = Column(Text, nullable=True)
+    incluido_por_user_id = Column(BigInteger, nullable=True)
+    incluido_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    ativo_operacional = Column(Boolean, nullable=False, server_default=text("true"))
+    removido_em = Column(DateTime(timezone=False), nullable=True)
+    removido_por_user_id = Column(BigInteger, nullable=True)
+    motivo_remocao = Column(Text, nullable=True)
+
+    sessao = relationship("SaidaSessao", back_populates="itens")
+
+
+# ==========================
 # Tabela: conferencia_saida
 # ==========================
 class ConferenciaSaida(Base):
     __tablename__ = "conferencia_saida"
-    __table_args__ = (
-        UniqueConstraint("sub_base", "motoboy_id", "data_ref", name="uq_conferencia_saida_sub_motoboy_dia"),
-    )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sessao_id = Column(BigInteger, ForeignKey("saida_sessoes.id", ondelete="CASCADE"), nullable=True)
     sub_base = Column(Text, nullable=False)
     owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="SET NULL"), nullable=True)
     motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)

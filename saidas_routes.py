@@ -76,6 +76,13 @@ from ausencia_bloqueio_service import (
     snapshot_bloqueio_ausencias,
 )
 from saida_historico_service import build_ausencia_historico_payload
+from saida_sessao_service import (
+    STATUS_AGUARDANDO_CONFIRMACAO,
+    exigir_confirmacao_saidas,
+    fluxo_confirmacao_ativo,
+    incluir_saida_na_sessao,
+    invalidar_vinculo_operacional,
+)
 from upload_storage_utils import (
     MAX_FOTOS_POR_EVENTO_TENTATIVA,
     build_foto_item,
@@ -120,6 +127,13 @@ def _enqueue_atribuicao_push_externa(
             db.rollback()
         except Exception:
             pass
+
+
+def remove_delivery_from_open_routes(*args, **kwargs):
+    """Import tardio evita ciclo saidas_routes <-> active_route_sync."""
+    from active_route_sync import remove_delivery_from_open_routes as _remove
+
+    return _remove(*args, **kwargs)
 
 
 # ============================================================
@@ -341,6 +355,7 @@ def _normalizar_nome(s: str) -> str:
 
 # Status canônicos do fluxo motoboy (armazenados em maiúsculas)
 STATUS_SAIU_PARA_ENTREGA = "SAIU_PARA_ENTREGA"
+STATUS_AGUARDANDO_CONFIRMACAO_SAIDA = "AGUARDANDO_CONFIRMACAO_SAIDA"
 _PENDING_AVULSO_KEY_RE = re.compile(
     r"^saida/pending/lancar_avulso/[a-fA-F0-9]{16,64}\.(jpg|jpeg|png|gif|webp)$"
 )
@@ -376,6 +391,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
     # Novos status motoboy (aceitar em maiúsculas ou lowercase)
     if lower in ("saiu_para_entrega", "saiu para entrega"):
         return STATUS_SAIU_PARA_ENTREGA
+    if lower in ("aguardando_confirmacao_saida", "aguardando confirmação de saída"):
+        return STATUS_AGUARDANDO_CONFIRMACAO_SAIDA
     if lower == "em_rota":
         return STATUS_EM_ROTA
     if lower == "entregue":
@@ -397,7 +414,11 @@ def _status_ja_em_rota_ou_saida(status_norm: str) -> bool:
     """
     if status_norm == "saiu":
         return True
-    if status_norm in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    if status_norm in (
+        STATUS_SAIU_PARA_ENTREGA,
+        STATUS_EM_ROTA,
+        STATUS_AGUARDANDO_CONFIRMACAO_SAIDA,
+    ):
         return True
     return False
 
@@ -671,9 +692,21 @@ def _ensure_motoboy_owns_saida(current_user: User, saida: Saida) -> None:
         return
     motoboy_id = getattr(current_user, "motoboy_id", None)
     if not motoboy_id or int(saida.motoboy_id or 0) != int(motoboy_id):
+        status = normalizar_status_saida(saida.status)
+        motivo = (
+            "CANCELADO"
+            if status == STATUS_CANCELADO
+            else "DESATRIBUIDO"
+            if saida.motoboy_id is None
+            else "REATRIBUIDO"
+        )
         raise HTTPException(
-            status_code=404,
-            detail={"code": "SAIDA_NOT_FOUND", "message": "Saída não encontrada."},
+            status_code=409,
+            detail={
+                "code": "ACAO_PEDIDO_OBSOLETA",
+                "reason": motivo,
+                "message": "O pedido não pertence mais a este motoboy.",
+            },
         )
 
 
@@ -922,6 +955,7 @@ def ler_saida(
 
     owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
     bloquear_saida_sem_coleta = False
+    fluxo_sessoes = False
     if owner_row is not None:
         ignorar_coleta = bool(owner_row.ignorar_coleta)
         entrada_obrigatoria = bool(getattr(owner_row, "entrada_obrigatoria_habilitada", False))
@@ -960,6 +994,45 @@ def ler_saida(
             status_code=422,
             detail={"code": "ENTREGADOR_OBRIGATORIO", "message": "Informe motoboy_id ou entregador_id/entregador."},
         )
+
+    # motoboy_id só é conhecido após resolver o destinatário.
+    fluxo_sessoes = bool(
+        motoboy_id is not None
+        and owner_row is not None
+        and getattr(owner_row, "confirmacao_saida_sessoes_habilitada", False)
+    )
+    status_saida_lida = (
+        STATUS_AGUARDANDO_CONFIRMACAO_SAIDA
+        if fluxo_sessoes
+        else STATUS_SAIU_PARA_ENTREGA
+    )
+
+    def _vincular_sessao(row: Saida):
+        if not fluxo_sessoes or motoboy_id is None:
+            return None
+        from saida_sessao_service import incluir_saida_na_sessao
+
+        row.status = STATUS_AGUARDANDO_CONFIRMACAO_SAIDA
+        return incluir_saida_na_sessao(
+            db,
+            saida=row,
+            sub_base=sub_base,
+            motoboy_id=int(motoboy_id),
+            user_id=getattr(current_user, "id", None),
+            flag_ja_validada=True,
+        )
+
+    def _resposta_leitura(row: Saida, qr_result, sessao=None) -> dict:
+        out = _saida_out_com_qr(row, qr_result)
+        out.update(
+            {
+                "fluxo_confirmacao_ativo": fluxo_sessoes,
+                "sessao_id": int(sessao.id) if sessao is not None else None,
+                "sessao_status": sessao.estado if sessao is not None else None,
+                "sessao_total": None,
+            }
+        )
+        return out
 
     codigo_norm, servico_norm, qr_from_norm = normalize_codigo(payload.codigo.strip(), strict_qr=False)
     if codigo_norm is None or servico_norm is None:
@@ -1005,15 +1078,16 @@ def ler_saida(
                 db,
                 sub_base=sub_base,
                 codigo=codigo,
-                status_inicial=STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu",
+                status_inicial=status_saida_lida if motoboy_id else "saiu",
                 username=username,
                 user_id=getattr(current_user, "id", None),
-                evento_historico="lido",
+                evento_historico="leitura_saida" if fluxo_sessoes else "lido",
             )
             if admitida is not None:
                 admitida.entregador = entregador_nome
                 admitida.entregador_id = entregador_id
                 admitida.motoboy_id = motoboy_id
+                sessao = _vincular_sessao(admitida)
                 db.add(
                     OwnerCobrancaItem(
                         sub_base=sub_base,
@@ -1037,7 +1111,7 @@ def ler_saida(
                 )
                 return JSONResponse(
                     status_code=201,
-                    content=_saida_out_com_qr(admitida, None),
+                    content=_resposta_leitura(admitida, None, sessao),
                 )
 
         permitir_soft = bool(payload.registrar_nao_coletado) and not bloquear_saida_sem_coleta
@@ -1051,7 +1125,7 @@ def ler_saida(
             return JSONResponse(status_code=422, content=gate)
         # status: "saiu" quando sem coleta; "não coletado" quando usuário confirmou registrar mesmo assim
         status_inicial = "não coletado" if permitir_soft else (
-            STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+            status_saida_lida if motoboy_id else "saiu"
         )
         store_qr = _should_store_qr_payload_raw(servico, qr_payload_raw)
         try:
@@ -1071,7 +1145,7 @@ def ler_saida(
             db.add(
                 SaidaHistorico(
                     id_saida=row.id_saida,
-                    evento="lido",
+                    evento="leitura_saida" if fluxo_sessoes else "lido",
                     status_novo=status_inicial,
                     user_id=getattr(current_user, "id", None),
                 )
@@ -1085,6 +1159,7 @@ def ler_saida(
                 )
             )
             qr_result = apply_qr_payload_if_needed(row, None, servico)
+            sessao = _vincular_sessao(row)
             db.commit()
             db.refresh(row)
             _enqueue_atribuicao_push_externa(
@@ -1096,7 +1171,7 @@ def ler_saida(
             )
             return JSONResponse(
                 status_code=201,
-                content=_saida_out_com_qr(row, qr_result),
+                content=_resposta_leitura(row, qr_result, sessao),
             )
         except HTTPException:
             db.rollback()
@@ -1119,16 +1194,17 @@ def ler_saida(
             return JSONResponse(status_code=422, content=gate)
         # Sem pré-requisito: promove etiqueta → saiu
         status_anterior = existente.status
-        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.status = status_saida_lida if motoboy_id else "saiu"
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+        sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
-                evento="lido",
+                evento="leitura_saida" if fluxo_sessoes else "lido",
                 status_anterior=status_anterior,
                 status_novo=existente.status,
                 user_id=getattr(current_user, "id", None),
@@ -1152,7 +1228,7 @@ def ler_saida(
                 motoboy_id=motoboy_id,
                 codigo=existente.codigo,
             )
-            return _saida_out_com_qr(existente, qr_result)
+            return _resposta_leitura(existente, qr_result, sessao)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
@@ -1178,16 +1254,17 @@ def ler_saida(
             return JSONResponse(status_code=422, content=gate)
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
         status_anterior = existente.status
-        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.status = status_saida_lida if motoboy_id else "saiu"
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+        sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
-                evento="lido",
+                evento="leitura_saida" if fluxo_sessoes else "lido",
                 status_anterior=status_anterior,
                 status_novo=existente.status,
                 user_id=getattr(current_user, "id", None),
@@ -1203,23 +1280,24 @@ def ler_saida(
                 motoboy_id=motoboy_id,
                 codigo=existente.codigo,
             )
-            return _saida_out_com_qr(existente, qr_result)
+            return _resposta_leitura(existente, qr_result, sessao)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
 
     if status_norm == STATUS_NA_BASE:
         status_anterior = existente.status
-        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.status = status_saida_lida if motoboy_id else "saiu"
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+        sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
-                evento="lido",
+                evento="leitura_saida" if fluxo_sessoes else "lido",
                 status_anterior=status_anterior,
                 status_novo=existente.status,
                 user_id=getattr(current_user, "id", None),
@@ -1235,7 +1313,7 @@ def ler_saida(
                 motoboy_id=motoboy_id,
                 codigo=existente.codigo,
             )
-            return _saida_out_com_qr(existente, qr_result)
+            return _resposta_leitura(existente, qr_result, sessao)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao atualizar saída.")
@@ -1489,12 +1567,13 @@ def ler_saida(
                 },
             )
         status_anterior = existente.status
-        existente.status = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+        existente.status = status_saida_lida if motoboy_id else "saiu"
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+        sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
@@ -1510,7 +1589,7 @@ def ler_saida(
         try:
             db.commit()
             db.refresh(existente)
-            return _saida_out_com_qr(existente, qr_result)
+            return _resposta_leitura(existente, qr_result, sessao)
         except Exception:
             db.rollback()
             raise HTTPException(500, "Erro ao reativar saída encerrada.")
@@ -3154,6 +3233,8 @@ def atualizar_saida(
         else None
     )
     cancelando = status_alvo == STATUS_CANCELADO
+    if status_alvo in (STATUS_ENTREGUE, STATUS_AUSENTE, STATUS_EM_ROTA):
+        exigir_confirmacao_saidas(db, sub_base=sub_base, saida_ids=[id_saida])
     reatribuicao_entregue = (
         status_anterior == STATUS_ENTREGUE
         and payload.motoboy_id is not None
@@ -3177,20 +3258,72 @@ def atualizar_saida(
         raise_if_bloqueado_ausencias(db, obj.id_saida)
     if reatribuicao_entregue:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        invalidar_vinculo_operacional(
+            db,
+            id_saida=id_saida,
+            motivo="REATRIBUIDO",
+            user_id=getattr(current_user, "id", None),
+        )
+        remove_delivery_from_open_routes(
+            db,
+            sub_base=sub_base,
+            motoboy_id=motoboy_anterior,
+            id_saida=id_saida,
+        )
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
         obj.entregador_id = None
-        obj.status = STATUS_EM_ROTA
+        obj.status = (
+            STATUS_AGUARDANDO_CONFIRMACAO
+            if fluxo_confirmacao_ativo(db, sub_base)
+            else STATUS_EM_ROTA
+        )
         obj.data_hora_entrega = None
-        _aplicar_detail_reatribuicao_entregue(db, obj.id_saida, motoboy.id_motoboy, STATUS_EM_ROTA)
+        _aplicar_detail_reatribuicao_entregue(db, obj.id_saida, motoboy.id_motoboy, obj.status)
+        if fluxo_confirmacao_ativo(db, sub_base):
+            incluir_saida_na_sessao(
+                db,
+                saida=obj,
+                sub_base=sub_base,
+                motoboy_id=int(obj.motoboy_id),
+                user_id=getattr(current_user, "id", None),
+                flag_ja_validada=True,
+            )
         payload_changed["motoboy"] = True
         payload_changed["executor"] = True
         payload_changed["status"] = True
     elif payload.motoboy_id is not None and not cancelando:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        trocou_motoboy = motoboy_anterior != motoboy.id_motoboy
+        if trocou_motoboy:
+            invalidar_vinculo_operacional(
+                db,
+                id_saida=id_saida,
+                motivo="REATRIBUIDO",
+                user_id=getattr(current_user, "id", None),
+            )
+            remove_delivery_from_open_routes(
+                db,
+                sub_base=sub_base,
+                motoboy_id=motoboy_anterior,
+                id_saida=id_saida,
+            )
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
-        obj.status = STATUS_SAIU_PARA_ENTREGA
+        obj.status = (
+            STATUS_AGUARDANDO_CONFIRMACAO
+            if trocou_motoboy and fluxo_confirmacao_ativo(db, sub_base)
+            else STATUS_SAIU_PARA_ENTREGA
+        )
+        if trocou_motoboy and fluxo_confirmacao_ativo(db, sub_base):
+            incluir_saida_na_sessao(
+                db,
+                saida=obj,
+                sub_base=sub_base,
+                motoboy_id=int(obj.motoboy_id),
+                user_id=getattr(current_user, "id", None),
+                flag_ja_validada=True,
+            )
         payload_changed["motoboy"] = (motoboy_anterior != obj.motoboy_id)
         payload_changed["executor"] = payload_changed["executor"] or payload_changed["motoboy"]
         payload_changed["status"] = True
@@ -3246,6 +3379,19 @@ def atualizar_saida(
     if status_mudou:
         _aplicar_cobranca_por_status_cancelamento(
             db, obj.id_saida, status_anterior, status_novo
+        )
+    if cancelando:
+        invalidar_vinculo_operacional(
+            db,
+            id_saida=id_saida,
+            motivo="CANCELADO",
+            user_id=getattr(current_user, "id", None),
+        )
+        remove_delivery_from_open_routes(
+            db,
+            sub_base=sub_base,
+            motoboy_id=motoboy_anterior,
+            id_saida=id_saida,
         )
     evento_historico = None
     if status_mudou:
@@ -3316,6 +3462,18 @@ def deletar_saida(
     _check_delete_window_or_409(obj.timestamp)
 
     try:
+        invalidar_vinculo_operacional(
+            db,
+            id_saida=id_saida,
+            motivo="DESATRIBUIDO",
+            user_id=getattr(current_user, "id", None),
+        )
+        remove_delivery_from_open_routes(
+            db,
+            sub_base=sub_base,
+            motoboy_id=obj.motoboy_id,
+            id_saida=id_saida,
+        )
         db.delete(obj)
         db.commit()
     except Exception:

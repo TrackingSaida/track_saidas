@@ -14,6 +14,7 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "reatribuido",
     "nova_saida_mesmo_entregador",
     "lancar_avulso",
+    "leitura_saida",
 }
 
 EVENTOS_REATRIBUICAO = {
@@ -45,6 +46,10 @@ EVENTOS_UI_ULTIMA_ACAO = {
     "criado_coleta",
     "coleta",
     "cancelado_plataforma",
+    "leitura_saida",
+    "sessao_leitura_finalizada",
+    "saida_confirmada",
+    "saida_removida_antes_confirmacao",
 }
 
 ROTULOS_ACAO = {
@@ -85,6 +90,10 @@ ROTULOS_ACAO = {
     "etiqueta_gerada": "Emitiu etiqueta",
     "etiqueta_cancelada": "Cancelou etiqueta",
     "etiqueta_expirada": "Etiqueta expirada",
+    "leitura_saida": "Leu pacote para saída",
+    "sessao_leitura_finalizada": "Finalizou leitura de saída",
+    "saida_confirmada": "Confirmou início da entrega",
+    "saida_removida_antes_confirmacao": "Removeu antes de começar entrega",
 }
 
 

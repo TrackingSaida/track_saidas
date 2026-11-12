@@ -35,6 +35,7 @@ class OperacaoPoliticas(BaseModel):
     bloquear_saida_sem_coleta: bool = False
     entrada_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
+    confirmacao_saida_sessoes_habilitada: bool = False
     devolucao_sub_base_habilitada: bool = False
     pix_receber: Optional[str] = None
     pix_receber_tipo: Optional[str] = None
@@ -80,6 +81,7 @@ class OperacaoPoliticasPatch(BaseModel):
     bloquear_saida_sem_coleta: Optional[bool] = None
     entrada_habilitada: Optional[bool] = None
     conferencia_saida_habilitada: Optional[bool] = None
+    confirmacao_saida_sessoes_habilitada: Optional[bool] = None
     devolucao_sub_base_habilitada: Optional[bool] = None
     pix_receber: Optional[str] = Field(default=None, max_length=140)
     pix_receber_tipo: Optional[str] = Field(default=None, max_length=20)
@@ -160,6 +162,9 @@ def _owner_to_out(
             bloquear_saida_sem_coleta=bool(getattr(owner, "bloquear_saida_sem_coleta", False)),
             entrada_habilitada=bool(getattr(owner, "entrada_obrigatoria_habilitada", False)),
             conferencia_saida_habilitada=bool(getattr(owner, "conferencia_saida_habilitada", False)),
+            confirmacao_saida_sessoes_habilitada=bool(
+                getattr(owner, "confirmacao_saida_sessoes_habilitada", False)
+            ),
             devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
             pix_receber=(getattr(owner, "pix_receber", None) or "").strip() or None,
             pix_receber_tipo=(getattr(owner, "pix_receber_tipo", None) or "").strip() or None,
@@ -255,6 +260,10 @@ def patch_politicas(
         if op.conferencia_saida_habilitada is not None:
             owner.conferencia_saida_habilitada = bool(op.conferencia_saida_habilitada)
             operacao_changed = True
+        if op.confirmacao_saida_sessoes_habilitada is not None:
+            # Contrato do PRD-012: flag autoritativa no backend, fora do JWT.
+            # Portanto esta alteração, isoladamente, não incrementa claims_version.
+            owner.confirmacao_saida_sessoes_habilitada = bool(op.confirmacao_saida_sessoes_habilitada)
         if op.devolucao_sub_base_habilitada is not None:
             owner.devolucao_sub_base_habilitada = bool(op.devolucao_sub_base_habilitada)
             operacao_changed = True

@@ -60,6 +60,7 @@ class OwnerUpdate(BaseModel):
     devolucao_sub_base_habilitada: Optional[bool] = None
     entrada_obrigatoria_habilitada: Optional[bool] = None
     conferencia_saida_habilitada: Optional[bool] = None
+    confirmacao_saida_sessoes_habilitada: Optional[bool] = None
     bloquear_saida_sem_coleta: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -83,6 +84,7 @@ class OwnerOut(BaseModel):
     devolucao_sub_base_habilitada: bool = False
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
+    confirmacao_saida_sessoes_habilitada: bool = False
     bloquear_saida_sem_coleta: bool = False
     cidade: Optional[str] = None
     estado: Optional[str] = None
@@ -141,6 +143,9 @@ def _owner_to_out(owner: Owner) -> OwnerOut:
         devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
         entrada_obrigatoria_habilitada=bool(getattr(owner, "entrada_obrigatoria_habilitada", False)),
         conferencia_saida_habilitada=bool(getattr(owner, "conferencia_saida_habilitada", False)),
+        confirmacao_saida_sessoes_habilitada=bool(
+            getattr(owner, "confirmacao_saida_sessoes_habilitada", False)
+        ),
         bloquear_saida_sem_coleta=bool(getattr(owner, "bloquear_saida_sem_coleta", False)),
     )
 
@@ -502,6 +507,9 @@ def update_owner(
 
     if body.conferencia_saida_habilitada is not None:
         owner.conferencia_saida_habilitada = bool(body.conferencia_saida_habilitada)
+
+    if body.confirmacao_saida_sessoes_habilitada is not None:
+        owner.confirmacao_saida_sessoes_habilitada = bool(body.confirmacao_saida_sessoes_habilitada)
 
     if body.bloquear_saida_sem_coleta is not None:
         owner.bloquear_saida_sem_coleta = bool(body.bloquear_saida_sem_coleta)

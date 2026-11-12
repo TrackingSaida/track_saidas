@@ -59,6 +59,7 @@ def upsert_conferencia_dia(
             ConferenciaSaida.sub_base == sub_base,
             ConferenciaSaida.motoboy_id == motoboy_id,
             ConferenciaSaida.data_ref == data_ref,
+            ConferenciaSaida.sessao_id.is_(None),
         )
     )
     now = datetime.utcnow()

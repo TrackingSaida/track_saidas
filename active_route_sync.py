@@ -155,3 +155,52 @@ def sync_active_route_after_delivery_update(
         "ordem": ordem,
         "rota_finalizada": rota_finalizada,
     }
+
+
+def remove_delivery_from_open_routes(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_id: Optional[int],
+    id_saida: int,
+) -> Dict[str, Any]:
+    """Remove um item reatribuído/cancelado das rotas aberta e pronta.
+
+    Não faz commit: deve participar da mesma transação da alteração operacional.
+    """
+    if motoboy_id is None:
+        return {"removed": False}
+    rotas = list(
+        db.scalars(
+            select(RotasMotoboy)
+            .where(
+                RotasMotoboy.sub_base == sub_base,
+                RotasMotoboy.motoboy_id == motoboy_id,
+                RotasMotoboy.status.in_(["preparando", "ativa"]),
+                RotasMotoboy.finalizado_em.is_(None),
+            )
+            .with_for_update()
+        ).all()
+    )
+    removidas: List[str] = []
+    now = datetime.utcnow()
+    for rota in rotas:
+        ordem = _ordem_from_rota(rota)
+        if int(id_saida) not in ordem:
+            continue
+        ordem = [sid for sid in ordem if sid != int(id_saida)]
+        rota.ordem_json = json.dumps(ordem)
+        rota.route_revision = int(getattr(rota, "route_revision", 0) or 0) + 1
+        rota.updated_at = now
+        rota.geometry_status = "stale" if getattr(rota, "polyline_encoded", None) else "missing"
+        rota.geometry_order_hash = None
+        rota.parada_atual = min(int(rota.parada_atual or 0), max(len(ordem) - 1, 0))
+        if not ordem:
+            if rota.status == "ativa":
+                rota.status = "finalizada"
+                rota.finalizado_em = now
+            else:
+                rota.status = "cancelada"
+                rota.finalizado_em = now
+        removidas.append(str(rota.id))
+    return {"removed": bool(removidas), "route_ids": removidas}
