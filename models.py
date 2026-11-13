@@ -124,6 +124,8 @@ class Owner(Base):
     pix_receber = Column(Text, nullable=True)
     # cpf | cnpj | telefone | email | aleatoria. Nulo em chave antiga, sem tipo.
     pix_receber_tipo = Column(Text, nullable=True)
+    # n = vários coletores sem restrição; um = um por vez (409 + Ajudar)
+    coleta_participantes_modo = Column(Text, nullable=False, server_default=text("'n'"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"

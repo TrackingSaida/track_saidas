@@ -27,6 +27,7 @@ from models import Owner, User
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
 
 MODOS_OPERACAO = {"codigo", "coleta_manual", "ambos"}
+MODOS_PARTICIPANTES = {"n", "um"}
 
 
 class OperacaoPoliticas(BaseModel):
@@ -39,6 +40,7 @@ class OperacaoPoliticas(BaseModel):
     devolucao_sub_base_habilitada: bool = False
     pix_receber: Optional[str] = None
     pix_receber_tipo: Optional[str] = None
+    coleta_participantes_modo: str = "n"
 
 
 class PadroesMotoboyPoliticas(BaseModel):
@@ -85,6 +87,7 @@ class OperacaoPoliticasPatch(BaseModel):
     devolucao_sub_base_habilitada: Optional[bool] = None
     pix_receber: Optional[str] = Field(default=None, max_length=140)
     pix_receber_tipo: Optional[str] = Field(default=None, max_length=20)
+    coleta_participantes_modo: Optional[str] = None
 
 
 class PadroesMotoboyPatch(BaseModel):
@@ -155,6 +158,9 @@ def _owner_to_out(
             pode_criar_avulso_saida=avulso_saida,
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         )
+    modo_part = (getattr(owner, "coleta_participantes_modo", None) or "n").strip().lower() or "n"
+    if modo_part not in MODOS_PARTICIPANTES:
+        modo_part = "n"
     return PoliticasOut(
         operacao=OperacaoPoliticas(
             coleta_habilitada=not bool(owner.ignorar_coleta),
@@ -168,6 +174,7 @@ def _owner_to_out(
             devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
             pix_receber=(getattr(owner, "pix_receber", None) or "").strip() or None,
             pix_receber_tipo=(getattr(owner, "pix_receber_tipo", None) or "").strip() or None,
+            coleta_participantes_modo=modo_part,
         ),
         padroes_motoboy=padroes,
         cobertura=CoberturaPoliticas(
@@ -277,6 +284,12 @@ def patch_politicas(
                 raise HTTPException(422, str(exc)) from exc
             owner.pix_receber_tipo = tipo
             owner.pix_receber = chave
+        if op.coleta_participantes_modo is not None:
+            modo_part = op.coleta_participantes_modo.strip().lower()
+            if modo_part not in MODOS_PARTICIPANTES:
+                raise HTTPException(422, "coleta_participantes_modo deve ser 'n' ou 'um'.")
+            owner.coleta_participantes_modo = modo_part
+            operacao_changed = True
 
     if body.padroes_motoboy:
         p = body.padroes_motoboy
