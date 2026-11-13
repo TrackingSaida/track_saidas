@@ -7,6 +7,7 @@ from fechamento_base_ciclo_pure import (
     aviso_ciclo_fechamento,
     ciclo_corresponde,
     normalizar_periodo_fechamento,
+    periodo_aberto_para_base,
     renome_fechamento_bloqueado,
     resolver_chave_pix,
 )
@@ -63,3 +64,21 @@ def test_pix_da_base_prevalece_sobre_o_global():
     assert resolver_chave_pix("  ", "global@pix") == "global@pix"
     assert resolver_chave_pix(None, "  ") is None
     assert resolver_chave_pix(None, None) is None
+
+
+def test_periodo_aberto_respeita_agenda_da_base():
+    inicio = date(2026, 11, 9)  # segunda
+    fim = date(2026, 11, 15)  # domingo
+    sabado = date(2026, 11, 14)
+    domingo = date(2026, 11, 15)
+    # Seg–Sex: no sábado a agenda do período já encerrou.
+    assert not periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5])
+    # Seg–Sáb: sábado ainda é dia de coleta.
+    assert periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5, 6])
+    # Seg–Sáb: no domingo não resta dia programado.
+    assert not periodo_aberto_para_base(inicio, fim, domingo, [1, 2, 3, 4, 5, 6])
+    # COLETA_EXTRA no domingo mantém aberto no sábado.
+    assert periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5], [domingo])
+    # Sem dias_coleta, cai no critério civil.
+    assert periodo_aberto_para_base(inicio, fim, sabado, [])
+    assert not periodo_aberto_para_base(inicio, fim, date(2026, 11, 16), [])
