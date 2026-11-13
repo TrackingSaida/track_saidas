@@ -205,6 +205,7 @@ class UserResponse(BaseModel):
     pode_criar_avulso_coleta: bool = True
     pode_criar_avulso_saida: bool = True
     avulso_exige_foto: bool = False
+    pode_realizar_entrada: bool = False
     aniversario: Optional[AniversarioOut] = None
 
 
@@ -650,6 +651,8 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
     if owner.ignorar_coleta:
         pode_ler_coleta = False
         pode_realizar_coleta = False
+    entrada_owner_on = bool(getattr(owner, "entrada_obrigatoria_habilitada", False))
+    pode_realizar_entrada = bool(getattr(motoboy, "pode_realizar_entrada", False)) and entrada_owner_on
     return {
         "sub": _subject(user),
         "uid": user.id,
@@ -661,6 +664,7 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "sub_base": sub_base,
         "pode_ler_coleta": bool(pode_ler_coleta),
         "pode_realizar_coleta": bool(pode_realizar_coleta),
+        "pode_realizar_entrada": bool(pode_realizar_entrada),
         "pode_ler_saida": bool(motoboy.pode_ler_saida),
         "pode_digitar_codigo_manual": bool(getattr(motoboy, "pode_digitar_codigo_manual", True)),
         "pode_lancar_avulso": bool(
@@ -684,9 +688,7 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "devolucao_sub_base_habilitada": bool(
             getattr(owner, "devolucao_sub_base_habilitada", False)
         ),
-        "entrada_obrigatoria_habilitada": bool(
-            getattr(owner, "entrada_obrigatoria_habilitada", False)
-        ),
+        "entrada_obrigatoria_habilitada": entrada_owner_on,
         "conferencia_saida_habilitada": bool(
             getattr(owner, "conferencia_saida_habilitada", False)
         ),
@@ -729,6 +731,7 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
         u.tipo_owner = "subbase"
     u.pode_ler_coleta = bool(payload.get("pode_ler_coleta", False))
     u.pode_realizar_coleta = bool(payload.get("pode_realizar_coleta", u.pode_ler_coleta))
+    u.pode_realizar_entrada = bool(payload.get("pode_realizar_entrada", False))
     u.devolucao_sub_base_habilitada = bool(payload.get("devolucao_sub_base_habilitada", False))
     u.entrada_obrigatoria_habilitada = bool(payload.get("entrada_obrigatoria_habilitada", False))
     u.conferencia_saida_habilitada = bool(payload.get("conferencia_saida_habilitada", False))
@@ -885,6 +888,8 @@ def _hydrate_motoboy_permissions_from_db(
     user.motoboy_id = int(motoboy.id_motoboy)
     user.pode_realizar_coleta = pode_realizar
     user.pode_ler_coleta = bool(pode_ler_coleta)
+    entrada_owner_on = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
+    user.pode_realizar_entrada = bool(getattr(motoboy, "pode_realizar_entrada", False)) and entrada_owner_on
     user.pode_ler_saida = bool(getattr(motoboy, "pode_ler_saida", True))
     user.pode_digitar_codigo_manual = bool(getattr(motoboy, "pode_digitar_codigo_manual", False))
     user.pode_criar_avulso_coleta = bool(
@@ -1409,6 +1414,7 @@ async def read_users_me(
         pode_criar_avulso_coleta=bool(getattr(current_user, "pode_criar_avulso_coleta", True)) if live_role == 4 else True,
         pode_criar_avulso_saida=bool(getattr(current_user, "pode_criar_avulso_saida", True)) if live_role == 4 else True,
         avulso_exige_foto=avulso_exige_foto,
+        pode_realizar_entrada=bool(getattr(current_user, "pode_realizar_entrada", False)) if live_role == 4 else False,
         aniversario=aniversario_out,
     )
 
