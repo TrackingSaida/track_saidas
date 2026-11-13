@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 from models import Motoboy, MotoboySubBase, Owner, User
 
 ORIGENS_LEITURA = ("camera", "manual", "selecao")
-AvulsoContexto = Literal["coleta", "saida"]
+AvulsoContexto = Literal["coleta", "saida", "entrada"]
 
 
 def normalize_origem_leitura(origem: Optional[str], *, default: str = "camera") -> str:
@@ -81,7 +81,8 @@ def _explicit_bool(obj: object, attr: str) -> Optional[bool]:
 
 def motoboy_pode_criar_avulso(motoboy: Motoboy, contexto: AvulsoContexto) -> bool:
     legado = _explicit_bool(motoboy, "pode_lancar_avulso")
-    if contexto == "coleta":
+    # Entrada = intake na base: mesma flag de avulso de coleta.
+    if contexto in ("coleta", "entrada"):
         flag = _explicit_bool(motoboy, "pode_criar_avulso_coleta")
     else:
         flag = _explicit_bool(motoboy, "pode_criar_avulso_saida")
@@ -276,6 +277,7 @@ def flush_motoboy_avulso_columns(db: Session, motoboy: Motoboy) -> None:
             pode_lancar_avulso=bool(getattr(motoboy, "pode_lancar_avulso", False)),
             avulso_exige_foto=bool(getattr(motoboy, "avulso_exige_foto", False)),
             pode_realizar_coleta=bool(getattr(motoboy, "pode_realizar_coleta", False)),
+            pode_realizar_entrada=bool(getattr(motoboy, "pode_realizar_entrada", False)),
             pode_ler_coleta=bool(getattr(motoboy, "pode_ler_coleta", False)),
             pode_ler_saida=bool(getattr(motoboy, "pode_ler_saida", True)),
             pode_digitar_codigo_manual=bool(getattr(motoboy, "pode_digitar_codigo_manual", False)),
@@ -345,7 +347,12 @@ def ensure_lancar_avulso_allowed(
 
     motoboy = db.get(Motoboy, int(motoboy_id))
     if not motoboy or not motoboy_pode_criar_avulso(motoboy, contexto):
-        fluxo = "coleta" if contexto == "coleta" else "saída"
+        if contexto == "entrada":
+            fluxo = "entrada"
+        elif contexto == "coleta":
+            fluxo = "coleta"
+        else:
+            fluxo = "saída"
         raise HTTPException(
             status_code=403,
             detail={

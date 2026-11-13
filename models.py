@@ -105,6 +105,7 @@ class Owner(Base):
     bloquear_saida_sem_coleta = Column(Boolean, nullable=False, server_default=text("false"))
     # Defaults Motoboy (Políticas gerais) — novos cadastros
     default_pode_realizar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
+    default_pode_realizar_entrada = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_ler_saida = Column(Boolean, nullable=False, server_default=text("true"))
     default_pode_digitar_codigo_manual = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_lancar_avulso = Column(Boolean, nullable=False, server_default=text("true"))
@@ -192,6 +193,8 @@ class Motoboy(Base):
     # Permissão canônica para participar de coleta por leitura e/ou manual.
     # pode_ler_coleta é mantido por compatibilidade com clientes antigos.
     pode_realizar_coleta = Column(Boolean, default=False, nullable=False, server_default=text("false"))
+    # Registrar entrada no app; só vale com owner.entrada_obrigatoria_habilitada
+    pode_realizar_entrada = Column(Boolean, default=False, nullable=False, server_default=text("false"))
     pode_ler_saida = Column(Boolean, default=True, nullable=False)
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
     pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
