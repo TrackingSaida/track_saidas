@@ -26,12 +26,15 @@ from coleta_operacional_service import (
     atualizar_status_execucao,
     combinar_modo_execucao,
     encerrar_coletas_dias_anteriores,
+    exige_confirmacao_ajudar,
     exigir_modo,
     liberar_participacao_vazia,
     liberar_participacoes_vazias_do_usuario,
     modo_coleta,
     obter_ou_criar_execucao,
+    obter_owner,
     participante_sem_lancamento,
+    participantes_modo_owner,
     resolver_base,
     resolver_executor,
 )
@@ -506,6 +509,7 @@ def consultar_situacao_bases(
     eh_hoje = data_operacao == hoje_operacao()
     contas = contas_por_base(db, sub_base)
     contagem = contagem_a_coletar(db, sub_base) if eh_hoje else {}
+    modo_participantes = participantes_modo_owner(obter_owner(db, sub_base))
     itens = []
     weekday = data_operacao.isoweekday()
     for base in bases:
@@ -553,7 +557,8 @@ def consultar_situacao_bases(
                     for p in execucao.participantes
                 ) if execucao else False,
                 "pode_ajudar": bool(
-                    execucao
+                    modo_participantes == "um"
+                    and execucao
                     and execucao.status == "em_coleta"
                     and not any(p.user_id == current_user.id for p in execucao.participantes)
                 ),
@@ -792,7 +797,14 @@ def iniciar_coleta(
     execucao.modo = combinar_modo_execucao(execucao.modo, body.metodo)
     participante = _participante_atual(execucao, executor.id)
     outros_ativos = [p.username for p in execucao.participantes if p.user_id != executor.id and getattr(p, "status", "finalizado") == "em_coleta"]
-    if not participante and outros_ativos and not body.ajudar and not retroativo:
+    modo_participantes = participantes_modo_owner(obter_owner(db, sub_base))
+    if exige_confirmacao_ajudar(
+        modo=modo_participantes,
+        ja_participa=bool(participante),
+        outros_ativos=outros_ativos,
+        ajudar=bool(body.ajudar),
+        retroativo=retroativo,
+    ):
         raise HTTPException(
             409,
             {
