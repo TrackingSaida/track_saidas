@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, timedelta
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
 PERIODOS_FECHAMENTO = ("semanal", "quinzenal", "mensal")
 MOTIVO_PERIODO_FECHAMENTO = "PERIODO_FECHAMENTO"
+MOTIVO_PERIODO_ABERTO = "PERIODO_ABERTO"
 
 _ROTULO_CICLO = {
     "semanal": "semana (segunda a domingo)",
@@ -178,6 +179,32 @@ def resolver_chave_pix(chave_base: Optional[str], chave_global: Optional[str]) -
     """A chave da base prevalece. Sem as duas, não há PIX no relatório."""
     chave, _tipo = resolver_pix_receber(chave_base, None, chave_global, None)
     return chave
+
+
+def periodo_aberto_para_base(
+    inicio: date,
+    fim: date,
+    hoje: date,
+    dias_coleta: Optional[Sequence[int]] = None,
+    datas_extra: Optional[Iterable[date]] = None,
+) -> bool:
+    """True se ainda há dia de coleta no intervalo em hoje ou no futuro.
+
+    Dia programado = isoweekday em dias_coleta, ou data em datas_extra (COLETA_EXTRA).
+    Sem dias_coleta, cai no critério civil periodo_fim >= hoje.
+    """
+    if fim < inicio:
+        return False
+    dias = [int(d) for d in (dias_coleta or []) if d is not None]
+    if not dias:
+        return fim >= hoje
+    extras = {d for d in (datas_extra or []) if inicio <= d <= fim}
+    cursor = max(inicio, hoje)
+    while cursor <= fim:
+        if cursor.isoweekday() in dias or cursor in extras:
+            return True
+        cursor += timedelta(days=1)
+    return False
 
 
 def ciclo_corresponde(periodo: Optional[str], inicio: date, fim: date) -> bool:

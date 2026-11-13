@@ -8,6 +8,7 @@ POST /coletas/fechamentos/marcar-recebido — baixar recebimentos
 POST /coletas/fechamentos — criar
 GET /coletas/fechamentos/{id_fechamento} — obter (para modal)
 PATCH /coletas/fechamentos/{id_fechamento} — reajustar
+DELETE /coletas/fechamentos/{id_fechamento} — excluir gerado ou reajustado
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -39,12 +40,15 @@ from base_fechamento_status_pure import (
     MOTIVO_JA_GERADO,
     fechamento_base_divergente,
     motivo_bloqueio_lote_base,
+    normalizar_status_fechamento_base,
     status_base_permite_reajuste,
 )
 from fechamento_base_ciclo_pure import (
+    MOTIVO_PERIODO_ABERTO,
     MOTIVO_PERIODO_FECHAMENTO,
     aviso_ciclo_fechamento,
     normalizar_periodo_fechamento,
+    periodo_aberto_para_base,
     resolver_pix_receber,
 )
 from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
@@ -329,6 +333,79 @@ def _ciclo_da_base(
         nome = (preco.base or nome).strip() or nome
     aviso = aviso_ciclo_fechamento(nome, codigo, periodo_inicio, periodo_fim)
     return codigo, aviso
+
+
+def _preco_da_base(db: Session, sub_base: str, base_nome: str) -> Optional[BasePreco]:
+    nome = (base_nome or "").strip()
+    if not nome:
+        return None
+    return db.scalar(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base,
+            func.upper(BasePreco.base) == nome.upper(),
+        )
+    )
+
+
+def _datas_coleta_extra(
+    db: Session,
+    sub_base: str,
+    preco: Optional[BasePreco],
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> set[date]:
+    if periodo_inicio > periodo_fim:
+        return set()
+    base_id = getattr(preco, "id_base", None) if preco is not None else None
+    stmt = select(ColetaCalendarioExcecao).where(
+        ColetaCalendarioExcecao.sub_base == sub_base,
+        ColetaCalendarioExcecao.data >= periodo_inicio,
+        ColetaCalendarioExcecao.data <= periodo_fim,
+        ColetaCalendarioExcecao.tipo == "COLETA_EXTRA",
+    )
+    if base_id is not None:
+        stmt = stmt.where(
+            or_(
+                ColetaCalendarioExcecao.base_id == base_id,
+                ColetaCalendarioExcecao.base_id.is_(None),
+            )
+        )
+    else:
+        stmt = stmt.where(ColetaCalendarioExcecao.base_id.is_(None))
+    return {item.data for item in db.scalars(stmt).all()}
+
+
+def _periodo_ainda_aberto_base(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    hoje: Optional[date] = None,
+    preco: Optional[BasePreco] = None,
+) -> bool:
+    """True se a base ainda tem dia de coleta no intervalo em aberto."""
+    ref = hoje or date.today()
+    preco_base = preco if preco is not None else _preco_da_base(db, sub_base, base_nome)
+    dias = list(getattr(preco_base, "dias_coleta", None) or []) if preco_base is not None else []
+    extras = _datas_coleta_extra(db, sub_base, preco_base, periodo_inicio, periodo_fim)
+    return periodo_aberto_para_base(periodo_inicio, periodo_fim, ref, dias, extras)
+
+
+def _exigir_periodo_encerrado_base(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> None:
+    if _periodo_ainda_aberto_base(db, sub_base, base_nome, periodo_inicio, periodo_fim):
+        raise HTTPException(
+            400,
+            "Não é permitido calcular ou gerar fechamento enquanto ainda houver dia de coleta "
+            "neste período. Aguarde o fim da agenda da base ou ajuste o período.",
+        )
 
 
 def _emitido_por(db: Session, sub_base: str) -> str:
@@ -930,12 +1007,7 @@ def calcular_fechamento(
     sub_base = _sub_base_from_token_or_422(current_user)
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if periodo_fim >= date.today():
-        raise HTTPException(
-            400,
-            "Não é permitido calcular fechamento para período ainda em aberto. "
-            "Escolha um período cuja data final seja anterior à data de hoje.",
-        )
+    _exigir_periodo_encerrado_base(db, sub_base, base, periodo_inicio, periodo_fim)
 
     itens, valor_bruto, valor_cancelados, valor_final = _build_itens_e_valores(
         db, sub_base, base, periodo_inicio, periodo_fim
@@ -1002,14 +1074,11 @@ def _criar_fechamento_base_core(
     """Valida e insere o fechamento (sem commit). Retorna (fechamento, itens, ajuste_g)."""
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if payload.periodo_fim >= date.today():
-        raise HTTPException(
-            400,
-            "Não é permitido criar fechamento para período ainda em aberto. "
-            "Escolha um período cuja data final seja anterior à data de hoje.",
-        )
 
     base_norm = payload.base.strip()
+    _exigir_periodo_encerrado_base(
+        db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
+    )
     _, aviso_ciclo = _ciclo_da_base(
         db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
     )
@@ -1704,6 +1773,22 @@ def _linhas_resumo_por_base(
             aviso_ciclo = aviso_ciclo_fechamento(nome, periodo_codigo, periodo_inicio, periodo_fim)
         if motivo is None and aviso_ciclo:
             motivo = MOTIVO_PERIODO_FECHAMENTO
+        if motivo is None:
+            base_id = getattr(preco, "id_base", None) if preco is not None else None
+            extras = {
+                item.data
+                for item in excecoes
+                if item.tipo == "COLETA_EXTRA"
+                and (
+                    item.base_id is None
+                    or (base_id is not None and item.base_id == base_id)
+                )
+            }
+            dias_coleta = list(getattr(preco, "dias_coleta", None) or []) if preco is not None else []
+            if periodo_aberto_para_base(
+                periodo_inicio, periodo_fim, date.today(), dias_coleta, extras
+            ):
+                motivo = MOTIVO_PERIODO_ABERTO
         linhas.append(
             ResumoBaseLinha(
                 base=nome,
@@ -1782,8 +1867,6 @@ def criar_fechamentos_lote(
     sub_base = _sub_base_from_token_or_422(current_user)
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if payload.periodo_fim >= date.today():
-        raise HTTPException(400, "O período ainda está em aberto. Escolha um período encerrado.")
 
     linhas = {
         linha.base.upper(): linha
@@ -1929,6 +2012,31 @@ def obter_fechamento(
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
     )
+
+
+# =========================================================
+# DELETE — Excluir fechamento ainda não recebido
+# =========================================================
+
+@router.delete("/{id_fechamento}", status_code=204)
+def excluir_fechamento(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Apaga um fechamento GERADO ou REAJUSTADO. Recebido não entra. As coletas permanecem."""
+    _exigir_admin_financeiro(current_user)
+    sub_base = _sub_base_from_token_or_422(current_user)
+    fech = db.get(BaseFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+    status = normalizar_status_fechamento_base(fech.status)
+    if status == STATUS_RECEBIDO:
+        raise HTTPException(400, "Fechamento recebido não pode ser excluído.")
+    if not status_base_permite_reajuste(fech.status):
+        raise HTTPException(400, "Só é possível excluir um fechamento gerado ou reajustado.")
+    db.delete(fech)
+    db.commit()
 
 
 # =========================================================

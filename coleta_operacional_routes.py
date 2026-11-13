@@ -21,6 +21,7 @@ from coleta_a_coletar_service import (
     hoje_operacao,
     resumo_a_coletar,
 )
+from coleta_agenda_pure import omitir_base_situacao_dia
 from coleta_operacional_service import (
     atualizar_status_execucao,
     combinar_modo_execucao,
@@ -485,13 +486,38 @@ def consultar_situacao_bases(
         ),
     )
     por_base = {item.base_id: item for item in execucoes}
+    excecoes_dia = list(
+        db.scalars(
+            select(ColetaCalendarioExcecao).where(
+                ColetaCalendarioExcecao.sub_base == sub_base,
+                ColetaCalendarioExcecao.data == data_operacao,
+            )
+        ).all()
+    )
+    coleta_extra_global = any(
+        item.tipo == "COLETA_EXTRA" and item.base_id is None for item in excecoes_dia
+    )
+    coleta_extra_por_base = {
+        int(item.base_id)
+        for item in excecoes_dia
+        if item.tipo == "COLETA_EXTRA" and item.base_id is not None
+    }
     is_root = _root_admin(current_user)
     eh_hoje = data_operacao == hoje_operacao()
     contas = contas_por_base(db, sub_base)
     contagem = contagem_a_coletar(db, sub_base) if eh_hoje else {}
     itens = []
+    weekday = data_operacao.isoweekday()
     for base in bases:
         execucao = por_base.get(base.id_base)
+        if omitir_base_situacao_dia(
+            agenda_confirmada=bool(base.agenda_coleta_confirmada),
+            dias_coleta=base.dias_coleta,
+            weekday=weekday,
+            tem_execucao=bool(execucao),
+            coleta_extra=coleta_extra_global or int(base.id_base) in coleta_extra_por_base,
+        ):
+            continue
         status = execucao.status if execucao else "pendente"
         participantes = _participantes_resumo(execucao, current_user, base) if execucao else []
         shopee = sum(int(p.shopee or 0) for p in execucao.participantes) if execucao else 0
