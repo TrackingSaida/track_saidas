@@ -199,6 +199,7 @@ class UserResponse(BaseModel):
     must_change_password: Optional[bool] = None
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
+    confirmacao_saida_sessoes_habilitada: bool = False
     bloquear_saida_sem_coleta: bool = False
     pode_lancar_avulso: bool = True
     pode_criar_avulso_coleta: bool = True
@@ -547,6 +548,9 @@ def _claims(user: User, owner: Owner, sub_base: Optional[str] = None) -> Dict[st
         "conferencia_saida_habilitada": bool(
             getattr(owner, "conferencia_saida_habilitada", False)
         ),
+        "confirmacao_saida_sessoes_habilitada": bool(
+            getattr(owner, "confirmacao_saida_sessoes_habilitada", False)
+        ),
         "bloquear_saida_sem_coleta": bool(
             getattr(owner, "bloquear_saida_sem_coleta", False)
         ),
@@ -686,6 +690,9 @@ def _claims_motoboy(user: User, motoboy: Motoboy, owner: Owner, sub_base: str) -
         "conferencia_saida_habilitada": bool(
             getattr(owner, "conferencia_saida_habilitada", False)
         ),
+        "confirmacao_saida_sessoes_habilitada": bool(
+            getattr(owner, "confirmacao_saida_sessoes_habilitada", False)
+        ),
         "bloquear_saida_sem_coleta": bool(
             getattr(owner, "bloquear_saida_sem_coleta", False)
         ),
@@ -725,6 +732,9 @@ def _user_from_claims(payload: Dict[str, Any]) -> User:
     u.devolucao_sub_base_habilitada = bool(payload.get("devolucao_sub_base_habilitada", False))
     u.entrada_obrigatoria_habilitada = bool(payload.get("entrada_obrigatoria_habilitada", False))
     u.conferencia_saida_habilitada = bool(payload.get("conferencia_saida_habilitada", False))
+    u.confirmacao_saida_sessoes_habilitada = bool(
+        payload.get("confirmacao_saida_sessoes_habilitada", False)
+    )
     u.bloquear_saida_sem_coleta = bool(payload.get("bloquear_saida_sem_coleta", False))
     u.sub_base_nome = (payload.get("sub_base_nome") or payload.get("sub_base") or "").strip() or None
     u.pode_ler_saida = bool(payload.get("pode_ler_saida", True))
@@ -860,6 +870,9 @@ def _hydrate_motoboy_permissions_from_db(
         user.devolucao_sub_base_habilitada = bool(getattr(owner, "devolucao_sub_base_habilitada", False))
         user.entrada_obrigatoria_habilitada = bool(getattr(owner, "entrada_obrigatoria_habilitada", False))
         user.conferencia_saida_habilitada = bool(getattr(owner, "conferencia_saida_habilitada", False))
+        user.confirmacao_saida_sessoes_habilitada = bool(
+            getattr(owner, "confirmacao_saida_sessoes_habilitada", False)
+        )
         user.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
         user.owner_ativo = bool(owner.ativo)
         user.sub_base_nome = (owner.sub_base or sub_base).strip() or sub_base
@@ -1334,6 +1347,7 @@ async def read_users_me(
     modo_operacao = getattr(current_user, "modo_operacao", None) or "codigo"
     entrada_obrigatoria = bool(getattr(current_user, "entrada_obrigatoria_habilitada", False))
     conferencia = bool(getattr(current_user, "conferencia_saida_habilitada", False))
+    confirmacao_sessoes = bool(getattr(current_user, "confirmacao_saida_sessoes_habilitada", False))
     bloquear_saida_sem_coleta = bool(getattr(current_user, "bloquear_saida_sem_coleta", False))
     sub_base = (
         getattr(current_user, "sub_base", None)
@@ -1352,6 +1366,7 @@ async def read_users_me(
             modo_operacao = (getattr(owner, "modo_operacao", None) or "codigo")
             entrada_obrigatoria = bool(getattr(owner, "entrada_obrigatoria_habilitada", False))
             conferencia = bool(getattr(owner, "conferencia_saida_habilitada", False))
+            confirmacao_sessoes = bool(getattr(owner, "confirmacao_saida_sessoes_habilitada", False))
             bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
     if live_role == 4:
         avulso_exige_foto = bool(getattr(current_user, "avulso_exige_foto", False))
@@ -1388,6 +1403,7 @@ async def read_users_me(
         must_change_password=bool(getattr(db_user, "must_change_password", False)),
         entrada_obrigatoria_habilitada=entrada_obrigatoria,
         conferencia_saida_habilitada=conferencia,
+        confirmacao_saida_sessoes_habilitada=confirmacao_sessoes,
         bloquear_saida_sem_coleta=bloquear_saida_sem_coleta,
         pode_lancar_avulso=bool(getattr(current_user, "pode_lancar_avulso", True)) if live_role == 4 else True,
         pode_criar_avulso_coleta=bool(getattr(current_user, "pode_criar_avulso_coleta", True)) if live_role == 4 else True,

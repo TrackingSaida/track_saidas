@@ -48,7 +48,11 @@ def _saida_conta_para_indicador(saida: Saida, modo_entregas: str) -> bool:
     modo 'saiu'/'operacional': status operacionais válidos (alinhado a Registros/Fechamento).
     modo 'entregue': apenas status exatamente "entregue" (app mobile).
     """
+    from saida_operacional_pure import status_aguardando_confirmacao_saida
+
     st = (getattr(saida, "status", None) or "").strip().lower()
+    if status_aguardando_confirmacao_saida(st):
+        return False
     if modo_entregas == "entregue":
         return st == "entregue"
     # modo "saiu"/"operacional" ou default

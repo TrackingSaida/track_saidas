@@ -29,11 +29,15 @@ from conferencia_saida_service import (
 from db import get_db
 from models import ConferenciaSaida, Saida, SaidaHistorico, SaidaSessao, SaidaSessaoItem, User
 from saida_sessao_service import (
-    ESTADO_ABERTA,
+    _travar,
+    carregar_sessao_no_escopo,
     finalizar_sessao,
     fluxo_confirmacao_ativo,
-    obter_sessao_aberta,
+    recuperar_sessao_aberta_staff,
+    visoes_conferencia_sessao,
 )
+
+router_sessoes = APIRouter(prefix="/sessoes-saida", tags=["SessoesSaida"])
 
 router = APIRouter(prefix="/conferencias-saida", tags=["ConferenciasSaida"])
 
@@ -81,6 +85,14 @@ class ConferenciaDetalheOut(BaseModel):
     novos_mercado: int = 0
     novos_avulso: int = 0
     novos_pacotes: List[PacoteNovoOut] = Field(default_factory=list)
+    snapshot_total: Optional[int] = None
+    snapshot_shopee: Optional[int] = None
+    snapshot_ml: Optional[int] = None
+    snapshot_avulso: Optional[int] = None
+    operacional_total: Optional[int] = None
+    operacional_shopee: Optional[int] = None
+    operacional_ml: Optional[int] = None
+    operacional_avulso: Optional[int] = None
 
 
 class ConferirBody(BaseModel):
@@ -92,6 +104,7 @@ class ConfirmarLeituraBody(BaseModel):
     data_ref: date = Field(...)
     qtd: Optional[int] = Field(None, ge=0)
     sessao_id: Optional[int] = Field(None, ge=1)
+    versao: Optional[int] = Field(None, ge=0)
 
 
 class ConfirmarLeituraOut(BaseModel):
@@ -116,6 +129,7 @@ class SessaoAbertaOut(BaseModel):
     sessao_id: Optional[int] = None
     sessao_status: Optional[str] = None
     sessao_total: int = 0
+    versao: Optional[int] = None
     saida_ids: List[int] = Field(default_factory=list)
 
 
@@ -203,8 +217,7 @@ def _saidas_operacionais_sessao(db: Session, sessao: SaidaSessao) -> List[Saida]
 def _detalhe_sessao_out(
     db: Session, *, sessao: SaidaSessao, row: ConferenciaSaida
 ) -> ConferenciaDetalheOut:
-    saidas = _saidas_operacionais_sessao(db, sessao)
-    shopee, ml, avulso = somar_servicos_saidas(saidas)
+    visoes = visoes_conferencia_sessao(db, sessao)
     nome = carregar_nomes_motoboy(db, [int(sessao.motoboy_id)]).get(
         int(sessao.motoboy_id), f"Motoboy {sessao.motoboy_id}"
     )
@@ -214,12 +227,20 @@ def _detalhe_sessao_out(
         motoboy_nome=nome,
         data_ref=sessao.data_ref,
         status=row.status,
-        sum_shopee=shopee,
-        sum_mercado=ml,
-        sum_avulso=avulso,
-        total=len(saidas),
-        qtd_no_momento=len(saidas),
+        sum_shopee=int(visoes["operacional_shopee"]),
+        sum_mercado=int(visoes["operacional_ml"]),
+        sum_avulso=int(visoes["operacional_avulso"]),
+        total=int(visoes["operacional_total"]),
+        qtd_no_momento=int(visoes["operacional_total"]),
         conferido_em=row.conferido_em.isoformat() if row.conferido_em else None,
+        snapshot_total=int(visoes["snapshot_total"]),
+        snapshot_shopee=int(visoes["snapshot_shopee"]),
+        snapshot_ml=int(visoes["snapshot_ml"]),
+        snapshot_avulso=int(visoes["snapshot_avulso"]),
+        operacional_total=int(visoes["operacional_total"]),
+        operacional_shopee=int(visoes["operacional_shopee"]),
+        operacional_ml=int(visoes["operacional_ml"]),
+        operacional_avulso=int(visoes["operacional_avulso"]),
     )
 
 
@@ -248,6 +269,7 @@ def confirmar_leitura(
                 motoboy_id=int(body.motoboy_id),
                 user_id=int(current_user.id),
                 sessao_id=body.sessao_id,
+                versao_esperada=body.versao,
             )
             if sessao.estado != "FINALIZADA":
                 db.commit()
@@ -368,35 +390,30 @@ def confirmar_leitura(
     )
 
 
+def _sessao_aberta_out(db: Session, current_user: User, motoboy_id: int) -> SessaoAbertaOut:
+    _require_staff(current_user)
+    sub_base = (current_user.sub_base or "").strip()
+    if not sub_base:
+        raise HTTPException(403, "Sub-base não definida.")
+    return SessaoAbertaOut(**recuperar_sessao_aberta_staff(db, sub_base=sub_base, motoboy_id=motoboy_id))
+
+
 @router.get("/sessao-aberta/{motoboy_id}", response_model=SessaoAbertaOut)
 def recuperar_sessao_aberta(
     motoboy_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_staff(current_user)
-    sub_base = (current_user.sub_base or "").strip()
-    ativo = fluxo_confirmacao_ativo(db, sub_base)
-    if not ativo:
-        return SessaoAbertaOut(fluxo_confirmacao_ativo=False)
-    sessao = obter_sessao_aberta(db, sub_base=sub_base, motoboy_id=motoboy_id)
-    if sessao is None:
-        return SessaoAbertaOut(fluxo_confirmacao_ativo=True)
-    saida_ids = list(
-        db.scalars(
-            select(SaidaSessaoItem.id_saida).where(
-                SaidaSessaoItem.sessao_id == sessao.id,
-                SaidaSessaoItem.ativo_operacional.is_(True),
-            )
-        ).all()
-    )
-    return SessaoAbertaOut(
-        fluxo_confirmacao_ativo=True,
-        sessao_id=int(sessao.id),
-        sessao_status=sessao.estado,
-        sessao_total=len(saida_ids),
-        saida_ids=[int(x) for x in saida_ids],
-    )
+    return _sessao_aberta_out(db, current_user, motoboy_id)
+
+
+@router_sessoes.get("/aberta", response_model=SessaoAbertaOut)
+def recuperar_sessao_aberta_por_query(
+    motoboy_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _sessao_aberta_out(db, current_user, motoboy_id)
 
 
 @router.get("/sessoes/{sessao_id}", response_model=ConferenciaDetalheOut)
@@ -408,16 +425,14 @@ def detalhe_conferencia_sessao(
     _require_staff(current_user)
     sub_base = (current_user.sub_base or "").strip()
     _require_flag(db, current_user, sub_base)
-    sessao = db.scalar(
-        select(SaidaSessao).where(SaidaSessao.id == sessao_id, SaidaSessao.sub_base == sub_base)
-    )
+    sessao = carregar_sessao_no_escopo(db, sessao_id=sessao_id, sub_base=sub_base)
     row = db.scalar(
         select(ConferenciaSaida).where(
-            ConferenciaSaida.sessao_id == sessao_id,
+            ConferenciaSaida.sessao_id == sessao.id,
             ConferenciaSaida.sub_base == sub_base,
         )
     )
-    if sessao is None or row is None:
+    if row is None:
         raise HTTPException(404, "Conferência da sessão não encontrada.")
     return _detalhe_sessao_out(db, sessao=sessao, row=row)
 
@@ -431,17 +446,18 @@ def conferir_sessao(
     _require_staff(current_user)
     sub_base = (current_user.sub_base or "").strip()
     _require_flag(db, current_user, sub_base)
-    sessao = db.scalar(
-        select(SaidaSessao)
-        .where(SaidaSessao.id == sessao_id, SaidaSessao.sub_base == sub_base)
-        .with_for_update()
-    )
+    sessao = carregar_sessao_no_escopo(db, sessao_id=sessao_id, sub_base=sub_base)
+    db.scalar(_travar(select(SaidaSessao).where(SaidaSessao.id == sessao.id), db))
     row = db.scalar(
-        select(ConferenciaSaida)
-        .where(ConferenciaSaida.sessao_id == sessao_id, ConferenciaSaida.sub_base == sub_base)
-        .with_for_update()
+        _travar(
+            select(ConferenciaSaida).where(
+                ConferenciaSaida.sessao_id == sessao.id,
+                ConferenciaSaida.sub_base == sub_base,
+            ),
+            db,
+        )
     )
-    if sessao is None or row is None:
+    if row is None:
         raise HTTPException(404, "Conferência da sessão não encontrada.")
     now = datetime.utcnow()
     saidas = _saidas_operacionais_sessao(db, sessao)
@@ -462,7 +478,6 @@ def conferir_sessao(
     row.status = STATUS_CONFERIDA
     row.conferido_em = now
     row.conferido_por = getattr(current_user, "id", None)
-    row.qtd_no_momento = len(saidas)
     db.commit()
     db.refresh(row)
     return _detalhe_sessao_out(db, sessao=sessao, row=row)

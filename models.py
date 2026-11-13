@@ -99,7 +99,7 @@ class Owner(Base):
     # Conferência de saída após Começar Entrega
     conferencia_saida_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
     # Fluxo PRD-012: leitura por sessão e confirmação real pelo motoboy.
-    # Não faz parte dos claims/JWT; o backend é a fonte autoritativa.
+    # A flag entra nos claims e incrementa claims_version quando muda.
     confirmacao_saida_sessoes_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
     # Com coleta ativa: true = impede saída sem coleta; false = avisa e permite registrar
     bloquear_saida_sem_coleta = Column(Boolean, nullable=False, server_default=text("false"))
@@ -1270,6 +1270,28 @@ class SaidaSessaoItem(Base):
     sessao = relationship("SaidaSessao", back_populates="itens")
 
 
+class SaidaConfirmacaoIdempotencia(Base):
+    """Resultado persistido da confirmação do motoboy. A chave é da tentativa, não do histórico."""
+
+    __tablename__ = "saida_confirmacao_idempotencia"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base",
+            "motoboy_id",
+            "chave",
+            name="uq_saida_confirmacao_idem_sub_motoboy_chave",
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, nullable=False)
+    chave = Column(Text, nullable=False)
+    resultado_json = Column(Text, nullable=False)
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
 # ==========================
 # Tabela: conferencia_saida
 # ==========================
@@ -1374,6 +1396,7 @@ class RotasMotoboy(Base):
     duracao_total_s = Column(Integer, nullable=True)
     optimization_input_hash = Column(Text, nullable=True)
     optimized_at = Column(DateTime(timezone=True), nullable=True)
+    motivo_encerramento = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<RotasMotoboy id={self.id} motoboy_id={self.motoboy_id} status={self.status!r}>"

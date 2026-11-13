@@ -81,7 +81,6 @@ from saida_sessao_service import (
     exigir_confirmacao_saidas,
     fluxo_confirmacao_ativo,
     incluir_saida_na_sessao,
-    invalidar_vinculo_operacional,
 )
 from upload_storage_utils import (
     MAX_FOTOS_POR_EVENTO_TENTATIVA,
@@ -134,6 +133,13 @@ def remove_delivery_from_open_routes(*args, **kwargs):
     from active_route_sync import remove_delivery_from_open_routes as _remove
 
     return _remove(*args, **kwargs)
+
+
+def encerrar_item_da_operacao_anterior(*args, **kwargs):
+    """Único fluxo de cancelamento, desatribuição e reatribuição com rota aberta."""
+    from active_route_sync import encerrar_item_da_operacao_anterior as _encerrar
+
+    return _encerrar(*args, **kwargs)
 
 
 # ============================================================
@@ -691,21 +697,28 @@ def _ensure_motoboy_owns_saida(current_user: User, saida: Saida) -> None:
     if role != 4:
         return
     motoboy_id = getattr(current_user, "motoboy_id", None)
-    if not motoboy_id or int(saida.motoboy_id or 0) != int(motoboy_id):
-        status = normalizar_status_saida(saida.status)
-        motivo = (
-            "CANCELADO"
-            if status == STATUS_CANCELADO
-            else "DESATRIBUIDO"
-            if saida.motoboy_id is None
-            else "REATRIBUIDO"
-        )
+    from saida_operacional_pure import (
+        MENSAGEM_ACAO_PEDIDO_OBSOLETA,
+        classificar_acao_obsoleta,
+    )
+
+    motivo = classificar_acao_obsoleta(
+        status=saida.status,
+        motoboy_id=saida.motoboy_id,
+        ator_motoboy_id=motoboy_id,
+    )
+    dono = (
+        motoboy_id is not None
+        and saida.motoboy_id is not None
+        and int(saida.motoboy_id) == int(motoboy_id)
+    )
+    if motivo and not dono:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "ACAO_PEDIDO_OBSOLETA",
                 "reason": motivo,
-                "message": "O pedido não pertence mais a este motoboy.",
+                "message": MENSAGEM_ACAO_PEDIDO_OBSOLETA,
             },
         )
 
@@ -1023,13 +1036,17 @@ def ler_saida(
         )
 
     def _resposta_leitura(row: Saida, qr_result, sessao=None) -> dict:
+        from saida_operacional_pure import rotulo_situacao
+
         out = _saida_out_com_qr(row, qr_result)
+        from saida_sessao_service import campos_sessao_leitura
+
         out.update(
             {
                 "fluxo_confirmacao_ativo": fluxo_sessoes,
-                "sessao_id": int(sessao.id) if sessao is not None else None,
-                "sessao_status": sessao.estado if sessao is not None else None,
-                "sessao_total": None,
+                "situacao": row.status,
+                "situacao_label": rotulo_situacao(row.status),
+                **campos_sessao_leitura(db, sessao),
             }
         )
         return out
@@ -1330,6 +1347,40 @@ def ler_saida(
             return JSONResponse(status_code=422, content=gate)
 
     if _status_ja_em_rota_ou_saida(status_norm):
+        # Pacote removido da sessão fica aguardando, sem motoboy. A leitura seguinte
+        # reabre vínculo na sessão atual e não é troca de entregador.
+        if (
+            fluxo_sessoes
+            and motoboy_id is not None
+            and status_norm == STATUS_AGUARDANDO_CONFIRMACAO_SAIDA
+            and existente.motoboy_id is None
+        ):
+            status_anterior = existente.status
+            existente.status = STATUS_AGUARDANDO_CONFIRMACAO_SAIDA
+            existente.motoboy_id = motoboy_id
+            existente.entregador_id = entregador_id
+            existente.entregador = entregador_nome
+            qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
+            sessao = _vincular_sessao(existente)
+            db.add(
+                SaidaHistorico(
+                    id_saida=existente.id_saida,
+                    evento="leitura_saida",
+                    status_anterior=status_anterior,
+                    status_novo=existente.status,
+                    motoboy_id_anterior=None,
+                    motoboy_id_novo=motoboy_id,
+                    user_id=getattr(current_user, "id", None),
+                )
+            )
+            try:
+                db.commit()
+                db.refresh(existente)
+                return _resposta_leitura(existente, qr_result, sessao)
+            except Exception:
+                db.rollback()
+                raise HTTPException(500, "Erro ao reatribuir saída.")
+
         # mesmo entregador/motoboy → 200 idempotente (sem 409)
         mesmo_ent = False
         if motoboy_id is not None:
@@ -1393,7 +1444,24 @@ def ler_saida(
                     },
                 )
             qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
-            if qr_result.get("updated"):
+            sessao = None
+            incluiu_sessao = False
+            if fluxo_sessoes and motoboy_id is not None:
+                from saida_sessao_service import localizar_sessao_do_item
+
+                sessao = localizar_sessao_do_item(
+                    db,
+                    id_saida=int(existente.id_saida),
+                    sub_base=sub_base,
+                    motoboy_id=int(motoboy_id),
+                )
+                if (
+                    sessao is None
+                    and status_norm == STATUS_AGUARDANDO_CONFIRMACAO_SAIDA
+                ):
+                    sessao = _vincular_sessao(existente)
+                    incluiu_sessao = sessao is not None
+            if qr_result.get("updated") or incluiu_sessao:
                 try:
                     db.commit()
                     db.refresh(existente)
@@ -1413,7 +1481,7 @@ def ler_saida(
                 origem_app="web",
                 endpoint="/saidas/ler",
             )
-            return _saida_out_com_qr(existente, qr_result)
+            return _resposta_leitura(existente, qr_result, sessao)
         # outro entregador → 409 para front acionar PATCH de troca.
         # Sem retry: front trata com Swal + PATCH, evita latência de retry em fluxo normal.
         registrar_log_leitura_critico(
@@ -1699,17 +1767,19 @@ def confirmar_nova_saida_mesmo_entregador(
         origem=payload.origem or "desconhecida",
         data_hora_confirmacao=data_hora_confirmacao,
     )
-    db.add(
-        SaidaHistorico(
-            id_saida=saida.id_saida,
-            evento="nova_saida_mesmo_entregador",
-            status_anterior=saida.status,
-            status_novo=saida.status,
-            motoboy_id_anterior=saida.motoboy_id,
-            motoboy_id_novo=saida.motoboy_id,
-            user_id=getattr(current_user, "id", None),
-            payload=payload_historico,
-        )
+    fluxo_sessoes = False
+    owner_row = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
+    if owner_row is not None and saida.motoboy_id is not None:
+        fluxo_sessoes = bool(getattr(owner_row, "confirmacao_saida_sessoes_habilitada", False))
+    from saida_sessao_service import aplicar_nova_saida_mesmo_entregador
+
+    sessao = aplicar_nova_saida_mesmo_entregador(
+        db,
+        saida=saida,
+        sub_base=sub_base,
+        user_id=getattr(current_user, "id", None),
+        payload_historico=payload_historico,
+        fluxo_ativo=fluxo_sessoes,
     )
     try:
         db.commit()
@@ -1731,7 +1801,12 @@ def confirmar_nova_saida_mesmo_entregador(
         origem_app=payload.origem or "web",
         endpoint="/saidas/confirmar-nova-saida-mesmo-entregador",
     )
-    return SaidaOut.model_validate(saida)
+    from saida_sessao_service import campos_sessao_leitura
+
+    out = SaidaOut.model_validate(saida).model_dump()
+    out["fluxo_confirmacao_ativo"] = bool(fluxo_sessoes)
+    out.update(campos_sessao_leitura(db, sessao))
+    return out
 
 
 def _lancar_avulso_impl(
@@ -1868,6 +1943,8 @@ def _lancar_avulso_impl(
     codigos: List[str] = []
     saidas_criadas: List[dict] = []
     status_inicial = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
+    if motoboy_id and fluxo_confirmacao_ativo(db, sub_base):
+        status_inicial = STATUS_AGUARDANDO_CONFIRMACAO
     servico = canonicalize_servico("Avulso")
     excepcional = bool(motivo)
 
@@ -1889,6 +1966,15 @@ def _lancar_avulso_impl(
             )
             db.add(row)
             db.flush()
+            if status_inicial == STATUS_AGUARDANDO_CONFIRMACAO and motoboy_id:
+                incluir_saida_na_sessao(
+                    db,
+                    saida=row,
+                    sub_base=sub_base,
+                    motoboy_id=int(motoboy_id),
+                    user_id=getattr(current_user, "id", None),
+                    flag_ja_validada=True,
+                )
             db.add(
                 SaidaHistorico(
                     id_saida=row.id_saida,
@@ -2076,16 +2162,19 @@ def _montar_item_listar_saida(
     op_ctx: Optional[SaidaOperacionalContext],
     nome_executor: Optional[str],
 ) -> Dict[str, Any]:
-    acao = (op_ctx.acao_label if op_ctx else None) or None
-    status_up = (getattr(row, "status", None) or "").strip().upper()
-    if (not acao or acao.strip() in {"", "—", "-"}) and status_up == "ETIQUETADO":
-        acao = "Emitiu etiqueta"
+    from saida_operacional_pure import apresentar_situacao_acao
+
+    apresentado = apresentar_situacao_acao(
+        status=row.status,
+        acao_label=(op_ctx.acao_label if op_ctx else None),
+        acao_codigo=(op_ctx.ultimo_evento if op_ctx else None),
+    )
     return {
         "id_saida": row.id_saida,
         "timestamp": row.timestamp,
         "data": row.data.isoformat() if getattr(row, "data", None) else None,
         "data_hora_acao": (op_ctx.ultimo_evento_ts if op_ctx else None) or row.timestamp,
-        "acao": acao or "Sem ação",
+        **apresentado,
         "executado_por": (op_ctx.executado_por if op_ctx else None) or "—",
         "sub_base": row.sub_base,
         "username": (op_ctx.ultimo_ator_username if op_ctx else None) or row.username,
@@ -3258,17 +3347,13 @@ def atualizar_saida(
         raise_if_bloqueado_ausencias(db, obj.id_saida)
     if reatribuicao_entregue:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
-        invalidar_vinculo_operacional(
-            db,
-            id_saida=id_saida,
-            motivo="REATRIBUIDO",
-            user_id=getattr(current_user, "id", None),
-        )
-        remove_delivery_from_open_routes(
+        encerrar_item_da_operacao_anterior(
             db,
             sub_base=sub_base,
             motoboy_id=motoboy_anterior,
             id_saida=id_saida,
+            motivo="REATRIBUIDO",
+            user_id=getattr(current_user, "id", None),
         )
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
@@ -3296,17 +3381,13 @@ def atualizar_saida(
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         trocou_motoboy = motoboy_anterior != motoboy.id_motoboy
         if trocou_motoboy:
-            invalidar_vinculo_operacional(
-                db,
-                id_saida=id_saida,
-                motivo="REATRIBUIDO",
-                user_id=getattr(current_user, "id", None),
-            )
-            remove_delivery_from_open_routes(
+            encerrar_item_da_operacao_anterior(
                 db,
                 sub_base=sub_base,
                 motoboy_id=motoboy_anterior,
                 id_saida=id_saida,
+                motivo="REATRIBUIDO",
+                user_id=getattr(current_user, "id", None),
             )
         obj.motoboy_id = motoboy.id_motoboy
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
@@ -3348,6 +3429,31 @@ def atualizar_saida(
         payload_changed["status"] = payload_changed["status"] or (novo_status != normalizar_status_saida(obj.status))
         obj.status = novo_status
 
+    if (
+        fluxo_confirmacao_ativo(db, sub_base)
+        and obj.motoboy_id is not None
+        and normalizar_status_saida(obj.status) in (STATUS_SAIU_PARA_ENTREGA, "saiu")
+    ):
+        ja_confirmada = normalizar_status_saida(status_anterior) in (
+            STATUS_SAIU_PARA_ENTREGA,
+            "saiu",
+            STATUS_EM_ROTA,
+            STATUS_ENTREGUE,
+            STATUS_AUSENTE,
+        )
+        trocou_motoboy = motoboy_anterior != obj.motoboy_id
+        if trocou_motoboy or not ja_confirmada:
+            obj.status = STATUS_AGUARDANDO_CONFIRMACAO
+            incluir_saida_na_sessao(
+                db,
+                saida=obj,
+                sub_base=sub_base,
+                motoboy_id=int(obj.motoboy_id),
+                user_id=getattr(current_user, "id", None),
+                flag_ja_validada=True,
+            )
+            payload_changed["status"] = True
+
     if payload.servico is not None:
         obj.servico = canonicalize_servico(payload.servico)
 
@@ -3381,17 +3487,13 @@ def atualizar_saida(
             db, obj.id_saida, status_anterior, status_novo
         )
     if cancelando:
-        invalidar_vinculo_operacional(
-            db,
-            id_saida=id_saida,
-            motivo="CANCELADO",
-            user_id=getattr(current_user, "id", None),
-        )
-        remove_delivery_from_open_routes(
+        encerrar_item_da_operacao_anterior(
             db,
             sub_base=sub_base,
             motoboy_id=motoboy_anterior,
             id_saida=id_saida,
+            motivo="CANCELADO",
+            user_id=getattr(current_user, "id", None),
         )
     evento_historico = None
     if status_mudou:
@@ -3462,17 +3564,13 @@ def deletar_saida(
     _check_delete_window_or_409(obj.timestamp)
 
     try:
-        invalidar_vinculo_operacional(
-            db,
-            id_saida=id_saida,
-            motivo="DESATRIBUIDO",
-            user_id=getattr(current_user, "id", None),
-        )
-        remove_delivery_from_open_routes(
+        encerrar_item_da_operacao_anterior(
             db,
             sub_base=sub_base,
             motoboy_id=obj.motoboy_id,
             id_saida=id_saida,
+            motivo="DESATRIBUIDO",
+            user_id=getattr(current_user, "id", None),
         )
         db.delete(obj)
         db.commit()

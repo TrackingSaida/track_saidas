@@ -11,6 +11,7 @@ from sqlalchemy.sql import ColumnElement
 from db_utils import run_db_query_with_retry
 from models import Saida, SaidaHistorico, User
 from saida_operacional_pure import (
+    evento_tecnico_nao_substitui_acao,
     EVENTOS_ATRIBUICAO_VALIDOS,
     EVENTOS_FECHAMENTO_MARCOS,
     EVENTOS_INVALIDANTES,
@@ -126,6 +127,8 @@ def carregar_contexto_operacional(
                 "teve_reatribuicao": False,
             },
         )
+        if evento_tecnico_nao_substitui_acao(evento):
+            continue
 
         estado["ultimo"] = h
         if h.user_id is not None:
@@ -405,11 +408,17 @@ def _conds_saidas_fechamento(
 ) -> Optional[List[ColumnElement]]:
     """None = resultado vazio (executor sem ids)."""
     from fechamento_resumo_utils import base_filtro_ativo, expr_base_normalizada
+    from saida_operacional_pure import status_aguardando_confirmacao_saida
 
+    status_fechamento = [
+        status
+        for status in status_validos
+        if not status_aguardando_confirmacao_saida(status)
+    ]
     conds: List[ColumnElement] = [
         Saida.sub_base == sub_base,
         Saida.codigo.isnot(None),
-        func.lower(Saida.status).in_(list(status_validos)),
+        func.lower(Saida.status).in_(status_fechamento),
     ]
     if exigir_executor:
         conds.append(

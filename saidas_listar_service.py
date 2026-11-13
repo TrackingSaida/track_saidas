@@ -20,6 +20,7 @@ from saida_operacional_pure import (
     SaidaOperacionalContext,
     deve_excluir_saida_operacional,
     eh_reatribuicao_real,
+    evento_tecnico_nao_substitui_acao,
     normalizar_evento_atribuicao,
     rotulo_acao_evento,
     timestamp_operacional_saida,
@@ -195,6 +196,8 @@ def build_operacional_ctx_from_historico_rows(
                 "teve_reatribuicao": False,
             },
         )
+        if evento_tecnico_nao_substitui_acao(evento):
+            continue
         estado["ultimo"] = h
         if evento in EVENTOS_INVALIDANTES:
             estado["op"] = None

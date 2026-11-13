@@ -50,6 +50,8 @@ EVENTOS_UI_ULTIMA_ACAO = {
     "sessao_leitura_finalizada",
     "saida_confirmada",
     "saida_removida_antes_confirmacao",
+    "rota_iniciada",
+    "rota_preparada",
 }
 
 ROTULOS_ACAO = {
@@ -59,11 +61,12 @@ ROTULOS_ACAO = {
     "assumido": "Reatribuiu pedido",
     "reatribuicao": "Reatribuiu pedido",
     "reatribuido": "Reatribuiu pedido",
-    "nova_saida_mesmo_entregador": "Nova saída confirmada com mesmo motoboy",
     "lancar_avulso": "Lançou avulso",
     "reatribuido_em_rota": "Reatribuído -> Iniciou rota",
     "removido_sem_inicio": "Removeu sem iniciar rota",
     "em_rota": "Iniciou rota",
+    "rota_iniciada": "Rota iniciada",
+    "rota_preparada": "Rota preparada",
     "entregue": "Finalizou entrega",
     "ausente": "Registrou ausência",
     "ausente_lote": "Registrou ausência em lote",
@@ -94,6 +97,57 @@ ROTULOS_ACAO = {
     "sessao_leitura_finalizada": "Finalizou leitura de saída",
     "saida_confirmada": "Confirmou início da entrega",
     "saida_removida_antes_confirmacao": "Removeu antes de começar entrega",
+    "nova_saida_mesmo_entregador": "Pacote incluído em novo lote de saída",
+}
+
+FALLBACK_ACAO_HISTORICO_ANTERIOR = "Histórico anterior à atualização"
+
+MENSAGEM_ACAO_PEDIDO_OBSOLETA = (
+    "Este pedido foi removido da sua carga e não precisa mais ser sincronizado."
+)
+
+
+def classificar_acao_obsoleta(
+    *,
+    status: Optional[str],
+    motoboy_id: Optional[int],
+    ator_motoboy_id: Optional[int],
+) -> Optional[str]:
+    """Motivo estável da outbox, sem identificar o motoboy novo."""
+    bruto = (status or "").strip().upper()
+    if bruto in {"CANCELADO", "CANCELADA"}:
+        return "CANCELADO"
+    if motoboy_id is None:
+        return "DESATRIBUIDO"
+    try:
+        if ator_motoboy_id is None or int(motoboy_id) != int(ator_motoboy_id):
+            return "REATRIBUIDO"
+    except (TypeError, ValueError):
+        return "DESATRIBUIDO"
+    return None
+
+ROTULOS_SITUACAO = {
+    "AGUARDANDO_CONFIRMACAO_SAIDA": "Aguardando confirmação de saída",
+    "SAIU_PARA_ENTREGA": "Saiu para entrega",
+    "SAIU": "Saiu para entrega",
+    "EM_ROTA": "Em rota",
+    "ENTREGUE": "Entregue",
+    "AUSENTE": "Ausente",
+    "CANCELADO": "Cancelado",
+    "ENCERRADO_SISTEMA": "Encerrado",
+    "ENCERRADO": "Encerrado",
+    "NA_BASE": "Na base",
+    "ETIQUETADO": "Etiqueta gerada",
+    "COLETADO": "Coletado",
+    "AGUARDANDO_COLETA": "Aguardando coleta",
+}
+
+_STATUS_CONTA_COMO_SAIU = {
+    "saiu",
+    "saiu para entrega",
+    "saiu pra entrega",
+    "saiu_para_entrega",
+    "saiu_pra_entrega",
 }
 
 
@@ -247,11 +301,99 @@ def resolver_chave_acao(
     return key
 
 
+def evento_tecnico_nao_substitui_acao(evento: Optional[str]) -> bool:
+    """Retry e reconciliação não viram a Ação operacional exibida."""
+    key = _normalizar_evento(evento)
+    if not key:
+        return False
+    if key in {
+        "retry",
+        "sync_retry",
+        "outbox_retry",
+        "reconciliacao",
+        "reconciliacao_sync",
+        "retry_reconciliacao",
+    }:
+        return True
+    if "reconcil" in key:
+        return True
+    if key == "retry" or key.startswith("retry_") or key.endswith("_retry"):
+        return True
+    return False
+
+
+def _chave_status(status: Optional[str]) -> str:
+    return (status or "").strip().lower().replace(" ", "_")
+
+
+def status_aguardando_confirmacao_saida(status: Optional[str]) -> bool:
+    return _chave_status(status) in {
+        "aguardando_confirmacao_saida",
+        "aguardando_confirmação_de_saída",
+    }
+
+
+def conta_como_saiu_para_entrega(status: Optional[str]) -> bool:
+    """Indicador de saída confirmada. Aguardando confirmação não entra."""
+    if status_aguardando_confirmacao_saida(status):
+        return False
+    bruto = (status or "").strip().lower()
+    return bruto in _STATUS_CONTA_COMO_SAIU or _chave_status(status) in {
+        "saiu",
+        "saiu_para_entrega",
+        "saiu_pra_entrega",
+    }
+
+
+def rotulo_situacao(status: Optional[str]) -> str:
+    raw = (status or "").strip()
+    if not raw:
+        return "—"
+    if status_aguardando_confirmacao_saida(raw):
+        return ROTULOS_SITUACAO["AGUARDANDO_CONFIRMACAO_SAIDA"]
+    if conta_como_saiu_para_entrega(raw):
+        return "Saiu para entrega"
+    chave = raw.upper().replace(" ", "_")
+    if chave in ROTULOS_SITUACAO:
+        return ROTULOS_SITUACAO[chave]
+    lower = raw.lower()
+    if lower in {"não coletado", "nao coletado", "não coletada", "nao coletada"}:
+        return "Não coletado"
+    return raw[:1].upper() + raw[1:]
+
+
+def apresentar_situacao_acao(
+    *,
+    status: Optional[str],
+    acao_label: Optional[str],
+    acao_codigo: Optional[str] = None,
+) -> dict:
+    """Rótulos de listagem. Legado sem Ação conhecida usa o fallback amigável."""
+    acao = (acao_label or "").strip()
+    codigo = acao_codigo
+    status_up = (status or "").strip().upper()
+    if acao in {"", "—", "-"} and status_up == "ETIQUETADO":
+        acao = "Emitiu etiqueta"
+        codigo = codigo or "etiqueta_gerada"
+    if acao in {"", "—", "-", "Sem ação"}:
+        acao = FALLBACK_ACAO_HISTORICO_ANTERIOR
+        codigo = None
+    return {
+        "acao": acao,
+        "acao_codigo": codigo,
+        "acao_label": acao,
+        "situacao": status,
+        "situacao_label": rotulo_situacao(status),
+    }
+
+
 def rotulo_acao_evento(
     evento: Optional[str],
     houve_reatribuicao: bool = False,
     motoboy_id_anterior: Optional[int] = None,
 ) -> Optional[str]:
+    if evento_tecnico_nao_substitui_acao(evento):
+        return None
     key = resolver_chave_acao(
         evento,
         houve_reatribuicao=houve_reatribuicao,
@@ -259,7 +401,7 @@ def rotulo_acao_evento(
     )
     if not key:
         return None
-    return ROTULOS_ACAO.get(key, (evento or "").replace("_", " ").strip().capitalize())
+    return ROTULOS_ACAO.get(key)
 
 
 def deve_excluir_saida_operacional(ctx: Optional[SaidaOperacionalContext]) -> bool:

@@ -16,6 +16,8 @@ from saidas_routes import STATUS_AUSENTE, STATUS_ENTREGUE, normalizar_status_sai
 
 logger = logging.getLogger(__name__)
 
+MOTIVO_ROTA_SEM_ITENS = "SEM_ITENS_EXECUTAVEIS"
+
 
 def _status_upper(status: Optional[str]) -> str:
     return (normalizar_status_saida(status) or "").strip().upper()
@@ -183,24 +185,78 @@ def remove_delivery_from_open_routes(
         ).all()
     )
     removidas: List[str] = []
+    encerradas: List[str] = []
     now = datetime.utcnow()
     for rota in rotas:
         ordem = _ordem_from_rota(rota)
         if int(id_saida) not in ordem:
             continue
+        idx = ordem.index(int(id_saida))
+        parada = int(rota.parada_atual or 0)
+        if idx < parada:
+            parada -= 1
         ordem = [sid for sid in ordem if sid != int(id_saida)]
+        if parada < 0:
+            parada = 0
+        if ordem and parada > len(ordem):
+            parada = len(ordem)
+        if not ordem:
+            parada = 0
         rota.ordem_json = json.dumps(ordem)
         rota.route_revision = int(getattr(rota, "route_revision", 0) or 0) + 1
         rota.updated_at = now
         rota.geometry_status = "stale" if getattr(rota, "polyline_encoded", None) else "missing"
         rota.geometry_order_hash = None
-        rota.parada_atual = min(int(rota.parada_atual or 0), max(len(ordem) - 1, 0))
+        rota.parada_atual = parada
         if not ordem:
+            rota.motivo_encerramento = MOTIVO_ROTA_SEM_ITENS
+            rota.finalizado_em = now
             if rota.status == "ativa":
                 rota.status = "finalizada"
-                rota.finalizado_em = now
             else:
                 rota.status = "cancelada"
-                rota.finalizado_em = now
+            logger.info(
+                "active_route_sync rota_sem_itens rota_id=%s status=%s motivo=%s",
+                rota.id,
+                rota.status,
+                MOTIVO_ROTA_SEM_ITENS,
+            )
+            encerradas.append(str(rota.id))
         removidas.append(str(rota.id))
-    return {"removed": bool(removidas), "route_ids": removidas}
+    return {
+        "removed": bool(removidas),
+        "route_ids": removidas,
+        "rotas_encerradas": encerradas,
+        "motivo_sistema": MOTIVO_ROTA_SEM_ITENS if encerradas else None,
+        "inserido_em_outra_rota": False,
+    }
+
+
+def encerrar_item_da_operacao_anterior(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_id: Optional[int],
+    id_saida: int,
+    motivo: str,
+    user_id: Optional[int],
+) -> Dict[str, Any]:
+    """Invalida a sessão viva e tira o item da rota aberta do motoboy anterior.
+
+    Não inclui o pedido na rota de outro motoboy e não marca conferência como Reconferir.
+    """
+    from saida_sessao_service import invalidar_vinculo_operacional
+
+    vinculos = invalidar_vinculo_operacional(
+        db,
+        id_saida=int(id_saida),
+        motivo=motivo,
+        user_id=user_id,
+    )
+    rota = remove_delivery_from_open_routes(
+        db,
+        sub_base=sub_base,
+        motoboy_id=motoboy_id,
+        id_saida=int(id_saida),
+    )
+    return {"vinculos_invalidados": vinculos, **rota}

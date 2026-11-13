@@ -201,6 +201,7 @@ from avulso_campos_routes import router_config as avulso_campos_config_router
 from avulso_campos_routes import router_avulsos as avulsos_router
 from entradas_routes import router as entradas_router
 from conferencia_saida_routes import router as conferencia_saida_router
+from conferencia_saida_routes import router_sessoes as sessoes_saida_router
 from mobile_push_routes import router as mobile_push_router
 from avisos_routes import router as avisos_router, mobile_router as avisos_mobile_router
 from mobile_fechamentos_routes import router as mobile_fechamentos_router
@@ -233,6 +234,7 @@ app.include_router(pedidos_router,      prefix=API_PREFIX)
 app.include_router(acompanhamento_router, prefix=API_PREFIX)
 app.include_router(entradas_router, prefix=API_PREFIX)
 app.include_router(conferencia_saida_router, prefix=API_PREFIX)
+app.include_router(sessoes_saida_router, prefix=API_PREFIX)
 app.include_router(mobile_entregas_router, prefix=API_PREFIX)
 app.include_router(mobile_push_router, prefix=API_PREFIX)
 app.include_router(avisos_router, prefix=API_PREFIX)

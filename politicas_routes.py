@@ -261,9 +261,10 @@ def patch_politicas(
             owner.conferencia_saida_habilitada = bool(op.conferencia_saida_habilitada)
             operacao_changed = True
         if op.confirmacao_saida_sessoes_habilitada is not None:
-            # Contrato do PRD-012: flag autoritativa no backend, fora do JWT.
-            # Portanto esta alteração, isoladamente, não incrementa claims_version.
-            owner.confirmacao_saida_sessoes_habilitada = bool(op.confirmacao_saida_sessoes_habilitada)
+            novo_fluxo = bool(op.confirmacao_saida_sessoes_habilitada)
+            if bool(getattr(owner, "confirmacao_saida_sessoes_habilitada", False)) != novo_fluxo:
+                operacao_changed = True
+            owner.confirmacao_saida_sessoes_habilitada = novo_fluxo
         if op.devolucao_sub_base_habilitada is not None:
             owner.devolucao_sub_base_habilitada = bool(op.devolucao_sub_base_habilitada)
             operacao_changed = True

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from db import get_db
-from auth import _coerce_role_int, get_current_user
+from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from fechamento_base_ciclo_pure import aplicar_chave_pix
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
 from etiqueta_identidade_service import resolver_logo_owner, resolver_nome_exibicao
@@ -509,7 +509,12 @@ def update_owner(
         owner.conferencia_saida_habilitada = bool(body.conferencia_saida_habilitada)
 
     if body.confirmacao_saida_sessoes_habilitada is not None:
-        owner.confirmacao_saida_sessoes_habilitada = bool(body.confirmacao_saida_sessoes_habilitada)
+        novo_fluxo = bool(body.confirmacao_saida_sessoes_habilitada)
+        mudou_fluxo = bool(getattr(owner, "confirmacao_saida_sessoes_habilitada", False)) != novo_fluxo
+        owner.confirmacao_saida_sessoes_habilitada = novo_fluxo
+        sub_base_owner = (owner.sub_base or "").strip()
+        if mudou_fluxo and sub_base_owner:
+            bump_motoboys_claims_version_for_sub_base(db, sub_base_owner)
 
     if body.bloquear_saida_sem_coleta is not None:
         owner.bloquear_saida_sem_coleta = bool(body.bloquear_saida_sem_coleta)
