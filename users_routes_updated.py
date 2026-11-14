@@ -156,6 +156,7 @@ class UserOut(BaseModel):
 class UserFull(UserOut):
     ignorar_coleta: Optional[bool] = None  # para desabilitar checkbox no frontend
     bloquear_saida_sem_coleta: Optional[bool] = None
+    entrada_obrigatoria_habilitada: Optional[bool] = None  # Controle de entrada do owner
 
 
 class AdminUserUpdate(BaseModel):
@@ -711,6 +712,9 @@ def read_current_user(
         if owner:
             full.ignorar_coleta = bool(owner.ignorar_coleta)
             full.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
+            full.entrada_obrigatoria_habilitada = bool(
+                getattr(owner, "entrada_obrigatoria_habilitada", False)
+            )
     return full
 
 
@@ -1327,6 +1331,9 @@ def update_current_user(
         if owner:
             full.ignorar_coleta = bool(owner.ignorar_coleta)
             full.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
+            full.entrada_obrigatoria_habilitada = bool(
+                getattr(owner, "entrada_obrigatoria_habilitada", False)
+            )
     return full
 
 
