@@ -69,12 +69,17 @@ def test_pix_da_base_prevalece_sobre_o_global():
 def test_periodo_aberto_respeita_agenda_da_base():
     inicio = date(2026, 11, 9)  # segunda
     fim = date(2026, 11, 15)  # domingo
+    sexta = date(2026, 11, 13)
     sabado = date(2026, 11, 14)
     domingo = date(2026, 11, 15)
+    # Seg–Sex: na sexta (último dia) não há dia programado depois de hoje.
+    assert not periodo_aberto_para_base(inicio, fim, sexta, [1, 2, 3, 4, 5])
     # Seg–Sex: no sábado a agenda do período já encerrou.
     assert not periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5])
-    # Seg–Sáb: sábado ainda é dia de coleta.
-    assert periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5, 6])
+    # Seg–Sáb: na sexta ainda há sábado à frente.
+    assert periodo_aberto_para_base(inicio, fim, sexta, [1, 2, 3, 4, 5, 6])
+    # Seg–Sáb: no sábado é o último dia; pendência do dia fica no calendário.
+    assert not periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5, 6])
     # Seg–Sáb: no domingo não resta dia programado.
     assert not periodo_aberto_para_base(inicio, fim, domingo, [1, 2, 3, 4, 5, 6])
     # COLETA_EXTRA no domingo mantém aberto no sábado.
@@ -82,3 +87,54 @@ def test_periodo_aberto_respeita_agenda_da_base():
     # Sem dias_coleta, cai no critério civil.
     assert periodo_aberto_para_base(inicio, fim, sabado, [])
     assert not periodo_aberto_para_base(inicio, fim, date(2026, 11, 16), [])
+
+
+def test_dias_pendentes_exigem_coleta_encerrada():
+    from fechamento_base_ciclo_pure import (
+        listar_dias_pendentes_agenda,
+        status_coleta_satisfaz_fechamento,
+    )
+
+    assert status_coleta_satisfaz_fechamento("coletado")
+    assert status_coleta_satisfaz_fechamento("sem_volume")
+    assert not status_coleta_satisfaz_fechamento("em_coleta")
+    assert not status_coleta_satisfaz_fechamento(None)
+
+    inicio = date(2026, 11, 9)
+    fim = date(2026, 11, 13)  # sexta
+    dias = [1, 2, 3, 4, 5]
+    # Sem execução → pendente.
+    assert listar_dias_pendentes_agenda(
+        inicio,
+        fim,
+        dias,
+        execucoes_ok=set(),
+        lancamentos_legados=set(),
+    ) == [
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+        "2026-11-12",
+        "2026-11-13",
+    ]
+    # Só dias com coletado/sem_volume (já filtrados no caller) satisfazem.
+    ok = {date(2026, 11, d) for d in (9, 10, 11, 12, 13)}
+    assert (
+        listar_dias_pendentes_agenda(
+            inicio,
+            fim,
+            dias,
+            execucoes_ok=ok,
+            lancamentos_legados=set(),
+        )
+        == []
+    )
+    # Sexta sem status terminal permanece pendente (em_coleta não entra em execucoes_ok).
+    ok_sem_sexta = {date(2026, 11, d) for d in (9, 10, 11, 12)}
+    assert listar_dias_pendentes_agenda(
+        inicio,
+        fim,
+        dias,
+        execucoes_ok=ok_sem_sexta,
+        lancamentos_legados=set(),
+    ) == ["2026-11-13"]

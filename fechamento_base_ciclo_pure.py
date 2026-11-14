@@ -7,11 +7,56 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, timedelta
-from typing import Iterable, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 PERIODOS_FECHAMENTO = ("semanal", "quinzenal", "mensal")
 MOTIVO_PERIODO_FECHAMENTO = "PERIODO_FECHAMENTO"
 MOTIVO_PERIODO_ABERTO = "PERIODO_ABERTO"
+STATUS_COLETA_OK_FECHAMENTO = frozenset({"coletado", "sem_volume"})
+_EXCECOES_SEM_PENDENCIA = frozenset({"FERIADO", "SEM_COLETA", "JUSTIFICADO"})
+
+
+def status_coleta_satisfaz_fechamento(status: Optional[str]) -> bool:
+    """True quando a execução encerrou o dia para fins de fechamento."""
+    return (status or "").strip().lower() in STATUS_COLETA_OK_FECHAMENTO
+
+
+def listar_dias_pendentes_agenda(
+    periodo_inicio: date,
+    periodo_fim: date,
+    dias_coleta: Sequence[int],
+    *,
+    execucoes_ok: Iterable[date],
+    lancamentos_legados: Iterable[date],
+    excecoes_tipo_por_data: Optional[Mapping[date, str]] = None,
+) -> List[str]:
+    """Datas ISO de dias programados (ou COLETA_EXTRA) ainda pendentes.
+
+    `execucoes_ok` deve conter só dias com status coletado/sem_volume.
+    Exceções FERIADO/SEM_COLETA/JUSTIFICADO não geram pendência; COLETA_EXTRA
+    agenda o dia mesmo fora de dias_coleta.
+    """
+    dias = {int(d) for d in (dias_coleta or []) if d is not None}
+    ok: Set[date] = set(execucoes_ok or ())
+    legados: Set[date] = set(lancamentos_legados or ())
+    excecoes: Dict[date, str] = dict(excecoes_tipo_por_data or {})
+    pendentes: List[str] = []
+    cursor = periodo_inicio
+    while cursor <= periodo_fim:
+        tipo = (excecoes.get(cursor) or "").strip().upper()
+        programado = cursor.isoweekday() in dias
+        coleta_extra = tipo == "COLETA_EXTRA"
+        if not programado and not coleta_extra:
+            cursor += timedelta(days=1)
+            continue
+        if cursor in ok or cursor in legados:
+            pass
+        elif tipo in _EXCECOES_SEM_PENDENCIA:
+            pass
+        else:
+            pendentes.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return pendentes
 
 _ROTULO_CICLO = {
     "semanal": "semana (segunda a domingo)",
@@ -188,7 +233,10 @@ def periodo_aberto_para_base(
     dias_coleta: Optional[Sequence[int]] = None,
     datas_extra: Optional[Iterable[date]] = None,
 ) -> bool:
-    """True se ainda há dia de coleta no intervalo em hoje ou no futuro.
+    """True se ainda há dia de coleta no intervalo estritamente depois de hoje.
+
+    No último dia da agenda o período já não é "aberto" por esta regra; pendências
+    do próprio dia ficam a cargo do calendário de coleta (DIAS_PENDENTES).
 
     Dia programado = isoweekday em dias_coleta, ou data em datas_extra (COLETA_EXTRA).
     Sem dias_coleta, cai no critério civil periodo_fim >= hoje.
@@ -199,7 +247,7 @@ def periodo_aberto_para_base(
     if not dias:
         return fim >= hoje
     extras = {d for d in (datas_extra or []) if inicio <= d <= fim}
-    cursor = max(inicio, hoje)
+    cursor = max(inicio, hoje + timedelta(days=1))
     while cursor <= fim:
         if cursor.isoweekday() in dias or cursor in extras:
             return True
