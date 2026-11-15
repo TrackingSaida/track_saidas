@@ -59,6 +59,13 @@ MENU_DEFS = [
                 "group": "registros"
             },
             {
+                "label": "Conferência de saída",
+                "href": "tracking-conferencia-saida.html",
+                "roles": [0, 1, 2, 3],
+                "group": "registros",
+                "conferencia_only": True,
+            },
+            {
                 "label": "Avisos da Base",
                 "href": "tracking-avisos.html",
                 "roles": [0, 1],
@@ -146,6 +153,7 @@ def menu_for_role(
     modo_operacao: str = "codigo",
     tipo_owner: str = "subbase",
     entrada_obrigatoria: bool = False,
+    conferencia_saida: bool = False,
 ):
     visible_sections = []
     tipo_owner = (tipo_owner or "subbase").strip().lower()
@@ -159,6 +167,7 @@ def menu_for_role(
             # coleta_only: ocultar sempre quando ignorar_coleta
             # visao360_only: sempre ocultar quando ignorar_coleta
             # entrada_only: mostrar só quando owner habilitou entrada obrigatória
+            # conferencia_only: mostrar quando conferência de saída está habilitada (independe de sessões)
             # base_only: mostrar só quando tipo_owner == "base"; base_only_roles: aplicar só a esses roles (ex.: [1] = só admin exige base)
             allowed_items = []
             for item in section["items"]:
@@ -169,6 +178,8 @@ def menu_for_role(
                     if roles_that_require_base is None or role in roles_that_require_base:
                         continue
                 if item.get("entrada_only") and not entrada_obrigatoria:
+                    continue
+                if item.get("conferencia_only") and not conferencia_saida:
                     continue
                 if ignorar_coleta and item.get("visao360_only"):
                     continue
@@ -206,12 +217,14 @@ def get_menu(user: User = Depends(get_current_user)):
     modo_operacao = getattr(user, "modo_operacao", None) or "codigo"
     tipo_owner = getattr(user, "tipo_owner", None) or "subbase"
     entrada_obrigatoria = bool(getattr(user, "entrada_obrigatoria_habilitada", False))
+    conferencia_saida = bool(getattr(user, "conferencia_saida_habilitada", False))
     menu = menu_for_role(
         role,
         ignorar_coleta,
         modo_operacao,
         tipo_owner,
         entrada_obrigatoria=entrada_obrigatoria,
+        conferencia_saida=conferencia_saida,
     )
 
     return {
