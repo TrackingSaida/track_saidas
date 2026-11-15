@@ -197,6 +197,35 @@ def test_matriz_ausencia_historico_usa_timestamp_saida():
     assert page[0].id_saida == 9
 
 
+def test_entrega_meia_noite_entra_no_dia_da_acao():
+    """Leitura no dia anterior e entrega à 00:01 entram só no dia da entrega."""
+    ts_leitura = datetime(2026, 11, 12, 18, 30, 0)
+    ts_entrega = datetime(2026, 11, 13, 0, 1, 0)
+    rows = [_row(21, ts_leitura, status="ENTREGUE")]
+    historicos = [
+        _hist(1, 21, "lido", ts_leitura, user_id=1),
+        _hist(2, 21, "entregue", ts_entrega, user_id=1),
+    ]
+    ctx = build_operacional_ctx_from_historico_rows([21], historicos, {1: "u"})
+    _, no_dia, _ = filtrar_ordenar_agregar_listagem(
+        rows, ctx, de=date(2026, 11, 13), ate=date(2026, 11, 13), limit=50, offset=0
+    )
+    _, dia_leitura, _ = filtrar_ordenar_agregar_listagem(
+        rows, ctx, de=date(2026, 11, 12), ate=date(2026, 11, 12), limit=50, offset=0
+    )
+    assert no_dia["total"] == 1
+    assert dia_leitura["total"] == 0
+
+
+def test_sql_listagem_inclui_acao_no_dia_consultado():
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1].joinpath("saidas_listar_service.py").read_text(encoding="utf-8")
+    assert "COALESCE(ops.ult_ts, ops.operacional_ts, ops.timestamp)" in src
+    assert "h_ui.evento IN :eventos_ui" in src
+    assert "s.data_hora_entrega" in src
+
+
 def test_matriz_fora_do_periodo_excluida():
     rows = [_row(11, datetime(2026, 6, 1, 10, 0, 0))]
     ctx = build_operacional_ctx_from_historico_rows([11], [], {})
@@ -268,6 +297,16 @@ def test_status_group_alias_ainda_na_base_inclui_coletado():
     assert "na_base" in unificado or "na base" in unificado
     assert "coletado" not in so_entrada
     assert _status_group_aliases("ainda na base") == unificado
+
+
+def test_status_group_alias_saiu_para_entrega_inclui_em_rota():
+    """Consulta unificada: Situação Saiu para entrega inclui EM_ROTA."""
+    saiu = _status_group_aliases("saiu para entrega")
+    assert "em_rota" in saiu or "em rota" in saiu
+    assert "saiu" in saiu or "saiu_para_entrega" in saiu
+    legado = _status_group_aliases("em_rota")
+    assert set(legado) == set(saiu)
+    assert set(_status_group_aliases("saiu")) == set(saiu)
 
 
 def test_localizar_avulso_variants_cep_parcial_e_completo():

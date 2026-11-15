@@ -99,7 +99,11 @@ def _classify_servico(servico: Optional[str]) -> str:
 
 def _saida_conta_para_indicador(saida: Saida, modo_entregas: str) -> bool:
     """Define elegibilidade de saída para indicadores conforme modo escolhido."""
+    from saida_operacional_pure import status_aguardando_confirmacao_saida
+
     st = (getattr(saida, "status", None) or "").strip().lower()
+    if status_aguardando_confirmacao_saida(st):
+        return False
     if modo_entregas == "entregue":
         return st == "entregue"
     # modo "saiu"/"operacional" (default): status operacionais válidos

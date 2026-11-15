@@ -19,6 +19,7 @@ EXPORT_COLUMNS: List[Dict[str, str]] = [
     {"key": "codigo", "label": "Código"},
     {"key": "servico", "label": "Serviço"},
     {"key": "status", "label": "Status"},
+    {"key": "situacao", "label": "Situação"},
     {"key": "acao", "label": "Última ação"},
     {"key": "entregador", "label": "Motoboy"},
     {"key": "data_hora_acao", "label": "Horário da ação"},
@@ -80,6 +81,8 @@ def formatar_status_export(status: Any) -> str:
     lower = s.lower()
     if lower == "na base":
         return "Na Base"
+    if lower in {"aguardando confirmacao saida", "aguardando confirmação de saída"}:
+        return "Aguardando confirmação de saída"
     if lower in {"saiu", "saiu para entrega"}:
         return "SAIU PARA ENTREGA"
     if lower in {"encerrado sistema", "encerrado pelo sistema", "encerrado"}:
@@ -108,14 +111,16 @@ def formatar_datetime_export(value: Any) -> str:
 
 def formatar_celula(key: str, item: Dict[str, Any]) -> str:
     if key == "status":
-        return formatar_status_export(item.get("status"))
+        return formatar_status_export(item.get("situacao_label") or item.get("situacao") or item.get("status"))
+    if key == "situacao":
+        return formatar_status_export(item.get("situacao_label") or item.get("situacao") or item.get("status"))
     if key == "is_grande":
         return "Sim" if item.get("is_grande") else "Não"
     if key in {"timestamp", "data_hora_acao"}:
         return formatar_datetime_export(item.get(key))
     if key == "acao":
-        value = str(item.get("acao") or "").strip()
-        return value or "Sem ação"
+        value = str(item.get("acao_label") or item.get("acao") or "").strip()
+        return value or "Histórico anterior à atualização"
     value = item.get(key)
     if value is None:
         return ""

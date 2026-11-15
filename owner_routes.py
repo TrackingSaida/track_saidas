@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from db import get_db
-from auth import _coerce_role_int, get_current_user
+from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from fechamento_base_ciclo_pure import aplicar_chave_pix
 from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
 from etiqueta_identidade_service import resolver_logo_owner, resolver_nome_exibicao
@@ -60,6 +60,7 @@ class OwnerUpdate(BaseModel):
     devolucao_sub_base_habilitada: Optional[bool] = None
     entrada_obrigatoria_habilitada: Optional[bool] = None
     conferencia_saida_habilitada: Optional[bool] = None
+    confirmacao_saida_sessoes_habilitada: Optional[bool] = None
     bloquear_saida_sem_coleta: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -83,6 +84,7 @@ class OwnerOut(BaseModel):
     devolucao_sub_base_habilitada: bool = False
     entrada_obrigatoria_habilitada: bool = False
     conferencia_saida_habilitada: bool = False
+    confirmacao_saida_sessoes_habilitada: bool = False
     bloquear_saida_sem_coleta: bool = False
     cidade: Optional[str] = None
     estado: Optional[str] = None
@@ -141,6 +143,9 @@ def _owner_to_out(owner: Owner) -> OwnerOut:
         devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
         entrada_obrigatoria_habilitada=bool(getattr(owner, "entrada_obrigatoria_habilitada", False)),
         conferencia_saida_habilitada=bool(getattr(owner, "conferencia_saida_habilitada", False)),
+        confirmacao_saida_sessoes_habilitada=bool(
+            getattr(owner, "confirmacao_saida_sessoes_habilitada", False)
+        ),
         bloquear_saida_sem_coleta=bool(getattr(owner, "bloquear_saida_sem_coleta", False)),
     )
 
@@ -502,6 +507,14 @@ def update_owner(
 
     if body.conferencia_saida_habilitada is not None:
         owner.conferencia_saida_habilitada = bool(body.conferencia_saida_habilitada)
+
+    if body.confirmacao_saida_sessoes_habilitada is not None:
+        novo_fluxo = bool(body.confirmacao_saida_sessoes_habilitada)
+        mudou_fluxo = bool(getattr(owner, "confirmacao_saida_sessoes_habilitada", False)) != novo_fluxo
+        owner.confirmacao_saida_sessoes_habilitada = novo_fluxo
+        sub_base_owner = (owner.sub_base or "").strip()
+        if mudou_fluxo and sub_base_owner:
+            bump_motoboys_claims_version_for_sub_base(db, sub_base_owner)
 
     if body.bloquear_saida_sem_coleta is not None:
         owner.bloquear_saida_sem_coleta = bool(body.bloquear_saida_sem_coleta)

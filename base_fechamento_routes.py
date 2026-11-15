@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -44,9 +44,13 @@ from base_fechamento_status_pure import (
     status_base_permite_reajuste,
 )
 from fechamento_base_ciclo_pure import (
+    MOTIVO_PERIODO_ABERTO,
     MOTIVO_PERIODO_FECHAMENTO,
     aviso_ciclo_fechamento,
+    listar_dias_pendentes_agenda,
     normalizar_periodo_fechamento,
+    status_coleta_satisfaz_fechamento,
+    periodo_aberto_para_base,
     resolver_pix_receber,
 )
 from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
@@ -125,8 +129,9 @@ def _resumo_calendario_fechamento(
     ).all()
     globais = {item.data: item for item in excecoes if item.base_id is None}
     por_base = {item.data: item for item in excecoes if item.base_id == base.id_base}
-    execucoes = {
-        item.data_operacao: item
+    # Só execução encerrada satisfaz o dia; em_coleta continua pendente.
+    execucoes_ok = {
+        item.data_operacao
         for item in db.scalars(
             select(ColetaExecucao).where(
                 ColetaExecucao.sub_base == sub_base,
@@ -135,6 +140,7 @@ def _resumo_calendario_fechamento(
                 ColetaExecucao.data_operacao <= periodo_fim,
             )
         ).all()
+        if status_coleta_satisfaz_fechamento(item.status)
     }
     # Compatibilidade: coletas anteriores à migração ainda vivem apenas na
     # tabela legada e devem satisfazer a agenda da base.
@@ -150,26 +156,39 @@ def _resumo_calendario_fechamento(
         ).all()
     }
     dias_configurados = set(base.dias_coleta or [])
+    tipos: Dict[date, str] = {}
+    for data, item in globais.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
+    for data, item in por_base.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
     esperado = com_lancamento = feriados = justificados = 0
-    pendentes: list[dict] = []
     cursor = periodo_inicio
     while cursor <= periodo_fim:
-        excecao = por_base.get(cursor) or globais.get(cursor)
+        tipo = (tipos.get(cursor) or "").strip().upper()
         programado = cursor.isoweekday() in dias_configurados
-        coleta_extra = bool(excecao and excecao.tipo == "COLETA_EXTRA")
+        coleta_extra = tipo == "COLETA_EXTRA"
         if not programado and not coleta_extra:
             cursor += timedelta(days=1)
             continue
         esperado += 1
-        if cursor in execucoes or cursor in lancamentos_legados:
+        if cursor in execucoes_ok or cursor in lancamentos_legados:
             com_lancamento += 1
-        elif excecao and excecao.tipo == "FERIADO":
+        elif tipo == "FERIADO":
             feriados += 1
-        elif excecao and excecao.tipo in ("SEM_COLETA", "JUSTIFICADO"):
+        elif tipo in ("SEM_COLETA", "JUSTIFICADO"):
             justificados += 1
-        else:
-            pendentes.append({"data": cursor.isoformat(), "status": "PENDENTE"})
         cursor += timedelta(days=1)
+    pendentes_iso = listar_dias_pendentes_agenda(
+        periodo_inicio,
+        periodo_fim,
+        list(base.dias_coleta or []),
+        execucoes_ok=execucoes_ok,
+        lancamentos_legados=lancamentos_legados,
+        excecoes_tipo_por_data=tipos,
+    )
+    pendentes = [{"data": d, "status": "PENDENTE"} for d in pendentes_iso]
     return {
         "coleta_habilitada": True,
         "agenda_confirmada": True,
@@ -331,6 +350,79 @@ def _ciclo_da_base(
         nome = (preco.base or nome).strip() or nome
     aviso = aviso_ciclo_fechamento(nome, codigo, periodo_inicio, periodo_fim)
     return codigo, aviso
+
+
+def _preco_da_base(db: Session, sub_base: str, base_nome: str) -> Optional[BasePreco]:
+    nome = (base_nome or "").strip()
+    if not nome:
+        return None
+    return db.scalar(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base,
+            func.upper(BasePreco.base) == nome.upper(),
+        )
+    )
+
+
+def _datas_coleta_extra(
+    db: Session,
+    sub_base: str,
+    preco: Optional[BasePreco],
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> set[date]:
+    if periodo_inicio > periodo_fim:
+        return set()
+    base_id = getattr(preco, "id_base", None) if preco is not None else None
+    stmt = select(ColetaCalendarioExcecao).where(
+        ColetaCalendarioExcecao.sub_base == sub_base,
+        ColetaCalendarioExcecao.data >= periodo_inicio,
+        ColetaCalendarioExcecao.data <= periodo_fim,
+        ColetaCalendarioExcecao.tipo == "COLETA_EXTRA",
+    )
+    if base_id is not None:
+        stmt = stmt.where(
+            or_(
+                ColetaCalendarioExcecao.base_id == base_id,
+                ColetaCalendarioExcecao.base_id.is_(None),
+            )
+        )
+    else:
+        stmt = stmt.where(ColetaCalendarioExcecao.base_id.is_(None))
+    return {item.data for item in db.scalars(stmt).all()}
+
+
+def _periodo_ainda_aberto_base(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    hoje: Optional[date] = None,
+    preco: Optional[BasePreco] = None,
+) -> bool:
+    """True se a base ainda tem dia de coleta no intervalo em aberto."""
+    ref = hoje or date.today()
+    preco_base = preco if preco is not None else _preco_da_base(db, sub_base, base_nome)
+    dias = list(getattr(preco_base, "dias_coleta", None) or []) if preco_base is not None else []
+    extras = _datas_coleta_extra(db, sub_base, preco_base, periodo_inicio, periodo_fim)
+    return periodo_aberto_para_base(periodo_inicio, periodo_fim, ref, dias, extras)
+
+
+def _exigir_periodo_encerrado_base(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> None:
+    if _periodo_ainda_aberto_base(db, sub_base, base_nome, periodo_inicio, periodo_fim):
+        raise HTTPException(
+            400,
+            "Não é permitido calcular ou gerar fechamento enquanto ainda houver dia de coleta "
+            "futuro neste período. Aguarde o último dia da agenda da base ou ajuste o período.",
+        )
 
 
 def _emitido_por(db: Session, sub_base: str) -> str:
@@ -932,12 +1024,7 @@ def calcular_fechamento(
     sub_base = _sub_base_from_token_or_422(current_user)
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if periodo_fim >= date.today():
-        raise HTTPException(
-            400,
-            "Não é permitido calcular fechamento para período ainda em aberto. "
-            "Escolha um período cuja data final seja anterior à data de hoje.",
-        )
+    _exigir_periodo_encerrado_base(db, sub_base, base, periodo_inicio, periodo_fim)
 
     itens, valor_bruto, valor_cancelados, valor_final = _build_itens_e_valores(
         db, sub_base, base, periodo_inicio, periodo_fim
@@ -1004,14 +1091,11 @@ def _criar_fechamento_base_core(
     """Valida e insere o fechamento (sem commit). Retorna (fechamento, itens, ajuste_g)."""
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if payload.periodo_fim >= date.today():
-        raise HTTPException(
-            400,
-            "Não é permitido criar fechamento para período ainda em aberto. "
-            "Escolha um período cuja data final seja anterior à data de hoje.",
-        )
 
     base_norm = payload.base.strip()
+    _exigir_periodo_encerrado_base(
+        db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
+    )
     _, aviso_ciclo = _ciclo_da_base(
         db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
     )
@@ -1395,7 +1479,10 @@ def _dias_pendentes_calendario_em_memoria(
     execucoes_datas: set,
     lancamentos_legados: set,
 ) -> List[str]:
-    """Mesma regra de `_resumo_calendario_fechamento`, sem novas consultas."""
+    """Mesma regra de `_resumo_calendario_fechamento`, sem novas consultas.
+
+    `execucoes_datas` deve conter só dias com status coletado/sem_volume.
+    """
     if ignorar_coleta:
         return []
     if not preco or not bool(preco.agenda_coleta_confirmada):
@@ -1405,24 +1492,21 @@ def _dias_pendentes_calendario_em_memoria(
     por_base = {
         item.data: item for item in excecoes if base_id is not None and item.base_id == base_id
     }
-    dias_configurados = set(preco.dias_coleta or [])
-    pendentes: List[str] = []
-    cursor = periodo_inicio
-    while cursor <= periodo_fim:
-        excecao = por_base.get(cursor) or globais.get(cursor)
-        programado = cursor.isoweekday() in dias_configurados
-        coleta_extra = bool(excecao and excecao.tipo == "COLETA_EXTRA")
-        if not programado and not coleta_extra:
-            cursor += timedelta(days=1)
-            continue
-        if cursor in execucoes_datas or cursor in lancamentos_legados:
-            pass
-        elif excecao and excecao.tipo in ("FERIADO", "SEM_COLETA", "JUSTIFICADO"):
-            pass
-        else:
-            pendentes.append(cursor.isoformat())
-        cursor += timedelta(days=1)
-    return pendentes
+    tipos: Dict[date, str] = {}
+    for data, item in globais.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
+    for data, item in por_base.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
+    return listar_dias_pendentes_agenda(
+        periodo_inicio,
+        periodo_fim,
+        list(preco.dias_coleta or []),
+        execucoes_ok=execucoes_datas,
+        lancamentos_legados=lancamentos_legados,
+        excecoes_tipo_por_data=tipos,
+    )
 
 
 def _cnpj_por_base_precos(
@@ -1625,6 +1709,8 @@ def _linhas_resumo_por_base(
     ).all():
         if item.base_id is None:
             continue
+        if not status_coleta_satisfaz_fechamento(item.status):
+            continue
         execucoes_por_base_id.setdefault(int(item.base_id), set()).add(item.data_operacao)
 
     cnpj_por_chave = _cnpj_por_base_precos(db, sub_base, precos_por_chave)
@@ -1706,6 +1792,23 @@ def _linhas_resumo_por_base(
             aviso_ciclo = aviso_ciclo_fechamento(nome, periodo_codigo, periodo_inicio, periodo_fim)
         if motivo is None and aviso_ciclo:
             motivo = MOTIVO_PERIODO_FECHAMENTO
+        if motivo is None:
+            base_id = getattr(preco, "id_base", None) if preco is not None else None
+            extras = {
+                item.data
+                for item in excecoes
+                if (item.tipo or "").strip().upper() == "COLETA_EXTRA"
+                and (
+                    item.base_id is None
+                    or (base_id is not None and item.base_id == base_id)
+                )
+            }
+            dias_coleta = list(getattr(preco, "dias_coleta", None) or []) if preco is not None else []
+            # Sem agenda de coleta do owner, não bloqueia por dias futuros.
+            if (not ignorar_coleta) and periodo_aberto_para_base(
+                periodo_inicio, periodo_fim, date.today(), dias_coleta, extras
+            ):
+                motivo = MOTIVO_PERIODO_ABERTO
         linhas.append(
             ResumoBaseLinha(
                 base=nome,
@@ -1784,8 +1887,6 @@ def criar_fechamentos_lote(
     sub_base = _sub_base_from_token_or_422(current_user)
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if payload.periodo_fim >= date.today():
-        raise HTTPException(400, "O período ainda está em aberto. Escolha um período encerrado.")
 
     linhas = {
         linha.base.upper(): linha

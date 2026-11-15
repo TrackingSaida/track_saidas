@@ -18,6 +18,29 @@ from models import (
 )
 
 MODOS_COM_COLETA = {"codigo", "coleta_manual", "ambos"}
+MODOS_PARTICIPANTES = {"n", "um"}
+
+
+def participantes_modo_owner(owner: Owner) -> str:
+    """n = vários sem restrição; um = um por vez (exige Ajudar). Default n."""
+    modo = (getattr(owner, "coleta_participantes_modo", None) or "n").strip().lower()
+    return modo if modo in MODOS_PARTICIPANTES else "n"
+
+
+def exige_confirmacao_ajudar(
+    *,
+    modo: str,
+    ja_participa: bool,
+    outros_ativos: list,
+    ajudar: bool,
+    retroativo: bool,
+) -> bool:
+    """True quando o iniciar deve responder 409 com pode_ajudar."""
+    if modo != "um":
+        return False
+    if ja_participa or not outros_ativos or ajudar or retroativo:
+        return False
+    return True
 
 
 def combinar_modo_execucao(atual: str, solicitado: str) -> str:

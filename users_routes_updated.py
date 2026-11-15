@@ -84,6 +84,7 @@ class MotoboyOut(BaseModel):
     cep: Optional[str] = None
     pode_ler_coleta: bool = False
     pode_realizar_coleta: bool = False
+    pode_realizar_entrada: bool = False
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = False
     pode_lancar_avulso: bool
@@ -121,6 +122,7 @@ class UserCreate(BaseModel):
     cep: Optional[str] = None
     pode_ler_coleta: Optional[bool] = None
     pode_realizar_coleta: Optional[bool] = None
+    pode_realizar_entrada: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
@@ -154,6 +156,7 @@ class UserOut(BaseModel):
 class UserFull(UserOut):
     ignorar_coleta: Optional[bool] = None  # para desabilitar checkbox no frontend
     bloquear_saida_sem_coleta: Optional[bool] = None
+    entrada_obrigatoria_habilitada: Optional[bool] = None  # Controle de entrada do owner
 
 
 class AdminUserUpdate(BaseModel):
@@ -179,6 +182,7 @@ class AdminUserUpdate(BaseModel):
     cep: Optional[str] = None
     pode_ler_coleta: Optional[bool] = None
     pode_realizar_coleta: Optional[bool] = None
+    pode_realizar_entrada: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
@@ -474,6 +478,7 @@ def _motoboy_to_out(motoboy: Optional[Any]) -> MotoboyOut:
             getattr(motoboy, "pode_realizar_coleta", False)
             or getattr(motoboy, "pode_ler_coleta", False)
         ),
+        pode_realizar_entrada=bool(getattr(motoboy, "pode_realizar_entrada", False)),
         pode_ler_saida=getattr(motoboy, "pode_ler_saida", True) is not False,
         pode_digitar_codigo_manual=bool(getattr(motoboy, "pode_digitar_codigo_manual", False)),
         pode_lancar_avulso=pode_avulso,
@@ -707,6 +712,9 @@ def read_current_user(
         if owner:
             full.ignorar_coleta = bool(owner.ignorar_coleta)
             full.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
+            full.entrada_obrigatoria_habilitada = bool(
+                getattr(owner, "entrada_obrigatoria_habilitada", False)
+            )
     return full
 
 
@@ -1079,7 +1087,8 @@ def admin_update_user(
     # Campos Motoboy (role=4)
     motoboy_fields = {
         "documento", "cnpj", "chave_pix", "rua", "numero", "complemento", "bairro", "cidade", "estado", "cep",
-        "pode_ler_coleta", "pode_realizar_coleta", "pode_ler_saida", "pode_digitar_codigo_manual",
+        "pode_ler_coleta", "pode_realizar_coleta", "pode_realizar_entrada", "pode_ler_saida",
+        "pode_digitar_codigo_manual",
         "pode_lancar_avulso", "pode_criar_avulso_coleta", "pode_criar_avulso_saida",
         "avulso_exige_foto",
     }
@@ -1095,6 +1104,10 @@ def admin_update_user(
                         val = False
                     if field == "pode_realizar_coleta" and owner and owner.ignorar_coleta:
                         val = False
+                    if field == "pode_realizar_entrada" and owner and not bool(
+                        getattr(owner, "entrada_obrigatoria_habilitada", False)
+                    ):
+                        val = False
                     setattr(user.motoboy, field, val)
             if "pode_realizar_coleta" in updates:
                 user.motoboy.pode_ler_coleta = bool(user.motoboy.pode_realizar_coleta)
@@ -1109,7 +1122,7 @@ def admin_update_user(
             if not bool(getattr(user.motoboy, "pode_lancar_avulso", True)):
                 user.motoboy.avulso_exige_foto = False
             perm_keys = {
-                "pode_ler_coleta", "pode_realizar_coleta", "pode_ler_saida",
+                "pode_ler_coleta", "pode_realizar_coleta", "pode_realizar_entrada", "pode_ler_saida",
                 "pode_digitar_codigo_manual", "pode_lancar_avulso",
                 "pode_criar_avulso_coleta", "pode_criar_avulso_saida", "avulso_exige_foto",
             }
@@ -1123,6 +1136,9 @@ def admin_update_user(
                 raise HTTPException(422, f"Campos obrigatórios para Motoboy: {', '.join(faltando)}")
             pode_ler_coleta = updates.get("pode_ler_coleta", False) or False
             pode_realizar_coleta = updates.get("pode_realizar_coleta", pode_ler_coleta) or False
+            pode_realizar_entrada = bool(updates.get("pode_realizar_entrada", False))
+            if owner and not bool(getattr(owner, "entrada_obrigatoria_habilitada", False)):
+                pode_realizar_entrada = False
             pode_ler_saida = updates.get("pode_ler_saida", True) if updates.get("pode_ler_saida") is not None else True
             pode_digitar_codigo_manual = (
                 updates.get("pode_digitar_codigo_manual", True)
@@ -1169,6 +1185,7 @@ def admin_update_user(
                 data_cadastro=date.today(),
                 pode_ler_coleta=pode_ler_coleta,
                 pode_realizar_coleta=pode_realizar_coleta,
+                pode_realizar_entrada=bool(pode_realizar_entrada),
                 pode_ler_saida=pode_ler_saida,
                 pode_digitar_codigo_manual=bool(pode_digitar_codigo_manual),
                 pode_lancar_avulso=bool(pode_lancar_avulso),
@@ -1314,6 +1331,9 @@ def update_current_user(
         if owner:
             full.ignorar_coleta = bool(owner.ignorar_coleta)
             full.bloquear_saida_sem_coleta = bool(getattr(owner, "bloquear_saida_sem_coleta", False))
+            full.entrada_obrigatoria_habilitada = bool(
+                getattr(owner, "entrada_obrigatoria_habilitada", False)
+            )
     return full
 
 

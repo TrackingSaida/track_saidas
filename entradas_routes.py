@@ -14,8 +14,9 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from codigo_normalizer import canonicalize_servico, is_qr_like_scan_payload, normalize_codigo
 from db import get_db
-from leitura_manual_auth import ensure_manual_code_entry_allowed
-from models import Owner, Saida, SaidaDetail, SaidaHistorico, User
+from entrada_access import owner_entrada_habilitada, require_entrada_access
+from leitura_manual_auth import ensure_lancar_avulso_allowed, ensure_manual_code_entry_allowed
+from models import Motoboy, Owner, Saida, SaidaDetail, SaidaHistorico, User
 from qr_payload_utils import (
     apply_qr_payload_if_needed,
     needs_qr_update,
@@ -69,29 +70,10 @@ class EntradaResumoDiaOut(BaseModel):
     sum_avulso: int
 
 
-def _owner_entrada_habilitada(db: Session, sub_base: str, user: User) -> bool:
-    if bool(getattr(user, "entrada_obrigatoria_habilitada", False)):
-        return True
-    owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base))
-    return bool(owner and getattr(owner, "entrada_obrigatoria_habilitada", False))
-
-
-def _require_staff_entrada(db: Session, current_user: User) -> str:
-    role = int(getattr(current_user, "role", 0) or 0)
-    if role not in (0, 1, 2, 3):
-        raise HTTPException(status_code=403, detail="Acesso restrito a admin/operador.")
-    sub_base = (current_user.sub_base or "").strip()
-    if not sub_base:
-        raise HTTPException(status_code=403, detail="Sub-base não definida.")
-    if not _owner_entrada_habilitada(db, sub_base, current_user):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "ENTRADA_DESABILITADA",
-                "message": "Registrar entrada não está habilitado para esta base.",
-            },
-        )
-    return sub_base
+_owner_entrada_habilitada = owner_entrada_habilitada
+_require_entrada_access = require_entrada_access
+# Compatível com imports/testes legados.
+_require_staff_entrada = require_entrada_access
 
 
 def _servico_bucket(servico: Optional[str]) -> str:
@@ -175,7 +157,7 @@ def ler_entrada(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sub_base = _require_staff_entrada(db, current_user)
+    sub_base = _require_entrada_access(db, current_user)
 
     origem = ensure_manual_code_entry_allowed(
         db, current_user, origem=getattr(payload, "origem", None) or "camera"
@@ -334,7 +316,8 @@ def lancar_avulso_entrada(
     current_user: User = Depends(get_current_user),
 ):
     """Cria pacotes avulso já em NA_BASE (sem seller, sem motoboy, sem cobrança)."""
-    sub_base = _require_staff_entrada(db, current_user)
+    sub_base = _require_entrada_access(db, current_user)
+    ensure_lancar_avulso_allowed(db, current_user, contexto="entrada")
 
     quantidade = int(payload.quantidade or 0)
     if quantidade < 1:
@@ -347,8 +330,14 @@ def lancar_avulso_entrada(
     from upload_storage_utils import MAX_FOTOS_POR_EVENTO_TENTATIVA, build_foto_item, serialize_foto_items
     from leitura_manual_auth import resolve_avulso_exige_foto
 
-    # Entrada é staff: segue política global do owner (também para root/admin/operador).
-    avulso_exige_foto = resolve_avulso_exige_foto(db, sub_base=sub_base, motoboy=None)
+    motoboy_foto = None
+    role = int(getattr(current_user, "role", 0) or 0)
+    if role == 4:
+        mid = getattr(current_user, "motoboy_id", None)
+        if mid:
+            motoboy_foto = db.get(Motoboy, int(mid))
+    # Staff: política global do owner. Motoboy: owner global OU flag do perfil.
+    avulso_exige_foto = resolve_avulso_exige_foto(db, sub_base=sub_base, motoboy=motoboy_foto)
 
     foto_keys: List[str] = []
     for k in list(payload.foto_object_keys or []):

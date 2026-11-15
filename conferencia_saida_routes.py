@@ -1,12 +1,13 @@
 """Endpoints de Conferência de Saída (staff)."""
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import date, datetime
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -26,7 +27,17 @@ from conferencia_saida_service import (
     upsert_conferencia_dia,
 )
 from db import get_db
-from models import ConferenciaSaida, User
+from models import ConferenciaSaida, Saida, SaidaHistorico, SaidaSessao, SaidaSessaoItem, User
+from saida_sessao_service import (
+    _travar,
+    carregar_sessao_no_escopo,
+    finalizar_sessao,
+    fluxo_confirmacao_ativo,
+    recuperar_sessao_aberta_staff,
+    visoes_conferencia_sessao,
+)
+
+router_sessoes = APIRouter(prefix="/sessoes-saida", tags=["SessoesSaida"])
 
 router = APIRouter(prefix="/conferencias-saida", tags=["ConferenciasSaida"])
 
@@ -35,6 +46,7 @@ AbaTipo = Literal["pendente", "reconferir", "conferida"]
 
 class ConferenciaItemOut(BaseModel):
     id: int
+    sessao_id: Optional[int] = None
     motoboy_id: int
     motoboy_nome: str
     data_ref: date
@@ -57,6 +69,7 @@ class PacoteNovoOut(BaseModel):
 
 
 class ConferenciaDetalheOut(BaseModel):
+    sessao_id: Optional[int] = None
     motoboy_id: int
     motoboy_nome: str
     data_ref: date
@@ -72,6 +85,14 @@ class ConferenciaDetalheOut(BaseModel):
     novos_mercado: int = 0
     novos_avulso: int = 0
     novos_pacotes: List[PacoteNovoOut] = Field(default_factory=list)
+    snapshot_total: Optional[int] = None
+    snapshot_shopee: Optional[int] = None
+    snapshot_ml: Optional[int] = None
+    snapshot_avulso: Optional[int] = None
+    operacional_total: Optional[int] = None
+    operacional_shopee: Optional[int] = None
+    operacional_ml: Optional[int] = None
+    operacional_avulso: Optional[int] = None
 
 
 class ConferirBody(BaseModel):
@@ -82,6 +103,8 @@ class ConfirmarLeituraBody(BaseModel):
     motoboy_id: int = Field(..., ge=1)
     data_ref: date = Field(...)
     qtd: Optional[int] = Field(None, ge=0)
+    sessao_id: Optional[int] = Field(None, ge=1)
+    versao: Optional[int] = Field(None, ge=0)
 
 
 class ConfirmarLeituraOut(BaseModel):
@@ -95,6 +118,19 @@ class ConfirmarLeituraOut(BaseModel):
     sum_avulso: int
     total: int
     virou_reconferir: bool = False
+    sessao_id: Optional[int] = None
+    sessao_status: Optional[str] = None
+    sessao_total: Optional[int] = None
+    fluxo_confirmacao_ativo: bool = False
+
+
+class SessaoAbertaOut(BaseModel):
+    fluxo_confirmacao_ativo: bool
+    sessao_id: Optional[int] = None
+    sessao_status: Optional[str] = None
+    sessao_total: int = 0
+    versao: Optional[int] = None
+    saida_ids: List[int] = Field(default_factory=list)
 
 
 def _require_staff(user: User) -> None:
@@ -143,6 +179,7 @@ def _detalhe_out(
         novos_payload = resumo_novos_pacotes(novos)
 
     return ConferenciaDetalheOut(
+        sessao_id=int(row.sessao_id) if row.sessao_id is not None else None,
         motoboy_id=motoboy_id,
         motoboy_nome=nome,
         data_ref=data_ref,
@@ -161,6 +198,52 @@ def _detalhe_out(
     )
 
 
+def _saidas_operacionais_sessao(db: Session, sessao: SaidaSessao) -> List[Saida]:
+    return list(
+        db.scalars(
+            select(Saida)
+            .join(SaidaSessaoItem, SaidaSessaoItem.id_saida == Saida.id_saida)
+            .where(
+                SaidaSessaoItem.sessao_id == sessao.id,
+                SaidaSessaoItem.ativo_operacional.is_(True),
+                Saida.sub_base == sessao.sub_base,
+                Saida.motoboy_id == sessao.motoboy_id,
+            )
+            .order_by(Saida.codigo, Saida.id_saida)
+        ).all()
+    )
+
+
+def _detalhe_sessao_out(
+    db: Session, *, sessao: SaidaSessao, row: ConferenciaSaida
+) -> ConferenciaDetalheOut:
+    visoes = visoes_conferencia_sessao(db, sessao)
+    nome = carregar_nomes_motoboy(db, [int(sessao.motoboy_id)]).get(
+        int(sessao.motoboy_id), f"Motoboy {sessao.motoboy_id}"
+    )
+    return ConferenciaDetalheOut(
+        sessao_id=int(sessao.id),
+        motoboy_id=int(sessao.motoboy_id),
+        motoboy_nome=nome,
+        data_ref=sessao.data_ref,
+        status=row.status,
+        sum_shopee=int(visoes["operacional_shopee"]),
+        sum_mercado=int(visoes["operacional_ml"]),
+        sum_avulso=int(visoes["operacional_avulso"]),
+        total=int(visoes["operacional_total"]),
+        qtd_no_momento=int(visoes["operacional_total"]),
+        conferido_em=row.conferido_em.isoformat() if row.conferido_em else None,
+        snapshot_total=int(visoes["snapshot_total"]),
+        snapshot_shopee=int(visoes["snapshot_shopee"]),
+        snapshot_ml=int(visoes["snapshot_ml"]),
+        snapshot_avulso=int(visoes["snapshot_avulso"]),
+        operacional_total=int(visoes["operacional_total"]),
+        operacional_shopee=int(visoes["operacional_shopee"]),
+        operacional_ml=int(visoes["operacional_ml"]),
+        operacional_avulso=int(visoes["operacional_avulso"]),
+    )
+
+
 @router.post("/confirmar-leitura", response_model=ConfirmarLeituraOut)
 def confirmar_leitura(
     body: ConfirmarLeituraBody,
@@ -176,6 +259,58 @@ def confirmar_leitura(
     if not sub_base:
         raise HTTPException(403, "Sub-base não definida.")
     _require_flag(db, current_user, sub_base)
+
+    fluxo_sessao = fluxo_confirmacao_ativo(db, sub_base)
+    if fluxo_sessao:
+        try:
+            sessao = finalizar_sessao(
+                db,
+                sub_base=sub_base,
+                motoboy_id=int(body.motoboy_id),
+                user_id=int(current_user.id),
+                sessao_id=body.sessao_id,
+                versao_esperada=body.versao,
+            )
+            if sessao.estado != "FINALIZADA":
+                db.commit()
+                raise HTTPException(
+                    422,
+                    detail={"code": "SEM_LEITURAS", "message": "A sessão não possui pacotes válidos."},
+                )
+            row = db.scalar(
+                select(ConferenciaSaida).where(ConferenciaSaida.sessao_id == sessao.id)
+            )
+            if row is None:
+                raise HTTPException(500, "Conferência da sessão não foi criada.")
+            db.commit()
+            db.refresh(sessao)
+            db.refresh(row)
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(500, f"Erro ao finalizar sessão de leitura: {e}")
+
+        nome = carregar_nomes_motoboy(db, [int(body.motoboy_id)]).get(
+            int(body.motoboy_id), f"Motoboy {body.motoboy_id}"
+        )
+        return ConfirmarLeituraOut(
+            motoboy_id=int(body.motoboy_id),
+            motoboy_nome=nome,
+            data_ref=sessao.data_ref,
+            status=row.status,
+            qtd_no_momento=int(sessao.total_snapshot or 0),
+            sum_shopee=int(sessao.total_shopee_snapshot or 0),
+            sum_mercado=int(sessao.total_ml_snapshot or 0),
+            sum_avulso=int(sessao.total_avulso_snapshot or 0),
+            total=int(sessao.total_snapshot or 0),
+            virou_reconferir=False,
+            sessao_id=int(sessao.id),
+            sessao_status=sessao.estado,
+            sessao_total=int(sessao.total_snapshot or 0),
+            fluxo_confirmacao_ativo=True,
+        )
 
     saidas = listar_saidas_motoboy_dia(
         db,
@@ -251,7 +386,101 @@ def confirmar_leitura(
         sum_avulso=avulso,
         total=shopee + ml + avulso,
         virou_reconferir=bool(virou_reconferir),
+        fluxo_confirmacao_ativo=False,
     )
+
+
+def _sessao_aberta_out(db: Session, current_user: User, motoboy_id: int) -> SessaoAbertaOut:
+    _require_staff(current_user)
+    sub_base = (current_user.sub_base or "").strip()
+    if not sub_base:
+        raise HTTPException(403, "Sub-base não definida.")
+    return SessaoAbertaOut(**recuperar_sessao_aberta_staff(db, sub_base=sub_base, motoboy_id=motoboy_id))
+
+
+@router.get("/sessao-aberta/{motoboy_id}", response_model=SessaoAbertaOut)
+def recuperar_sessao_aberta(
+    motoboy_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _sessao_aberta_out(db, current_user, motoboy_id)
+
+
+@router_sessoes.get("/aberta", response_model=SessaoAbertaOut)
+def recuperar_sessao_aberta_por_query(
+    motoboy_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _sessao_aberta_out(db, current_user, motoboy_id)
+
+
+@router.get("/sessoes/{sessao_id}", response_model=ConferenciaDetalheOut)
+def detalhe_conferencia_sessao(
+    sessao_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_staff(current_user)
+    sub_base = (current_user.sub_base or "").strip()
+    _require_flag(db, current_user, sub_base)
+    sessao = carregar_sessao_no_escopo(db, sessao_id=sessao_id, sub_base=sub_base)
+    row = db.scalar(
+        select(ConferenciaSaida).where(
+            ConferenciaSaida.sessao_id == sessao.id,
+            ConferenciaSaida.sub_base == sub_base,
+        )
+    )
+    if row is None:
+        raise HTTPException(404, "Conferência da sessão não encontrada.")
+    return _detalhe_sessao_out(db, sessao=sessao, row=row)
+
+
+@router.post("/sessoes/{sessao_id}/conferir", response_model=ConferenciaDetalheOut)
+def conferir_sessao(
+    sessao_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_staff(current_user)
+    sub_base = (current_user.sub_base or "").strip()
+    _require_flag(db, current_user, sub_base)
+    sessao = carregar_sessao_no_escopo(db, sessao_id=sessao_id, sub_base=sub_base)
+    db.scalar(_travar(select(SaidaSessao).where(SaidaSessao.id == sessao.id), db))
+    row = db.scalar(
+        _travar(
+            select(ConferenciaSaida).where(
+                ConferenciaSaida.sessao_id == sessao.id,
+                ConferenciaSaida.sub_base == sub_base,
+            ),
+            db,
+        )
+    )
+    if row is None:
+        raise HTTPException(404, "Conferência da sessão não encontrada.")
+    now = datetime.utcnow()
+    saidas = _saidas_operacionais_sessao(db, sessao)
+    evento = "saida_reconferida" if row.status == STATUS_RECONFERIR else "saida_conferida"
+    for saida in saidas:
+        db.add(
+            SaidaHistorico(
+                id_saida=saida.id_saida,
+                evento=evento,
+                status_anterior=saida.status,
+                status_novo=saida.status,
+                motoboy_id_anterior=saida.motoboy_id,
+                motoboy_id_novo=saida.motoboy_id,
+                user_id=getattr(current_user, "id", None),
+                payload=json.dumps({"sessao_id": sessao_id}),
+            )
+        )
+    row.status = STATUS_CONFERIDA
+    row.conferido_em = now
+    row.conferido_por = getattr(current_user, "id", None)
+    db.commit()
+    db.refresh(row)
+    return _detalhe_sessao_out(db, sessao=sessao, row=row)
 
 
 @router.get("", response_model=ConferenciaListOut)
@@ -293,7 +522,25 @@ def listar_conferencias(
     chaves = [(int(r.motoboy_id), r.data_ref) for r in rows]
     qtd_map: dict = {}
     novos_map: dict = {}
+    qtd_sessao_map: dict[int, int] = {}
     if rows:
+        sessao_ids = [int(r.sessao_id) for r in rows if r.sessao_id is not None]
+        if sessao_ids:
+            qtd_sessao_map = {
+                int(sessao_id): int(total)
+                for sessao_id, total in db.execute(
+                    select(SaidaSessaoItem.sessao_id, func.count(Saida.id_saida))
+                    .join(SaidaSessao, SaidaSessao.id == SaidaSessaoItem.sessao_id)
+                    .join(Saida, Saida.id_saida == SaidaSessaoItem.id_saida)
+                    .where(
+                        SaidaSessaoItem.sessao_id.in_(sessao_ids),
+                        SaidaSessaoItem.ativo_operacional.is_(True),
+                        Saida.sub_base == SaidaSessao.sub_base,
+                        Saida.motoboy_id == SaidaSessao.motoboy_id,
+                    )
+                    .group_by(SaidaSessaoItem.sessao_id)
+                ).all()
+            }
         if status == STATUS_RECONFERIR:
             qtd_map, novos_map = contar_totais_e_novos_por_motoboy_dia(
                 db, sub_base=sub_base, chaves=chaves
@@ -306,11 +553,16 @@ def listar_conferencias(
     items = [
         ConferenciaItemOut(
             id=int(r.id),
+            sessao_id=int(r.sessao_id) if r.sessao_id is not None else None,
             motoboy_id=int(r.motoboy_id),
             motoboy_nome=nomes.get(int(r.motoboy_id), f"Motoboy {r.motoboy_id}"),
             data_ref=r.data_ref,
             status=r.status,
-            qtd_no_momento=qtd_map.get((int(r.motoboy_id), r.data_ref), 0),
+            qtd_no_momento=(
+                qtd_sessao_map.get(int(r.sessao_id), 0)
+                if r.sessao_id is not None
+                else qtd_map.get((int(r.motoboy_id), r.data_ref), 0)
+            ),
             conferido_em=r.conferido_em.isoformat() if r.conferido_em else None,
             ultima_abertura_em=r.ultima_abertura_em.isoformat() if r.ultima_abertura_em else None,
             novos_qtd=(
@@ -343,6 +595,7 @@ def detalhe_conferencia(
             ConferenciaSaida.sub_base == sub_base,
             ConferenciaSaida.motoboy_id == motoboy_id,
             ConferenciaSaida.data_ref == data_ref,
+            ConferenciaSaida.sessao_id.is_(None),
         )
     )
     if row is None:

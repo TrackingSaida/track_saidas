@@ -98,10 +98,14 @@ class Owner(Base):
     entrada_obrigatoria_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
     # Conferência de saída após Começar Entrega
     conferencia_saida_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
+    # Fluxo PRD-012: leitura por sessão e confirmação real pelo motoboy.
+    # A flag entra nos claims e incrementa claims_version quando muda.
+    confirmacao_saida_sessoes_habilitada = Column(Boolean, nullable=False, server_default=text("false"))
     # Com coleta ativa: true = impede saída sem coleta; false = avisa e permite registrar
     bloquear_saida_sem_coleta = Column(Boolean, nullable=False, server_default=text("false"))
     # Defaults Motoboy (Políticas gerais) — novos cadastros
     default_pode_realizar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
+    default_pode_realizar_entrada = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_ler_saida = Column(Boolean, nullable=False, server_default=text("true"))
     default_pode_digitar_codigo_manual = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_lancar_avulso = Column(Boolean, nullable=False, server_default=text("true"))
@@ -121,6 +125,8 @@ class Owner(Base):
     pix_receber = Column(Text, nullable=True)
     # cpf | cnpj | telefone | email | aleatoria. Nulo em chave antiga, sem tipo.
     pix_receber_tipo = Column(Text, nullable=True)
+    # n = vários coletores sem restrição; um = um por vez (409 + Ajudar)
+    coleta_participantes_modo = Column(Text, nullable=False, server_default=text("'n'"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -187,6 +193,8 @@ class Motoboy(Base):
     # Permissão canônica para participar de coleta por leitura e/ou manual.
     # pode_ler_coleta é mantido por compatibilidade com clientes antigos.
     pode_realizar_coleta = Column(Boolean, default=False, nullable=False, server_default=text("false"))
+    # Registrar entrada no app; só vale com owner.entrada_obrigatoria_habilitada
+    pode_realizar_entrada = Column(Boolean, default=False, nullable=False, server_default=text("false"))
     pode_ler_saida = Column(Boolean, default=True, nullable=False)
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
     pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
@@ -1214,15 +1222,89 @@ class SaidaHistorico(Base):
 
 
 # ==========================
+# Tabelas: saida_sessoes / saida_sessao_itens
+# ==========================
+class SaidaSessao(Base):
+    __tablename__ = "saida_sessoes"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="SET NULL"), nullable=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
+    data_ref = Column(Date, nullable=False)
+    estado = Column(Text, nullable=False, server_default=text("'ABERTA'"))
+    versao = Column(Integer, nullable=False, server_default=text("1"))
+    aberta_por_user_id = Column(BigInteger, nullable=True)
+    finalizada_por_user_id = Column(BigInteger, nullable=True)
+    cancelada_por_user_id = Column(BigInteger, nullable=True)
+    confirmada_por_user_id = Column(BigInteger, nullable=True)
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    atualizada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), onupdate=func.now())
+    finalizada_em = Column(DateTime(timezone=False), nullable=True)
+    cancelada_em = Column(DateTime(timezone=False), nullable=True)
+    confirmada_em = Column(DateTime(timezone=False), nullable=True)
+    motivo_cancelamento = Column(Text, nullable=True)
+    total_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+    total_shopee_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+    total_ml_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+    total_avulso_snapshot = Column(Integer, nullable=False, server_default=text("0"))
+
+    itens = relationship("SaidaSessaoItem", back_populates="sessao", cascade="all, delete-orphan")
+
+
+class SaidaSessaoItem(Base):
+    __tablename__ = "saida_sessao_itens"
+    __table_args__ = (
+        UniqueConstraint("sessao_id", "id_saida", name="uq_saida_sessao_item_sessao_saida"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sessao_id = Column(BigInteger, ForeignKey("saida_sessoes.id", ondelete="CASCADE"), nullable=False)
+    # Sem FK destrutiva: o snapshot deve sobreviver à exclusão operacional da saída.
+    id_saida = Column(BigInteger, nullable=False)
+    codigo_snapshot = Column(Text, nullable=True)
+    servico_snapshot = Column(Text, nullable=True)
+    status_snapshot = Column(Text, nullable=True)
+    incluido_por_user_id = Column(BigInteger, nullable=True)
+    incluido_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    ativo_operacional = Column(Boolean, nullable=False, server_default=text("true"))
+    removido_em = Column(DateTime(timezone=False), nullable=True)
+    removido_por_user_id = Column(BigInteger, nullable=True)
+    motivo_remocao = Column(Text, nullable=True)
+
+    sessao = relationship("SaidaSessao", back_populates="itens")
+
+
+class SaidaConfirmacaoIdempotencia(Base):
+    """Resultado persistido da confirmação do motoboy. A chave é da tentativa, não do histórico."""
+
+    __tablename__ = "saida_confirmacao_idempotencia"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base",
+            "motoboy_id",
+            "chave",
+            name="uq_saida_confirmacao_idem_sub_motoboy_chave",
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, nullable=False)
+    chave = Column(Text, nullable=False)
+    resultado_json = Column(Text, nullable=False)
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+# ==========================
 # Tabela: conferencia_saida
 # ==========================
 class ConferenciaSaida(Base):
     __tablename__ = "conferencia_saida"
-    __table_args__ = (
-        UniqueConstraint("sub_base", "motoboy_id", "data_ref", name="uq_conferencia_saida_sub_motoboy_dia"),
-    )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sessao_id = Column(BigInteger, ForeignKey("saida_sessoes.id", ondelete="CASCADE"), nullable=True)
     sub_base = Column(Text, nullable=False)
     owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="SET NULL"), nullable=True)
     motoboy_id = Column(BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False)
@@ -1319,6 +1401,7 @@ class RotasMotoboy(Base):
     duracao_total_s = Column(Integer, nullable=True)
     optimization_input_hash = Column(Text, nullable=True)
     optimized_at = Column(DateTime(timezone=True), nullable=True)
+    motivo_encerramento = Column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<RotasMotoboy id={self.id} motoboy_id={self.motoboy_id} status={self.status!r}>"

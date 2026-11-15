@@ -20,9 +20,9 @@ from saida_operacional_pure import (
     SaidaOperacionalContext,
     deve_excluir_saida_operacional,
     eh_reatribuicao_real,
+    evento_tecnico_nao_substitui_acao,
     normalizar_evento_atribuicao,
     rotulo_acao_evento,
-    timestamp_operacional_saida,
 )
 
 # SQLAlchemy / models são importados sob demanda nas rotinas de banco
@@ -83,10 +83,21 @@ def _parse_multi_values(values: Optional[List[str]]) -> List[str]:
 def _status_group_aliases(token: str) -> List[str]:
     key = _norm_text(token).replace("_", " ").replace("-", " ")
     key = " ".join(key.split())
+    # Situação de consulta "Saiu para entrega" inclui SAIU e EM_ROTA (tracking/rota iniciada).
+    _saiu_consulta = [
+        "saiu",
+        "saiu para entrega",
+        "saiu pra entrega",
+        "saiu_pra_entrega",
+        "saiu_para_entrega",
+        "em rota",
+        "em_rota",
+    ]
     groups = {
-        "saiu": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
-        "saiu para entrega": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
-        "em rota": ["em rota", "em_rota"],
+        "saiu": list(_saiu_consulta),
+        "saiu para entrega": list(_saiu_consulta),
+        # Legado: filtro "Em rota" como Situação passa a equivaler à mesma consulta unificada.
+        "em rota": list(_saiu_consulta),
         "entregue": ["entregue"],
         "ausente": ["ausente"],
         "coletado": ["coletado"],
@@ -195,6 +206,8 @@ def build_operacional_ctx_from_historico_rows(
                 "teve_reatribuicao": False,
             },
         )
+        if evento_tecnico_nao_substitui_acao(evento):
+            continue
         estado["ultimo"] = h
         if evento in EVENTOS_INVALIDANTES:
             estado["op"] = None
@@ -297,7 +310,13 @@ def filtrar_ordenar_agregar_listagem(
         ctx = ctx_map.get(int(row.id_saida))
         if deve_excluir_saida_operacional(ctx):
             continue
-        ts = timestamp_operacional_saida(ctx, row.timestamp)
+        # Dia da consulta segue a última ação exibida (entrega à 00:00), não a leitura.
+        if ctx and ctx.ultimo_evento_ts:
+            ts = ctx.ultimo_evento_ts
+        elif ctx and ctx.operacional_ts:
+            ts = ctx.operacional_ts
+        else:
+            ts = row.timestamp
         if ts is None:
             continue
         dia = ts.date()
@@ -1027,6 +1046,29 @@ def listar_saidas_paginado(
         datetime.combine(ate + timedelta(days=1), datetime.min.time()) if ate is not None else None
     )
 
+    def _sql_acao_no_periodo() -> str:
+        """Entrega ou ausência à meia-noite entra no dia da ação, não no da leitura."""
+        if de is not None and ate is not None:
+            janela_h = "h_ui.timestamp >= :dt_inicio AND h_ui.timestamp < :dt_fim_exclusivo"
+            janela_e = "s.data_hora_entrega >= :dt_inicio AND s.data_hora_entrega < :dt_fim_exclusivo"
+        elif de is not None:
+            janela_h = "h_ui.timestamp >= :dt_inicio"
+            janela_e = "s.data_hora_entrega >= :dt_inicio"
+        else:
+            janela_h = "h_ui.timestamp < :dt_fim_exclusivo"
+            janela_e = "s.data_hora_entrega < :dt_fim_exclusivo"
+        return f"""
+              OR (
+                s.data_hora_entrega IS NOT NULL
+                AND {janela_e}
+              )
+              OR EXISTS (
+                SELECT 1 FROM saida_historico h_ui
+                WHERE h_ui.id_saida = s.id_saida
+                  AND h_ui.evento IN :eventos_ui
+                  AND {janela_h}
+              )"""
+
     where_extra: List[str] = []
     params: Dict[str, Any] = {
         "sub_base": sub_base,
@@ -1037,13 +1079,14 @@ def listar_saidas_paginado(
         "ate": ate,
         "dt_inicio": dt_inicio,
         "dt_fim_exclusivo": dt_fim_exclusivo,
+        "eventos_ui": sorted(EVENTOS_UI_ULTIMA_ACAO),
         "limit": limit,
         "offset": offset,
     }
 
     if de is not None and ate is not None:
         where_extra.append(
-            """(
+            f"""(
               (s.timestamp >= :dt_inicio AND s.timestamp < :dt_fim_exclusivo)
               OR EXISTS (
                 SELECT 1 FROM saida_historico h0
@@ -1052,11 +1095,12 @@ def listar_saidas_paginado(
                   AND h0.timestamp >= :dt_inicio
                   AND h0.timestamp < :dt_fim_exclusivo
               )
+              {_sql_acao_no_periodo()}
             )"""
         )
     elif de is not None:
         where_extra.append(
-            """(
+            f"""(
               s.timestamp >= :dt_inicio
               OR EXISTS (
                 SELECT 1 FROM saida_historico h0
@@ -1064,11 +1108,12 @@ def listar_saidas_paginado(
                   AND h0.evento IN :eventos_atr
                   AND h0.timestamp >= :dt_inicio
               )
+              {_sql_acao_no_periodo()}
             )"""
         )
     elif ate is not None:
         where_extra.append(
-            """(
+            f"""(
               s.timestamp < :dt_fim_exclusivo
               OR EXISTS (
                 SELECT 1 FROM saida_historico h0
@@ -1076,6 +1121,7 @@ def listar_saidas_paginado(
                   AND h0.evento IN :eventos_atr
                   AND h0.timestamp < :dt_fim_exclusivo
               )
+              {_sql_acao_no_periodo()}
             )"""
         )
 
@@ -1197,12 +1243,14 @@ def listar_saidas_paginado(
     # Evita bind de data NULL (pode zerar resultado em alguns drivers/planos).
     de_sql = ""
     ate_sql = ""
+    # Dia da última ação (entrega à 00:00), não o dia da leitura.
+    dia_acao = "COALESCE(ops.ult_ts, ops.operacional_ts, ops.timestamp)"
     if de is not None:
-        de_sql = " AND (ops.operacional_ts)::date >= :de "
+        de_sql = f" AND ({dia_acao})::date >= :de "
     else:
         params.pop("de", None)
     if ate is not None:
-        ate_sql = " AND (ops.operacional_ts)::date <= :ate "
+        ate_sql = f" AND ({dia_acao})::date <= :ate "
     else:
         params.pop("ate", None)
     if de is None:
@@ -1340,11 +1388,16 @@ def listar_saidas_paginado(
     ORDER BY COALESCE(p.ult_ts, p.operacional_ts, p.timestamp) DESC NULLS LAST, p.id_saida DESC NULLS LAST
     """
 
-    stmt = text(sql).bindparams(
+    bind_args = [
         bindparam("eventos_atr", expanding=True),
         bindparam("eventos_inv", expanding=True),
         bindparam("eventos_filtro", expanding=True),
-    )
+    ]
+    if de is not None or ate is not None:
+        bind_args.append(bindparam("eventos_ui", expanding=True))
+    else:
+        params.pop("eventos_ui", None)
+    stmt = text(sql).bindparams(*bind_args)
     if acao_eventos:
         stmt = stmt.bindparams(bindparam("acao_eventos", expanding=True))
 

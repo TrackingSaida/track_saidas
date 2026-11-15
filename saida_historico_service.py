@@ -11,7 +11,12 @@ from sqlalchemy.orm import Session
 
 from baixa_plataforma_pure import rotulo_evento_payload
 from models import SaidaHistorico, User
-from saida_operacional_utils import rotulo_acao_evento
+from saida_operacional_pure import (
+    FALLBACK_ACAO_HISTORICO_ANTERIOR,
+    evento_tecnico_nao_substitui_acao,
+    rotulo_acao_evento,
+    rotulo_situacao,
+)
 
 
 class SaidaHistoricoItemOut(BaseModel):
@@ -28,6 +33,8 @@ class SaidaHistoricoItemOut(BaseModel):
     motoboy_id_anterior: Optional[int] = None
     motoboy_id_novo: Optional[int] = None
     acao_label: Optional[str] = None
+    situacao: Optional[str] = None
+    situacao_label: Optional[str] = None
     motivo_ocorrencia: Optional[str] = None
     observacao_ocorrencia: Optional[str] = None
     tentativa: Optional[int] = None
@@ -123,6 +130,12 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
             base_nome = str(data.get("sub_base_nome") or "").strip()
             acao_label = f"Devolvido à {base_nome}" if base_nome else "Devolvido à base"
         acao_label = rotulo_evento_payload(evento_norm, data) or acao_label
+        if evento_tecnico_nao_substitui_acao(evento_norm):
+            acao_label = acao_label or "Sincronização registrada"
+        elif not acao_label:
+            acao_label = FALLBACK_ACAO_HISTORICO_ANTERIOR
+        situacao = h.status_novo or None
+        situacao_label = rotulo_situacao(situacao) if situacao else None
         usuario_nome = format_person_full_name(
             nome, sobrenome, username=username, fallback=username or ""
         ) or None
@@ -139,6 +152,8 @@ def listar_historico_saida(db: Session, id_saida: int) -> List[SaidaHistoricoIte
                 motoboy_id_anterior=h.motoboy_id_anterior,
                 motoboy_id_novo=h.motoboy_id_novo,
                 acao_label=acao_label,
+                situacao=situacao,
+                situacao_label=situacao_label,
                 motivo_ocorrencia=extra["motivo_ocorrencia"],
                 observacao_ocorrencia=extra["observacao_ocorrencia"],
                 tentativa=extra["tentativa"],
