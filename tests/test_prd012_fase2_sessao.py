@@ -47,6 +47,9 @@ def test_rotulos_e_aguardando_nao_contam_como_saiu():
     assert rotulo_acao_evento("saida_confirmada") == "Confirmou início da entrega"
     assert rotulo_acao_evento("nova_saida_mesmo_entregador") == "Pacote incluído em novo lote de saída"
     assert rotulo_situacao("AGUARDANDO_CONFIRMACAO_SAIDA") == "Aguardando confirmação de saída"
+    assert rotulo_situacao("SAIU_PARA_ENTREGA") == "Saiu para entrega"
+    assert rotulo_situacao("EM_ROTA") == "Saiu para entrega"
+    assert rotulo_acao_evento("em_rota") == "Iniciou rota"
     assert status_aguardando_confirmacao_saida("AGUARDANDO_CONFIRMACAO_SAIDA")
     assert conta_como_saiu_para_entrega("AGUARDANDO_CONFIRMACAO_SAIDA") is False
     assert conta_como_saiu_para_entrega("SAIU_PARA_ENTREGA") is True

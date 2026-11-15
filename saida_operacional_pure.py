@@ -130,7 +130,8 @@ ROTULOS_SITUACAO = {
     "AGUARDANDO_CONFIRMACAO_SAIDA": "Aguardando confirmação de saída",
     "SAIU_PARA_ENTREGA": "Saiu para entrega",
     "SAIU": "Saiu para entrega",
-    "EM_ROTA": "Em rota",
+    # Consulta: Situação unificada. Código técnico EM_ROTA permanece no banco (rota/tracking).
+    "EM_ROTA": "Saiu para entrega",
     "ENTREGUE": "Entregue",
     "AUSENTE": "Ausente",
     "CANCELADO": "Cancelado",
