@@ -215,15 +215,12 @@ def _build_watermark_image_bytes(*, image_bytes: bytes, codigo: str) -> bytes:
 
 
 def _status_amigavel(status: Optional[str]) -> str:
-    norm = (status or "").strip().upper().replace(" ", "_")
-    mapping = {
-        "ENTREGUE": "Entregue",
-        "AUSENTE": "Ausente",
-        "EM_ROTA": "Em rota",
-        "SAIU_PARA_ENTREGA": "Saiu para entrega",
-        "CANCELADO": "Cancelado",
-    }
-    return mapping.get(norm, (status or "—").strip() or "—")
+    from saida_operacional_pure import rotulo_situacao
+
+    raw = (status or "").strip()
+    if not raw:
+        return "—"
+    return rotulo_situacao(raw)
 
 
 def _format_dt_br(value: Optional[datetime], *, assume_utc: bool = False) -> str:

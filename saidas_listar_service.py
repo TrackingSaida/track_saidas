@@ -83,10 +83,21 @@ def _parse_multi_values(values: Optional[List[str]]) -> List[str]:
 def _status_group_aliases(token: str) -> List[str]:
     key = _norm_text(token).replace("_", " ").replace("-", " ")
     key = " ".join(key.split())
+    # Situação de consulta "Saiu para entrega" inclui SAIU e EM_ROTA (tracking/rota iniciada).
+    _saiu_consulta = [
+        "saiu",
+        "saiu para entrega",
+        "saiu pra entrega",
+        "saiu_pra_entrega",
+        "saiu_para_entrega",
+        "em rota",
+        "em_rota",
+    ]
     groups = {
-        "saiu": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
-        "saiu para entrega": ["saiu", "saiu para entrega", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega"],
-        "em rota": ["em rota", "em_rota"],
+        "saiu": list(_saiu_consulta),
+        "saiu para entrega": list(_saiu_consulta),
+        # Legado: filtro "Em rota" como Situação passa a equivaler à mesma consulta unificada.
+        "em rota": list(_saiu_consulta),
         "entregue": ["entregue"],
         "ausente": ["ausente"],
         "coletado": ["coletado"],

@@ -299,6 +299,16 @@ def test_status_group_alias_ainda_na_base_inclui_coletado():
     assert _status_group_aliases("ainda na base") == unificado
 
 
+def test_status_group_alias_saiu_para_entrega_inclui_em_rota():
+    """Consulta unificada: Situação Saiu para entrega inclui EM_ROTA."""
+    saiu = _status_group_aliases("saiu para entrega")
+    assert "em_rota" in saiu or "em rota" in saiu
+    assert "saiu" in saiu or "saiu_para_entrega" in saiu
+    legado = _status_group_aliases("em_rota")
+    assert set(legado) == set(saiu)
+    assert set(_status_group_aliases("saiu")) == set(saiu)
+
+
 def test_localizar_avulso_variants_cep_parcial_e_completo():
     from saidas_listar_service import _localizar_avulso_variants
 
