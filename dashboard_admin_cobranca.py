@@ -30,6 +30,7 @@ STATUS_SAIDAS_COBRANCA = (
     "em_rota",
     "entregue",
     "ausente",
+    "enviado_para_base",  # PRD-011: repasse a base parceira
 )
 STATUS_CANCELADOS = ("cancelado", "cancelada")
 

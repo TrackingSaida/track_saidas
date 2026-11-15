@@ -15,6 +15,7 @@ from openpyxl.styles import Font
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from base_papel_service import papel_default_importacao
 from models import BasePreco, User
 
 MAX_LINHAS = 200
@@ -439,6 +440,7 @@ def confirmar_importacao(
                     }
                 )
             else:
+                papel_import = papel_default_importacao(db, sub_base)
                 obj = BasePreco(
                     base=linha_ok.base,
                     sub_base=sub_base,
@@ -449,6 +451,7 @@ def confirmar_importacao(
                     ativo=True,
                     dias_coleta=[1, 2, 3, 4, 5, 6],
                     agenda_coleta_confirmada=False,
+                    papel=papel_import,
                 )
                 db.add(obj)
                 db.flush()

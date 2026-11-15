@@ -24,6 +24,9 @@ from owner_cobranca_engine import (
     DECISAO_TIPOS,
     ESCOPO_CICLO,
     ESCOPO_PERIODO,
+    ESCOPO_PRECO_BASES,
+    ESCOPO_PRECO_SELLERS,
+    ESCOPOS_PRECO,
     MODELOS,
     NIVEL_ATENCAO,
     NIVEL_BLOQUEANTE,
@@ -39,6 +42,8 @@ from owner_cobranca_engine import (
     Remocao,
     apurar,
     calcular_ajustes,
+    chave_base,
+    modo_dual,
     normalizar_codigo,
     periodo_fechavel,
     periodos_sobrepostos,
@@ -46,7 +51,14 @@ from owner_cobranca_engine import (
     sugerir_modelo,
     valor_ajuste_assinado,
 )
+from owner_cobranca_faturamento_pure import (
+    calcular_data_faturamento,
+    estado_faturamento,
+    normalizar_dias_faturamento,
+    rotulo_faturar_em,
+)
 from models import (
+    BasePreco,
     BaseSellerDados,
     Owner,
     OwnerApuracao,
@@ -113,19 +125,47 @@ def obter_config(db: Session, owner: Owner) -> OwnerConfiguracaoCobranca:
     )
 
 
-def listar_precos(db: Session, owner_id: int) -> List[OwnerPrecoVigencia]:
-    return list(
-        db.scalars(
-            select(OwnerPrecoVigencia)
-            .where(OwnerPrecoVigencia.owner_id == owner_id)
-            .order_by(OwnerPrecoVigencia.inicio.desc())
-        ).all()
-    )
+def _validar_escopo_preco(escopo: Optional[str]) -> str:
+    esc = (escopo or ESCOPO_PRECO_BASES).strip().lower()
+    if esc not in ESCOPOS_PRECO:
+        raise HTTPException(422, "Escopo de preço inválido. Use bases ou sellers.")
+    return esc
 
 
-def preco_vigente(precos: Sequence[OwnerPrecoVigencia], em: date) -> Optional[OwnerPrecoVigencia]:
-    candidatos = [p for p in precos if p.inicio <= em and (p.fim is None or p.fim >= em)]
+def listar_precos(db: Session, owner_id: int, escopo: Optional[str] = None) -> List[OwnerPrecoVigencia]:
+    """Vigências do owner. Sem `escopo`, devolve os dois (cada linha tem o seu `escopo`)."""
+    stmt = select(OwnerPrecoVigencia).where(OwnerPrecoVigencia.owner_id == owner_id)
+    if escopo is not None:
+        stmt = stmt.where(OwnerPrecoVigencia.escopo == _validar_escopo_preco(escopo))
+    return list(db.scalars(stmt.order_by(OwnerPrecoVigencia.inicio.desc())).all())
+
+
+def preco_vigente(
+    precos: Sequence[OwnerPrecoVigencia], em: date, escopo: str = ESCOPO_PRECO_BASES
+) -> Optional[OwnerPrecoVigencia]:
+    """Preço vigente em `em`, só do escopo pedido (bases por padrão, como antes do PRD-011)."""
+    candidatos = [
+        p
+        for p in precos
+        if (getattr(p, "escopo", None) or ESCOPO_PRECO_BASES) == escopo
+        and p.inicio <= em
+        and (p.fim is None or p.fim >= em)
+    ]
     return max(candidatos, key=lambda p: p.inicio) if candidatos else None
+
+
+def carregar_papeis_clientes(db: Session, sub_base: str) -> Dict[str, Optional[str]]:
+    """Papel de cada cliente da sub_base, por nome normalizado (casa com `item.base`)."""
+    rows = db.execute(
+        select(BasePreco.base, BasePreco.papel).where(BasePreco.sub_base == sub_base)
+    ).all()
+    return {chave_base(nome): papel for nome, papel in rows if chave_base(nome)}
+
+
+def operacao_dual(db: Session, sub_base: str) -> Tuple[bool, Dict[str, Optional[str]]]:
+    """Dois preços só com clientes Seller e Base parceira na mesma sub_base."""
+    papeis = carregar_papeis_clientes(db, sub_base)
+    return modo_dual(papeis.values()), papeis
 
 
 def salvar_config(db: Session, owner: Owner, user: User, dados: Dict[str, Any]) -> OwnerConfiguracaoCobranca:
@@ -171,6 +211,11 @@ def salvar_config(db: Session, owner: Owner, user: User, dados: Dict[str, Any]) 
         if campo in dados:
             valor = dados.get(campo)
             setattr(cfg, campo, (str(valor).strip() or None) if valor is not None else None)
+    if "dias_faturamento" in dados:
+        try:
+            cfg.dias_faturamento = normalizar_dias_faturamento(dados.get("dias_faturamento"))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     if dados.get("confirmar"):
         cfg.status = "confirmado"
         cfg.confirmado_por = user.id
@@ -183,8 +228,16 @@ def salvar_config(db: Session, owner: Owner, user: User, dados: Dict[str, Any]) 
 
 
 def adicionar_preco(
-    db: Session, owner: Owner, user: User, *, valor: Decimal, inicio: date, motivo: Optional[str]
+    db: Session,
+    owner: Owner,
+    user: User,
+    *,
+    valor: Decimal,
+    inicio: date,
+    motivo: Optional[str],
+    escopo: str = ESCOPO_PRECO_BASES,
 ) -> OwnerPrecoVigencia:
+    escopo = _validar_escopo_preco(escopo)
     if valor is None or Decimal(str(valor)) < 0:
         raise HTTPException(422, "Informe um preço maior ou igual a zero.")
     fechado_depois = db.scalar(
@@ -198,15 +251,16 @@ def adicionar_preco(
         raise HTTPException(
             409, "Já existe período fechado a partir desta data. O preço novo deve começar depois dele."
         )
-    precos = listar_precos(db, owner.id_owner)
+    precos = listar_precos(db, owner.id_owner, escopo)
     if any(p.inicio == inicio for p in precos):
         raise HTTPException(409, "Já existe um preço com início nesta data.")
-    anterior = preco_vigente(precos, inicio - timedelta(days=1))
+    anterior = preco_vigente(precos, inicio - timedelta(days=1), escopo)
     if anterior is not None and (anterior.fim is None or anterior.fim >= inicio):
         anterior.fim = inicio - timedelta(days=1)
     posterior = min((p for p in precos if p.inicio > inicio), key=lambda p: p.inicio, default=None)
     novo = OwnerPrecoVigencia(
         owner_id=owner.id_owner,
+        escopo=escopo,
         valor=Decimal(str(valor)),
         inicio=inicio,
         fim=(posterior.inicio - timedelta(days=1)) if posterior else None,
@@ -512,10 +566,39 @@ class ApuracaoOwner:
     divergencias: List[Divergencia] = field(default_factory=list)
     fechavel: bool = False
     motivo_bloqueio_fechar: Optional[str] = None
+    # PRD-011: preço de Sellers vigente e modo de dois preços.
+    preco_sellers: Optional[OwnerPrecoVigencia] = None
+    dual: bool = False
 
     @property
     def bloqueantes(self) -> List[Divergencia]:
         return [d for d in self.divergencias if d.nivel == NIVEL_BLOQUEANTE]
+
+    @property
+    def data_faturamento(self) -> Optional[date]:
+        """Congelada no fechamento; na prévia, fim do período + N dias da configuração."""
+        if self.fechamento is not None and self.fechamento.data_faturamento is not None:
+            return self.fechamento.data_faturamento
+        return calcular_data_faturamento(self.periodo_fim, self.config.dias_faturamento)
+
+    def faturar_em(self, hoje: Optional[date] = None) -> Dict[str, Any]:
+        """Data, prazo e estado da lista: agendado | faturar_hoje | atrasado | gerado | sem_prazo."""
+        hoje = hoje or date.today()
+        data = self.data_faturamento
+        dias = (
+            None
+            if data is None
+            else (data - self.periodo_fim).days
+            if self.fechamento is not None
+            else self.config.dias_faturamento
+        )
+        estado = estado_faturamento(data, hoje, gerada=self.fechamento is not None)
+        return {
+            "data": data,
+            "dias": dias,
+            "estado": estado,
+            "rotulo": rotulo_faturar_em(data, dias),
+        }
 
     @property
     def pode_conferir(self) -> bool:
@@ -526,9 +609,19 @@ class ApuracaoOwner:
         return self.status == "conferido" and not self.bloqueantes and self.motivo_bloqueio_fechar is None
 
     @property
+    def pode_gerar(self) -> bool:
+        """PRD-011: gerar fecha o período sem passo de Conferir. Período aberto ou bloqueio real não gera."""
+        return (
+            self.status in ("em_apuracao", "conferido")
+            and not self.bloqueantes
+            and self.motivo_bloqueio_fechar is None
+        )
+
+    @property
     def totais(self) -> Dict[str, Any]:
         if self.fechamento is not None:
             f = self.fechamento
+            dual = f.preco_sellers is not None
             return {
                 "bruto": int(f.qtd_bruto),
                 "cancelados": int(f.qtd_cancelados),
@@ -538,6 +631,9 @@ class ApuracaoOwner:
                 "valor_ajustes": Decimal(f.valor_ajustes),
                 "valor_total": Decimal(f.valor_total),
                 "preco_unitario": Decimal(f.preco_unitario),
+                "dual": dual,
+                "sellers": _lado_dict(f.qtd_sellers, f.preco_sellers, f.valor_sellers) if dual else None,
+                "bases": _lado_dict(f.qtd_bases, f.preco_bases, f.valor_bases) if dual else None,
             }
         a = self.apuracao
         return {
@@ -549,7 +645,19 @@ class ApuracaoOwner:
             "valor_ajustes": a.valor_ajustes,
             "valor_total": a.valor_total,
             "preco_unitario": a.preco if self.preco is not None else None,
+            "dual": a.dual,
+            "sellers": _lado_dict(a.qtd_sellers, a.preco_sellers, a.valor_sellers) if a.dual else None,
+            "bases": _lado_dict(a.qtd_bases, a.preco, a.valor_bases) if a.dual else None,
         }
+
+
+def _lado_dict(qtd: Any, preco: Any, valor: Any) -> Dict[str, Any]:
+    """Um lado do modo de dois preços: qtd × preço = subtotal (zero continua aparecendo)."""
+    return {
+        "quantidade": int(qtd or 0),
+        "preco_unitario": Decimal(str(preco)) if preco is not None else None,
+        "valor": Decimal(str(valor or 0)),
+    }
 
 
 def _ambos_modos(owner: Owner) -> bool:
@@ -569,7 +677,8 @@ def apurar_owner(
     hoje = hoje or date.today()
     cfg = obter_config(db, owner)
     precos = listar_precos(db, owner.id_owner)
-    preco = preco_vigente(precos, ini)
+    preco = preco_vigente(precos, ini, ESCOPO_PRECO_BASES)
+    preco_sellers = preco_vigente(precos, ini, ESCOPO_PRECO_SELLERS)
 
     if usar_snapshot:
         fech = fechamento_vigente(db, owner.id_owner, ini, fim)
@@ -583,9 +692,12 @@ def apurar_owner(
                 status=fech.status,
                 fechamento=fech,
                 fechavel=True,
+                preco_sellers=preco_sellers,
+                dual=fech.preco_sellers is not None,
             )
 
     sub_base = owner.sub_base
+    dual, papeis_por_base = operacao_dual(db, sub_base)
     eventos = carregar_eventos(db, sub_base, ini, fim)
     manuais = carregar_manuais(db, sub_base, ini, fim)
     remocoes = carregar_remocoes(db, sub_base, ini, fim)
@@ -616,6 +728,9 @@ def apurar_owner(
         codigos_ja_faturados=faturados,
         ajustes=[ajuste_para_engine(a) for a in ajustes],
         lotes_avulso=lotes,
+        dual=dual,
+        preco_sellers=Decimal(preco_sellers.valor) if preco_sellers is not None else None,
+        papeis_por_base=papeis_por_base,
     )
 
     divergencias: List[Divergencia] = []
@@ -630,6 +745,14 @@ def apurar_owner(
     if preco is None:
         divergencias.append(
             Divergencia(NIVEL_BLOQUEANTE, "sem_preco", "Sem preço vigente no início do período.")
+        )
+    if dual and preco_sellers is None:
+        divergencias.append(
+            Divergencia(
+                NIVEL_BLOQUEANTE,
+                "sem_preco_sellers",
+                "Sem preço de Coletas em Sellers vigente no início do período.",
+            )
         )
     for f in fechamentos_sobrepostos(db, owner.id_owner, ini, fim):
         divergencias.append(
@@ -697,6 +820,8 @@ def apurar_owner(
         divergencias=divergencias,
         fechavel=fechavel,
         motivo_bloqueio_fechar=motivo_fechar,
+        preco_sellers=preco_sellers,
+        dual=dual,
     )
 
 
@@ -971,6 +1096,42 @@ def fechar(
     hash_confirmado: str,
     observacao: Optional[str] = None,
 ) -> OwnerFechamento:
+    """Fecha um período já conferido (fluxo anterior ao PRD-011, mantido)."""
+    return _fechar_periodo(
+        db, owner, user, ini, fim, hash_confirmado=hash_confirmado, observacao=observacao, exigir_conferido=True
+    )
+
+
+def gerar(
+    db: Session,
+    owner: Owner,
+    user: User,
+    ini: date,
+    fim: date,
+    *,
+    observacao: Optional[str] = None,
+) -> OwnerFechamento:
+    """PRD-011: gerar cobrança. Fecha o período sem Conferir; o aceite é o próprio gerar.
+
+    Usa o hash da apuração lida dentro da trava do período, então não há janela entre
+    ver os números e fechá-los.
+    """
+    return _fechar_periodo(
+        db, owner, user, ini, fim, hash_confirmado=None, observacao=observacao, exigir_conferido=False
+    )
+
+
+def _fechar_periodo(
+    db: Session,
+    owner: Owner,
+    user: User,
+    ini: date,
+    fim: date,
+    *,
+    hash_confirmado: Optional[str],
+    observacao: Optional[str],
+    exigir_conferido: bool,
+) -> OwnerFechamento:
     _travar_periodo(db, owner.id_owner, ini, fim)
     if fechamento_vigente(db, owner.id_owner, ini, fim) is not None:
         raise HTTPException(409, "Este período já foi fechado.")
@@ -980,10 +1141,11 @@ def fechar(
         raise HTTPException(409, atual.bloqueantes[0].mensagem)
     if atual.motivo_bloqueio_fechar:
         raise HTTPException(409, atual.motivo_bloqueio_fechar)
-    if atual.status != "conferido":
-        raise HTTPException(409, "Confira o período antes de fechar.")
-    if not hash_confirmado or hash_confirmado != ap.hash:
-        raise HTTPException(409, "Os números mudaram desde a conferência. Revise e confira de novo.")
+    if exigir_conferido:
+        if atual.status != "conferido":
+            raise HTTPException(409, "Confira o período antes de fechar.")
+        if not hash_confirmado or hash_confirmado != ap.hash:
+            raise HTTPException(409, "Os números mudaram desde a conferência. Revise e confira de novo.")
 
     cfg = atual.config
     versao_atual = db.scalar(
@@ -1011,12 +1173,22 @@ def fechar(
         valor_ajustes=ap.valor_ajustes,
         valor_total=ap.valor_total,
         hash=ap.hash,
+        data_faturamento=calcular_data_faturamento(fim, cfg.dias_faturamento),
+        qtd_sellers=ap.qtd_sellers if ap.dual else None,
+        preco_sellers=ap.preco_sellers if ap.dual else None,
+        valor_sellers=ap.valor_sellers if ap.dual else None,
+        qtd_bases=ap.qtd_bases if ap.dual else None,
+        preco_bases=ap.preco if ap.dual else None,
+        valor_bases=ap.valor_bases if ap.dual else None,
         owner_snapshot=_owner_snapshot(db, owner, cfg),
         config_snapshot={
             "modelo": cfg.modelo,
             "periodicidade": cfg.periodicidade,
             "status": cfg.status,
             "preco_vigencia_id": atual.preco.id if atual.preco else None,
+            "preco_sellers_vigencia_id": atual.preco_sellers.id if (ap.dual and atual.preco_sellers) else None,
+            "dias_faturamento": cfg.dias_faturamento,
+            "dois_precos": bool(ap.dual),
             "decisoes": [
                 {"id": d.id, "tipo": d.tipo, "id_coleta": d.id_coleta, "servico": d.servico, "motivo": d.motivo}
                 for d in decisoes_ativas(db, owner.id_owner, ini, fim)
@@ -1113,10 +1285,10 @@ def fechar(
         owner_id=owner.id_owner,
         ini=ini,
         fim=fim,
-        acao="fechar",
+        acao="fechar" if exigir_conferido else "gerar",
         user=user,
         fechamento_id=fech.id,
-        status_anterior="conferido",
+        status_anterior=atual.status,
         status_novo="fechado",
         detalhes={"versao": fech.versao, "valor_total": str(fech.valor_total), "hash": fech.hash},
     )

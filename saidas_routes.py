@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from db import get_db
 from db_utils import run_db_query_with_retry
 from auth import get_current_user
-from models import User, Saida, Coleta, Entregador, Owner, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail
+from models import User, Saida, Coleta, Entregador, Owner, OwnerCobrancaItem, Motoboy, MotoboySubBase, SaidaHistorico, SaidaDetail, BasePreco
 from saida_prerequisito import avaliar_prerequisito_saida
 from entrega_audit_log import audit_entrega, norm_client_action_id
 from saida_operacional_utils import (
@@ -194,6 +194,7 @@ class SaidaOut(BaseModel):
     username: Optional[str]
     entregador: Optional[str]
     motoboy_id: Optional[int] = None
+    repasse_base_id: Optional[int] = None
     data_hora_entrega: Optional[datetime] = None
     codigo: Optional[str]
     servico: Optional[str]
@@ -225,6 +226,8 @@ class SaidaUpdate(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
+    # PRD-011: base parceira que entrega o pedido (exclusivo com motoboy_id)
+    repasse_base_id: Optional[int] = None
     status: Optional[str] = None
     codigo: Optional[str] = None
     servico: Optional[str] = None
@@ -241,6 +244,8 @@ class SaidaLerIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None  # Prioridade sobre entregador_id quando preenchido
+    # PRD-011: base parceira que entrega o pedido (exclusivo com motoboy_id)
+    repasse_base_id: Optional[int] = None
     servico: str = Field(min_length=1)
     # Quando True e código não existe: permite registrar com status "não coletado" mesmo com ignorar_coleta=False
     registrar_nao_coletado: bool = False
@@ -264,6 +269,8 @@ class LancarAvulsoIn(BaseModel):
     entregador_id: Optional[int] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
+    # PRD-011: base parceira que entrega o pedido (exclusivo com motoboy_id)
+    repasse_base_id: Optional[int] = None
     # Foto(s) do lançamento (presign pending); obrigatória(s) se avulso_exige_foto.
     foto_object_key: Optional[str] = Field(default=None, max_length=500)
     photo_id: Optional[str] = Field(default=None, max_length=80)
@@ -322,6 +329,8 @@ class SaidaDetalheCompletoOut(BaseModel):
     username: Optional[str] = None
     entregador: Optional[str] = None
     motoboy_id: Optional[int] = None
+    repasse_base_id: Optional[int] = None
+    repasse_base_nome: Optional[str] = None
     data_hora_entrega: Optional[datetime] = None
     ausencias_total: int = 0
     bloqueado_ausencias: bool = False
@@ -371,6 +380,8 @@ STATUS_AUSENTE = "AUSENTE"
 STATUS_CANCELADO = "CANCELADO"
 STATUS_ENCERRADO_SISTEMA = "ENCERRADO_SISTEMA"
 STATUS_NA_BASE = "NA_BASE"
+# PRD-011: saída repassada a uma base parceira (A pagar da base, sem motoboy).
+STATUS_ENVIADO_PARA_BASE = "ENVIADO_PARA_BASE"
 
 
 def normalizar_status_saida(raw: Optional[str]) -> str:
@@ -409,6 +420,8 @@ def normalizar_status_saida(raw: Optional[str]) -> str:
         return STATUS_CANCELADO
     if lower in ("encerrado", "encerrado_sistema", "encerrado pelo sistema", "encerrado_pelo_sistema"):
         return STATUS_ENCERRADO_SISTEMA
+    if lower in ("enviado_para_base", "enviado para a base", "enviado para base"):
+        return STATUS_ENVIADO_PARA_BASE
     return s
 
 
@@ -424,6 +437,7 @@ def _status_ja_em_rota_ou_saida(status_norm: str) -> bool:
         STATUS_SAIU_PARA_ENTREGA,
         STATUS_EM_ROTA,
         STATUS_AGUARDANDO_CONFIRMACAO_SAIDA,
+        STATUS_ENVIADO_PARA_BASE,
     ):
         return True
     return False
@@ -486,6 +500,7 @@ def _validar_alteracao_saida_finalizada(
                     payload.entregador_id is not None,
                     payload.entregador is not None and (payload.entregador or "").strip(),
                     payload.motoboy_id is not None,
+                    payload.repasse_base_id is not None,
                 ]
             )
             if has_other:
@@ -681,6 +696,57 @@ def _resolve_motoboy_for_subbase(db: Session, sub_base: str, motoboy_id: int) ->
     return motoboy
 
 
+def _resolve_base_repasse(db: Session, sub_base: str, repasse_base_id: int) -> BasePreco:
+    """PRD-011: base parceira ativa, com entrega de pedidos ligada, na mesma sub_base."""
+    from base_repasse_pure import validar_destino_repasse
+
+    base = db.get(BasePreco, repasse_base_id)
+    erro = None
+    if base is None or (base.sub_base or "").strip() != (sub_base or "").strip():
+        erro = {"code": "BASE_REPASSE_NAO_ENCONTRADA", "message": "Base não encontrada nesta operação."}
+    else:
+        msg = validar_destino_repasse(
+            papel=getattr(base, "papel", None),
+            entrega_pedidos=bool(getattr(base, "entrega_pedidos", False)),
+            ativo=bool(base.ativo),
+        )
+        if msg:
+            erro = {"code": "BASE_REPASSE_INVALIDA", "message": msg}
+    if erro:
+        raise HTTPException(status_code=422, detail=erro)
+    return base
+
+
+def _exigir_staff_para_repasse(role: Any) -> None:
+    try:
+        role_int = int(role)
+    except (TypeError, ValueError):
+        role_int = -1
+    if role_int == 4:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "REPASSE_SOMENTE_STAFF", "message": "Apenas a operação pode enviar pedidos para uma base."},
+        )
+
+
+def _validar_destino_exclusivo(motoboy_id: Optional[int], repasse_base_id: Optional[int]) -> None:
+    if motoboy_id is not None and repasse_base_id is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "DESTINO_AMBIGUO",
+                "message": "Informe motoboy_id ou repasse_base_id, não os dois.",
+            },
+        )
+
+
+def _nome_base_repasse(db: Session, repasse_base_id: Optional[int]) -> Optional[str]:
+    if repasse_base_id is None:
+        return None
+    base = db.get(BasePreco, int(repasse_base_id))
+    return (base.base or "").strip() if base is not None else None
+
+
 def _get_owned_saida(db: Session, sub_base: str, id_saida: int) -> Saida:
     obj = db.get(Saida, id_saida)
     if not obj or obj.sub_base != sub_base:
@@ -842,6 +908,8 @@ def _nome_executor_atual(db: Session, saida: Saida) -> Optional[str]:
         motoboy = db.get(Motoboy, mid)
         if motoboy:
             return _get_motoboy_nome(db, motoboy)
+    if getattr(saida, "repasse_base_id", None) is not None:
+        return _nome_base_repasse(db, saida.repasse_base_id)
     return getattr(saida, "entregador", None)
 
 
@@ -990,9 +1058,16 @@ def ler_saida(
 
     motoboy_id: Optional[int] = None
     entregador_id: Optional[int] = None
-    entregador_nome: str = ""
+    entregador_nome: Optional[str] = ""
+    repasse_base_id: Optional[int] = None
 
-    if payload.motoboy_id is not None:
+    _validar_destino_exclusivo(payload.motoboy_id, payload.repasse_base_id)
+    if payload.repasse_base_id is not None:
+        _exigir_staff_para_repasse(role)
+        base_repasse = _resolve_base_repasse(db, sub_base, int(payload.repasse_base_id))
+        repasse_base_id = int(base_repasse.id_base)
+        entregador_nome = None
+    elif payload.motoboy_id is not None:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         motoboy_id = motoboy.id_motoboy
         entregador_nome = _get_motoboy_nome(db, motoboy)
@@ -1019,6 +1094,35 @@ def ler_saida(
         if fluxo_sessoes
         else STATUS_SAIU_PARA_ENTREGA
     )
+    # PRD-011: repasse a base parceira usa o próprio status; não passa por sessão de motoboy.
+    if repasse_base_id is not None:
+        status_lido = STATUS_ENVIADO_PARA_BASE
+    else:
+        status_lido = status_saida_lida if motoboy_id else "saiu"
+    evento_lido = (
+        "enviado_para_base"
+        if repasse_base_id is not None
+        else ("leitura_saida" if fluxo_sessoes else "lido")
+    )
+
+    payload_lido = (
+        json.dumps(
+            {"repasse_base_id": repasse_base_id, "base": _nome_base_repasse(db, repasse_base_id)},
+            ensure_ascii=False,
+        )
+        if repasse_base_id is not None
+        else None
+    )
+
+    def _aplicar_destino(row: Saida) -> None:
+        """Base parceira limpa motoboy/entregador; motoboy limpa o repasse."""
+        if repasse_base_id is not None:
+            row.repasse_base_id = repasse_base_id
+            row.motoboy_id = None
+            row.entregador_id = None
+            row.entregador = None
+        else:
+            row.repasse_base_id = None
 
     def _vincular_sessao(row: Saida):
         if not fluxo_sessoes or motoboy_id is None:
@@ -1043,6 +1147,8 @@ def ler_saida(
 
         out.update(
             {
+                "repasse_base_id": getattr(row, "repasse_base_id", None),
+                "repasse_base_nome": _nome_base_repasse(db, getattr(row, "repasse_base_id", None)),
                 "fluxo_confirmacao_ativo": fluxo_sessoes,
                 "situacao": row.status,
                 "situacao_label": rotulo_situacao(row.status),
@@ -1095,15 +1201,16 @@ def ler_saida(
                 db,
                 sub_base=sub_base,
                 codigo=codigo,
-                status_inicial=status_saida_lida if motoboy_id else "saiu",
+                status_inicial=status_lido,
                 username=username,
                 user_id=getattr(current_user, "id", None),
-                evento_historico="leitura_saida" if fluxo_sessoes else "lido",
+                evento_historico=evento_lido,
             )
             if admitida is not None:
                 admitida.entregador = entregador_nome
                 admitida.entregador_id = entregador_id
                 admitida.motoboy_id = motoboy_id
+                _aplicar_destino(admitida)
                 sessao = _vincular_sessao(admitida)
                 db.add(
                     OwnerCobrancaItem(
@@ -1141,8 +1248,8 @@ def ler_saida(
         if gate:
             return JSONResponse(status_code=422, content=gate)
         # status: "saiu" quando sem coleta; "não coletado" quando usuário confirmou registrar mesmo assim
-        status_inicial = "não coletado" if permitir_soft else (
-            status_saida_lida if motoboy_id else "saiu"
+        status_inicial = (
+            "não coletado" if permitir_soft and repasse_base_id is None else status_lido
         )
         store_qr = _should_store_qr_payload_raw(servico, qr_payload_raw)
         try:
@@ -1152,6 +1259,7 @@ def ler_saida(
                 entregador=entregador_nome,
                 entregador_id=entregador_id,
                 motoboy_id=motoboy_id,
+                repasse_base_id=repasse_base_id,
                 codigo=codigo,
                 servico=servico,
                 status=status_inicial,
@@ -1162,7 +1270,8 @@ def ler_saida(
             db.add(
                 SaidaHistorico(
                     id_saida=row.id_saida,
-                    evento="leitura_saida" if fluxo_sessoes else "lido",
+                    evento=evento_lido,
+                    payload=payload_lido,
                     status_novo=status_inicial,
                     user_id=getattr(current_user, "id", None),
                 )
@@ -1211,17 +1320,19 @@ def ler_saida(
             return JSONResponse(status_code=422, content=gate)
         # Sem pré-requisito: promove etiqueta → saiu
         status_anterior = existente.status
-        existente.status = status_saida_lida if motoboy_id else "saiu"
+        existente.status = status_lido
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        _aplicar_destino(existente)
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
-                evento="leitura_saida" if fluxo_sessoes else "lido",
+                evento=evento_lido,
+                payload=payload_lido,
                 status_anterior=status_anterior,
                 status_novo=existente.status,
                 user_id=getattr(current_user, "id", None),
@@ -1271,17 +1382,19 @@ def ler_saida(
             return JSONResponse(status_code=422, content=gate)
         # coletado → UPDATE para saiu / SAIU_PARA_ENTREGA
         status_anterior = existente.status
-        existente.status = status_saida_lida if motoboy_id else "saiu"
+        existente.status = status_lido
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        _aplicar_destino(existente)
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
-                evento="leitura_saida" if fluxo_sessoes else "lido",
+                evento=evento_lido,
+                payload=payload_lido,
                 status_anterior=status_anterior,
                 status_novo=existente.status,
                 user_id=getattr(current_user, "id", None),
@@ -1304,17 +1417,19 @@ def ler_saida(
 
     if status_norm == STATUS_NA_BASE:
         status_anterior = existente.status
-        existente.status = status_saida_lida if motoboy_id else "saiu"
+        existente.status = status_lido
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        _aplicar_destino(existente)
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
-                evento="leitura_saida" if fluxo_sessoes else "lido",
+                evento=evento_lido,
+                payload=payload_lido,
                 status_anterior=status_anterior,
                 status_novo=existente.status,
                 user_id=getattr(current_user, "id", None),
@@ -1383,12 +1498,18 @@ def ler_saida(
 
         # mesmo entregador/motoboy → 200 idempotente (sem 409)
         mesmo_ent = False
-        if motoboy_id is not None:
-            mesmo_ent = existente.motoboy_id == motoboy_id
-        if not mesmo_ent and entregador_id is not None:
-            mesmo_ent = existente.entregador_id == entregador_id
-        if not mesmo_ent:
-            mesmo_ent = _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
+        if repasse_base_id is not None:
+            mesmo_ent = existente.repasse_base_id == repasse_base_id
+        else:
+            if motoboy_id is not None:
+                mesmo_ent = existente.motoboy_id == motoboy_id
+            if not mesmo_ent and entregador_id is not None:
+                mesmo_ent = existente.entregador_id == entregador_id
+            if not mesmo_ent:
+                mesmo_ent = (
+                    existente.repasse_base_id is None
+                    and _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
+                )
         if mesmo_ent:
             if _status_esta_finalizado(status_norm):
                 registrar_log_leitura_critico(
@@ -1411,7 +1532,7 @@ def ler_saida(
                         "id_saida": existente.id_saida,
                         "status_atual": status_norm,
                         "message": f"Pedido com status finalizado: {status_norm}.",
-                        "entregador_atual": existente.entregador,
+                        "entregador_atual": _nome_executor_atual(db, existente),
                     },
                 )
             ctx_map = carregar_contexto_operacional(db, [existente.id_saida])
@@ -1501,7 +1622,7 @@ def ler_saida(
             "code": "TROCA_ENTREGADOR",
             "id_saida": existente.id_saida,
             "message": "Código já saiu com outro entregador.",
-            "entregador_atual": existente.entregador,
+            "entregador_atual": _nome_executor_atual(db, existente),
             "username": existente.username,
             "status_atual": status_norm,
         }
@@ -1509,12 +1630,18 @@ def ler_saida(
 
     if status_norm == STATUS_ENTREGUE:
         mesmo_ent = False
-        if motoboy_id is not None:
-            mesmo_ent = existente.motoboy_id == motoboy_id
-        if not mesmo_ent and entregador_id is not None:
-            mesmo_ent = existente.entregador_id == entregador_id
-        if not mesmo_ent:
-            mesmo_ent = _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
+        if repasse_base_id is not None:
+            mesmo_ent = existente.repasse_base_id == repasse_base_id
+        else:
+            if motoboy_id is not None:
+                mesmo_ent = existente.motoboy_id == motoboy_id
+            if not mesmo_ent and entregador_id is not None:
+                mesmo_ent = existente.entregador_id == entregador_id
+            if not mesmo_ent:
+                mesmo_ent = (
+                    existente.repasse_base_id is None
+                    and _normalizar_nome(entregador_nome or "") == _normalizar_nome(existente.entregador or "")
+                )
         if not mesmo_ent:
             registrar_log_leitura_critico(
                 sub_base=sub_base,
@@ -1535,7 +1662,7 @@ def ler_saida(
                     "code": "TROCA_ENTREGADOR",
                     "id_saida": existente.id_saida,
                     "message": "Pedido entregue com outro entregador.",
-                    "entregador_atual": existente.entregador,
+                    "entregador_atual": _nome_executor_atual(db, existente),
                     "username": existente.username,
                     "status_atual": status_norm,
                 },
@@ -1579,7 +1706,7 @@ def ler_saida(
                 "id_saida": existente.id_saida,
                 "status_atual": status_norm,
                 "message": f"Pedido com status finalizado: {status_norm}.",
-                "entregador_atual": existente.entregador,
+                "entregador_atual": _nome_executor_atual(db, existente),
             },
         )
 
@@ -1635,23 +1762,24 @@ def ler_saida(
                 },
             )
         status_anterior = existente.status
-        existente.status = status_saida_lida if motoboy_id else "saiu"
+        existente.status = status_lido
         existente.entregador_id = entregador_id
         existente.entregador = entregador_nome
         if motoboy_id is not None:
             existente.motoboy_id = motoboy_id
+        _aplicar_destino(existente)
         qr_result = apply_qr_payload_if_needed(existente, qr_payload_raw, servico)
         sessao = _vincular_sessao(existente)
         db.add(
             SaidaHistorico(
                 id_saida=existente.id_saida,
-                evento="assumir",
+                evento="enviado_para_base" if repasse_base_id is not None else "assumir",
                 status_anterior=status_anterior,
                 status_novo=existente.status,
                 motoboy_id_anterior=None,
                 motoboy_id_novo=motoboy_id,
                 user_id=getattr(current_user, "id", None),
-                payload="reativado_de_encerrado_sistema",
+                payload=payload_lido or "reativado_de_encerrado_sistema",
             )
         )
         try:
@@ -1828,10 +1956,17 @@ def _lancar_avulso_impl(
 
     motoboy_id: Optional[int] = None
     entregador_id: Optional[int] = None
-    entregador_nome = ""
+    entregador_nome: Optional[str] = ""
+    repasse_base_id: Optional[int] = None
 
     motoboy_row = None
-    if payload.motoboy_id is not None:
+    _validar_destino_exclusivo(payload.motoboy_id, payload.repasse_base_id)
+    if payload.repasse_base_id is not None:
+        _exigir_staff_para_repasse(role)
+        base_repasse = _resolve_base_repasse(db, sub_base, int(payload.repasse_base_id))
+        repasse_base_id = int(base_repasse.id_base)
+        entregador_nome = None
+    elif payload.motoboy_id is not None:
         motoboy_row = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         motoboy_id = motoboy_row.id_motoboy
         entregador_nome = _get_motoboy_nome(db, motoboy_row)
@@ -1945,6 +2080,8 @@ def _lancar_avulso_impl(
     status_inicial = STATUS_SAIU_PARA_ENTREGA if motoboy_id else "saiu"
     if motoboy_id and fluxo_confirmacao_ativo(db, sub_base):
         status_inicial = STATUS_AGUARDANDO_CONFIRMACAO
+    if repasse_base_id is not None:
+        status_inicial = STATUS_ENVIADO_PARA_BASE
     servico = canonicalize_servico("Avulso")
     excepcional = bool(motivo)
 
@@ -1957,6 +2094,7 @@ def _lancar_avulso_impl(
                 entregador=entregador_nome,
                 entregador_id=entregador_id,
                 motoboy_id=motoboy_id,
+                repasse_base_id=repasse_base_id,
                 codigo=codigo,
                 servico=servico,
                 status=status_inicial,
@@ -1987,11 +2125,25 @@ def _lancar_avulso_impl(
                             "codigo": codigo,
                             "motivo_excepcional": motivo or None,
                             "campos": valores_norm,
+                            "repasse_base_id": repasse_base_id,
                         },
                         ensure_ascii=False,
                     ),
                 )
             )
+            if repasse_base_id is not None:
+                db.add(
+                    SaidaHistorico(
+                        id_saida=row.id_saida,
+                        evento="enviado_para_base",
+                        status_novo=status_inicial,
+                        user_id=getattr(current_user, "id", None),
+                        payload=json.dumps(
+                            {"repasse_base_id": repasse_base_id, "base": base_repasse.base},
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
             db.add(
                 OwnerCobrancaItem(
                     sub_base=sub_base,
@@ -2181,6 +2333,7 @@ def _montar_item_listar_saida(
         "entregador": nome_executor or row.entregador,
         "entregador_id": getattr(row, "entregador_id", None),
         "motoboy_id": getattr(row, "motoboy_id", None),
+        "repasse_base_id": getattr(row, "repasse_base_id", None),
         "codigo": row.codigo,
         "codigo_exibicao": row.codigo,
         "servico": row.servico,
@@ -2896,6 +3049,8 @@ def get_saida_detalhe(
         username=obj.username,
         entregador=executor_nome,
         motoboy_id=obj.motoboy_id,
+        repasse_base_id=getattr(obj, "repasse_base_id", None),
+        repasse_base_nome=_nome_base_repasse(db, getattr(obj, "repasse_base_id", None)),
         data_hora_entrega=obj.data_hora_entrega,
         ausencias_total=bloqueio["ausencias_total"],
         bloqueado_ausencias=bloqueio["bloqueado_ausencias"],
@@ -3262,6 +3417,7 @@ def atualizar_saida(
     current_user: User = Depends(get_current_user),
 ):
     sub_base = current_user.sub_base
+    _validar_destino_exclusivo(payload.motoboy_id, payload.repasse_base_id)
     obj = _get_owned_saida(db, sub_base, id_saida)
     status_anterior = normalizar_status_saida(obj.status)
     if payload.reverter_cancelamento:
@@ -3271,6 +3427,7 @@ def atualizar_saida(
         payload = payload.model_copy(update={"status": restaurado})
     _validar_alteracao_saida_finalizada(obj, status_anterior, payload, current_user)
     motoboy_anterior = obj.motoboy_id
+    repasse_anterior = getattr(obj, "repasse_base_id", None)
     entregador_anterior = (obj.entregador or "").strip()
     payload_changed = {
         "status": False,
@@ -3300,6 +3457,11 @@ def atualizar_saida(
             )
             obj.entregador_id = entregador_id
             obj.entregador = entregador_nome
+            if payload.repasse_base_id is None and getattr(obj, "repasse_base_id", None) is not None:
+                # Passou para entregador legado: sai do repasse.
+                obj.repasse_base_id = None
+                if status_anterior == STATUS_ENVIADO_PARA_BASE:
+                    obj.status = "saiu"
             payload_changed["executor"] = (
                 payload_changed["executor"]
                 or (entregador_nome or "").strip() != entregador_anterior
@@ -3356,6 +3518,7 @@ def atualizar_saida(
             user_id=getattr(current_user, "id", None),
         )
         obj.motoboy_id = motoboy.id_motoboy
+        obj.repasse_base_id = None
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
         obj.entregador_id = None
         obj.status = (
@@ -3390,6 +3553,7 @@ def atualizar_saida(
                 user_id=getattr(current_user, "id", None),
             )
         obj.motoboy_id = motoboy.id_motoboy
+        obj.repasse_base_id = None
         obj.entregador = payload.entregador or _get_motoboy_nome(db, motoboy)
         obj.status = (
             STATUS_AGUARDANDO_CONFIRMACAO
@@ -3408,6 +3572,32 @@ def atualizar_saida(
         payload_changed["motoboy"] = (motoboy_anterior != obj.motoboy_id)
         payload_changed["executor"] = payload_changed["executor"] or payload_changed["motoboy"]
         payload_changed["status"] = True
+    elif payload.repasse_base_id is not None and not cancelando:
+        # PRD-011: envio para base parceira. Limpa motoboy/entregador e encerra o vínculo vivo.
+        _exigir_staff_para_repasse(getattr(current_user, "role", None))
+        base_repasse = _resolve_base_repasse(db, sub_base, int(payload.repasse_base_id))
+        mudou_destino = (
+            repasse_anterior != int(base_repasse.id_base)
+            or motoboy_anterior is not None
+            or status_anterior != STATUS_ENVIADO_PARA_BASE
+        )
+        if mudou_destino:
+            encerrar_item_da_operacao_anterior(
+                db,
+                sub_base=sub_base,
+                motoboy_id=motoboy_anterior,
+                id_saida=id_saida,
+                motivo="REATRIBUIDO",
+                user_id=getattr(current_user, "id", None),
+            )
+        obj.motoboy_id = None
+        obj.entregador_id = None
+        obj.entregador = None
+        obj.repasse_base_id = int(base_repasse.id_base)
+        obj.status = STATUS_ENVIADO_PARA_BASE
+        payload_changed["motoboy"] = motoboy_anterior is not None
+        payload_changed["executor"] = mudou_destino
+        payload_changed["status"] = mudou_destino
 
     if payload.status is not None:
         novo_status = status_alvo if status_alvo is not None else normalizar_status_saida(payload.status)
@@ -3500,6 +3690,14 @@ def atualizar_saida(
         evento_historico = _evento_status_manual(status_novo)
     if executor_mudou and evento_historico not in {"cancelado", "entregue", "ausente"}:
         evento_historico = "reatribuido"
+    enviou_para_base = (
+        payload.repasse_base_id is not None
+        and not cancelando
+        and getattr(obj, "repasse_base_id", None) is not None
+        and (status_mudou or executor_mudou)
+    )
+    if enviou_para_base:
+        evento_historico = "enviado_para_base"
 
     if evento_historico:
         hist_payload = None
@@ -3514,6 +3712,14 @@ def atualizar_saida(
                 motivo=getattr(detail_hist, "motivo_ocorrencia", None) if detail_hist else None,
                 observacao=getattr(detail_hist, "observacao_ocorrencia", None) if detail_hist else None,
                 tentativa=getattr(detail_hist, "tentativa", None) if detail_hist else None,
+            )
+        elif evento_historico == "enviado_para_base":
+            hist_payload = json.dumps(
+                {
+                    "repasse_base_id": int(obj.repasse_base_id),
+                    "base": _nome_base_repasse(db, obj.repasse_base_id),
+                },
+                ensure_ascii=False,
             )
         db.add(
             SaidaHistorico(

@@ -15,6 +15,8 @@ EVENTOS_ATRIBUICAO_VALIDOS = {
     "nova_saida_mesmo_entregador",
     "lancar_avulso",
     "leitura_saida",
+    # PRD-011: saída enviada para base parceira (repasse a pagar).
+    "enviado_para_base",
 }
 
 EVENTOS_REATRIBUICAO = {
@@ -98,6 +100,7 @@ ROTULOS_ACAO = {
     "saida_confirmada": "Confirmou início da entrega",
     "saida_removida_antes_confirmacao": "Removeu antes de começar entrega",
     "nova_saida_mesmo_entregador": "Pacote incluído em novo lote de saída",
+    "enviado_para_base": "Enviado para a base",
 }
 
 FALLBACK_ACAO_HISTORICO_ANTERIOR = "Histórico anterior à atualização"
@@ -141,6 +144,7 @@ ROTULOS_SITUACAO = {
     "ETIQUETADO": "Etiqueta gerada",
     "COLETADO": "Coletado",
     "AGUARDANDO_COLETA": "Aguardando coleta",
+    "ENVIADO_PARA_BASE": "Enviado para a base",
 }
 
 _STATUS_CONTA_COMO_SAIU = {

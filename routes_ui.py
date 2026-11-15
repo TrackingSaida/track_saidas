@@ -137,11 +137,11 @@ MENU_DEFS = [
 # =============================
 
 def _menu_label_for_owner(item_label: str, tipo_owner: str) -> str:
-    """Quando owner é BASE, troca labels Base -> Seller nas entradas do menu."""
+    """Quando owner é BASE, labels de cadastro e fechamento (PRD-011: Clientes)."""
     if (tipo_owner or "").strip().lower() != "base":
         return item_label
     if item_label == "Bases":
-        return "Sellers"
+        return "Clientes"
     if item_label == "Fechamento Bases":
         return "Fechamento Seller"
     return item_label

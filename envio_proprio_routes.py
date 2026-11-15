@@ -163,7 +163,12 @@ def listar_remetentes(
     bases = list(
         db.scalars(
             select(BasePreco)
-            .where(BasePreco.sub_base == sub_base, BasePreco.ativo.is_(True))
+            .where(
+                BasePreco.sub_base == sub_base,
+                BasePreco.ativo.is_(True),
+                # PRD-011: base parceira não é remetente de etiqueta.
+                (BasePreco.papel.is_(None)) | (BasePreco.papel != "base_parceira"),
+            )
             .order_by(BasePreco.base)
         ).all()
     )

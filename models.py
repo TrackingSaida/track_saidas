@@ -127,6 +127,8 @@ class Owner(Base):
     pix_receber_tipo = Column(Text, nullable=True)
     # n = vários coletores sem restrição; um = um por vez (409 + Ajudar)
     coleta_participantes_modo = Column(Text, nullable=False, server_default=text("'n'"))
+    # PRD-011: data de parceria. Nula no legado; preenchida na criação ou informada uma vez.
+    criado_em = Column(Date, nullable=True)
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -414,9 +416,31 @@ class BasePreco(Base):
     # semanal | quinzenal | mensal. Nulo = Nenhum, sem validação de ciclo no fechamento.
     periodo_fechamento = Column(Text, nullable=True)
     etiqueta_limite_diario = Column(Integer, nullable=True)
+    # PRD-011: seller | base_parceira. Nulo no owner subbase.
+    papel = Column(Text, nullable=True)
+    # PRD-011 Fatia 2: base parceira que também recebe pedidos para entregar (repasse a pagar).
+    entrega_pedidos = Column(Boolean, nullable=False, server_default=text("false"))
 
     def __repr__(self) -> str:
         return f"<BasePreco id_base={self.id_base} sub_base={self.sub_base!r} username={self.username!r}>"
+
+
+# ==========================
+# Tabela: base_preco_pagar (PRD-011: exceção de preço a pagar por base parceira)
+# ==========================
+class BasePrecoPagar(Base):
+    __tablename__ = "base_preco_pagar"
+
+    id_base = Column(BigInteger, ForeignKey("base.id_base", ondelete="CASCADE"), primary_key=True)
+    sub_base = Column(Text, nullable=False)
+    shopee_valor = Column(Numeric(12, 2), nullable=True)
+    ml_valor = Column(Numeric(12, 2), nullable=True)
+    avulso_valor = Column(Numeric(12, 2), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<BasePrecoPagar id_base={self.id_base} sub_base={self.sub_base!r}>"
 
 
 # ==========================
@@ -457,6 +481,8 @@ class Saida(Base):
     categoria_g_atualizado_por = Column(BigInteger, nullable=True)
     avulso_lote_id = Column(BigInteger, nullable=True, index=True)
     avulso_criado_excepcional = Column(Boolean, nullable=False, server_default=text("false"))
+    # PRD-011 Fatia 2: base parceira que entrega o pedido (exclusivo com motoboy_id).
+    repasse_base_id = Column(BigInteger, ForeignKey("base.id_base", ondelete="RESTRICT"), nullable=True)
 
     coleta = relationship("Coleta", back_populates="saidas")
 
@@ -688,6 +714,8 @@ class OwnerConfiguracaoCobranca(Base):
     endereco = Column(Text, nullable=True)
     contato_financeiro = Column(Text, nullable=True)
     observacao = Column(Text, nullable=True)
+    # PRD-011: faturar depois de N dias do fim do período (nulo = não definido)
+    dias_faturamento = Column(Integer, nullable=True)
     confirmado_por = Column(BigInteger, nullable=True)
     confirmado_em = Column(DateTime(timezone=False), nullable=True)
     atualizado_por = Column(BigInteger, nullable=True)
@@ -697,10 +725,14 @@ class OwnerConfiguracaoCobranca(Base):
 
 class OwnerPrecoVigencia(Base):
     __tablename__ = "owner_preco_vigencia"
-    __table_args__ = (UniqueConstraint("owner_id", "inicio", name="uq_owner_preco_vigencia_inicio"),)
+    __table_args__ = (
+        UniqueConstraint("owner_id", "escopo", "inicio", name="uq_owner_preco_vigencia_escopo_inicio"),
+    )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     owner_id = Column(BigInteger, ForeignKey("owner.id_owner", ondelete="CASCADE"), nullable=False)
+    # PRD-011: bases (preço histórico) | sellers
+    escopo = Column(Text, nullable=False, server_default=text("'bases'"))
     valor = Column(Numeric(12, 4), nullable=False)
     inicio = Column(Date, nullable=False)
     fim = Column(Date, nullable=True)
@@ -790,6 +822,14 @@ class OwnerFechamento(Base):
     anulado_por = Column(BigInteger, nullable=True)
     anulado_em = Column(DateTime(timezone=False), nullable=True)
     anulado_motivo = Column(Text, nullable=True)
+    # PRD-011: data de faturamento (fim do período + N dias) e snapshot dos dois preços.
+    data_faturamento = Column(Date, nullable=True)
+    qtd_sellers = Column(Integer, nullable=True)
+    preco_sellers = Column(Numeric(12, 4), nullable=True)
+    valor_sellers = Column(Numeric(14, 2), nullable=True)
+    qtd_bases = Column(Integer, nullable=True)
+    preco_bases = Column(Numeric(12, 4), nullable=True)
+    valor_bases = Column(Numeric(14, 2), nullable=True)
 
 
 class OwnerFechamentoComposicao(Base):
@@ -1043,6 +1083,69 @@ class BaseFechamentoItem(Base):
 
     def __repr__(self) -> str:
         return f"<BaseFechamentoItem id_item={self.id_item} data={self.data}>"
+
+
+# ==========================
+# Tabelas: base_repasse_fechamento (+itens) — PRD-011, A Pagar da base parceira
+# ==========================
+class BaseRepasseFechamento(Base):
+    __tablename__ = "base_repasse_fechamento"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base", "id_base", "periodo_inicio", "periodo_fim",
+            name="uq_base_repasse_fechamento_periodo",
+        ),
+    )
+
+    id_fechamento = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    id_base = Column(BigInteger, ForeignKey("base.id_base", ondelete="RESTRICT"), nullable=False)
+    base = Column(Text, nullable=False)
+    periodo_inicio = Column(Date, nullable=False)
+    periodo_fim = Column(Date, nullable=False)
+    valor_base = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    valor_adicao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_adicao = Column(Text, nullable=True)
+    valor_subtracao = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    motivo_subtracao = Column(Text, nullable=True)
+    valor_final = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    status = Column(Text, nullable=False, server_default=text("'GERADO'"))
+    preco_snapshot = Column(JSON, nullable=False, server_default=text("'{}'::jsonb"))
+    criado_em = Column(DateTime(timezone=False), server_default=func.now())
+    pago_em = Column(DateTime(timezone=False), nullable=True)
+    pago_por = Column(Text, nullable=True)
+
+    itens = relationship(
+        "BaseRepasseFechamentoItem", back_populates="fechamento", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BaseRepasseFechamento id_fechamento={self.id_fechamento} "
+            f"id_base={self.id_base} status={self.status!r}>"
+        )
+
+
+class BaseRepasseFechamentoItem(Base):
+    __tablename__ = "base_repasse_fechamento_itens"
+    __table_args__ = (
+        UniqueConstraint("id_fechamento", "data", name="uq_base_repasse_fechamento_item_data"),
+    )
+
+    id_item = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_fechamento = Column(
+        BigInteger,
+        ForeignKey("base_repasse_fechamento.id_fechamento", ondelete="CASCADE"),
+        nullable=False,
+    )
+    data = Column(Date, nullable=False)
+    shopee = Column(Integer, nullable=False, server_default=text("0"))
+    ml = Column(Integer, nullable=False, server_default=text("0"))
+    avulso = Column(Integer, nullable=False, server_default=text("0"))
+    cancelados = Column(Integer, nullable=False, server_default=text("0"))
+    valor_dia = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+
+    fechamento = relationship("BaseRepasseFechamento", back_populates="itens")
 
 
 # ==========================

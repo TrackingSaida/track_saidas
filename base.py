@@ -20,6 +20,8 @@ from models import (  # classe do models.py com __tablename__ = "base"
     MLConexao,
     MotoboySubBase,
     Saida,
+    SellerPortalAccess,
+    ShopeeToken,
     User,
 )
 from base_import_service import (
@@ -28,6 +30,12 @@ from base_import_service import (
     confirmar_importacao,
     gerar_modelo_xlsx,
     preview_importacao,
+)
+from base_papel_pure import eh_base_parceira, exige_papel_obrigatorio, normalizar_papel
+from base_papel_service import (
+    preencher_papel_seller_ao_promover,
+    resolver_papel_ao_criar,
+    tipo_owner_da_sub_base,
 )
 from fechamento_base_ciclo_pure import normalizar_periodo_fechamento, renome_fechamento_bloqueado
 
@@ -97,6 +105,10 @@ class BaseCreate(BaseModel):
     dias_coleta: List[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5, 6])
     agenda_coleta_confirmada: bool = False
     periodo_fechamento: Optional[str] = None
+    # PRD-011: obrigatório quando o owner da sub_base é tipo base
+    papel: Optional[str] = None
+    # PRD-011 Fatia 2: só para base_parceira
+    entrega_pedidos: Optional[bool] = None
 
     @field_validator("dias_coleta")
     @classmethod
@@ -111,6 +123,14 @@ class BaseCreate(BaseModel):
     def validar_periodo_fechamento(cls, value: Optional[str]) -> Optional[str]:
         try:
             return normalizar_periodo_fechamento(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("papel")
+    @classmethod
+    def validar_papel(cls, value: Optional[str]) -> Optional[str]:
+        try:
+            return normalizar_papel(value)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -129,6 +149,8 @@ class BaseOut(BaseModel):
     dias_coleta: List[int]
     agenda_coleta_confirmada: bool
     periodo_fechamento: Optional[str] = None
+    papel: Optional[str] = None
+    entrega_pedidos: bool = False
     # Endereço cadastrado em base_seller_dados (opcional; aditivo)
     endereco_completo: Optional[str] = None
     # Contas Mercado Livre vinculadas (ml_conexoes.id_base); aditivo, só leitura
@@ -145,6 +167,8 @@ class BaseUpdate(BaseModel):
     dias_coleta: Optional[List[int]] = None
     agenda_coleta_confirmada: Optional[bool] = None
     periodo_fechamento: Optional[str] = None
+    papel: Optional[str] = None
+    entrega_pedidos: Optional[bool] = None
 
     @field_validator("dias_coleta")
     @classmethod
@@ -161,6 +185,14 @@ class BaseUpdate(BaseModel):
     def validar_periodo_fechamento(cls, value: Optional[str]) -> Optional[str]:
         try:
             return normalizar_periodo_fechamento(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("papel")
+    @classmethod
+    def validar_papel(cls, value: Optional[str]) -> Optional[str]:
+        try:
+            return normalizar_papel(value)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -276,6 +308,43 @@ def _periodo_lido(valor: Optional[str]) -> Optional[str]:
         return None
 
 
+def _bloquear_troca_papel(db: Session, obj: BasePreco, novo_papel: str) -> None:
+    atual = (getattr(obj, "papel", None) or "").strip().lower() or None
+    if atual == novo_papel:
+        return
+    id_base = int(obj.id_base)
+    sub_base = (obj.sub_base or "").strip()
+    chave = _chave_nome_base(obj.base)
+
+    if db.scalar(select(MLConexao.id).where(MLConexao.id_base == id_base).limit(1)):
+        raise HTTPException(409, "Não é possível alterar o papel: há conta Mercado Livre vinculada.")
+    if db.scalar(select(ShopeeToken.id).where(ShopeeToken.id_base == id_base).limit(1)):
+        raise HTTPException(409, "Não é possível alterar o papel: há loja Shopee vinculada.")
+    if db.scalar(
+        select(SellerPortalAccess.id).where(SellerPortalAccess.id_base == id_base).limit(1)
+    ):
+        raise HTTPException(409, "Não é possível alterar o papel: há acesso ao portal liberado.")
+    if chave and db.scalar(
+        select(Coleta.id_coleta).where(
+            Coleta.sub_base == sub_base,
+            func.upper(func.trim(Coleta.base)) == chave,
+        ).limit(1)
+    ):
+        raise HTTPException(409, "Não é possível alterar o papel: já há coleta deste cliente.")
+    if chave and db.scalar(
+        select(BaseFechamento.id_fechamento).where(
+            BaseFechamento.sub_base == sub_base,
+            func.upper(func.trim(BaseFechamento.base)) == chave,
+        ).limit(1)
+    ):
+        raise HTTPException(409, "Não é possível alterar o papel: já há fechamento A Receber deste cliente.")
+    # repasse_base_id: coluna da Fatia 2; se ainda não existir no banco, getattr evita AttributeError no model.
+    if hasattr(Saida, "repasse_base_id") and db.scalar(
+        select(Saida.id_saida).where(Saida.repasse_base_id == id_base).limit(1)
+    ):
+        raise HTTPException(409, "Não é possível alterar o papel: há saída enviada para esta base.")
+
+
 def _base_to_out(
     obj: BasePreco,
     endereco_completo: Optional[str] = None,
@@ -294,6 +363,8 @@ def _base_to_out(
         dias_coleta=list(obj.dias_coleta or []),
         agenda_coleta_confirmada=bool(obj.agenda_coleta_confirmada),
         periodo_fechamento=_periodo_lido(getattr(obj, "periodo_fechamento", None)),
+        papel=getattr(obj, "papel", None),
+        entrega_pedidos=bool(getattr(obj, "entrega_pedidos", False)),
         endereco_completo=endereco_completo,
     )
 
@@ -363,6 +434,14 @@ def criar_precos_base(
             detail="Já existe um registro de preços para essa 'base' nesta sub_base."
         )
 
+    papel = resolver_papel_ao_criar(db, sub_base_user, payload.papel)
+    entrega_pedidos = bool(payload.entrega_pedidos)
+    if entrega_pedidos and not eh_base_parceira(papel):
+        raise HTTPException(
+            status_code=422,
+            detail="Só uma Base parceira pode entregar pedidos.",
+        )
+
     # Criar objeto se não houver duplicidade
     obj = BasePreco(
         base=nome,
@@ -375,13 +454,15 @@ def criar_precos_base(
         dias_coleta=payload.dias_coleta,
         agenda_coleta_confirmada=bool(payload.agenda_coleta_confirmada),
         periodo_fechamento=payload.periodo_fechamento,
+        papel=papel,
+        entrega_pedidos=entrega_pedidos,
     )
 
     db.add(obj)
     db.commit()
     db.refresh(obj)
 
-    return {"ok": True, "action": "created", "id_base": obj.id_base}
+    return {"ok": True, "action": "created", "id_base": obj.id_base, "papel": obj.papel, "entrega_pedidos": bool(obj.entrega_pedidos)}
 
 # =========================
 # GET /base/
@@ -539,6 +620,28 @@ def patch_base(
         obj.agenda_coleta_confirmada = bool(body.agenda_coleta_confirmada)
     if "periodo_fechamento" in body.model_fields_set:
         obj.periodo_fechamento = body.periodo_fechamento
+
+    if "papel" in body.model_fields_set:
+        tipo = tipo_owner_da_sub_base(db, sub_base_user)
+        if not exige_papel_obrigatorio(tipo):
+            # Owner subbase ignora papel.
+            pass
+        elif body.papel is None:
+            raise HTTPException(status_code=422, detail="Informe o papel do cliente: Seller ou Base.")
+        else:
+            _bloquear_troca_papel(db, obj, body.papel)
+            obj.papel = body.papel
+            if not eh_base_parceira(body.papel):
+                obj.entrega_pedidos = False
+
+    if "entrega_pedidos" in body.model_fields_set and body.entrega_pedidos is not None:
+        novo_flag = bool(body.entrega_pedidos)
+        if novo_flag and not eh_base_parceira(getattr(obj, "papel", None)):
+            raise HTTPException(
+                status_code=422,
+                detail="Só uma Base parceira pode entregar pedidos.",
+            )
+        obj.entrega_pedidos = novo_flag
 
     try:
         db.commit()

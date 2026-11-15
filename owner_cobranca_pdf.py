@@ -56,6 +56,29 @@ def _preco(v) -> str:
     return f"R$ {s}"
 
 
+def _dois_precos(fech) -> bool:
+    """PRD-011: fechamento com preço de Sellers gravado mostra duas linhas de preço."""
+    return getattr(fech, "preco_sellers", None) is not None
+
+
+def _linhas_dois_precos(fech) -> List[Tuple[str, int, Decimal, Decimal]]:
+    """(rótulo, quantidade, preço unitário, subtotal). Lado zerado continua aparecendo."""
+    return [
+        (
+            "Coletas em Sellers",
+            int(fech.qtd_sellers or 0),
+            Decimal(str(fech.preco_sellers or 0)),
+            Decimal(str(fech.valor_sellers or 0)),
+        ),
+        (
+            "Coletas em Bases",
+            int(fech.qtd_bases or 0),
+            Decimal(str(fech.preco_bases if fech.preco_bases is not None else fech.preco_unitario or 0)),
+            Decimal(str(fech.valor_bases or 0)),
+        ),
+    ]
+
+
 def _int(v) -> str:
     return f"{int(v or 0):,}".replace(",", ".")
 
@@ -200,13 +223,17 @@ def gerar_demonstrativo_pdf(
     el.append(t)
 
     el.append(Spacer(1, 4 * mm))
+    sufixo_ajustes = " + ajustes" if Decimal(str(fech.valor_ajustes or 0)) != 0 else ""
+    if _dois_precos(fech):
+        linhas_resumo = "<br/>".join(
+            f"{rot}: {_int(q)} × {_preco(p)} = {_brl(v)}" for rot, q, p, v in _linhas_dois_precos(fech)
+        )
+        texto_resumo = linhas_resumo + (f"<br/>{sufixo_ajustes.strip()}" if sufixo_ajustes else "")
+    else:
+        texto_resumo = f"{_int(fech.qtd_faturavel)} pacotes × {_preco(fech.preco_unitario)}" + sufixo_ajustes
     resumo = Table(
         [[
-            Paragraph(
-                f"{_int(fech.qtd_faturavel)} pacotes × {_preco(fech.preco_unitario)}"
-                + (" + ajustes" if Decimal(str(fech.valor_ajustes or 0)) != 0 else ""),
-                st["val"],
-            ),
+            Paragraph(texto_resumo, st["val"]),
             Paragraph(_brl(fech.valor_total), st["total"]),
         ]],
         colWidths=[largura * 0.6, largura * 0.4],
@@ -241,11 +268,23 @@ def gerar_demonstrativo_pdf(
         ])
     preco = Decimal(str(fech.preco_unitario))
     idx_subtotal = len(linhas)
-    linhas.append(["Subtotal bruto", _int(fech.qtd_bruto), _brl(preco * fech.qtd_bruto)])
-    if fech.qtd_cancelados:
+    if _dois_precos(fech):
+        # Dois preços: o valor dos cancelados vem da composição gravada, não de um preço único.
+        valor_cancelados = sum(
+            (Decimal(str(c.valor or 0)) for c in composicao if c.classificacao == "cancelado"),
+            Decimal("0"),
+        )
         linhas.append([
-            "(−) Cancelados", f"−{_int(fech.qtd_cancelados)}", _brl(-preco * fech.qtd_cancelados),
+            "Subtotal bruto", _int(fech.qtd_bruto), _brl(Decimal(str(fech.valor_pacotes or 0)) - valor_cancelados),
         ])
+        if fech.qtd_cancelados:
+            linhas.append(["(−) Cancelados", f"−{_int(fech.qtd_cancelados)}", _brl(valor_cancelados)])
+    else:
+        linhas.append(["Subtotal bruto", _int(fech.qtd_bruto), _brl(preco * fech.qtd_bruto)])
+        if fech.qtd_cancelados:
+            linhas.append([
+                "(−) Cancelados", f"−{_int(fech.qtd_cancelados)}", _brl(-preco * fech.qtd_cancelados),
+            ])
     linhas.append(["Pacotes faturáveis", _int(fech.qtd_faturavel), _brl(fech.valor_pacotes)])
     tc = Table(linhas, colWidths=[largura * 0.56, largura * 0.18, largura * 0.26])
     n = len(linhas)
@@ -264,11 +303,31 @@ def gerar_demonstrativo_pdf(
     ]))
     el.append(tc)
     el.append(Spacer(1, 2 * mm))
-    el.append(Paragraph(
-        f"Preço unitário do período: {_preco(fech.preco_unitario)} por pacote. "
-        "Cancelados aparecem só como dedução do subtotal bruto.",
-        st["nota"],
-    ))
+    if _dois_precos(fech):
+        lp = [["Preço aplicado", "Pacotes", "Preço unitário", "Subtotal"]]
+        for rot, q, p, v in _linhas_dois_precos(fech):
+            lp.append([rot, _int(q), _preco(p), _brl(v)])
+        lp.append(["Total dos pacotes", _int(fech.qtd_faturavel), "", _brl(fech.valor_pacotes)])
+        el.append(Spacer(1, 2 * mm))
+        el.append(_tabela_simples(
+            lp,
+            [largura * 0.40, largura * 0.14, largura * 0.22, largura * 0.24],
+            alinhar_direita=(1, 2, 3),
+            negrito_ultima=True,
+        ))
+        el.append(Spacer(1, 2 * mm))
+        el.append(Paragraph(
+            "Cada pacote é cobrado uma vez. Coletas em clientes Seller usam o preço de Sellers; "
+            "coletas em Bases e volume sem coleta de cliente usam o preço de Bases. "
+            "Cancelados aparecem só como dedução do subtotal bruto.",
+            st["nota"],
+        ))
+    else:
+        el.append(Paragraph(
+            f"Preço unitário do período: {_preco(fech.preco_unitario)} por pacote. "
+            "Cancelados aparecem só como dedução do subtotal bruto.",
+            st["nota"],
+        ))
 
     lista_sit = list(situacao)
     if lista_sit:
