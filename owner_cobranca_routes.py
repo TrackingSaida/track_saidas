@@ -21,6 +21,7 @@ from auth import _coerce_role_int, get_current_user
 from db import get_db
 from models import OwnerFechamento, OwnerFechamentoItem, User
 import owner_cobranca_service as svc
+from owner_cobranca_faturamento_pure import ESTADO_LABELS
 from owner_cobranca_engine import (
     EXPLICACAO_MODELO,
     MODELO_LABELS,
@@ -29,6 +30,9 @@ from owner_cobranca_engine import (
     NIVEL_BLOQUEANTE,
     NIVEL_INFORMATIVO,
     ORIGEM_LABELS,
+    ESCOPO_PRECO_BASES,
+    ESCOPO_PRECO_LABELS,
+    ESCOPO_PRECO_SELLERS,
     SERVICO_LABELS,
     filtrar_itens,
     periodo_de,
@@ -69,6 +73,7 @@ STATUS_OPERACIONAL_LABELS = {
     "cancelada": "Cancelado",
     "coletado": "Coletado",
     "na_base": "Na base",
+    "enviado_para_base": "Enviado para a base",
 }
 AJUSTE_LABELS = {
     "acrescimo": "Acréscimo",
@@ -85,6 +90,7 @@ DECISAO_LABELS = {
 ACAO_LABELS = {
     "conferir": "Conferido",
     "fechar": "Fechado",
+    "gerar": "Cobrança gerada",
     "informar": "Marcado como informado",
     "reabrir": "Reaberto",
     "anular": "Anulado",
@@ -118,6 +124,38 @@ def _preco(v: Any) -> Optional[str]:
 
 def _iso(v: Any) -> Optional[str]:
     return v.isoformat() if v is not None else None
+
+
+def _lado_json(lado: Optional[Dict[str, Any]], escopo: str) -> Optional[Dict[str, Any]]:
+    """Linha do demonstrativo: qtd × preço = subtotal. Lado zerado continua aparecendo."""
+    if lado is None:
+        return None
+    return {
+        "escopo": escopo,
+        "label": ESCOPO_PRECO_LABELS[escopo],
+        "quantidade": int(lado["quantidade"]),
+        "preco_unitario": _preco(lado["preco_unitario"]),
+        "valor": _money(lado["valor"]),
+    }
+
+
+def _totais_dois_precos(tot: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "dois_precos": bool(tot.get("dual")),
+        "sellers": _lado_json(tot.get("sellers"), ESCOPO_PRECO_SELLERS),
+        "bases": _lado_json(tot.get("bases"), ESCOPO_PRECO_BASES),
+    }
+
+
+def _faturar_em_json(a: "svc.ApuracaoOwner") -> Dict[str, Any]:
+    f = a.faturar_em()
+    return {
+        "data": _iso(f["data"]),
+        "dias": f["dias"],
+        "estado": f["estado"],
+        "estado_label": ESTADO_LABELS.get(f["estado"], f["estado"]),
+        "rotulo": f["rotulo"],
+    }
 
 
 def _status_operacional(s: Optional[str]) -> Optional[str]:
@@ -187,6 +225,7 @@ def _config_dict(cfg) -> Dict[str, Any]:
         "endereco": cfg.endereco,
         "contato_financeiro": cfg.contato_financeiro,
         "observacao": cfg.observacao,
+        "dias_faturamento": cfg.dias_faturamento,
     }
 
 
@@ -197,7 +236,15 @@ def _owner_dict(owner) -> Dict[str, Any]:
         "username": owner.username,
         "sub_base": owner.sub_base,
         "teste": bool(owner.teste),
+        # Data de parceria (só leitura aqui). Nula = "Data de parceria não registrada".
+        "criado_em": _iso(getattr(owner, "criado_em", None)),
     }
+
+
+def _lado_fech(f: OwnerFechamento, lado: str) -> Dict[str, Any]:
+    return svc._lado_dict(
+        getattr(f, f"qtd_{lado}"), getattr(f, f"preco_{lado}"), getattr(f, f"valor_{lado}")
+    )
 
 
 def _fechamento_resumo(f: OwnerFechamento) -> Dict[str, Any]:
@@ -214,6 +261,10 @@ def _fechamento_resumo(f: OwnerFechamento) -> Dict[str, Any]:
         "preco_unitario": _preco(f.preco_unitario),
         "qtd_faturavel": f.qtd_faturavel,
         "valor_total": _money(f.valor_total),
+        "data_faturamento": _iso(f.data_faturamento),
+        "dois_precos": f.preco_sellers is not None,
+        "sellers": _lado_json(_lado_fech(f, "sellers"), ESCOPO_PRECO_SELLERS) if f.preco_sellers is not None else None,
+        "bases": _lado_json(_lado_fech(f, "bases"), ESCOPO_PRECO_BASES) if f.preco_sellers is not None else None,
         "fechado_em": _iso(f.fechado_em),
         "fechado_por": f.fechado_por_username,
         "informado_em": _iso(f.informado_em),
@@ -284,6 +335,17 @@ def _presets() -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _motivo_bloqueio_gerar(a: "svc.ApuracaoOwner") -> Optional[str]:
+    """Texto do botão Gerar cobrança desabilitado. None quando pode gerar ou já gerou."""
+    if a.fechamento is not None or a.pode_gerar:
+        return None
+    if a.motivo_bloqueio_fechar:
+        return a.motivo_bloqueio_fechar
+    if a.bloqueantes:
+        return a.bloqueantes[0].mensagem
+    return None
+
+
 def _linha_lista(a: svc.ApuracaoOwner) -> Dict[str, Any]:
     tot = a.totais
     modelo = a.fechamento.modelo if a.fechamento is not None else a.config.modelo
@@ -297,12 +359,16 @@ def _linha_lista(a: svc.ApuracaoOwner) -> Dict[str, Any]:
         "cancelados": tot["cancelados"],
         "desconsiderados": tot["desconsiderados"],
         "preco_unitario": _preco(tot["preco_unitario"]),
+        **_totais_dois_precos(tot),
         "valor_total": _money(tot["valor_total"]),
         "status": a.status,
         "status_label": STATUS_LABELS.get(a.status, a.status),
         "fonte": "snapshot" if a.fechamento is not None else "previa",
         "fechamento_id": a.fechamento.id if a.fechamento is not None else None,
         "divergencias": _contagem_divergencias(divs),
+        "faturar_em": _faturar_em_json(a),
+        "pode_gerar": a.fechamento is None and a.pode_gerar,
+        "motivo_bloqueio_gerar": _motivo_bloqueio_gerar(a),
     }
 
 
@@ -340,6 +406,10 @@ def _resumo(linhas: List[Dict[str, Any]], status_ativo: str) -> Dict[str, Any]:
         "owners_pendentes": sum(1 for l in linhas if l["status"] not in ("fechado", "informado")),
         "total_owners": len(linhas),
         "contagem": contagem,
+        "faturamento": {
+            estado: sum(1 for l in linhas if l["faturar_em"]["estado"] == estado)
+            for estado in ESTADO_LABELS
+        },
         "composicao": {
             "faturavel": sum(l["pacotes"] for l in aba),
             "cancelados": sum(l["cancelados"] for l in aba),
@@ -485,10 +555,12 @@ def _detalhe(db: Session, a: svc.ApuracaoOwner) -> Dict[str, Any]:
             "faturavel": tot["faturavel"],
             "desconsiderados": tot["desconsiderados"],
             "preco_unitario": _preco(tot["preco_unitario"]),
+            **_totais_dois_precos(tot),
             "valor_pacotes": _money(tot["valor_pacotes"]),
             "valor_ajustes": _money(tot["valor_ajustes"]),
             "valor_total": _money(tot["valor_total"]),
         },
+        "faturar_em": _faturar_em_json(a),
         "composicao": composicao,
         "explicacao_modelo": EXPLICACAO_MODELO.get(modelo, ""),
         "situacao_pacotes": situacao,
@@ -504,7 +576,9 @@ def _detalhe(db: Session, a: svc.ApuracaoOwner) -> Dict[str, Any]:
         "hash": hash_,
         "pode_conferir": a.fechamento is None and a.pode_conferir,
         "pode_fechar": a.fechamento is None and a.pode_fechar,
+        "pode_gerar": a.fechamento is None and a.pode_gerar,
         "motivo_bloqueio_fechar": a.motivo_bloqueio_fechar,
+        "motivo_bloqueio_gerar": _motivo_bloqueio_gerar(a),
     }
 
 
@@ -595,7 +669,9 @@ def _config_resposta(db: Session, owner) -> Dict[str, Any]:
     cfg = svc.obter_config(db, owner)
     precos = svc.listar_precos(db, owner.id_owner)
     hoje = date.today()
-    vigente = svc.preco_vigente(precos, hoje)
+    vigente = svc.preco_vigente(precos, hoje, ESCOPO_PRECO_BASES)
+    vigente_sellers = svc.preco_vigente(precos, hoje, ESCOPO_PRECO_SELLERS)
+    dois_precos, _papeis = svc.operacao_dual(db, owner.sub_base)
     ini_atual, fim_atual = periodo_de(hoje, cfg.periodicidade)
     return {
         "owner": _owner_dict(owner),
@@ -607,10 +683,18 @@ def _config_resposta(db: Session, owner) -> Dict[str, Any]:
             "modo_operacao": owner.modo_operacao or "codigo",
         },
         "preco_vigente": _preco(vigente.valor) if vigente else None,
+        "preco_vigente_sellers": _preco(vigente_sellers.valor) if vigente_sellers else None,
+        "dois_precos": dois_precos,
+        "escopos_preco": [
+            {"id": ESCOPO_PRECO_SELLERS, "label": ESCOPO_PRECO_LABELS[ESCOPO_PRECO_SELLERS]},
+            {"id": ESCOPO_PRECO_BASES, "label": ESCOPO_PRECO_LABELS[ESCOPO_PRECO_BASES]},
+        ],
         "periodo_atual": {"inicio": _iso(ini_atual), "fim": _iso(fim_atual)},
         "precos": [
             {
                 "id": p.id,
+                "escopo": p.escopo or ESCOPO_PRECO_BASES,
+                "escopo_label": ESCOPO_PRECO_LABELS.get(p.escopo or ESCOPO_PRECO_BASES),
                 "valor": _preco(p.valor),
                 "inicio": _iso(p.inicio),
                 "fim": _iso(p.fim),
@@ -632,11 +716,15 @@ class ConfiguracaoIn(BaseModel):
     endereco: Optional[str] = Field(None, max_length=300)
     contato_financeiro: Optional[str] = Field(None, max_length=200)
     observacao: Optional[str] = Field(None, max_length=1000)
+    # PRD-011: faturar depois de N dias do fim do período; null limpa.
+    dias_faturamento: Optional[int] = Field(None, ge=0, le=365)
 
 
 class PrecoIn(BaseModel):
     valor: Decimal = Field(..., ge=0, max_digits=12, decimal_places=4)
     inicio: date
+    # PRD-011: bases (padrão, preço histórico) | sellers
+    escopo: Literal["bases", "sellers"] = "bases"
     motivo: Optional[str] = Field(None, max_length=300)
 
 
@@ -666,7 +754,9 @@ def post_preco(
     user: User = Depends(require_root),
 ):
     owner = svc.carregar_owner(db, owner_id)
-    svc.adicionar_preco(db, owner, user, valor=body.valor, inicio=body.inicio, motivo=body.motivo)
+    svc.adicionar_preco(
+        db, owner, user, valor=body.valor, inicio=body.inicio, motivo=body.motivo, escopo=body.escopo
+    )
     db.commit()
     return _config_resposta(db, owner)
 
@@ -814,6 +904,25 @@ def post_fechar(
     return _detalhe(db, svc.apurar_owner(db, owner, ini, fim))
 
 
+class GerarIn(PeriodoIn):
+    observacao: Optional[str] = Field(None, max_length=500)
+
+
+@router.post("/apuracoes/{owner_id}/gerar", status_code=201)
+def post_gerar(
+    owner_id: int,
+    body: GerarIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_root),
+):
+    """PRD-011: fecha o período sem passo de Conferir. O demonstrativo (PDF) sai do fechamento."""
+    owner = svc.carregar_owner(db, owner_id)
+    ini, fim = _periodo(body.data_inicio, body.data_fim)
+    svc.gerar(db, owner, user, ini, fim, observacao=body.observacao)
+    db.commit()
+    return _detalhe(db, svc.apurar_owner(db, owner, ini, fim))
+
+
 # ---------------------------------------------------------------------------
 # Fechamentos
 # ---------------------------------------------------------------------------
@@ -864,6 +973,13 @@ def get_fechamento(fechamento_id: int, db: Session = Depends(get_db)):
             "valor_pacotes": _money(fech.valor_pacotes),
             "valor_ajustes": _money(fech.valor_ajustes),
             "valor_total": _money(fech.valor_total),
+            "dois_precos": fech.preco_sellers is not None,
+            "sellers": _lado_json(_lado_fech(fech, "sellers"), ESCOPO_PRECO_SELLERS)
+            if fech.preco_sellers is not None
+            else None,
+            "bases": _lado_json(_lado_fech(fech, "bases"), ESCOPO_PRECO_BASES)
+            if fech.preco_sellers is not None
+            else None,
         },
         "composicao": [
             _composicao_dict(c.classificacao, c.quantidade, c.valor) for c in svc.composicao_fechamento(db, fech)

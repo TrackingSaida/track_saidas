@@ -17,7 +17,16 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from auth import get_current_user
-from models import BaseFechamento, Coleta, Entregador, EntregadorFechamento, Motoboy, Saida, User
+from models import (
+    BaseFechamento,
+    BaseRepasseFechamento,
+    Coleta,
+    Entregador,
+    EntregadorFechamento,
+    Motoboy,
+    Saida,
+    User,
+)
 from saida_operacional_utils import filtrar_saidas_por_periodo_operacional
 
 from entregador_routes import resolver_precos_entregador, resolver_precos_motoboy, _normalizar_servico
@@ -254,6 +263,20 @@ def _consultar_fechamentos_entregador(
     ).all()
 
 
+def _consultar_repasses_base(
+    db: Session, sub_base: str, data_inicio: date, data_fim: date
+) -> List[BaseRepasseFechamento]:
+    """PRD-011: fechamentos A Pagar de bases parceiras que tocam o período."""
+    return db.scalars(
+        select(BaseRepasseFechamento).where(
+            BaseRepasseFechamento.sub_base == sub_base,
+            BaseRepasseFechamento.periodo_inicio <= data_fim,
+            BaseRepasseFechamento.periodo_fim >= data_inicio,
+            func.upper(BaseRepasseFechamento.status).in_(STATUS_FECHAMENTO_CONTABIL),
+        )
+    ).all()
+
+
 def _carregar_saidas_periodo(
     db: Session, sub_base: str, data_inicio: date, data_fim: date, modo: str
 ) -> Tuple[List[Saida], Dict[int, Any], Dict[int, Tuple[Optional[int], Optional[int]]]]:
@@ -267,6 +290,8 @@ def _carregar_saidas_periodo(
             func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
             Saida.timestamp >= dt_start,
             Saida.timestamp <= dt_end,
+            # PRD-011: repasse a base parceira não é despesa pendente de motoboy.
+            Saida.repasse_base_id.is_(None),
         )
     ).all()
     rows_saidas_raw, op_ctx_map = filtrar_saidas_por_periodo_operacional(db, rows_saidas_all, data_inicio, data_fim)
@@ -462,10 +487,16 @@ def _lado_receber(
     )
 
 
-def _lado_pagar(rows_fech: List[EntregadorFechamento], pendente: Decimal, qtd_pendente: int) -> BalancoLado:
+def _lado_pagar(
+    rows_fech: List[EntregadorFechamento],
+    pendente: Decimal,
+    qtd_pendente: int,
+    rows_repasse: Optional[List[BaseRepasseFechamento]] = None,
+) -> BalancoLado:
     gerado = pago = Decimal("0")
     qtd_gerado = qtd_pago = 0
-    for f in rows_fech:
+    # Fechamento de motoboy e repasse a base parceira compartilham GERADO/REAJUSTADO/PAGO.
+    for f in [*rows_fech, *(rows_repasse or [])]:
         faixa = faixa_despesa(f.status)
         if faixa == FAIXA_PAGO:
             pago += _decimal(f.valor_final)
@@ -488,13 +519,14 @@ def _lados_periodo(
     """Balanço completo de um período avulso (usado na comparação com o período anterior)."""
     rows_coletas = _consultar_coletas(db, sub_base, data_inicio, data_fim)
     rows_fech = _consultar_fechamentos_entregador(db, sub_base, data_inicio, data_fim)
+    rows_repasse = _consultar_repasses_base(db, sub_base, data_inicio, data_fim)
     rows_saidas, op_ctx_map, actor_por_saida = _carregar_saidas_periodo(db, sub_base, data_inicio, data_fim, modo)
     pendente, _, _, qtd = _estimar_despesa_pendente(
         db, sub_base, rows_saidas, actor_por_saida, op_ctx_map, _mapa_cobertura_entregador(rows_fech), {}
     )
     return (
         _lado_receber(db, sub_base, data_inicio, data_fim, rows_coletas),
-        _lado_pagar(rows_fech, pendente, qtd),
+        _lado_pagar(rows_fech, pendente, qtd, rows_repasse),
     )
 
 
@@ -874,7 +906,8 @@ def get_resumo_contabilidade(
 
     # ---- 10b) Balanço por status (pendente, gerado, recebido/pago) ----
     receber = _lado_receber(db, sub_base, data_inicio, data_fim, rows_coletas)
-    pagar = _lado_pagar(rows_fech, despesas_pendentes, qtd_saidas_pendentes)
+    rows_repasse = _consultar_repasses_base(db, sub_base, data_inicio, data_fim)
+    pagar = _lado_pagar(rows_fech, despesas_pendentes, qtd_saidas_pendentes, rows_repasse)
     delta_dias_bal = (data_fim - data_inicio).days + 1
     bal_prev_fim = data_inicio - timedelta(days=1)
     bal_prev_ini = bal_prev_fim - timedelta(days=delta_dias_bal - 1)

@@ -39,6 +39,16 @@ MODELO_LABELS = {
     "somente_saida": "Somente saída",
 }
 PERIODICIDADES = ("quinzenal", "mensal")
+
+# PRD-011: dois preços quando a operação tem clientes Seller e Base.
+ESCOPO_PRECO_BASES = "bases"  # preço histórico (único até aqui)
+ESCOPO_PRECO_SELLERS = "sellers"
+ESCOPOS_PRECO = (ESCOPO_PRECO_BASES, ESCOPO_PRECO_SELLERS)
+ESCOPO_PRECO_LABELS = {
+    ESCOPO_PRECO_SELLERS: "Coletas em Sellers",
+    ESCOPO_PRECO_BASES: "Coletas em Bases",
+}
+ORIGENS_COM_CLIENTE = ("coleta", "manual")
 SERVICOS = ("shopee", "mercado_livre", "avulso")
 SERVICO_LABELS = {"shopee": "Shopee", "mercado_livre": "Mercado Livre", "avulso": "Avulso"}
 
@@ -91,7 +101,7 @@ SITUACAO_LABELS = {
 }
 _STATUS_ENTREGUE = frozenset({"entregue"})
 _STATUS_EM_ENTREGA = frozenset(
-    {"saiu", "saiu_para_entrega", "em_rota", "ausente", "encerrado_sistema"}
+    {"saiu", "saiu_para_entrega", "em_rota", "ausente", "encerrado_sistema", "enviado_para_base"}
 )
 MOTIVO_LABELS = {
     "cancelado": "Cancelado",
@@ -222,6 +232,8 @@ class ItemApuracao:
     is_grande: bool = False
     status_operacional: Optional[str] = None
     no_bruto: bool = False
+    # PRD-011: "sellers" | "bases". Só preenchido no modo de dois preços.
+    papel_preco: Optional[str] = None
 
     @property
     def faturavel(self) -> bool:
@@ -266,6 +278,13 @@ class Apuracao:
     hash: str
     ajustes: List[Ajuste] = field(default_factory=list)
     valores_ajustes: Dict[int, Decimal] = field(default_factory=dict)
+    # PRD-011: modo de dois preços. `preco` continua sendo o preço de Bases.
+    dual: bool = False
+    preco_sellers: Optional[Decimal] = None
+    qtd_sellers: int = 0
+    valor_sellers: Decimal = Decimal("0.00")
+    qtd_bases: int = 0
+    valor_bases: Decimal = Decimal("0.00")
 
     @property
     def bloqueantes(self) -> List[Divergencia]:
@@ -493,6 +512,39 @@ def _chave_manual(id_coleta: int, servico: str) -> Tuple[int, str]:
     return int(id_coleta), servico
 
 
+def chave_base(base: Optional[str]) -> str:
+    """Chave de comparação do nome do cliente (mesma normalização do cadastro)."""
+    return _norm_base(base)
+
+
+def modo_dual(papeis: Iterable[Optional[str]]) -> bool:
+    """Dois preços só quando a operação tem clientes Seller e Base parceira."""
+    vistos = {(p or "").strip().lower() for p in papeis}
+    return "seller" in vistos and "base_parceira" in vistos
+
+
+def papel_preco_item(
+    origem: str, base: Optional[str], papeis_por_base: Mapping[str, Optional[str]]
+) -> str:
+    """Preço aplicado a uma unidade cobrada: `sellers` ou `bases`.
+
+    Coleta e coleta manual seguem o papel do cliente (nome da base da coleta). Entrada e saída
+    complementares, sem coleta de cliente, usam o preço de Bases. Cliente sem cadastro idem.
+    Pacote coletado em Seller e depois enviado à Base é uma unidade só, de origem coleta.
+    """
+    if origem in ORIGENS_COM_CLIENTE:
+        papel = (papeis_por_base.get(_norm_base(base)) or "").strip().lower()
+        if papel == "seller":
+            return ESCOPO_PRECO_SELLERS
+    return ESCOPO_PRECO_BASES
+
+
+def _valor_unidades(
+    qtd_sellers: int, qtd_bases: int, preco_bases: Decimal, preco_sellers: Decimal
+) -> Decimal:
+    return (preco_sellers * qtd_sellers + preco_bases * qtd_bases).quantize(CENT)
+
+
 def apurar(
     *,
     modelo: str,
@@ -506,12 +558,17 @@ def apurar(
     codigos_ja_faturados: Iterable[str] = (),
     ajustes: Iterable[Ajuste] = (),
     lotes_avulso: Mapping[int, LoteAvulso] | None = None,
+    dual: bool = False,
+    preco_sellers: Optional[Decimal] = None,
+    papeis_por_base: Optional[Mapping[str, Optional[str]]] = None,
 ) -> Apuracao:
     if modelo not in MODELOS:
         raise ValueError(f"Modelo comercial inválido: {modelo}")
     origens = MODELOS[modelo]
     ini, fim = periodo_inicio, periodo_fim
     preco_val = Decimal(str(preco)) if preco is not None else Decimal("0")
+    preco_sellers_val = Decimal(str(preco_sellers)) if preco_sellers is not None else Decimal("0")
+    papeis_por_base = papeis_por_base or {}
     ja_faturados: Set[str] = {normalizar_codigo(c) for c in codigos_ja_faturados}
     lotes_avulso = lotes_avulso or {}
 
@@ -769,26 +826,48 @@ def apurar(
         )
 
     # Totais
+    if dual:
+        for it in itens:
+            if it.no_bruto:
+                it.papel_preco = papel_preco_item(it.origem, it.base, papeis_por_base)
+
+    def _qtd_lados(its: Iterable[ItemApuracao]) -> Tuple[int, int]:
+        q_s = sum(i.quantidade for i in its if i.papel_preco == ESCOPO_PRECO_SELLERS)
+        q_b = sum(i.quantidade for i in its if i.papel_preco != ESCOPO_PRECO_SELLERS)
+        return q_s, q_b
+
+    def _valor(its: Sequence[ItemApuracao]) -> Decimal:
+        if not dual:
+            return (preco_val * sum(i.quantidade for i in its)).quantize(CENT)
+        q_s, q_b = _qtd_lados(its)
+        return _valor_unidades(q_s, q_b, preco_val, preco_sellers_val)
+
     qtd_bruto = sum(it.quantidade for it in itens if it.no_bruto)
     qtd_cancelados = sum(it.quantidade for it in itens if it.no_bruto and it.cancelado)
     qtd_faturavel = qtd_bruto - qtd_cancelados
     qtd_desconsiderados = sum(it.quantidade for it in itens if not it.no_bruto)
+    faturaveis = [it for it in itens if it.no_bruto and not it.cancelado]
+    qtd_sellers, qtd_bases = _qtd_lados(faturaveis) if dual else (0, 0)
+    valor_sellers = (preco_sellers_val * qtd_sellers).quantize(CENT) if dual else Decimal("0.00")
+    valor_bases = (preco_val * qtd_bases).quantize(CENT) if dual else Decimal("0.00")
 
     composicao: List[LinhaComposicao] = []
     for cls in CLASSIFICACOES_BRUTO:
-        q = sum(it.quantidade for it in itens if it.no_bruto and it.classificacao == cls)
+        grupo = [it for it in itens if it.no_bruto and it.classificacao == cls]
+        q = sum(it.quantidade for it in grupo)
         if q:
-            composicao.append(LinhaComposicao(cls, q, (preco_val * q).quantize(CENT)))
+            composicao.append(LinhaComposicao(cls, q, _valor(grupo)))
     if qtd_cancelados:
-        composicao.append(
-            LinhaComposicao("cancelado", -qtd_cancelados, (-preco_val * qtd_cancelados).quantize(CENT))
-        )
+        canceladas = [it for it in itens if it.no_bruto and it.cancelado]
+        composicao.append(LinhaComposicao("cancelado", -qtd_cancelados, -_valor(canceladas)))
     n_dup = sum(1 for it in itens if it.motivo == "duplicidade")
     if n_dup:
         composicao.append(LinhaComposicao("duplicidade", n_dup, Decimal("0.00")))
 
     lista_ajustes = list(ajustes)
-    valor_pacotes = (preco_val * qtd_faturavel).quantize(CENT)
+    valor_pacotes = (valor_sellers + valor_bases).quantize(CENT) if dual else (
+        preco_val * qtd_faturavel
+    ).quantize(CENT)
     valores_ajustes = calcular_ajustes(valor_pacotes, lista_ajustes)
     valor_ajustes = sum(valores_ajustes.values(), start=Decimal("0")).quantize(CENT)
     for cls, filtro in (
@@ -868,6 +947,8 @@ def apurar(
         preco=preco_val,
         itens=itens,
         ajustes=lista_ajustes,
+        dual=dual,
+        preco_sellers=preco_sellers_val if dual else None,
     )
     return Apuracao(
         modelo=modelo,
@@ -887,6 +968,12 @@ def apurar(
         hash=hash_,
         ajustes=lista_ajustes,
         valores_ajustes=valores_ajustes,
+        dual=dual,
+        preco_sellers=preco_sellers_val if dual else None,
+        qtd_sellers=qtd_sellers,
+        valor_sellers=valor_sellers,
+        qtd_bases=qtd_bases,
+        valor_bases=valor_bases,
     )
 
 
@@ -898,8 +985,14 @@ def calcular_hash(
     preco: Decimal,
     itens: Sequence[ItemApuracao],
     ajustes: Sequence[Ajuste] = (),
+    dual: bool = False,
+    preco_sellers: Optional[Decimal] = None,
 ) -> str:
-    """Hash das entradas da apuração. Muda se a operação, o preço ou os ajustes mudarem."""
+    """Hash das entradas da apuração. Muda se a operação, o preço ou os ajustes mudarem.
+
+    No modo de dois preços entram também o preço de Sellers e o preço aplicado a cada item.
+    Fora dele o hash é idêntico ao anterior ao PRD-011.
+    """
     linhas = sorted(
         (
             it.tipo,
@@ -913,6 +1006,7 @@ def calcular_hash(
             it.data_competencia.isoformat() if it.data_competencia else "",
             it.id_saida or 0,
         )
+        + ((it.papel_preco or "",) if dual else ())
         for it in itens
     )
     payload = {
@@ -925,6 +1019,9 @@ def calcular_hash(
             (a.id, a.tipo, str(a.valor), a.escopo, str(a.percentual or "")) for a in ajustes
         ),
     }
+    if dual:
+        payload["dual"] = True
+        payload["preco_sellers"] = str(Decimal(str(preco_sellers or 0)).normalize())
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 

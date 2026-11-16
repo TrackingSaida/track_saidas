@@ -273,6 +273,10 @@ def ml_int_vincular_seller(
         base_row = _base_vinculada(db, sub_base, body.id_base)
         if base_row is None:
             raise HTTPException(404, "Seller cadastrado não encontrado nesta sub_base.")
+        from base_papel_pure import eh_base_parceira
+
+        if eh_base_parceira(getattr(base_row, "papel", None)):
+            raise HTTPException(422, "Base parceira não pode ser vinculada à autenticação.")
         conflito = _conta_ml_do_seller(db, sub_base, body.id_base, user_id_ml)
         if conflito is not None:
             nick = (conflito.user_nickname_ml or "").strip() or str(conflito.user_id_ml)

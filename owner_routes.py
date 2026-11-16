@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timedelta
 from typing import Optional, List
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Query
 from fastapi.responses import Response
@@ -13,7 +14,9 @@ from sqlalchemy import select
 from db import get_db
 from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from fechamento_base_ciclo_pure import aplicar_chave_pix
-from models import Owner, User, OwnerCobrancaItem, BaseSellerDados
+from models import Owner, User, OwnerCobrancaItem, BasePreco, BaseSellerDados
+from base_papel_pure import eh_base_parceira, eh_seller
+from owner_cobranca_faturamento_pure import decidir_data_parceria
 from etiqueta_identidade_service import resolver_logo_owner, resolver_nome_exibicao
 from upload_storage_utils import B2_BUCKET_NAME, get_s3_client_optional, purge_b2_keys
 
@@ -42,6 +45,8 @@ class OwnerCreate(BaseModel):
     teste: Optional[bool] = None
     modo_operacao: Optional[str] = None
     tipo_owner: Optional[str] = None
+    # PRD-011: data de parceria; sem valor, assume a data de hoje (Brasília).
+    criado_em: Optional[date] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -62,6 +67,8 @@ class OwnerUpdate(BaseModel):
     conferencia_saida_habilitada: Optional[bool] = None
     confirmacao_saida_sessoes_habilitada: Optional[bool] = None
     bloquear_saida_sem_coleta: Optional[bool] = None
+    # PRD-011: informada uma vez no owner legado; depois trava.
+    criado_em: Optional[date] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -86,6 +93,7 @@ class OwnerOut(BaseModel):
     conferencia_saida_habilitada: bool = False
     confirmacao_saida_sessoes_habilitada: bool = False
     bloquear_saida_sem_coleta: bool = False
+    criado_em: Optional[date] = None
     cidade: Optional[str] = None
     estado: Optional[str] = None
 
@@ -147,6 +155,7 @@ def _owner_to_out(owner: Owner) -> OwnerOut:
             getattr(owner, "confirmacao_saida_sessoes_habilitada", False)
         ),
         bloquear_saida_sem_coleta=bool(getattr(owner, "bloquear_saida_sem_coleta", False)),
+        criado_em=getattr(owner, "criado_em", None),
     )
 
 
@@ -389,6 +398,7 @@ def create_owner(
         teste=bool(body.teste) if body.teste is not None else False,
         modo_operacao=modo_operacao,
         tipo_owner=tipo_owner,
+        criado_em=body.criado_em or datetime.now(ZoneInfo("America/Sao_Paulo")).date(),
     )
     db.add(obj)
     db.commit()
@@ -497,7 +507,13 @@ def update_owner(
         owner.ignorar_coleta = bool(body.ignorar_coleta)
 
     if body.tipo_owner is not None:
-        owner.tipo_owner = _normalize_tipo_owner(body.tipo_owner)
+        anterior = _normalize_tipo_owner(getattr(owner, "tipo_owner", None))
+        novo = _normalize_tipo_owner(body.tipo_owner)
+        owner.tipo_owner = novo
+        if anterior != "base" and novo == "base":
+            from base_papel_service import preencher_papel_seller_ao_promover
+
+            preencher_papel_seller_ao_promover(db, owner.sub_base)
 
     if body.devolucao_sub_base_habilitada is not None:
         owner.devolucao_sub_base_habilitada = bool(body.devolucao_sub_base_habilitada)
@@ -518,6 +534,12 @@ def update_owner(
 
     if body.bloquear_saida_sem_coleta is not None:
         owner.bloquear_saida_sem_coleta = bool(body.bloquear_saida_sem_coleta)
+
+    if body.criado_em is not None:
+        try:
+            owner.criado_em = decidir_data_parceria(getattr(owner, "criado_em", None), body.criado_em)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     db.commit()
     db.refresh(owner)
@@ -611,8 +633,28 @@ def upsert_seller_dados(
         cidade = (data.get("cidade") or "").strip()
         cep = (data.get("cep") or "").strip()
         tipo_owner = (getattr(owner, "tipo_owner", None) or "subbase").strip().lower()
-        # Owner tipo Base (Seller) exige CNPJ e endereço. Subbase: todos opcionais, inclusive PIX.
-        if tipo_owner == "base" and not all([cnpj, rua, numero, bairro, cidade, cep]):
+        papel_cliente = None
+        if base_id is not None:
+            base_row = db.get(BasePreco, int(base_id))
+            if base_row is None or (base_row.sub_base or "").strip() != (owner.sub_base or "").strip():
+                raise HTTPException(404, "Cliente não encontrado nesta sub_base.")
+            papel_cliente = getattr(base_row, "papel", None)
+            if eh_base_parceira(papel_cliente) and not cnpj and not any([rua, numero, bairro, cidade, cep]):
+                # Base parceira: seller-dados é opcional; sem CNPJ/endereço não cria linha.
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Para Base parceira, informe CNPJ e endereço completo ou deixe os dados em branco.",
+                )
+            if eh_base_parceira(papel_cliente) and cnpj and not all([rua, numero, bairro, cidade, cep]):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Com CNPJ informado, o endereço completo é obrigatório.",
+                )
+        # Seller (papel seller ou owner base legado sem papel) exige CNPJ e endereço.
+        exige_cnpj = tipo_owner == "base" and (
+            papel_cliente is None or eh_seller(papel_cliente)
+        )
+        if exige_cnpj and not all([cnpj, rua, numero, bairro, cidade, cep]):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Campos obrigatórios para criar seller: cnpj, rua, numero, bairro, cidade, cep.",

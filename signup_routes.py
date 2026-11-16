@@ -2,7 +2,9 @@
 # PUBLIC SIGNUP — Criação de Owner + Usuário Inicial (role=1)
 # ============================================
 
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
@@ -159,6 +161,8 @@ def public_signup(
             nome_fantasia=nome_fantasia_db,
             ativo=True,
             ignorar_coleta=False,
+            # PRD-011: data de parceria registrada na criação
+            criado_em=datetime.now(ZoneInfo("America/Sao_Paulo")).date(),
         )
         db.add(owner)
         db.flush()

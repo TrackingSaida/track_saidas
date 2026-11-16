@@ -57,7 +57,7 @@ OPERACAO_TZ = ZoneInfo("America/Sao_Paulo")
 
 # Status considerados válidos (saiu/em rota/entregue/ausente — alinhado ao app mobile)
 # Incluir "saiu_para_entrega" pois o app mobile grava SAIU_PARA_ENTREGA
-STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega", "em_rota", "entregue", "ausente"]
+STATUS_SAIDAS_VALIDOS = ["saiu", "saiu pra entrega", "saiu_pra_entrega", "saiu_para_entrega", "em_rota", "entregue", "ausente", "enviado_para_base"]
 STATUS_CANCELADO = "cancelado"
 STATUS_COLETADO = "coletado"
 

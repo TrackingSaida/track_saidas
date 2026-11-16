@@ -567,6 +567,10 @@ def staff_liberar(
         raise HTTPException(404, "Seller não encontrado.")
     if not base.ativo:
         raise HTTPException(422, "Ative o seller antes de liberar o portal.")
+    from base_papel_pure import eh_base_parceira
+
+    if eh_base_parceira(getattr(base, "papel", None)):
+        raise HTTPException(422, "Base parceira não possui portal de etiquetas.")
     dados = db.scalar(select(BaseSellerDados).where(BaseSellerDados.base_id == int(body.id_base)).limit(1))
     if not _seller_endereco_ok(dados):
         raise HTTPException(422, "Complete o endereço do seller antes de liberar o portal.")

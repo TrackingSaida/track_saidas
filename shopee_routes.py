@@ -589,6 +589,10 @@ def shopee_vincular_seller(
         base_row = _base_vinculada(db, sub_base, body.id_base)
         if base_row is None:
             raise HTTPException(404, "Seller cadastrado não encontrado nesta sub_base.")
+        from base_papel_pure import eh_base_parceira
+
+        if eh_base_parceira(getattr(base_row, "papel", None)):
+            raise HTTPException(422, "Base parceira não pode ser vinculada à autenticação.")
         conflito = (
             db.query(ShopeeToken)
             .filter(

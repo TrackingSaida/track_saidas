@@ -19,6 +19,7 @@ STATUS_SAIDAS_INDICADOR = (
     "em_rota",
     "entregue",
     "ausente",
+    "enviado_para_base",  # PRD-011
 )
 
 
