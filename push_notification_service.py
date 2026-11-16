@@ -37,6 +37,9 @@ ALWAYS_SEND_TYPES = frozenset(
         "fechamento_pronto",
         "fechamento_reajustado",
         "fechamento_pago",
+        "transferencia_pendente",
+        "transferencia_resolvida",
+        "transferencia_recusada",
     }
 )
 

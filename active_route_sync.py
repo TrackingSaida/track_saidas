@@ -48,6 +48,40 @@ def get_active_route_delivery_ids(
     return [int(x) for x in (ordem_raw or [])]
 
 
+def pacote_em_rota_ativa(
+    db: Session,
+    *,
+    motoboy_id: Optional[int],
+    id_saida: int,
+    sub_base: Optional[str] = None,
+    hoje: Optional[date] = None,
+) -> Optional[RotasMotoboy]:
+    """Retorna a rota ativa do titular que contém o id_saida, ou None."""
+    if motoboy_id is None:
+        return None
+    ref_date = hoje or _hoje_operacional()
+    q = (
+        select(RotasMotoboy)
+        .where(
+            RotasMotoboy.motoboy_id == int(motoboy_id),
+            RotasMotoboy.status == "ativa",
+            RotasMotoboy.data == ref_date,
+            RotasMotoboy.finalizado_em.is_(None),
+        )
+        .order_by(RotasMotoboy.iniciado_em.desc())
+        .limit(1)
+    )
+    if sub_base:
+        q = q.where(RotasMotoboy.sub_base == sub_base)
+    rota = db.scalar(q)
+    if not rota:
+        return None
+    ordem = _ordem_from_rota(rota)
+    if int(id_saida) not in ordem:
+        return None
+    return rota
+
+
 def _ordem_from_rota(rota: RotasMotoboy) -> List[int]:
     ordem_raw = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
     return [int(x) for x in (ordem_raw or [])]

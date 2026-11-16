@@ -3347,6 +3347,16 @@ def atualizar_saida(
         raise_if_bloqueado_ausencias(db, obj.id_saida)
     if reatribuicao_entregue:
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
+        from saida_transferencia_service import tentar_gate_reatribuicao
+
+        tentar_gate_reatribuicao(
+            db,
+            saida=obj,
+            sub_base=sub_base,
+            motoboy_destino_id=int(motoboy.id_motoboy),
+            solicitante_user_id=getattr(current_user, "id", None),
+            solicitante_motoboy_id=getattr(current_user, "motoboy_id", None),
+        )
         encerrar_item_da_operacao_anterior(
             db,
             sub_base=sub_base,
@@ -3381,6 +3391,16 @@ def atualizar_saida(
         motoboy = _resolve_motoboy_for_subbase(db, sub_base, payload.motoboy_id)
         trocou_motoboy = motoboy_anterior != motoboy.id_motoboy
         if trocou_motoboy:
+            from saida_transferencia_service import tentar_gate_reatribuicao
+
+            tentar_gate_reatribuicao(
+                db,
+                saida=obj,
+                sub_base=sub_base,
+                motoboy_destino_id=int(motoboy.id_motoboy),
+                solicitante_user_id=getattr(current_user, "id", None),
+                solicitante_motoboy_id=getattr(current_user, "motoboy_id", None),
+            )
             encerrar_item_da_operacao_anterior(
                 db,
                 sub_base=sub_base,
@@ -3487,6 +3507,11 @@ def atualizar_saida(
             db, obj.id_saida, status_anterior, status_novo
         )
     if cancelando:
+        from saida_transferencia_service import obsolecer_pendencias_da_saida
+
+        obsolecer_pendencias_da_saida(
+            db, id_saida=id_saida, user_id=getattr(current_user, "id", None)
+        )
         encerrar_item_da_operacao_anterior(
             db,
             sub_base=sub_base,
@@ -3494,6 +3519,12 @@ def atualizar_saida(
             id_saida=id_saida,
             motivo="CANCELADO",
             user_id=getattr(current_user, "id", None),
+        )
+    elif status_mudou and status_novo in (STATUS_ENTREGUE, STATUS_AUSENTE):
+        from saida_transferencia_service import obsolecer_pendencias_da_saida
+
+        obsolecer_pendencias_da_saida(
+            db, id_saida=id_saida, user_id=getattr(current_user, "id", None)
         )
     evento_historico = None
     if status_mudou:
@@ -3580,3 +3611,28 @@ def deletar_saida(
 
     invalidate_listar_cache(sub_base)
     return
+
+
+# ============================================================
+# PRD-013 — cancelar transferência pendente (staff ou solicitante)
+# ============================================================
+@router.post("/transferencias/{transferencia_id}/cancelar")
+def cancelar_transferencia_saida(
+    transferencia_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from saida_transferencia_service import cancelar_transferencia
+
+    try:
+        role_int = int(getattr(current_user, "role", -1))
+    except (TypeError, ValueError):
+        role_int = -1
+    is_staff = role_int != 4
+    return cancelar_transferencia(
+        db,
+        transferencia_id=transferencia_id,
+        sub_base=current_user.sub_base or "",
+        user=current_user,
+        is_staff=is_staff,
+    )
