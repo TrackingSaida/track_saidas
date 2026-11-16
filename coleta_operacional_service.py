@@ -282,6 +282,13 @@ def resolver_executor(db: Session, current_user: User, executor_user_id: Optiona
     exec_sub = (getattr(executor, "sub_base", None) or "").strip()
     if role not in (0, 1) and exec_sub != claim_sub:
         raise HTTPException(404, "Executor não encontrado nesta sub_base.")
+    try:
+        executor_role = int(getattr(executor, "role", -1))
+    except (TypeError, ValueError):
+        executor_role = -1
+    # A flag de coleta é do perfil motoboy. Staff logado não herda ficha antiga.
+    if executor_role != 4:
+        return executor, None
     motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == executor.id))
     if motoboy and not bool(getattr(motoboy, "pode_realizar_coleta", False)):
         raise HTTPException(403, "Este motoboy não possui permissão para realizar coletas.")
