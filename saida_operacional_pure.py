@@ -98,6 +98,9 @@ ROTULOS_ACAO = {
     "saida_confirmada": "Confirmou início da entrega",
     "saida_removida_antes_confirmacao": "Removeu antes de começar entrega",
     "nova_saida_mesmo_entregador": "Pacote incluído em novo lote de saída",
+    "transferencia_solicitada": "Solicitou transferência do pedido",
+    "transferencia_recusada": "Recusou transferência do pedido",
+    "transferencia_cancelada": "Cancelou solicitação de transferência",
 }
 
 FALLBACK_ACAO_HISTORICO_ANTERIOR = "Histórico anterior à atualização"

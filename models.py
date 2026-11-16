@@ -1408,6 +1408,40 @@ class RotasMotoboy(Base):
 
 
 # ==========================
+# Tabela: saida_transferencias_pendentes (PRD-013)
+# ==========================
+class SaidaTransferenciaPendente(Base):
+    __tablename__ = "saida_transferencias_pendentes"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_saida = Column(BigInteger, nullable=False, index=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_origem_id = Column(
+        BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False
+    )
+    motoboy_destino_id = Column(
+        BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="SET NULL"), nullable=True
+    )
+    repasse_base_id = Column(BigInteger, nullable=True)
+    solicitante_user_id = Column(BigInteger, nullable=True)
+    solicitante_motoboy_id = Column(
+        BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="SET NULL"), nullable=True
+    )
+    rota_id = Column(BigInteger, nullable=True)
+    route_revision_ref = Column(Integer, nullable=True)
+    status = Column(Text, nullable=False, server_default=text("'pendente'"))
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    resolvida_em = Column(DateTime(timezone=False), nullable=True)
+    resolvida_por_user_id = Column(BigInteger, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<SaidaTransferenciaPendente id={self.id} id_saida={self.id_saida} "
+            f"status={self.status!r}>"
+        )
+
+
+# ==========================
 # Tabela: route_optimization_requests (idempotência de otimização)
 # ==========================
 class RouteOptimizationRequest(Base):

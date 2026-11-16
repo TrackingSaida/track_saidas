@@ -422,6 +422,15 @@ class RotasAvancarOut(BaseModel):
     parada_atual: int
 
 
+class TransferenciaPendenteResumo(BaseModel):
+    transferencia_id: int
+    id_saida: int
+    codigo: Optional[str] = None
+    rota_id: Optional[str] = None
+    motoboy_destino_id: Optional[int] = None
+    criada_em: Optional[str] = None
+
+
 class RotasAtivaOut(BaseModel):
     status: str = "sem_rota"
     rota_id: Optional[str] = None
@@ -441,6 +450,7 @@ class RotasAtivaOut(BaseModel):
     polyline_coords: Optional[List[dict]] = None
     distancia_total_m: Optional[int] = None
     duracao_total_s: Optional[int] = None
+    transferencias_pendentes: List[TransferenciaPendenteResumo] = Field(default_factory=list)
 
 
 class RotasOrdemBody(BaseModel):
@@ -1807,14 +1817,52 @@ def _upsert_rota_preparando(
 
     existing = _find_open_rota(db, motoboy_id=motoboy_id, sub_base=sub_base, ref_date=ref_date)
     now = datetime.utcnow()
-    if existing and existing.status == "ativa":
-        return existing
 
     geom_status = "missing"
     geom_hash = None
     if polyline_encoded and geometry_provider:
         geom_status = "valid"
         geom_hash = order_hash(ordem)
+
+    if existing and existing.status == "ativa":
+        # PRD-013: persiste só o sufixo; prefixo até parada_atual permanece congelado.
+        ordem_atual = json.loads(existing.ordem_json) if isinstance(existing.ordem_json, str) else existing.ordem_json
+        if not isinstance(ordem_atual, list):
+            ordem_atual = []
+        parada = int(existing.parada_atual or 0)
+        prefix = [int(x) for x in ordem_atual[:parada]]
+        # `ordem` pode ser a ordem completa ou só o sufixo; normaliza pelo prefixo.
+        ordem_ints = [int(x) for x in ordem]
+        if prefix and ordem_ints[: len(prefix)] == prefix:
+            nova_ordem = ordem_ints
+        else:
+            nova_ordem = prefix + [sid for sid in ordem_ints if sid not in prefix]
+        if set(nova_ordem) != set(int(x) for x in ordem_atual):
+            # Otimização parcial não pode adicionar/remover ids; só reordenar futuros.
+            return existing
+        if nova_ordem[:parada] != prefix:
+            return existing
+        rev = int(getattr(existing, "route_revision", 0) or 0) + 1
+        existing.ordem_json = json.dumps(nova_ordem)
+        existing.updated_at = now
+        existing.route_revision = rev
+        existing.optimization_mode = optimization_mode
+        existing.optimization_input_hash = optimization_input_hash
+        existing.optimized_at = datetime.now(_tz.utc)
+        existing.distancia_total_m = distancia_total_m
+        existing.duracao_total_s = duracao_total_s
+        if polyline_encoded and geometry_provider:
+            existing.polyline_encoded = polyline_encoded
+            existing.geometry_provider = geometry_provider
+            existing.geometry_status = geom_status
+            existing.geometry_order_hash = geom_hash
+        else:
+            existing.geometry_status = "stale" if existing.polyline_encoded else "missing"
+            if not polyline_encoded:
+                existing.geometry_order_hash = None
+        db.commit()
+        db.refresh(existing)
+        return existing
 
     if existing and existing.status == "preparando":
         rev = int(getattr(existing, "route_revision", 0) or 0) + 1
@@ -2276,24 +2324,63 @@ def rotas_ativa(
     else:
         hoje = _hoje_operacional()
 
+    from saida_transferencia_service import pendentes_resumo_origem
+
+    pendencias = pendentes_resumo_origem(
+        db, motoboy_id=int(motoboy_id), sub_base=sub_base
+    )
+
+    def _with_pendencias(payload: dict) -> RotasAtivaOut:
+        payload = dict(payload)
+        payload["transferencias_pendentes"] = pendencias
+        return RotasAtivaOut(**payload)
+
     rota = _find_open_rota(db, motoboy_id=int(motoboy_id), sub_base=sub_base, ref_date=hoje)
     if not rota:
-        return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
+        return _with_pendencias(
+            build_rotas_ativa_out(
+                None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()
+            )
+        )
 
     if map_rota_to_api_status(rota) == API_STATUS_EM_ENTREGA:
         if not refresh_active_route_if_stale(db, rota):
-            return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
+            return _with_pendencias(
+                build_rotas_ativa_out(
+                    None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()
+                )
+            )
         ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
         if not isinstance(ordem, list):
             ordem = []
         if len(ordem) > 0 and rota.parada_atual >= len(ordem):
-            return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
-        return RotasAtivaOut(**build_rotas_ativa_out(rota, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat(), ordem=ordem))
+            return _with_pendencias(
+                build_rotas_ativa_out(
+                    None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()
+                )
+            )
+        return _with_pendencias(
+            build_rotas_ativa_out(
+                rota,
+                sub_base=sub_base,
+                motoboy_id=int(motoboy_id),
+                data_iso=hoje.isoformat(),
+                ordem=ordem,
+            )
+        )
 
     ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
     if not isinstance(ordem, list):
         ordem = []
-    return RotasAtivaOut(**build_rotas_ativa_out(rota, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat(), ordem=ordem))
+    return _with_pendencias(
+        build_rotas_ativa_out(
+            rota,
+            sub_base=sub_base,
+            motoboy_id=int(motoboy_id),
+            data_iso=hoje.isoformat(),
+            ordem=ordem,
+        )
+    )
 
 
 # ============================================================
@@ -3617,6 +3704,9 @@ def marcar_entregue(
             user_id=user.id,
         )
     )
+    from saida_transferencia_service import obsolecer_pendencias_da_saida
+
+    obsolecer_pendencias_da_saida(db, id_saida=id_saida, user_id=user.id)
     db.commit()
     db.refresh(s)
     audit_entrega(
@@ -3741,6 +3831,9 @@ def marcar_ausente(
             ),
         )
     )
+    from saida_transferencia_service import obsolecer_pendencias_da_saida
+
+    obsolecer_pendencias_da_saida(db, id_saida=id_saida, user_id=user.id)
     db.commit()
     db.refresh(s)
     try:
@@ -4952,6 +5045,17 @@ def assumir_entrega(
     if status_norm == STATUS_AUSENTE:
         raise_if_bloqueado_ausencias(db, id_saida)
     antigo = s.motoboy_id
+    if antigo is not None and antigo != user.motoboy_id:
+        from saida_transferencia_service import tentar_gate_reatribuicao
+
+        tentar_gate_reatribuicao(
+            db,
+            saida=s,
+            sub_base=user.sub_base or "",
+            motoboy_destino_id=int(user.motoboy_id),
+            solicitante_user_id=getattr(user, "id", None),
+            solicitante_motoboy_id=getattr(user, "motoboy_id", None),
+        )
     encerrar_item_da_operacao_anterior(
         db,
         sub_base=user.sub_base,
@@ -5029,3 +5133,55 @@ def assumir_entrega(
             endpoint="/mobile/entrega/{id_saida}/assumir",
         )
     return {"ok": True, "id_saida": id_saida}
+
+
+# ============================================================
+# PRD-013 — transferências pendentes (origem)
+# ============================================================
+@router.get("/transferencias/pendentes")
+def listar_transferencias_pendentes(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from saida_transferencia_service import pendentes_resumo_origem
+
+    sub_base = user.sub_base or ""
+    return {
+        "items": pendentes_resumo_origem(
+            db, motoboy_id=int(user.motoboy_id), sub_base=sub_base
+        )
+    }
+
+
+@router.post("/transferencias/{transferencia_id}/aceitar")
+def aceitar_transferencia_mobile(
+    transferencia_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from saida_transferencia_service import aceitar_transferencia
+
+    return aceitar_transferencia(
+        db,
+        transferencia_id=transferencia_id,
+        motoboy_id=int(user.motoboy_id),
+        sub_base=user.sub_base or "",
+        user_id=getattr(user, "id", None),
+    )
+
+
+@router.post("/transferencias/{transferencia_id}/recusar")
+def recusar_transferencia_mobile(
+    transferencia_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from saida_transferencia_service import recusar_transferencia
+
+    return recusar_transferencia(
+        db,
+        transferencia_id=transferencia_id,
+        motoboy_id=int(user.motoboy_id),
+        sub_base=user.sub_base or "",
+        user_id=getattr(user, "id", None),
+    )

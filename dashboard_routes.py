@@ -1518,25 +1518,35 @@ def get_dashboard_admin(
             ],
         )
 
-    stmt_coletas = select(Coleta).where(
-        Coleta.sub_base.in_(sub_bases),
-        Coleta.timestamp >= dt_min,
-        Coleta.timestamp <= dt_max,
-    ).where(
-        (Coleta.shopee != 0) | (Coleta.mercado_livre != 0) | (Coleta.avulso != 0) | (Coleta.valor_total != 0)
-    )
-    rows_coletas = db.execute(stmt_coletas).scalars().all()
-    total_coletas = len(rows_coletas)
+    rows_coletas = db.execute(
+        select(Coleta.sub_base, func.count())
+        .where(
+            Coleta.sub_base.in_(sub_bases),
+            Coleta.timestamp >= dt_min,
+            Coleta.timestamp <= dt_max,
+            (Coleta.shopee != 0)
+            | (Coleta.mercado_livre != 0)
+            | (Coleta.avulso != 0)
+            | (Coleta.valor_total != 0),
+        )
+        .group_by(Coleta.sub_base)
+    ).all()
+    coleta_por_sb = {sb: int(qtd) for sb, qtd in rows_coletas}
+    total_coletas = sum(coleta_por_sb.values())
 
-    stmt_saidas = select(Saida).where(
-        Saida.sub_base.in_(sub_bases),
-        Saida.data >= data_inicio,
-        Saida.data <= data_fim,
-        Saida.codigo.isnot(None),
-        func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
-    )
-    rows_saidas = db.execute(stmt_saidas).scalars().all()
-    total_saidas = len(rows_saidas)
+    rows_saidas = db.execute(
+        select(Saida.sub_base, func.count())
+        .where(
+            Saida.sub_base.in_(sub_bases),
+            Saida.data >= data_inicio,
+            Saida.data <= data_fim,
+            Saida.codigo.isnot(None),
+            func.lower(Saida.status).in_(STATUS_SAIDAS_VALIDOS),
+        )
+        .group_by(Saida.sub_base)
+    ).all()
+    saida_por_sb = {sb: int(qtd) for sb, qtd in rows_saidas}
+    total_saidas = sum(saida_por_sb.values())
 
     start_hist, end_hist = _bounds_periodo_operacional(data_inicio, data_fim)
     entradas_ops = buscar_ids_entrada_periodo(
@@ -1556,14 +1566,11 @@ def get_dashboard_admin(
     owner_map = {o.sub_base: o for o in owners}
     owners_ativos = len([s for s in sub_bases if owner_map.get(s) and owner_map[s].ativo])
 
-    coleta_por_sb: Dict[str, int] = {}
     entrada_por_sb: Dict[str, int] = {}
-    saida_por_sb: Dict[str, int] = {}
+    for _id, sb in entradas_ops:
+        entrada_por_sb[sb] = entrada_por_sb.get(sb, 0) + 1
     cob_por_sb: Dict[str, Decimal] = {}
     for sb in sub_bases:
-        coleta_por_sb[sb] = sum(1 for c in rows_coletas if c.sub_base == sb)
-        entrada_por_sb[sb] = sum(1 for _id, s in entradas_ops if s == sb)
-        saida_por_sb[sb] = sum(1 for s in rows_saidas if s.sub_base == sb)
         cob = cobranca_por_sb.get(sb)
         base_n = cob.base_cobranca if cob else 0
         cob_por_sb[sb] = receita_admin_owner(valor_owner(owner_map.get(sb)), base_n)
