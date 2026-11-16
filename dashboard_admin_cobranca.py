@@ -16,7 +16,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sqlalchemy import and_, exists, func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 if TYPE_CHECKING:
@@ -156,6 +156,60 @@ def buscar_ids_coleta_periodo(
     return [(int(r.id_saida), r.sub_base or "") for r in rows]
 
 
+def _stmt_ids_entrada_periodo(
+    sub_bases: Sequence[str],
+    start_hist: datetime,
+    end_hist: datetime,
+    *,
+    somente_sem_coleta: bool,
+):
+    """Primeira entrada no período, sem agregar o histórico inteiro.
+
+    O recorte começa pelos eventos `entrada_base` da janela e dos owners
+    pedidos. O MIN só roda nesses pacotes, para confirmar que a entrada da
+    janela é de fato a primeira.
+    """
+    from models import Saida, SaidaHistorico
+
+    no_periodo = (
+        select(SaidaHistorico.id_saida)
+        .join(Saida, Saida.id_saida == SaidaHistorico.id_saida)
+        .where(
+            SaidaHistorico.evento == "entrada_base",
+            SaidaHistorico.timestamp >= start_hist,
+            SaidaHistorico.timestamp < end_hist,
+            Saida.sub_base.in_(sub_bases),
+        )
+        .distinct()
+        .scalar_subquery()
+    )
+    primeira_entrada = (
+        select(
+            SaidaHistorico.id_saida.label("id_saida"),
+            func.min(SaidaHistorico.timestamp).label("ts"),
+        )
+        .where(
+            SaidaHistorico.evento == "entrada_base",
+            SaidaHistorico.id_saida.in_(no_periodo),
+        )
+        .group_by(SaidaHistorico.id_saida)
+        .subquery()
+    )
+    stmt = (
+        select(Saida.id_saida, Saida.sub_base)
+        .join(primeira_entrada, primeira_entrada.c.id_saida == Saida.id_saida)
+        .where(
+            Saida.sub_base.in_(sub_bases),
+            primeira_entrada.c.ts >= start_hist,
+            primeira_entrada.c.ts < end_hist,
+            _status_nao_cancelado(),
+        )
+    )
+    if somente_sem_coleta:
+        stmt = stmt.where(Saida.id_coleta.is_(None))
+    return stmt
+
+
 def buscar_ids_entrada_periodo(
     db: Session,
     sub_bases: Sequence[str],
@@ -164,33 +218,12 @@ def buscar_ids_entrada_periodo(
     *,
     somente_sem_coleta: bool,
 ) -> List[IdSubBase]:
-    from models import Saida, SaidaHistorico
-
-    primeira_entrada = (
-        select(
-            SaidaHistorico.id_saida.label("id_saida"),
-            func.min(SaidaHistorico.timestamp).label("ts"),
-        )
-        .where(SaidaHistorico.evento == "entrada_base")
-        .group_by(SaidaHistorico.id_saida)
-        .having(
-            and_(
-                func.min(SaidaHistorico.timestamp) >= start_hist,
-                func.min(SaidaHistorico.timestamp) < end_hist,
-            )
-        )
-        .subquery()
+    stmt = _stmt_ids_entrada_periodo(
+        sub_bases,
+        start_hist,
+        end_hist,
+        somente_sem_coleta=somente_sem_coleta,
     )
-    stmt = (
-        select(Saida.id_saida, Saida.sub_base)
-        .join(primeira_entrada, primeira_entrada.c.id_saida == Saida.id_saida)
-        .where(
-            Saida.sub_base.in_(sub_bases),
-            _status_nao_cancelado(),
-        )
-    )
-    if somente_sem_coleta:
-        stmt = stmt.where(Saida.id_coleta.is_(None))
     rows = db.execute(stmt).all()
     return [(int(r.id_saida), r.sub_base or "") for r in rows]
 
