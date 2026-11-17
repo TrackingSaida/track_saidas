@@ -5,9 +5,8 @@ está abaixo do piso do perfil. Quem ainda não tem essa checagem no
 aplicativo não é afetado: a trava vale a partir do build que a consulta.
 
 Padrão atual:
-- todos os perfis: 1.16.4
-- root (0), admin (1) e operador (2): piso por role legado 1.12.0
-  (efetivo = max com o piso geral → 1.16.4)
+- todos os perfis: 1.11.0 (melhorias que impactam o fluxo)
+- root (0), admin (1) e operador (2): 1.12.0
 - coletador (3) e motoboy (4): só o piso geral
 """
 from __future__ import annotations
@@ -16,7 +15,7 @@ import os
 from dataclasses import dataclass
 
 PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=br.com.trackingsaidas.mobile"
-DEFAULT_MIN_VERSION = "1.16.4"
+DEFAULT_MIN_VERSION = "1.11.0"
 DEFAULT_MESSAGE = (
     "Há uma nova versão do ROTEVO. Atualize para continuar usando o aplicativo."
 )
