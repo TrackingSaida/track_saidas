@@ -502,6 +502,7 @@ class ExtratoDiaItem(BaseModel):
 class ExtratoPedidoItem(BaseModel):
     id_saida: int
     codigo: Optional[str]
+    codigo_exibicao: Optional[str] = None
     status: str
     exibicao: str
     servico: str
@@ -1363,6 +1364,32 @@ def extrato_financeiro_motoboy(
             )
         )
     dias.sort(key=lambda item: item.data, reverse=True)
+
+    # Rótulo amigável do avulso (busca em Minhas entregas).
+    extrato_itens: List[ExtratoPedidoItem] = []
+    for dia in dias:
+        extrato_itens.extend(dia.itens)
+        extrato_itens.extend(dia.itens_cancelados or [])
+    extrato_itens.extend(itens_cancelados_periodo)
+    if extrato_itens and sub_base:
+        as_dicts: List[Dict[str, Any]] = [
+            {
+                "id_saida": int(p.id_saida),
+                "codigo": p.codigo,
+                "servico": p.servico,
+            }
+            for p in extrato_itens
+        ]
+        _enriquecer_codigo_exibicao_entregas(db, sub_base=sub_base, items=as_dicts)
+        labels = {
+            int(d["id_saida"]): d.get("codigo_exibicao")
+            for d in as_dicts
+            if d.get("codigo_exibicao")
+        }
+        for p in extrato_itens:
+            label = labels.get(int(p.id_saida))
+            if label:
+                p.codigo_exibicao = label
 
     fechamentos_periodo = run_db_query_with_retry(
         db,
