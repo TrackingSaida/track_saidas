@@ -167,6 +167,7 @@ def get_current_mobile_scan_user(
 class EntregaListItem(BaseModel):
     id_saida: int
     codigo: Optional[str]
+    codigo_exibicao: Optional[str] = None  # rótulo amigável do avulso (campos de identificação)
     status: str
     exibicao: str  # "Pendente" | "Entregue" | "Ausente"
     servico: Optional[str] = None  # Shopee | Mercado Livre | Flex | Avulso
@@ -776,6 +777,47 @@ def _saida_to_item(
     return item
 
 
+def _enriquecer_codigo_exibicao_entregas(
+    db: Session,
+    *,
+    sub_base: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    """Preenche codigo_exibicao com identificação amigável nos avulsos (igual Registros)."""
+    if not items or not sub_base:
+        return
+    from types import SimpleNamespace
+
+    from avulso_campos_service import labels_exibicao_por_saidas
+
+    row_ns = []
+    for it in items:
+        cod = str(it.get("codigo") or "")
+        srv = str(it.get("servico") or "").lower()
+        sid = it.get("id_saida")
+        if sid is None:
+            continue
+        if not (cod.upper().startswith("AVULSO-") or "avulso" in srv):
+            continue
+        row_ns.append(
+            SimpleNamespace(
+                id_saida=int(sid),
+                codigo=cod,
+                base=it.get("base"),
+            )
+        )
+    if not row_ns:
+        return
+    labels = labels_exibicao_por_saidas(db, sub_base=sub_base, rows=row_ns)
+    for it in items:
+        sid = it.get("id_saida")
+        if sid is None:
+            continue
+        label = labels.get(int(sid))
+        if label:
+            it["codigo_exibicao"] = label
+
+
 def _parse_data_yyyy_mm_dd(raw: Optional[str]) -> Optional[date]:
     if not raw:
         return None
@@ -1154,6 +1196,7 @@ def listar_entregas(
             campos_cache=campos_cache,
         )
         out.append(item)
+    _enriquecer_codigo_exibicao_entregas(db, sub_base=sub_base, items=out)
     return out
 
 
@@ -2727,6 +2770,8 @@ def detalhe_entrega(
     ocorrencia_map = _carregar_data_hora_ocorrencia_map(db, [id_saida])
     item = _saida_to_item(s, detail, data_hora_ocorrencia=ocorrencia_map.get(id_saida), db=db)
     _enrich_datas_detalhe(db, s, item)
+    if user.sub_base:
+        _enriquecer_codigo_exibicao_entregas(db, sub_base=user.sub_base, items=[item])
     return item
 
 
