@@ -27,6 +27,7 @@ from coleta_operacional_service import (
     combinar_modo_execucao,
     encerrar_coletas_dias_anteriores,
     exige_confirmacao_ajudar,
+    exigir_dia_programado,
     exigir_modo,
     liberar_participacao_vazia,
     liberar_participacoes_vazias_do_usuario,
@@ -1153,6 +1154,12 @@ def corrigir_quantidades_participante(
         base_nome=execucao.base_ref.base,
         data_operacao=execucao.data_operacao,
         motoboy_id=participante.motoboy_id,
+    )
+    exigir_dia_programado(
+        db,
+        sub_base=sub_base,
+        base=execucao.base_ref,
+        data_operacao=execucao.data_operacao,
     )
 
     ant_shopee = int(participante.shopee or 0)

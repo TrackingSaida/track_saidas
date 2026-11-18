@@ -21,6 +21,7 @@ from saidas_routes import _gerar_codigo_avulso, _normalizar_label_avulso
 from coleta_operacional_service import (
     agregar_leitura,
     atualizar_status_execucao,
+    exigir_dia_programado,
     exigir_modo,
     obter_ou_criar_execucao,
     resolver_base,
@@ -1025,6 +1026,14 @@ def criar_coleta_manual(
             "Já existe um lançamento para essa mesma data e base. Use a opção Editar no registro existente.",
         )
 
+    base_ref = resolver_base(db, sub_base, nome=base_norm)
+    exigir_dia_programado(
+        db,
+        sub_base=sub_base,
+        base=base_ref,
+        data_operacao=payload.data,
+    )
+
     p_shopee, p_ml, p_avulso = _get_precos_cached(db, sub_base, base_norm)
 
     valor_total = (
@@ -1063,7 +1072,6 @@ def criar_coleta_manual(
     )
     db.add(coleta)
     db.flush()
-    base_ref = resolver_base(db, sub_base, nome=base_norm)
     executor, motoboy_id = resolver_executor(db, current_user)
     from coleta_operacional_routes import _garantir_nao_fechado
     _garantir_nao_fechado(
