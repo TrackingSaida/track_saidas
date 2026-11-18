@@ -7,9 +7,11 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from coleta_agenda_pure import dia_permite_lancamento_coleta
 from models import (
     BasePreco,
     Coleta,
+    ColetaCalendarioExcecao,
     ColetaExecucao,
     ColetaExecucaoParticipante,
     Motoboy,
@@ -295,6 +297,58 @@ def resolver_executor(db: Session, current_user: User, executor_user_id: Optiona
     return executor, int(motoboy.id_motoboy) if motoboy else None
 
 
+def _tipo_excecao_calendario_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    base_id: Optional[int],
+    data_operacao: date,
+) -> Optional[str]:
+    """Exceção da base no dia prevalece sobre a global."""
+    excecoes = list(
+        db.scalars(
+            select(ColetaCalendarioExcecao).where(
+                ColetaCalendarioExcecao.sub_base == sub_base,
+                ColetaCalendarioExcecao.data == data_operacao,
+            )
+        ).all()
+    )
+    if not excecoes:
+        return None
+    if base_id is not None:
+        for item in excecoes:
+            if item.base_id is not None and int(item.base_id) == int(base_id):
+                return (item.tipo or "").strip() or None
+    for item in excecoes:
+        if item.base_id is None:
+            return (item.tipo or "").strip() or None
+    return None
+
+
+def exigir_dia_programado(
+    db: Session,
+    *,
+    sub_base: str,
+    base: BasePreco,
+    data_operacao: date,
+) -> None:
+    """Bloqueia lançamento fora da agenda confirmada (salvo Coleta extra)."""
+    tipo = _tipo_excecao_calendario_dia(
+        db,
+        sub_base=sub_base,
+        base_id=getattr(base, "id_base", None),
+        data_operacao=data_operacao,
+    )
+    ok, msg = dia_permite_lancamento_coleta(
+        agenda_confirmada=bool(getattr(base, "agenda_coleta_confirmada", False)),
+        dias_coleta=getattr(base, "dias_coleta", None),
+        weekday=data_operacao.isoweekday(),
+        tipo_excecao=tipo,
+    )
+    if not ok:
+        raise HTTPException(422, msg or "Dia fora da agenda de coleta da base.")
+
+
 def obter_ou_criar_execucao(
     db: Session,
     *,
@@ -303,6 +357,12 @@ def obter_ou_criar_execucao(
     data_operacao: date,
     modo: str,
 ) -> ColetaExecucao:
+    exigir_dia_programado(
+        db,
+        sub_base=sub_base,
+        base=base,
+        data_operacao=data_operacao,
+    )
     execucao = db.scalar(
         select(ColetaExecucao).where(
             ColetaExecucao.sub_base == sub_base,
