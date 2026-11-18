@@ -7,10 +7,12 @@ from decimal import Decimal
 import pytest
 
 from base_papel_pure import (
+    PAPEL_PREENCHIDO_AO_PROMOVER,
     eh_base_parceira,
     eh_seller,
     exige_papel_obrigatorio,
     normalizar_papel,
+    papel_ao_promover_owner_para_base,
     permite_autenticacao_portal,
 )
 from base_repasse_pure import (
@@ -62,6 +64,16 @@ def test_destino_repasse_exige_base_parceira_que_entrega_e_ativa():
     assert validar_destino_repasse(papel="seller", entrega_pedidos=True, ativo=True)
     assert validar_destino_repasse(papel="base_parceira", entrega_pedidos=False, ativo=True)
     assert validar_destino_repasse(papel="base_parceira", entrega_pedidos=True, ativo=False)
+
+
+def test_promocao_preenche_clientes_sem_papel_como_base_parceira():
+    assert PAPEL_PREENCHIDO_AO_PROMOVER == "base_parceira"
+    assert papel_ao_promover_owner_para_base(qtd_owners=1, tipo_owner="base") == "base_parceira"
+    assert papel_ao_promover_owner_para_base(qtd_owners=1, tipo_owner="BASE") == "base_parceira"
+    assert papel_ao_promover_owner_para_base(qtd_owners=2, tipo_owner="base") is None
+    assert papel_ao_promover_owner_para_base(qtd_owners=1, tipo_owner="subbase") is None
+    assert papel_ao_promover_owner_para_base(qtd_owners=0, tipo_owner="base") is None
+    assert papel_ao_promover_owner_para_base(qtd_owners=1, tipo_owner=None) is None
 
 
 # ---- preço a pagar -------------------------------------------------------

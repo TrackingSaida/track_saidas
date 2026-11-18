@@ -5,6 +5,18 @@ from typing import Optional
 
 PAPEIS = frozenset({"seller", "base_parceira"})
 
+# Clientes já cadastrados na subbase viram Base parceira; Sellers entram só no cadastro explícito.
+PAPEL_PREENCHIDO_AO_PROMOVER = "base_parceira"
+
+
+def papel_ao_promover_owner_para_base(*, qtd_owners: int, tipo_owner: Optional[str]) -> Optional[str]:
+    """Papel a gravar em clientes sem papel na promoção. None = não preenche."""
+    if int(qtd_owners or 0) != 1:
+        return None
+    if (tipo_owner or "").strip().lower() != "base":
+        return None
+    return PAPEL_PREENCHIDO_AO_PROMOVER
+
 
 def normalizar_papel(value: Optional[str]) -> Optional[str]:
     if value is None:

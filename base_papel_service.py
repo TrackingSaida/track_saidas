@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from base_papel_pure import exige_papel_obrigatorio
+from base_papel_pure import exige_papel_obrigatorio, papel_ao_promover_owner_para_base
 from models import BasePreco, Owner
 
 
@@ -38,17 +38,19 @@ def papel_default_importacao(db: Session, sub_base: str) -> Optional[str]:
     return None
 
 
-def preencher_papel_seller_ao_promover(db: Session, sub_base: Optional[str]) -> int:
-    """Ao promover owner para tipo base, clientes sem papel recebem seller."""
+def preencher_papel_base_parceira_ao_promover(db: Session, sub_base: Optional[str]) -> int:
+    """Ao promover owner para tipo base, clientes sem papel recebem base_parceira."""
     sb = (sub_base or "").strip()
     if not sb:
         return 0
     owners = list(
         db.scalars(select(Owner).where(func.btrim(func.coalesce(Owner.sub_base, "")) == sb)).all()
     )
-    if len(owners) != 1:
-        return 0
-    if (getattr(owners[0], "tipo_owner", None) or "").strip().lower() != "base":
+    papel = papel_ao_promover_owner_para_base(
+        qtd_owners=len(owners),
+        tipo_owner=getattr(owners[0], "tipo_owner", None) if owners else None,
+    )
+    if not papel:
         return 0
     rows = list(
         db.scalars(
@@ -59,5 +61,5 @@ def preencher_papel_seller_ao_promover(db: Session, sub_base: Optional[str]) -> 
         ).all()
     )
     for row in rows:
-        row.papel = "seller"
+        row.papel = papel
     return len(rows)

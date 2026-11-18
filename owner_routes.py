@@ -511,9 +511,9 @@ def update_owner(
         novo = _normalize_tipo_owner(body.tipo_owner)
         owner.tipo_owner = novo
         if anterior != "base" and novo == "base":
-            from base_papel_service import preencher_papel_seller_ao_promover
+            from base_papel_service import preencher_papel_base_parceira_ao_promover
 
-            preencher_papel_seller_ao_promover(db, owner.sub_base)
+            preencher_papel_base_parceira_ao_promover(db, owner.sub_base)
 
     if body.devolucao_sub_base_habilitada is not None:
         owner.devolucao_sub_base_habilitada = bool(body.devolucao_sub_base_habilitada)

@@ -33,7 +33,6 @@ from base_import_service import (
 )
 from base_papel_pure import eh_base_parceira, exige_papel_obrigatorio, normalizar_papel
 from base_papel_service import (
-    preencher_papel_seller_ao_promover,
     resolver_papel_ao_criar,
     tipo_owner_da_sub_base,
 )
