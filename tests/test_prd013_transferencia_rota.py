@@ -232,6 +232,11 @@ def test_gate_cria_pendencia_sem_trocar_posse(mock_res, mock_orig):
         )
     assert err.value.status_code == 409
     assert err.value.detail["code"] == CODE_AGUARDANDO
+    assert "motoboy_origem_nome" in err.value.detail
+    assert "motoboy_destino_nome" in err.value.detail
+    assert err.value.detail["motoboy_origem_nome"]
+    assert err.value.detail["motoboy_destino_nome"]
+    assert "está com" in str(err.value.detail["message"]).lower()
     db.refresh(a)
     assert a.motoboy_id == 10
     pend = pendencia_ativa_da_saida(db, int(a.id_saida))
