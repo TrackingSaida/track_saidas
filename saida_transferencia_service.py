@@ -23,6 +23,33 @@ MSG_AGUARDANDO = (
     "A transferência aguarda o aceite dele."
 )
 
+
+def _nome_motoboy(db: Session, motoboy_id: Optional[int]) -> Optional[str]:
+    if motoboy_id is None:
+        return None
+    try:
+        from motoboy_nome_utils import get_motoboy_display_name
+
+        nome = (get_motoboy_display_name(db, motoboy_id=int(motoboy_id)) or "").strip()
+        return nome or None
+    except Exception:
+        logger.exception("nome_motoboy_failed motoboy_id=%s", motoboy_id)
+        return None
+
+
+def _label_destino(
+    db: Session,
+    *,
+    motoboy_destino_id: Optional[int],
+    repasse_base_id: Optional[int] = None,
+) -> str:
+    nome = _nome_motoboy(db, motoboy_destino_id)
+    if nome:
+        return nome
+    if repasse_base_id is not None:
+        return "outra base"
+    return "outro entregador"
+
 STATUS_PENDENTE = "pendente"
 STATUS_ACEITA = "aceita"
 STATUS_RECUSADA = "recusada"
@@ -41,13 +68,28 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
-def _raise_aguardando(transferencia_id: int) -> None:
+def _raise_aguardando(
+    transferencia_id: int,
+    *,
+    motoboy_origem_nome: Optional[str] = None,
+    motoboy_destino_nome: Optional[str] = None,
+) -> None:
+    origem = (motoboy_origem_nome or "").strip()
+    if origem:
+        message = (
+            f"Este pedido está com {origem} em rota iniciada. "
+            "A transferência aguarda o aceite dele."
+        )
+    else:
+        message = MSG_AGUARDANDO
     raise HTTPException(
         status_code=409,
         detail={
             "code": CODE_AGUARDANDO,
             "transferencia_id": int(transferencia_id),
-            "message": MSG_AGUARDANDO,
+            "message": message,
+            "motoboy_origem_nome": motoboy_origem_nome,
+            "motoboy_destino_nome": motoboy_destino_nome,
         },
     )
 
@@ -110,15 +152,23 @@ def pendentes_resumo_origem(
     out: List[Dict[str, Any]] = []
     for row in rows:
         saida = db.get(Saida, int(row.id_saida))
+        destino_id = (
+            int(row.motoboy_destino_id) if row.motoboy_destino_id is not None else None
+        )
+        origem_id = int(row.motoboy_origem_id)
+        destino_nome = _nome_motoboy(db, destino_id)
+        if not destino_nome and row.repasse_base_id is not None:
+            destino_nome = "outra base"
         out.append(
             {
                 "transferencia_id": int(row.id),
                 "id_saida": int(row.id_saida),
                 "codigo": getattr(saida, "codigo", None),
                 "rota_id": str(row.rota_id) if row.rota_id is not None else None,
-                "motoboy_destino_id": int(row.motoboy_destino_id)
-                if row.motoboy_destino_id is not None
-                else None,
+                "motoboy_destino_id": destino_id,
+                "motoboy_destino_nome": destino_nome,
+                "motoboy_origem_id": origem_id,
+                "motoboy_origem_nome": _nome_motoboy(db, origem_id),
                 "criada_em": row.criada_em.isoformat() if row.criada_em else None,
             }
         )
@@ -133,10 +183,18 @@ def _push_origem(
     transferencia_id: int,
     id_saida: int,
     codigo: Optional[str],
+    motoboy_destino_id: Optional[int] = None,
+    repasse_base_id: Optional[int] = None,
 ) -> None:
     try:
         from push_notification_service import send_to_motoboy
 
+        destino_label = _label_destino(
+            db,
+            motoboy_destino_id=motoboy_destino_id,
+            repasse_base_id=repasse_base_id,
+        )
+        codigo_label = codigo or str(id_saida)
         send_to_motoboy(
             db,
             motoboy_id=int(motoboy_id),
@@ -144,13 +202,15 @@ def _push_origem(
             tipo="transferencia_pendente",
             title="Transferência de pedido",
             body=(
-                f"Pedido {codigo or id_saida} pode sair da sua rota. "
-                "As paradas podem mudar se você aceitar."
+                f"{destino_label} quer assumir o pedido {codigo_label}. "
+                "Pode sair da sua rota se você aceitar."
             ),
             data={
                 "tipo": "transferencia_pendente",
                 "transferencia_id": int(transferencia_id),
                 "id_saida": int(id_saida),
+                "codigo": codigo_label,
+                "motoboy_destino_nome": destino_label,
             },
             chave_dedupe=f"transferencia_pendente:{transferencia_id}",
         )
@@ -169,6 +229,7 @@ def _push_resolucao(
     tipo: str,
     title: str,
     body: str,
+    resolvida_por_nome: Optional[str] = None,
 ) -> None:
     if motoboy_id is None:
         return
@@ -182,7 +243,11 @@ def _push_resolucao(
             tipo=tipo,
             title=title,
             body=body,
-            data={"tipo": tipo, "transferencia_id": int(transferencia_id)},
+            data={
+                "tipo": tipo,
+                "transferencia_id": int(transferencia_id),
+                "resolvida_por_nome": resolvida_por_nome,
+            },
             chave_dedupe=f"{tipo}:{transferencia_id}",
         )
     except Exception:
@@ -285,6 +350,10 @@ def solicitar_reatribuicao(
         )
     )
     db.flush()
+    origem_nome = _nome_motoboy(db, int(origem_id))
+    destino_nome = _nome_motoboy(db, motoboy_destino_id)
+    if not destino_nome and repasse_base_id is not None:
+        destino_nome = "outra base"
     _push_origem(
         db,
         motoboy_id=int(origem_id),
@@ -292,11 +361,17 @@ def solicitar_reatribuicao(
         transferencia_id=int(row.id),
         id_saida=int(saida.id_saida),
         codigo=getattr(saida, "codigo", None),
+        motoboy_destino_id=motoboy_destino_id,
+        repasse_base_id=repasse_base_id,
     )
     db.commit()
     db.refresh(row)
     if raise_conflict:
-        _raise_aguardando(int(row.id))
+        _raise_aguardando(
+            int(row.id),
+            motoboy_origem_nome=origem_nome,
+            motoboy_destino_nome=destino_nome,
+        )
     return row
 
 
@@ -454,6 +529,8 @@ def aplicar_reatribuicao_apos_aceite(
         except Exception:
             logger.exception("enqueue_pacotes_apos_aceite_failed id_saida=%s", saida.id_saida)
 
+    origem_nome = _nome_motoboy(db, origem_id) or "O entregador"
+    codigo_label = getattr(saida, "codigo", None) or saida.id_saida
     _push_resolucao(
         db,
         motoboy_id=transferencia.solicitante_motoboy_id,
@@ -461,7 +538,8 @@ def aplicar_reatribuicao_apos_aceite(
         transferencia_id=int(transferencia.id),
         tipo="transferencia_resolvida",
         title="Transferência aceita",
-        body=f"O entregador aceitou a transferência do pedido {getattr(saida, 'codigo', saida.id_saida)}.",
+        body=f"{origem_nome} aceitou a transferência do pedido {codigo_label}.",
+        resolvida_por_nome=origem_nome,
     )
     return {
         "ok": True,
@@ -469,6 +547,7 @@ def aplicar_reatribuicao_apos_aceite(
         "id_saida": int(saida.id_saida),
         "status": STATUS_ACEITA,
         "motoboy_id": motoboy_novo,
+        "resolvida_por_nome": origem_nome,
     }
 
 
@@ -555,6 +634,9 @@ def recusar_transferencia(
             payload=json.dumps({"transferencia_id": int(row.id)}, ensure_ascii=False),
         )
     )
+    origem_nome = _nome_motoboy(db, int(row.motoboy_origem_id)) or "O entregador"
+    codigo_label = getattr(saida, "codigo", None) if saida else None
+    codigo_label = codigo_label or row.id_saida
     _push_resolucao(
         db,
         motoboy_id=row.solicitante_motoboy_id,
@@ -562,7 +644,8 @@ def recusar_transferencia(
         transferencia_id=int(row.id),
         tipo="transferencia_recusada",
         title="Transferência recusada",
-        body="O entregador recusou a transferência do pedido.",
+        body=f"{origem_nome} recusou a transferência do pedido {codigo_label}.",
+        resolvida_por_nome=origem_nome,
     )
     db.commit()
     return {
@@ -570,6 +653,7 @@ def recusar_transferencia(
         "transferencia_id": int(row.id),
         "id_saida": int(row.id_saida),
         "status": STATUS_RECUSADA,
+        "resolvida_por_nome": origem_nome,
     }
 
 
