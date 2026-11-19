@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -342,14 +342,42 @@ def _ciclo_da_base(
         )
     )
     codigo = None
+    dias_coleta = None
     if preco is not None:
         try:
             codigo = normalizar_periodo_fechamento(getattr(preco, "periodo_fechamento", None))
         except ValueError:
             codigo = None
         nome = (preco.base or nome).strip() or nome
-    aviso = aviso_ciclo_fechamento(nome, codigo, periodo_inicio, periodo_fim)
+        dias_coleta = list(getattr(preco, "dias_coleta", None) or [])
+    aviso = aviso_ciclo_fechamento(
+        nome, codigo, periodo_inicio, periodo_fim, dias_coleta=dias_coleta
+    )
     return codigo, aviso
+
+
+def _tipos_excecao_por_data(
+    excecoes: Iterable,
+    base_id: Optional[int],
+) -> Dict[date, str]:
+    """Merge global + override por base (mesma regra do calendário de pendências)."""
+    globais: Dict[date, str] = {}
+    por_base: Dict[date, str] = {}
+    for item in excecoes or ():
+        tipo = (getattr(item, "tipo", None) or "").strip().upper()
+        if not tipo:
+            continue
+        data = getattr(item, "data", None)
+        if data is None:
+            continue
+        item_base_id = getattr(item, "base_id", None)
+        if item_base_id is None:
+            globais[data] = tipo
+        elif base_id is not None and int(item_base_id) == int(base_id):
+            por_base[data] = tipo
+    tipos = dict(globais)
+    tipos.update(por_base)
+    return tipos
 
 
 def _preco_da_base(db: Session, sub_base: str, base_nome: str) -> Optional[BasePreco]:
@@ -392,6 +420,33 @@ def _datas_coleta_extra(
     return {item.data for item in db.scalars(stmt).all()}
 
 
+def _excecoes_calendario_periodo(
+    db: Session,
+    sub_base: str,
+    preco: Optional[BasePreco],
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> list:
+    if periodo_inicio > periodo_fim:
+        return []
+    base_id = getattr(preco, "id_base", None) if preco is not None else None
+    stmt = select(ColetaCalendarioExcecao).where(
+        ColetaCalendarioExcecao.sub_base == sub_base,
+        ColetaCalendarioExcecao.data >= periodo_inicio,
+        ColetaCalendarioExcecao.data <= periodo_fim,
+    )
+    if base_id is not None:
+        stmt = stmt.where(
+            or_(
+                ColetaCalendarioExcecao.base_id == base_id,
+                ColetaCalendarioExcecao.base_id.is_(None),
+            )
+        )
+    else:
+        stmt = stmt.where(ColetaCalendarioExcecao.base_id.is_(None))
+    return list(db.scalars(stmt).all())
+
+
 def _periodo_ainda_aberto_base(
     db: Session,
     sub_base: str,
@@ -407,7 +462,19 @@ def _periodo_ainda_aberto_base(
     preco_base = preco if preco is not None else _preco_da_base(db, sub_base, base_nome)
     dias = list(getattr(preco_base, "dias_coleta", None) or []) if preco_base is not None else []
     extras = _datas_coleta_extra(db, sub_base, preco_base, periodo_inicio, periodo_fim)
-    return periodo_aberto_para_base(periodo_inicio, periodo_fim, ref, dias, extras)
+    base_id = getattr(preco_base, "id_base", None) if preco_base is not None else None
+    tipos = _tipos_excecao_por_data(
+        _excecoes_calendario_periodo(db, sub_base, preco_base, periodo_inicio, periodo_fim),
+        int(base_id) if base_id is not None else None,
+    )
+    return periodo_aberto_para_base(
+        periodo_inicio,
+        periodo_fim,
+        ref,
+        dias,
+        extras,
+        excecoes_tipo_por_data=tipos,
+    )
 
 
 def _exigir_periodo_encerrado_base(
@@ -420,8 +487,9 @@ def _exigir_periodo_encerrado_base(
     if _periodo_ainda_aberto_base(db, sub_base, base_nome, periodo_inicio, periodo_fim):
         raise HTTPException(
             400,
-            "Não é permitido calcular ou gerar fechamento enquanto ainda houver dia de coleta "
-            "futuro neste período. Aguarde o último dia da agenda da base ou ajuste o período.",
+            "Não é permitido gerar fechamento enquanto ainda houver dia de coleta "
+            "futuro neste período. Justifique os dias restantes (feriado, sem coleta) "
+            "ou aguarde o último dia da agenda da base.",
         )
 
 
@@ -815,6 +883,7 @@ class CalcularOut(BaseModel):
     calendario: dict
     periodo_fechamento: Optional[str] = None
     aviso_ciclo: Optional[str] = None
+    periodo_aberto: bool = False
 
 
 class FechamentoOut(BaseModel):
@@ -1024,7 +1093,6 @@ def calcular_fechamento(
     sub_base = _sub_base_from_token_or_422(current_user)
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    _exigir_periodo_encerrado_base(db, sub_base, base, periodo_inicio, periodo_fim)
 
     itens, valor_bruto, valor_cancelados, valor_final = _build_itens_e_valores(
         db, sub_base, base, periodo_inicio, periodo_fim
@@ -1052,6 +1120,9 @@ def calcular_fechamento(
         db, sub_base, base, periodo_inicio, periodo_fim
     )
     periodo_codigo, aviso_ciclo = _ciclo_da_base(db, sub_base, base, periodo_inicio, periodo_fim)
+    periodo_aberto = _periodo_ainda_aberto_base(
+        db, sub_base, base, periodo_inicio, periodo_fim
+    )
 
     return CalcularOut(
         base=base.strip(),
@@ -1076,6 +1147,7 @@ def calcular_fechamento(
         calendario=calendario,
         periodo_fechamento=periodo_codigo,
         aviso_ciclo=aviso_ciclo,
+        periodo_aberto=periodo_aberto,
     )
 
 
@@ -1789,7 +1861,10 @@ def _linhas_resumo_por_base(
                 periodo_codigo = normalizar_periodo_fechamento(getattr(preco, "periodo_fechamento", None))
             except ValueError:
                 periodo_codigo = None
-            aviso_ciclo = aviso_ciclo_fechamento(nome, periodo_codigo, periodo_inicio, periodo_fim)
+            dias_coleta = list(getattr(preco, "dias_coleta", None) or [])
+            aviso_ciclo = aviso_ciclo_fechamento(
+                nome, periodo_codigo, periodo_inicio, periodo_fim, dias_coleta=dias_coleta
+            )
         if motivo is None and aviso_ciclo:
             motivo = MOTIVO_PERIODO_FECHAMENTO
         if motivo is None:
@@ -1804,9 +1879,17 @@ def _linhas_resumo_por_base(
                 )
             }
             dias_coleta = list(getattr(preco, "dias_coleta", None) or []) if preco is not None else []
+            tipos = _tipos_excecao_por_data(
+                excecoes, int(base_id) if base_id is not None else None
+            )
             # Sem agenda de coleta do owner, não bloqueia por dias futuros.
             if (not ignorar_coleta) and periodo_aberto_para_base(
-                periodo_inicio, periodo_fim, date.today(), dias_coleta, extras
+                periodo_inicio,
+                periodo_fim,
+                date.today(),
+                dias_coleta,
+                extras,
+                excecoes_tipo_por_data=tipos,
             ):
                 motivo = MOTIVO_PERIODO_ABERTO
         linhas.append(

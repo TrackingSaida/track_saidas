@@ -1,7 +1,8 @@
 """Ciclo de fechamento da base e resolução da chave PIX a receber.
 
-Nenhum (nulo) não valida o intervalo. Semanal, quinzenal e mensal exigem
-exatamente um ciclo civil fechado.
+Nenhum (nulo) não valida o intervalo. Quinzenal e mensal exigem um ciclo civil
+fechado. Semanal aceita segunda ao último dia de ``dias_coleta`` ou, por
+compatibilidade, segunda a domingo.
 """
 from __future__ import annotations
 
@@ -14,6 +15,15 @@ MOTIVO_PERIODO_FECHAMENTO = "PERIODO_FECHAMENTO"
 MOTIVO_PERIODO_ABERTO = "PERIODO_ABERTO"
 STATUS_COLETA_OK_FECHAMENTO = frozenset({"coletado", "sem_volume"})
 _EXCECOES_SEM_PENDENCIA = frozenset({"FERIADO", "SEM_COLETA", "JUSTIFICADO"})
+_NOME_WEEKDAY = {
+    1: "segunda",
+    2: "terça",
+    3: "quarta",
+    4: "quinta",
+    5: "sexta",
+    6: "sábado",
+    7: "domingo",
+}
 
 
 def status_coleta_satisfaz_fechamento(status: Optional[str]) -> bool:
@@ -63,6 +73,27 @@ _ROTULO_CICLO = {
     "quinzenal": "quinzena (dia 1 ao 15, ou dia 16 ao fim do mês)",
     "mensal": "mês (dia 1 ao último dia)",
 }
+
+
+def _dias_coleta_normalizados(dias_coleta: Optional[Sequence[int]]) -> List[int]:
+    return sorted({int(d) for d in (dias_coleta or []) if d is not None and 1 <= int(d) <= 7})
+
+
+def fim_semana_por_agenda(inicio_segunda: date, dias_coleta: Optional[Sequence[int]]) -> date:
+    """Fim da semana de fechamento: último weekday de ``dias_coleta``, ou domingo."""
+    if inicio_segunda.weekday() != 0:
+        raise ValueError("inicio_segunda deve ser uma segunda-feira.")
+    dias = _dias_coleta_normalizados(dias_coleta)
+    ultimo = max(dias) if dias else 7
+    return inicio_segunda + timedelta(days=ultimo - 1)
+
+
+def rotulo_ciclo_semanal(dias_coleta: Optional[Sequence[int]] = None) -> str:
+    """Rótulo do ciclo semanal conforme a agenda (fallback: segunda a domingo)."""
+    dias = _dias_coleta_normalizados(dias_coleta)
+    ultimo = max(dias) if dias else 7
+    nome = _NOME_WEEKDAY.get(ultimo, "domingo")
+    return f"semana (segunda a {nome})"
 
 
 def normalizar_periodo_fechamento(valor: Optional[str]) -> Optional[str]:
@@ -232,6 +263,7 @@ def periodo_aberto_para_base(
     hoje: date,
     dias_coleta: Optional[Sequence[int]] = None,
     datas_extra: Optional[Iterable[date]] = None,
+    excecoes_tipo_por_data: Optional[Mapping[date, str]] = None,
 ) -> bool:
     """True se ainda há dia de coleta no intervalo estritamente depois de hoje.
 
@@ -239,31 +271,54 @@ def periodo_aberto_para_base(
     do próprio dia ficam a cargo do calendário de coleta (DIAS_PENDENTES).
 
     Dia programado = isoweekday em dias_coleta, ou data em datas_extra (COLETA_EXTRA).
+    FERIADO/SEM_COLETA/JUSTIFICADO não mantêm o período aberto.
     Sem dias_coleta, cai no critério civil periodo_fim >= hoje.
     """
     if fim < inicio:
         return False
-    dias = [int(d) for d in (dias_coleta or []) if d is not None]
+    dias = _dias_coleta_normalizados(dias_coleta)
     if not dias:
         return fim >= hoje
     extras = {d for d in (datas_extra or []) if inicio <= d <= fim}
+    excecoes: Dict[date, str] = dict(excecoes_tipo_por_data or {})
     cursor = max(inicio, hoje + timedelta(days=1))
     while cursor <= fim:
+        tipo = (excecoes.get(cursor) or "").strip().upper()
+        if tipo in _EXCECOES_SEM_PENDENCIA:
+            cursor += timedelta(days=1)
+            continue
         if cursor.isoweekday() in dias or cursor in extras:
             return True
         cursor += timedelta(days=1)
     return False
 
 
-def ciclo_corresponde(periodo: Optional[str], inicio: date, fim: date) -> bool:
-    """Nenhum corresponde a qualquer intervalo. Os demais exigem um ciclo exato."""
+def ciclo_corresponde(
+    periodo: Optional[str],
+    inicio: date,
+    fim: date,
+    dias_coleta: Optional[Sequence[int]] = None,
+) -> bool:
+    """Nenhum corresponde a qualquer intervalo. Os demais exigem um ciclo exato.
+
+    Semanal: segunda ao último dia de ``dias_coleta`` e/ou segunda a domingo
+    (compatível com o preset civil). Sem agenda, só segunda a domingo.
+    """
     codigo = normalizar_periodo_fechamento(periodo)
     if codigo is None:
         return True
     if fim < inicio:
         return False
     if codigo == "semanal":
-        return inicio.weekday() == 0 and fim == inicio + timedelta(days=6)
+        if inicio.weekday() != 0:
+            return False
+        civil = inicio + timedelta(days=6)
+        if fim == civil:
+            return True
+        dias = _dias_coleta_normalizados(dias_coleta)
+        if not dias:
+            return False
+        return fim == fim_semana_por_agenda(inicio, dias)
     if inicio.year != fim.year or inicio.month != fim.month:
         return False
     ultimo = calendar.monthrange(inicio.year, inicio.month)[1]
@@ -277,12 +332,16 @@ def aviso_ciclo_fechamento(
     periodo: Optional[str],
     inicio: date,
     fim: date,
+    dias_coleta: Optional[Sequence[int]] = None,
 ) -> Optional[str]:
     """Texto para o operador quando o intervalo não é o ciclo da base. Nulo se pode gerar."""
-    if ciclo_corresponde(periodo, inicio, fim):
+    if ciclo_corresponde(periodo, inicio, fim, dias_coleta=dias_coleta):
         return None
     codigo = normalizar_periodo_fechamento(periodo)
-    rotulo = _ROTULO_CICLO.get(codigo or "", "período configurado")
+    if codigo == "semanal":
+        rotulo = rotulo_ciclo_semanal(dias_coleta)
+    else:
+        rotulo = _ROTULO_CICLO.get(codigo or "", "período configurado")
     nome = (nome_base or "Esta base").strip() or "Esta base"
     return (
         f"{nome} fecha por {rotulo}. "
