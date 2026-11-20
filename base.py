@@ -160,6 +160,8 @@ class BaseOut(BaseModel):
     endereco_completo: Optional[str] = None
     # Contas Mercado Livre vinculadas (ml_conexoes.id_base); aditivo, só leitura
     ml_contas: List[Dict[str, Any]] = Field(default_factory=list)
+    # Contas Shopee vinculadas (shopee_tokens.id_base); aditivo, só leitura
+    shopee_contas: List[Dict[str, Any]] = Field(default_factory=list)
     model_config = ConfigDict(from_attributes=True)
 
 class BaseUpdate(BaseModel):
@@ -354,9 +356,11 @@ def _base_to_out(
     obj: BasePreco,
     endereco_completo: Optional[str] = None,
     ml_contas: Optional[List[Dict[str, Any]]] = None,
+    shopee_contas: Optional[List[Dict[str, Any]]] = None,
 ) -> BaseOut:
     return BaseOut(
         ml_contas=ml_contas or [],
+        shopee_contas=shopee_contas or [],
         id_base=obj.id_base,
         base=obj.base,
         sub_base=obj.sub_base,
@@ -406,6 +410,26 @@ def _ml_contas_por_base_ids(db: Session, sub_base: str, base_ids: List[int]) -> 
         vistos.add(c.user_id_ml)
         out.setdefault(int(c.id_base), []).append(
             {"user_id_ml": c.user_id_ml, "nickname": c.user_nickname_ml}
+        )
+    return out
+
+
+def _shopee_contas_por_base_ids(db: Session, sub_base: str, base_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    if not base_ids:
+        return {}
+    rows = db.scalars(
+        select(ShopeeToken)
+        .where(ShopeeToken.sub_base == sub_base, ShopeeToken.id_base.in_(base_ids))
+        .order_by(ShopeeToken.shop_name, ShopeeToken.shop_id)
+    ).all()
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    vistos: set = set()
+    for tk in rows:
+        if tk.shop_id in vistos:
+            continue
+        vistos.add(tk.shop_id)
+        out.setdefault(int(tk.id_base), []).append(
+            {"shop_id": int(tk.shop_id), "shop_name": tk.shop_name}
         )
     return out
 
@@ -502,8 +526,14 @@ def list_bases(
     ids = [int(r.id_base) for r in rows]
     enderecos = _enderecos_por_base_ids(db, ids)
     ml_contas = _ml_contas_por_base_ids(db, sub_base_user, ids)
+    shopee_contas = _shopee_contas_por_base_ids(db, sub_base_user, ids)
     return [
-        _base_to_out(r, enderecos.get(int(r.id_base)), ml_contas.get(int(r.id_base)))
+        _base_to_out(
+            r,
+            enderecos.get(int(r.id_base)),
+            ml_contas.get(int(r.id_base)),
+            shopee_contas.get(int(r.id_base)),
+        )
         for r in rows
     ]
 
@@ -567,7 +597,13 @@ def get_base(
         raise HTTPException(status_code=404, detail="Não encontrado")
     enderecos = _enderecos_por_base_ids(db, [int(obj.id_base)])
     ml_contas = _ml_contas_por_base_ids(db, sub_base_user, [int(obj.id_base)])
-    return _base_to_out(obj, enderecos.get(int(obj.id_base)), ml_contas.get(int(obj.id_base)))
+    shopee_contas = _shopee_contas_por_base_ids(db, sub_base_user, [int(obj.id_base)])
+    return _base_to_out(
+        obj,
+        enderecos.get(int(obj.id_base)),
+        ml_contas.get(int(obj.id_base)),
+        shopee_contas.get(int(obj.id_base)),
+    )
 
 # =========================
 # PATCH /base/{id_base}
@@ -676,7 +712,14 @@ def patch_base(
         )
     db.refresh(obj)
     enderecos = _enderecos_por_base_ids(db, [int(obj.id_base)])
-    return _base_to_out(obj, enderecos.get(int(obj.id_base)))
+    ml_contas = _ml_contas_por_base_ids(db, sub_base_user, [int(obj.id_base)])
+    shopee_contas = _shopee_contas_por_base_ids(db, sub_base_user, [int(obj.id_base)])
+    return _base_to_out(
+        obj,
+        enderecos.get(int(obj.id_base)),
+        ml_contas.get(int(obj.id_base)),
+        shopee_contas.get(int(obj.id_base)),
+    )
 
 # =========================
 # DELETE /base/{id_base}
