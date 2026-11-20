@@ -8,8 +8,10 @@ import pytest
 
 from base_papel_pure import (
     PAPEL_PREENCHIDO_AO_PROMOVER,
+    cnpj_endereco_completo,
     eh_base_parceira,
     eh_seller,
+    exige_cnpj_endereco_seller,
     exige_papel_obrigatorio,
     normalizar_papel,
     papel_ao_promover_owner_para_base,
@@ -74,6 +76,19 @@ def test_promocao_preenche_clientes_sem_papel_como_base_parceira():
     assert papel_ao_promover_owner_para_base(qtd_owners=1, tipo_owner="subbase") is None
     assert papel_ao_promover_owner_para_base(qtd_owners=0, tipo_owner="base") is None
     assert papel_ao_promover_owner_para_base(qtd_owners=1, tipo_owner=None) is None
+
+
+def test_seller_exige_cnpj_endereco_no_owner_base():
+    assert exige_cnpj_endereco_seller(tipo_owner="base", papel="seller") is True
+    assert exige_cnpj_endereco_seller(tipo_owner="base", papel=None) is True
+    assert exige_cnpj_endereco_seller(tipo_owner="base", papel="base_parceira") is False
+    assert exige_cnpj_endereco_seller(tipo_owner="subbase", papel="seller") is False
+    assert cnpj_endereco_completo(
+        cnpj="123", rua="Rua", numero="1", bairro="B", cidade="C", cep="01311000"
+    )
+    assert not cnpj_endereco_completo(
+        cnpj="123", rua="Rua", numero="", bairro="B", cidade="C", cep="01311000"
+    )
 
 
 # ---- preço a pagar -------------------------------------------------------

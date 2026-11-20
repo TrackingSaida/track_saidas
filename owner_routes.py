@@ -15,7 +15,12 @@ from db import get_db
 from auth import _coerce_role_int, bump_motoboys_claims_version_for_sub_base, get_current_user
 from fechamento_base_ciclo_pure import aplicar_chave_pix
 from models import Owner, User, OwnerCobrancaItem, BasePreco, BaseSellerDados
-from base_papel_pure import eh_base_parceira, eh_seller
+from base_papel_pure import (
+    cnpj_endereco_completo,
+    eh_base_parceira,
+    eh_seller,
+    exige_cnpj_endereco_seller,
+)
 from owner_cobranca_faturamento_pure import decidir_data_parceria
 from etiqueta_identidade_service import resolver_logo_owner, resolver_nome_exibicao
 from upload_storage_utils import B2_BUCKET_NAME, get_s3_client_optional, purge_b2_keys
@@ -651,14 +656,14 @@ def upsert_seller_dados(
                     "Com CNPJ informado, o endereço completo é obrigatório.",
                 )
         # Seller (papel seller ou owner base legado sem papel) exige CNPJ e endereço.
-        exige_cnpj = tipo_owner == "base" and (
-            papel_cliente is None or eh_seller(papel_cliente)
-        )
-        if exige_cnpj and not all([cnpj, rua, numero, bairro, cidade, cep]):
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "Campos obrigatórios para criar seller: cnpj, rua, numero, bairro, cidade, cep.",
-            )
+        if exige_cnpj_endereco_seller(tipo_owner=tipo_owner, papel=papel_cliente):
+            if not cnpj_endereco_completo(
+                cnpj=cnpj, rua=rua, numero=numero, bairro=bairro, cidade=cidade, cep=cep
+            ):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Campos obrigatórios para Seller: cnpj, rua, numero, bairro, cidade, cep.",
+                )
 
         seller = BaseSellerDados(
             owner_id=id_owner,
@@ -699,6 +704,27 @@ def upsert_seller_dados(
         if definir_pix:
             seller.chave_pix = pix_chave
             seller.chave_pix_tipo = pix_tipo
+
+        tipo_owner = (getattr(owner, "tipo_owner", None) or "subbase").strip().lower()
+        papel_cliente = None
+        base_ref = seller.base_id
+        if base_ref is not None:
+            base_row = db.get(BasePreco, int(base_ref))
+            if base_row is not None:
+                papel_cliente = getattr(base_row, "papel", None)
+        if exige_cnpj_endereco_seller(tipo_owner=tipo_owner, papel=papel_cliente):
+            if not cnpj_endereco_completo(
+                cnpj=seller.cnpj,
+                rua=seller.rua,
+                numero=seller.numero,
+                bairro=seller.bairro,
+                cidade=seller.cidade,
+                cep=seller.cep,
+            ):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Seller exige CNPJ e endereço completo (rua, número, bairro, cidade, CEP).",
+                )
 
     db.commit()
     db.refresh(seller)

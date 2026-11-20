@@ -46,3 +46,27 @@ def permite_autenticacao_portal(papel: Optional[str], tipo_owner: Optional[str])
     if not exige_papel_obrigatorio(tipo_owner):
         return True
     return eh_seller(papel)
+
+
+def exige_cnpj_endereco_seller(*, tipo_owner: Optional[str], papel: Optional[str]) -> bool:
+    """Seller (ou legado sem papel) em owner base exige CNPJ e endereço."""
+    if not exige_papel_obrigatorio(tipo_owner):
+        return False
+    if papel is None:
+        return True
+    return eh_seller(papel)
+
+
+def cnpj_endereco_completo(
+    *,
+    cnpj: Optional[str],
+    rua: Optional[str],
+    numero: Optional[str],
+    bairro: Optional[str],
+    cidade: Optional[str],
+    cep: Optional[str],
+) -> bool:
+    return all(
+        str(v or "").strip()
+        for v in (cnpj, rua, numero, bairro, cidade, cep)
+    )

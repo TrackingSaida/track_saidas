@@ -236,6 +236,7 @@ def _owner_dict(owner) -> Dict[str, Any]:
         "username": owner.username,
         "sub_base": owner.sub_base,
         "teste": bool(owner.teste),
+        "tipo_owner": (getattr(owner, "tipo_owner", None) or "subbase"),
         # Data de parceria (só leitura aqui). Nula = "Data de parceria não registrada".
         "criado_em": _iso(getattr(owner, "criado_em", None)),
     }

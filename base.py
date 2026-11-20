@@ -31,7 +31,13 @@ from base_import_service import (
     gerar_modelo_xlsx,
     preview_importacao,
 )
-from base_papel_pure import eh_base_parceira, exige_papel_obrigatorio, normalizar_papel
+from base_papel_pure import (
+    cnpj_endereco_completo,
+    eh_base_parceira,
+    eh_seller,
+    exige_papel_obrigatorio,
+    normalizar_papel,
+)
 from base_papel_service import (
     resolver_papel_ao_criar,
     tipo_owner_da_sub_base,
@@ -632,6 +638,24 @@ def patch_base(
             obj.papel = body.papel
             if not eh_base_parceira(body.papel):
                 obj.entrega_pedidos = False
+            # Se já há seller-dados, não pode ficar incompleto ao marcar Seller.
+            # Ausência de linha é ok: o front grava CNPJ/endereço em seguida (seller-dados).
+            if eh_seller(body.papel):
+                seller = db.scalar(
+                    select(BaseSellerDados).where(BaseSellerDados.base_id == int(obj.id_base)).limit(1)
+                )
+                if seller and not cnpj_endereco_completo(
+                    cnpj=getattr(seller, "cnpj", None),
+                    rua=getattr(seller, "rua", None),
+                    numero=getattr(seller, "numero", None),
+                    bairro=getattr(seller, "bairro", None),
+                    cidade=getattr(seller, "cidade", None),
+                    cep=getattr(seller, "cep", None),
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Seller exige CNPJ e endereço completo. Preencha os dados do cliente.",
+                    )
 
     if "entrega_pedidos" in body.model_fields_set and body.entrega_pedidos is not None:
         novo_flag = bool(body.entrega_pedidos)
