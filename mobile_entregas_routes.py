@@ -429,6 +429,9 @@ class TransferenciaPendenteResumo(BaseModel):
     codigo: Optional[str] = None
     rota_id: Optional[str] = None
     motoboy_destino_id: Optional[int] = None
+    motoboy_destino_nome: Optional[str] = None
+    motoboy_origem_id: Optional[int] = None
+    motoboy_origem_nome: Optional[str] = None
     criada_em: Optional[str] = None
 
 
