@@ -10,10 +10,12 @@ import pytest
 from owner_cobranca_engine import (
     EventoCodigo,
     LancamentoManual,
+    PrecoFaixa,
     apurar,
     calcular_hash,
     modo_dual,
     papel_preco_item,
+    preco_faixa_vigente,
 )
 from owner_cobranca_faturamento_pure import (
     calcular_data_faturamento,
@@ -235,10 +237,69 @@ def test_hash_sem_dual_nao_recebe_campos_novos():
         modelo="coleta_saida", periodo_inicio=INI, periodo_fim=FIM, preco=PRECO_BASES, eventos=_eventos(),
     )
     igual = calcular_hash(
-        modelo="coleta_saida", periodo_inicio=INI, periodo_fim=FIM, preco=PRECO_BASES, itens=ap.itens,
+        modelo="coleta_saida", periodo_inicio=INI, periodo_fim=FIM, preco=ap.preco, itens=ap.itens,
         dual=False, preco_sellers=Decimal("9.99"),
     )
     assert igual == ap.hash
+
+
+def test_preco_faixa_vigente_escolhe_maior_inicio():
+    faixas = [
+        PrecoFaixa("sellers", date(2026, 11, 1), Decimal("0.10"), fim=None),
+        PrecoFaixa("sellers", date(2026, 11, 20), Decimal("0.13"), fim=None),
+        PrecoFaixa("bases", date(2026, 10, 1), Decimal("0.05"), fim=None),
+    ]
+    assert preco_faixa_vigente(faixas, date(2026, 11, 16), "sellers") == Decimal("0.10")
+    assert preco_faixa_vigente(faixas, date(2026, 11, 20), "sellers") == Decimal("0.13")
+    assert preco_faixa_vigente(faixas, date(2026, 11, 16), "bases") == Decimal("0.05")
+    assert preco_faixa_vigente(faixas, date(2026, 9, 1), "sellers") is None
+
+
+def test_dual_preco_por_data_do_item_mid_period():
+    """Sellers só a partir de 20/11: pacotes ≥20 usam 0,13; antes sem faixa → sem_preco."""
+    ini, fim = date(2026, 11, 16), date(2026, 11, 30)
+    faixas = [
+        PrecoFaixa("bases", date(2026, 11, 1), Decimal("0.05"), fim=None),
+        PrecoFaixa("sellers", date(2026, 11, 20), Decimal("0.13"), fim=None),
+    ]
+    ap = apurar(
+        modelo="coleta_saida",
+        periodo_inicio=ini,
+        periodo_fim=fim,
+        preco=None,
+        eventos=[
+            ev(1, "S20", base="LOJA SELLER", data_coleta=date(2026, 11, 20), id_coleta=1, status="coletado"),
+            ev(2, "S21", base="LOJA SELLER", data_coleta=date(2026, 11, 21), id_coleta=1, status="coletado"),
+            ev(3, "B1", base="BASE PARCEIRA", data_coleta=date(2026, 11, 16), id_coleta=2, status="coletado"),
+        ],
+        dual=True,
+        papeis_por_base=PAPEIS,
+        precos_vigencia=faixas,
+    )
+    assert ap.qtd_sem_preco_sellers == 0
+    assert ap.qtd_sem_preco_bases == 0
+    assert (ap.qtd_sellers, ap.qtd_bases) == (2, 1)
+    assert ap.valor_sellers == Decimal("0.26")
+    assert ap.valor_bases == Decimal("0.05")
+    assert ap.valor_pacotes == Decimal("0.31")
+    assert ap.preco_sellers == Decimal("0.13")
+    assert ap.preco == Decimal("0.05")
+
+    com_antes = apurar(
+        modelo="coleta_saida",
+        periodo_inicio=ini,
+        periodo_fim=fim,
+        preco=None,
+        eventos=[
+            ev(1, "S16", base="LOJA SELLER", data_coleta=date(2026, 11, 16), id_coleta=1, status="coletado"),
+            ev(2, "S20", base="LOJA SELLER", data_coleta=date(2026, 11, 20), id_coleta=1, status="coletado"),
+        ],
+        dual=True,
+        papeis_por_base=PAPEIS,
+        precos_vigencia=faixas,
+    )
+    assert com_antes.qtd_sem_preco_sellers == 1
+    assert com_antes.valor_sellers == Decimal("0.13")  # só o de 20/11
 
 
 # ---- escopo de preço (service) ----------------------------------------------

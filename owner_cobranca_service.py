@@ -39,6 +39,7 @@ from owner_cobranca_engine import (
     EventoCodigo,
     LancamentoManual,
     LoteAvulso,
+    PrecoFaixa,
     Remocao,
     apurar,
     calcular_ajustes,
@@ -152,6 +153,34 @@ def preco_vigente(
         and (p.fim is None or p.fim >= em)
     ]
     return max(candidatos, key=lambda p: p.inicio) if candidatos else None
+
+
+def faixas_preco_owner(precos: Sequence[OwnerPrecoVigencia]) -> List[PrecoFaixa]:
+    """Converte vigências do banco em faixas puras para o motor (preço por data do item)."""
+    out: List[PrecoFaixa] = []
+    for p in precos:
+        out.append(
+            PrecoFaixa(
+                escopo=(getattr(p, "escopo", None) or ESCOPO_PRECO_BASES),
+                inicio=p.inicio,
+                fim=p.fim,
+                valor=Decimal(str(p.valor)),
+            )
+        )
+    return out
+
+
+def _contagem_faixas_usadas(
+    precos: Sequence[OwnerPrecoVigencia], *, escopo: str, ini: date, fim: date
+) -> int:
+    """Quantas vigências do escopo se sobrepõem ao período (para snapshot de ids)."""
+    n = 0
+    for p in precos:
+        if (getattr(p, "escopo", None) or ESCOPO_PRECO_BASES) != escopo:
+            continue
+        if p.inicio <= fim and (p.fim is None or p.fim >= ini):
+            n += 1
+    return n
 
 
 def carregar_papeis_clientes(db: Session, sub_base: str) -> Dict[str, Optional[str]]:
@@ -644,7 +673,7 @@ class ApuracaoOwner:
             "valor_pacotes": a.valor_pacotes,
             "valor_ajustes": a.valor_ajustes,
             "valor_total": a.valor_total,
-            "preco_unitario": a.preco if self.preco is not None else None,
+            "preco_unitario": a.preco,
             "dual": a.dual,
             "sellers": _lado_dict(a.qtd_sellers, a.preco_sellers, a.valor_sellers) if a.dual else None,
             "bases": _lado_dict(a.qtd_bases, a.preco, a.valor_bases) if a.dual else None,
@@ -679,6 +708,7 @@ def apurar_owner(
     precos = listar_precos(db, owner.id_owner)
     preco = preco_vigente(precos, ini, ESCOPO_PRECO_BASES)
     preco_sellers = preco_vigente(precos, ini, ESCOPO_PRECO_SELLERS)
+    faixas = faixas_preco_owner(precos)
 
     if usar_snapshot:
         fech = fechamento_vigente(db, owner.id_owner, ini, fim)
@@ -710,7 +740,7 @@ def apurar_owner(
         modelo=cfg.modelo,
         periodo_inicio=ini,
         periodo_fim=fim,
-        preco=Decimal(preco.valor) if preco is not None else None,
+        preco=None,
         eventos=eventos,
         manuais=manuais,
         decisoes=[
@@ -729,8 +759,9 @@ def apurar_owner(
         ajustes=[ajuste_para_engine(a) for a in ajustes],
         lotes_avulso=lotes,
         dual=dual,
-        preco_sellers=Decimal(preco_sellers.valor) if preco_sellers is not None else None,
+        preco_sellers=None,
         papeis_por_base=papeis_por_base,
+        precos_vigencia=faixas,
     )
 
     divergencias: List[Divergencia] = []
@@ -742,16 +773,24 @@ def apurar_owner(
                 "Modelo comercial ainda não confirmado. Confirme em Configuração comercial.",
             )
         )
-    if preco is None:
+    if ap.qtd_sem_preco_bases > 0:
+        n = ap.qtd_sem_preco_bases
         divergencias.append(
-            Divergencia(NIVEL_BLOQUEANTE, "sem_preco", "Sem preço vigente no início do período.")
+            Divergencia(
+                NIVEL_BLOQUEANTE,
+                "sem_preco",
+                f"Sem preço de Coletas em Bases na data de {n} pacote{'s' if n != 1 else ''}.",
+                {"quantidade": n},
+            )
         )
-    if dual and preco_sellers is None:
+    if dual and ap.qtd_sem_preco_sellers > 0:
+        n = ap.qtd_sem_preco_sellers
         divergencias.append(
             Divergencia(
                 NIVEL_BLOQUEANTE,
                 "sem_preco_sellers",
-                "Sem preço de Coletas em Sellers vigente no início do período.",
+                f"Sem preço de Coletas em Sellers na data de {n} pacote{'s' if n != 1 else ''}.",
+                {"quantidade": n},
             )
         )
     for f in fechamentos_sobrepostos(db, owner.id_owner, ini, fim):
@@ -1086,6 +1125,49 @@ def _owner_snapshot(db: Session, owner: Owner, cfg: OwnerConfiguracaoCobranca) -
     return dados_cadastro(db, owner, cfg)
 
 
+def _config_snapshot_fechamento(
+    db: Session,
+    owner: Owner,
+    cfg: OwnerConfiguracaoCobranca,
+    atual: ApuracaoOwner,
+    ap: Apuracao,
+    ini: date,
+    fim: date,
+) -> Dict[str, Any]:
+    precos_snap = listar_precos(db, owner.id_owner)
+    return {
+        "modelo": cfg.modelo,
+        "periodicidade": cfg.periodicidade,
+        "status": cfg.status,
+        "preco_vigencia_id": (
+            atual.preco.id
+            if atual.preco
+            and _contagem_faixas_usadas(precos_snap, escopo=ESCOPO_PRECO_BASES, ini=ini, fim=fim) <= 1
+            else None
+        ),
+        "preco_sellers_vigencia_id": (
+            atual.preco_sellers.id
+            if (
+                ap.dual
+                and atual.preco_sellers
+                and _contagem_faixas_usadas(precos_snap, escopo=ESCOPO_PRECO_SELLERS, ini=ini, fim=fim)
+                <= 1
+            )
+            else None
+        ),
+        "dias_faturamento": cfg.dias_faturamento,
+        "dois_precos": bool(ap.dual),
+        "preco_por_data_item": True,
+        "decisoes": [
+            {"id": d.id, "tipo": d.tipo, "id_coleta": d.id_coleta, "servico": d.servico, "motivo": d.motivo}
+            for d in decisoes_ativas(db, owner.id_owner, ini, fim)
+        ],
+        "divergencias": [
+            {"nivel": d.nivel, "codigo": d.codigo, "mensagem": d.mensagem} for d in atual.divergencias
+        ],
+    }
+
+
 def fechar(
     db: Session,
     owner: Owner,
@@ -1181,22 +1263,9 @@ def _fechar_periodo(
         preco_bases=ap.preco if ap.dual else None,
         valor_bases=ap.valor_bases if ap.dual else None,
         owner_snapshot=_owner_snapshot(db, owner, cfg),
-        config_snapshot={
-            "modelo": cfg.modelo,
-            "periodicidade": cfg.periodicidade,
-            "status": cfg.status,
-            "preco_vigencia_id": atual.preco.id if atual.preco else None,
-            "preco_sellers_vigencia_id": atual.preco_sellers.id if (ap.dual and atual.preco_sellers) else None,
-            "dias_faturamento": cfg.dias_faturamento,
-            "dois_precos": bool(ap.dual),
-            "decisoes": [
-                {"id": d.id, "tipo": d.tipo, "id_coleta": d.id_coleta, "servico": d.servico, "motivo": d.motivo}
-                for d in decisoes_ativas(db, owner.id_owner, ini, fim)
-            ],
-            "divergencias": [
-                {"nivel": d.nivel, "codigo": d.codigo, "mensagem": d.mensagem} for d in atual.divergencias
-            ],
-        },
+        config_snapshot=_config_snapshot_fechamento(
+            db, owner, cfg, atual, ap, ini, fim
+        ),
         observacao=(observacao or "").strip() or None,
         fechado_por=user.id,
         fechado_por_username=user.username,

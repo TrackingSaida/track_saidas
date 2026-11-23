@@ -12,7 +12,7 @@ Coleta manual é outra unidade: (id_coleta, serviço) com a quantidade vigente.
 bruto      = unidades com código elegíveis + saldos manuais
 cancelados = unidades do bruto canceladas
 faturavel  = bruto − cancelados
-valor      = faturavel × preço do período + ajustes
+valor      = soma (qtd × preço vigente na data_competencia) + ajustes
 """
 from __future__ import annotations
 
@@ -209,6 +209,16 @@ class LoteAvulso:
     codigos_existentes: int
 
 
+@dataclass(frozen=True)
+class PrecoFaixa:
+    """Vigência de preço unitário por escopo (bases | sellers)."""
+
+    escopo: str
+    inicio: date
+    valor: Decimal
+    fim: Optional[date] = None
+
+
 # ---------------------------------------------------------------------------
 # Saídas do motor
 # ---------------------------------------------------------------------------
@@ -234,6 +244,8 @@ class ItemApuracao:
     no_bruto: bool = False
     # PRD-011: "sellers" | "bases". Só preenchido no modo de dois preços.
     papel_preco: Optional[str] = None
+    # Preço unitário na data_competencia (None = sem vigência na data).
+    preco_unitario: Optional[Decimal] = None
 
     @property
     def faturavel(self) -> bool:
@@ -278,13 +290,15 @@ class Apuracao:
     hash: str
     ajustes: List[Ajuste] = field(default_factory=list)
     valores_ajustes: Dict[int, Decimal] = field(default_factory=dict)
-    # PRD-011: modo de dois preços. `preco` continua sendo o preço de Bases.
+    # PRD-011: modo de dois preços. `preco` / `preco_sellers` = média efetiva do lado.
     dual: bool = False
     preco_sellers: Optional[Decimal] = None
     qtd_sellers: int = 0
     valor_sellers: Decimal = Decimal("0.00")
     qtd_bases: int = 0
     valor_bases: Decimal = Decimal("0.00")
+    qtd_sem_preco_bases: int = 0
+    qtd_sem_preco_sellers: int = 0
 
     @property
     def bloqueantes(self) -> List[Divergencia]:
@@ -539,10 +553,69 @@ def papel_preco_item(
     return ESCOPO_PRECO_BASES
 
 
-def _valor_unidades(
-    qtd_sellers: int, qtd_bases: int, preco_bases: Decimal, preco_sellers: Decimal
-) -> Decimal:
-    return (preco_sellers * qtd_sellers + preco_bases * qtd_bases).quantize(CENT)
+def preco_faixa_vigente(
+    faixas: Sequence[PrecoFaixa], em: date, escopo: str = ESCOPO_PRECO_BASES
+) -> Optional[Decimal]:
+    """Valor vigente em `em` no escopo pedido (maior `inicio` entre candidatos)."""
+    esc = (escopo or ESCOPO_PRECO_BASES).strip().lower()
+    candidatos = [
+        f
+        for f in faixas
+        if (f.escopo or ESCOPO_PRECO_BASES) == esc
+        and f.inicio <= em
+        and (f.fim is None or f.fim >= em)
+    ]
+    if not candidatos:
+        return None
+    escolhida = max(candidatos, key=lambda f: f.inicio)
+    return Decimal(str(escolhida.valor))
+
+
+def montar_faixas_preco_periodo(
+    *,
+    periodo_inicio: date,
+    periodo_fim: date,
+    preco: Optional[Decimal],
+    preco_sellers: Optional[Decimal] = None,
+    dual: bool = False,
+) -> List[PrecoFaixa]:
+    """Compat: um Decimal por escopo vira faixa cobrindo o período inteiro."""
+    out: List[PrecoFaixa] = []
+    if preco is not None:
+        out.append(
+            PrecoFaixa(
+                escopo=ESCOPO_PRECO_BASES,
+                inicio=periodo_inicio,
+                fim=periodo_fim,
+                valor=Decimal(str(preco)),
+            )
+        )
+    if dual and preco_sellers is not None:
+        out.append(
+            PrecoFaixa(
+                escopo=ESCOPO_PRECO_SELLERS,
+                inicio=periodo_inicio,
+                fim=periodo_fim,
+                valor=Decimal(str(preco_sellers)),
+            )
+        )
+    return out
+
+
+def _media_efetiva(valor: Decimal, qtd: int, fallback: Optional[Decimal] = None) -> Decimal:
+    if qtd > 0:
+        return (valor / Decimal(qtd)).quantize(CENT)
+    if fallback is not None:
+        return Decimal(str(fallback)).quantize(CENT)
+    return Decimal("0.00")
+
+
+def _valor_itens(its: Sequence[ItemApuracao]) -> Decimal:
+    total = Decimal("0")
+    for it in its:
+        unit = it.preco_unitario if it.preco_unitario is not None else Decimal("0")
+        total += unit * Decimal(it.quantidade)
+    return total.quantize(CENT)
 
 
 def apurar(
@@ -561,16 +634,24 @@ def apurar(
     dual: bool = False,
     preco_sellers: Optional[Decimal] = None,
     papeis_por_base: Optional[Mapping[str, Optional[str]]] = None,
+    precos_vigencia: Optional[Sequence[PrecoFaixa]] = None,
 ) -> Apuracao:
     if modelo not in MODELOS:
         raise ValueError(f"Modelo comercial inválido: {modelo}")
     origens = MODELOS[modelo]
     ini, fim = periodo_inicio, periodo_fim
-    preco_val = Decimal(str(preco)) if preco is not None else Decimal("0")
-    preco_sellers_val = Decimal(str(preco_sellers)) if preco_sellers is not None else Decimal("0")
     papeis_por_base = papeis_por_base or {}
     ja_faturados: Set[str] = {normalizar_codigo(c) for c in codigos_ja_faturados}
     lotes_avulso = lotes_avulso or {}
+    faixas: List[PrecoFaixa] = list(precos_vigencia) if precos_vigencia is not None else montar_faixas_preco_periodo(
+        periodo_inicio=ini,
+        periodo_fim=fim,
+        preco=preco,
+        preco_sellers=preco_sellers,
+        dual=dual,
+    )
+    preco_ini_bases = preco_faixa_vigente(faixas, ini, ESCOPO_PRECO_BASES)
+    preco_ini_sellers = preco_faixa_vigente(faixas, ini, ESCOPO_PRECO_SELLERS) if dual else None
 
     decisoes_por_manual: Dict[Tuple[int, str], List[Decisao]] = {}
     for d in decisoes:
@@ -825,11 +906,15 @@ def apurar(
             )
         )
 
-    # Totais
-    if dual:
-        for it in itens:
-            if it.no_bruto:
-                it.papel_preco = papel_preco_item(it.origem, it.base, papeis_por_base)
+    # Totais — preço por data_competencia + escopo
+    for it in itens:
+        if not it.no_bruto:
+            continue
+        if dual:
+            it.papel_preco = papel_preco_item(it.origem, it.base, papeis_por_base)
+        escopo = it.papel_preco if dual else ESCOPO_PRECO_BASES
+        data_ref = it.data_competencia or ini
+        it.preco_unitario = preco_faixa_vigente(faixas, data_ref, escopo or ESCOPO_PRECO_BASES)
 
     def _qtd_lados(its: Iterable[ItemApuracao]) -> Tuple[int, int]:
         q_s = sum(i.quantidade for i in its if i.papel_preco == ESCOPO_PRECO_SELLERS)
@@ -837,10 +922,7 @@ def apurar(
         return q_s, q_b
 
     def _valor(its: Sequence[ItemApuracao]) -> Decimal:
-        if not dual:
-            return (preco_val * sum(i.quantidade for i in its)).quantize(CENT)
-        q_s, q_b = _qtd_lados(its)
-        return _valor_unidades(q_s, q_b, preco_val, preco_sellers_val)
+        return _valor_itens(its)
 
     qtd_bruto = sum(it.quantidade for it in itens if it.no_bruto)
     qtd_cancelados = sum(it.quantidade for it in itens if it.no_bruto and it.cancelado)
@@ -848,8 +930,31 @@ def apurar(
     qtd_desconsiderados = sum(it.quantidade for it in itens if not it.no_bruto)
     faturaveis = [it for it in itens if it.no_bruto and not it.cancelado]
     qtd_sellers, qtd_bases = _qtd_lados(faturaveis) if dual else (0, 0)
-    valor_sellers = (preco_sellers_val * qtd_sellers).quantize(CENT) if dual else Decimal("0.00")
-    valor_bases = (preco_val * qtd_bases).quantize(CENT) if dual else Decimal("0.00")
+
+    def _soma_lado(its: Sequence[ItemApuracao], sellers: bool) -> Decimal:
+        grupo = [
+            i
+            for i in its
+            if (i.papel_preco == ESCOPO_PRECO_SELLERS) is sellers
+        ]
+        return _valor_itens(grupo)
+
+    if dual:
+        valor_sellers = _soma_lado(faturaveis, True)
+        valor_bases = _soma_lado(faturaveis, False)
+    else:
+        valor_sellers = Decimal("0.00")
+        valor_bases = _valor_itens(faturaveis)
+
+    qtd_sem_preco_sellers = 0
+    qtd_sem_preco_bases = 0
+    for it in faturaveis:
+        if it.preco_unitario is not None:
+            continue
+        if dual and it.papel_preco == ESCOPO_PRECO_SELLERS:
+            qtd_sem_preco_sellers += it.quantidade
+        else:
+            qtd_sem_preco_bases += it.quantidade
 
     composicao: List[LinhaComposicao] = []
     for cls in CLASSIFICACOES_BRUTO:
@@ -865,9 +970,7 @@ def apurar(
         composicao.append(LinhaComposicao("duplicidade", n_dup, Decimal("0.00")))
 
     lista_ajustes = list(ajustes)
-    valor_pacotes = (valor_sellers + valor_bases).quantize(CENT) if dual else (
-        preco_val * qtd_faturavel
-    ).quantize(CENT)
+    valor_pacotes = (valor_sellers + valor_bases).quantize(CENT) if dual else valor_bases
     valores_ajustes = calcular_ajustes(valor_pacotes, lista_ajustes)
     valor_ajustes = sum(valores_ajustes.values(), start=Decimal("0")).quantize(CENT)
     for cls, filtro in (
@@ -940,21 +1043,30 @@ def apurar(
             )
         )
 
+    preco_medio_bases = _media_efetiva(
+        valor_bases if dual else valor_pacotes,
+        qtd_bases if dual else qtd_faturavel,
+        preco_ini_bases,
+    )
+    preco_medio_sellers = (
+        _media_efetiva(valor_sellers, qtd_sellers, preco_ini_sellers) if dual else None
+    )
+
     hash_ = calcular_hash(
         modelo=modelo,
         periodo_inicio=ini,
         periodo_fim=fim,
-        preco=preco_val,
+        preco=preco_medio_bases,
         itens=itens,
         ajustes=lista_ajustes,
         dual=dual,
-        preco_sellers=preco_sellers_val if dual else None,
+        preco_sellers=preco_medio_sellers if dual else None,
     )
     return Apuracao(
         modelo=modelo,
         periodo_inicio=ini,
         periodo_fim=fim,
-        preco=preco_val,
+        preco=preco_medio_bases,
         itens=itens,
         qtd_bruto=qtd_bruto,
         qtd_cancelados=qtd_cancelados,
@@ -969,11 +1081,13 @@ def apurar(
         ajustes=lista_ajustes,
         valores_ajustes=valores_ajustes,
         dual=dual,
-        preco_sellers=preco_sellers_val if dual else None,
+        preco_sellers=preco_medio_sellers if dual else None,
         qtd_sellers=qtd_sellers,
         valor_sellers=valor_sellers,
         qtd_bases=qtd_bases,
         valor_bases=valor_bases,
+        qtd_sem_preco_bases=qtd_sem_preco_bases,
+        qtd_sem_preco_sellers=qtd_sem_preco_sellers,
     )
 
 
@@ -990,9 +1104,16 @@ def calcular_hash(
 ) -> str:
     """Hash das entradas da apuração. Muda se a operação, o preço ou os ajustes mudarem.
 
-    No modo de dois preços entram também o preço de Sellers e o preço aplicado a cada item.
-    Fora dele o hash é idêntico ao anterior ao PRD-011.
+    Inclui o unitário resolvido por item no bruto (detecta mudança de vigência no período).
     """
+
+    def _unit(it: ItemApuracao) -> str:
+        if not it.no_bruto:
+            return ""
+        if it.preco_unitario is None:
+            return "sem_preco"
+        return str(Decimal(str(it.preco_unitario)).normalize())
+
     linhas = sorted(
         (
             it.tipo,
@@ -1005,6 +1126,7 @@ def calcular_hash(
             it.quantidade,
             it.data_competencia.isoformat() if it.data_competencia else "",
             it.id_saida or 0,
+            _unit(it),
         )
         + ((it.papel_preco or "",) if dual else ())
         for it in itens
