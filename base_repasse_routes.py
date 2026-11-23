@@ -399,8 +399,12 @@ def calcular_repasse_preview(
     db: Session = Depends(get_db),
     current_user=Depends(usuario_financeiro),
 ):
+    """Preview do período — permitido com período ainda aberto (como /entregadores/resumo).
+    A trava de período fechado fica só no POST de gerar.
+    """
     sub_base = _resolve_user_base(db, current_user)
-    _validar_periodo_fechado(periodo_inicio, periodo_fim)
+    if periodo_inicio > periodo_fim:
+        raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
     base = _base_parceira_do_tenant(db, sub_base, id_base)
     calc = _calcular(db, sub_base, base, periodo_inicio, periodo_fim)
     existente = _fechamento_sobreposto(db, sub_base, int(base.id_base), periodo_inicio, periodo_fim)
