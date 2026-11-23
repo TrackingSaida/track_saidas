@@ -1157,7 +1157,7 @@ def filtrar_itens(
     origem: Optional[str] = None,
     filtro: Optional[str] = None,
 ) -> List[ItemApuracao]:
-    """filtro: faturavel | cancelado | duplicado | manual | reconciliado | desconsiderado."""
+    """filtro: faturavel | cancelado | duplicado | manual | reconciliado | desconsiderado | sellers | bases."""
     out: List[ItemApuracao] = []
     cod = normalizar_codigo(codigo) if codigo else ""
     for it in itens:
@@ -1180,6 +1180,10 @@ def filtrar_itens(
         if filtro == "reconciliado" and it.status_financeiro != "reconciliado":
             continue
         if filtro == "desconsiderado" and it.no_bruto:
+            continue
+        if filtro == "sellers" and it.papel_preco != ESCOPO_PRECO_SELLERS:
+            continue
+        if filtro == "bases" and it.papel_preco == ESCOPO_PRECO_SELLERS:
             continue
         out.append(it)
     out.sort(

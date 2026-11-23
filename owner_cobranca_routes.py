@@ -35,10 +35,17 @@ from owner_cobranca_engine import (
     ESCOPO_PRECO_SELLERS,
     SERVICO_LABELS,
     filtrar_itens,
+    papel_preco_item,
     periodo_de,
     presets_periodo,
     quinzena_de,
 )
+
+# Badge curto na tabela de itens (ledger usa ESCOPO_PRECO_LABELS).
+_PAPEL_PRECO_BADGE = {
+    ESCOPO_PRECO_SELLERS: "Seller",
+    ESCOPO_PRECO_BASES: "Base",
+}
 
 
 def require_root(current_user: User = Depends(get_current_user)) -> User:
@@ -165,9 +172,12 @@ def _status_operacional(s: Optional[str]) -> Optional[str]:
     return STATUS_OPERACIONAL_LABELS.get(k, k.replace("_", " ").capitalize())
 
 
-def _item_dict(it: Any) -> Dict[str, Any]:
+def _item_dict(it: Any, *, papel_preco: Optional[str] = None) -> Dict[str, Any]:
     status_fin = it.status_financeiro
     motivo = it.motivo
+    papel = papel_preco if papel_preco is not None else getattr(it, "papel_preco", None)
+    if papel not in (ESCOPO_PRECO_SELLERS, ESCOPO_PRECO_BASES):
+        papel = None
     return {
         "tipo": it.tipo,
         "codigo": it.codigo,
@@ -191,6 +201,8 @@ def _item_dict(it: Any) -> Dict[str, Any]:
         "quantidade": int(it.quantidade or 0),
         "is_grande": bool(it.is_grande),
         "status_operacional": _status_operacional(it.status_operacional),
+        "papel_preco": papel,
+        "papel_preco_label": _PAPEL_PRECO_BADGE.get(papel) if papel else None,
     }
 
 
@@ -561,6 +573,8 @@ def _detalhe(db: Session, a: svc.ApuracaoOwner) -> Dict[str, Any]:
             "valor_ajustes": _money(tot["valor_ajustes"]),
             "valor_total": _money(tot["valor_total"]),
         },
+        # Espelha totais dual no topo (compat com o FE do detalhe).
+        **_totais_dois_precos(tot),
         "faturar_em": _faturar_em_json(a),
         "composicao": composicao,
         "explicacao_modelo": EXPLICACAO_MODELO.get(modelo, ""),
@@ -595,7 +609,19 @@ def get_apuracao(
     return _detalhe(db, svc.apurar_owner(db, owner, ini, fim))
 
 
-FiltroItens = Literal["faturavel", "cancelado", "duplicado", "manual", "reconciliado", "desconsiderado"]
+FiltroItens = Literal[
+    "faturavel", "cancelado", "duplicado", "manual", "reconciliado", "desconsiderado",
+    "sellers", "bases",
+]
+
+
+def _papel_do_item(it: Any, papeis: Dict[str, Optional[str]], dual: bool) -> Optional[str]:
+    if not dual:
+        return None
+    papel = getattr(it, "papel_preco", None)
+    if papel in (ESCOPO_PRECO_SELLERS, ESCOPO_PRECO_BASES):
+        return papel
+    return papel_preco_item(getattr(it, "origem", None), getattr(it, "base", None), papeis)
 
 
 @router.get("/apuracoes/{owner_id}/itens")
@@ -624,24 +650,45 @@ def get_itens(
         fech = svc.fechamento_vigente(db, owner.id_owner, ini, fim)
 
     filtros = dict(codigo=codigo, data=data, servico=servico, origem=origem, filtro=filtro)
+    filtro_papel = filtro in ("sellers", "bases")
     if fech is not None:
-        stmt = svc.itens_fechamento_query(fech.id, **filtros)
-        total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
-        rows = db.scalars(
-            stmt.order_by(
-                OwnerFechamentoItem.data_competencia, OwnerFechamentoItem.tipo.desc(),
-                OwnerFechamentoItem.codigo, OwnerFechamentoItem.id,
-            )
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-        ).all()
-        itens = [_item_dict(r) for r in rows]
+        dual = fech.preco_sellers is not None
+        papeis = svc.carregar_papeis_clientes(db, owner.sub_base) if dual else {}
+        # Snapshot não grava papel_preco: filtros Seller/Base resolvem em memória.
+        filtros_sql = dict(filtros)
+        if filtro_papel:
+            filtros_sql["filtro"] = None
+        stmt = svc.itens_fechamento_query(fech.id, **filtros_sql)
+        stmt = stmt.order_by(
+            OwnerFechamentoItem.data_competencia, OwnerFechamentoItem.tipo.desc(),
+            OwnerFechamentoItem.codigo, OwnerFechamentoItem.id,
+        )
+        if filtro_papel and dual:
+            rows = list(db.scalars(stmt).all())
+            pares = [(r, _papel_do_item(r, papeis, True)) for r in rows]
+            if filtro == "sellers":
+                pares = [(r, p) for r, p in pares if p == ESCOPO_PRECO_SELLERS]
+            else:
+                pares = [(r, p) for r, p in pares if p != ESCOPO_PRECO_SELLERS]
+            total = len(pares)
+            fatia = pares[(page - 1) * page_size : page * page_size]
+            itens = [_item_dict(r, papel_preco=p) for r, p in fatia]
+        else:
+            total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+            rows = db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+            itens = [
+                _item_dict(r, papel_preco=_papel_do_item(r, papeis, dual)) for r in rows
+            ]
         fonte = "snapshot"
     else:
         a = svc.apurar_owner(db, owner, ini, fim, usar_snapshot=False)
+        dual = bool(a.apuracao.dual)
         lista = filtrar_itens(a.apuracao.itens, **filtros)
         total = len(lista)
-        itens = [_item_dict(it) for it in lista[(page - 1) * page_size : page * page_size]]
+        fatia = lista[(page - 1) * page_size : page * page_size]
+        itens = [
+            _item_dict(it, papel_preco=_papel_do_item(it, {}, dual)) for it in fatia
+        ]
         fonte = "previa"
     return {"fonte": fonte, "page": page, "page_size": page_size, "total": total, "itens": itens}
 
@@ -1089,6 +1136,7 @@ CSV_COLUNAS = [
     ("origem_label", "Origem"),
     ("servico_label", "Serviço"),
     ("base", "Base"),
+    ("papel_preco_label", "Tipo de preço"),
     ("quantidade", "Quantidade"),
     ("status_financeiro_label", "Situação"),
     ("motivo_label", "Motivo"),
@@ -1099,7 +1147,9 @@ CSV_COLUNAS = [
 
 @router.get("/fechamentos/{fechamento_id}/itens.csv")
 def get_itens_csv(fechamento_id: int, db: Session = Depends(get_db)):
-    fech, _owner = svc.carregar_fechamento(db, fechamento_id)
+    fech, owner = svc.carregar_fechamento(db, fechamento_id)
+    dual = fech.preco_sellers is not None
+    papeis = svc.carregar_papeis_clientes(db, owner.sub_base) if dual else {}
 
     def gerar():
         buf = io.StringIO()
@@ -1120,7 +1170,7 @@ def get_itens_csv(fechamento_id: int, db: Session = Depends(get_db)):
             buf = io.StringIO()
             w = csv.writer(buf, delimiter=";")
             for r in rows:
-                d = _item_dict(r)
+                d = _item_dict(r, papel_preco=_papel_do_item(r, papeis, dual))
                 d["is_grande"] = "Sim" if d["is_grande"] else "Não"
                 w.writerow(["" if d.get(k) is None else d.get(k) for k, _h in CSV_COLUNAS])
             ultimo_id = rows[-1].id

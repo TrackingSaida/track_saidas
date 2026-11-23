@@ -13,6 +13,7 @@ from owner_cobranca_engine import (
     PrecoFaixa,
     apurar,
     calcular_hash,
+    filtrar_itens,
     modo_dual,
     papel_preco_item,
     preco_faixa_vigente,
@@ -139,6 +140,10 @@ def test_dual_cobra_cada_lado_com_seu_preco_e_lado_zerado_aparece():
     assert ap.valor_pacotes == Decimal("2.10")
     assert ap.valor_total == Decimal("2.10")
     assert ap.dual is True and ap.preco_sellers == PRECO_SELLERS
+    sellers = filtrar_itens(ap.itens, filtro="sellers")
+    bases = filtrar_itens(ap.itens, filtro="bases")
+    assert sorted(it.codigo for it in sellers) == ["S1", "S2"]
+    assert [it.codigo for it in bases] == ["B1"]
 
     so_sellers = run_dual("coleta_saida", [
         ev(1, "S1", base="LOJA SELLER", data_coleta=D5, id_coleta=10, status="coletado"),
