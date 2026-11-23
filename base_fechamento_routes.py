@@ -861,6 +861,7 @@ class FechamentoReceberItem(BaseModel):
     recebido_em: Optional[datetime] = None
     recebido_por: Optional[str] = None
     cnpj: Optional[str] = None
+    papel: Optional[str] = None
     precisa_reajuste: bool = False
     alerta_pos_recebido: bool = False
     valor_final_recalculado: Optional[Decimal] = None
@@ -894,6 +895,7 @@ class ResumoBaseFechamento(BaseModel):
 class ResumoBaseLinha(BaseModel):
     base: str
     cnpj: Optional[str] = None
+    papel: Optional[str] = None
     dias: List[ResumoBaseDia]
     shopee: int = 0
     mercado_livre: int = 0
@@ -1365,6 +1367,19 @@ def listar_fechamentos_a_receber(
     total_recebido = Decimal("0.00")
     qtd_a_receber = qtd_recebido = qtd_precisa_reajuste = 0
     cnpj_por_base: Dict[str, Optional[str]] = {}
+    nomes_bases = sorted({(fech.base or "").strip() for fech in rows if (fech.base or "").strip()})
+    papel_por_base: Dict[str, str] = {}
+    if nomes_bases:
+        for preco in db.scalars(
+            select(BasePreco).where(
+                BasePreco.sub_base == sub_base,
+                BasePreco.base.in_(nomes_bases),
+            )
+        ).all():
+            nome_p = (preco.base or "").strip()
+            if not nome_p:
+                continue
+            papel_por_base[nome_p] = (getattr(preco, "papel", None) or "").strip().lower() or "seller"
 
     for fech in rows:
         status_atual = _status_receber(fech)
@@ -1397,6 +1412,7 @@ def listar_fechamentos_a_receber(
                 recebido_em=getattr(fech, "recebido_em", None),
                 recebido_por=getattr(fech, "recebido_por", None),
                 cnpj=cnpj_por_base.get(fech.base),
+                papel=papel_por_base.get((fech.base or "").strip()),
                 precisa_reajuste=precisa_reajuste,
                 alerta_pos_recebido=alerta_pos_recebido,
                 valor_final_recalculado=div["valor_final"],
@@ -1809,10 +1825,14 @@ def _linhas_resumo_por_base(
                 periodo_inicio, periodo_fim, date.today(), dias_coleta, extras
             ):
                 motivo = MOTIVO_PERIODO_ABERTO
+        papel_linha = None
+        if preco is not None:
+            papel_linha = (getattr(preco, "papel", None) or "").strip().lower() or "seller"
         linhas.append(
             ResumoBaseLinha(
                 base=nome,
                 cnpj=cnpj_por_chave.get(chave),
+                papel=papel_linha,
                 dias=dias,
                 shopee=sum(d.shopee for d in dias),
                 mercado_livre=sum(d.mercado_livre for d in dias),

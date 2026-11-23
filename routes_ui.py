@@ -143,7 +143,7 @@ def _menu_label_for_owner(item_label: str, tipo_owner: str) -> str:
     if item_label == "Bases":
         return "Clientes"
     if item_label == "Fechamento Bases":
-        return "Fechamento Seller"
+        return "Clientes"
     return item_label
 
 
