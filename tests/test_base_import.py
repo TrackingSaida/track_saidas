@@ -68,12 +68,45 @@ def test_gerar_modelo_tem_cabecalhos():
     assert normalize_base_nome(str(linhas[0]["base"])) == "EXEMPLO BASE"
 
 
+def test_gerar_modelo_clientes_com_tipo():
+    content = gerar_modelo_xlsx(exige_tipo=True)
+    linhas = ler_linhas_xlsx(content, exige_tipo=True)
+    assert len(linhas) == 1
+    assert normalize_base_nome(str(linhas[0]["base"])) == "EXEMPLO SELLER"
+    assert str(linhas[0]["tipo"]).strip().lower() == "seller"
+
+
 def test_ler_xlsx_exige_colunas():
     content = _xlsx_bytes([["nome", "preco"], ["A", 1]])
     with pytest.raises(HTTPException) as exc:
         ler_linhas_xlsx(content)
     assert exc.value.status_code == 400
     assert "colunas obrigatórias" in str(exc.value.detail).lower()
+
+
+def test_ler_xlsx_owner_base_exige_tipo():
+    content = _xlsx_bytes(
+        [
+            ["cliente", "flex", "shopee", "avulso"],
+            ["A.L.", 8, 5, 8],
+        ]
+    )
+    with pytest.raises(HTTPException) as exc:
+        ler_linhas_xlsx(content, exige_tipo=True)
+    assert "tipo" in str(exc.value.detail).lower()
+
+
+def test_ler_xlsx_owner_base_aceita_alias_base_no_cabecalho():
+    content = _xlsx_bytes(
+        [
+            ["base", "tipo", "flex", "shopee", "avulso"],
+            ["A.L.", "base", 8, 5, 8],
+        ]
+    )
+    linhas = ler_linhas_xlsx(content, exige_tipo=True)
+    assert len(linhas) == 1
+    assert normalize_base_nome(str(linhas[0]["base"])) == "A.L."
+    assert str(linhas[0]["tipo"]).strip().lower() == "base"
 
 
 def test_ler_xlsx_ignora_linha_em_branco():
@@ -140,6 +173,68 @@ def test_preview_importacao_com_db_mock():
     assert out["resumo"]["criar"] == 1
     assert out["linhas"][0]["acao"] == ACAO_CRIAR
     assert out["linhas"][0]["base"] == "NOVA BASE"
+
+
+def test_classificar_owner_base_tipo_obrigatorio_e_aliases():
+    brutas = [
+        {"linha": 2, "base": "Seller A", "tipo": "seller", "flex": 8, "shopee": 5, "avulso": 8},
+        {"linha": 3, "base": "Base B", "tipo": "base", "flex": 9, "shopee": 6, "avulso": 9},
+        {"linha": 4, "base": "Sem tipo", "tipo": None, "flex": 1, "shopee": 1, "avulso": 1},
+        {"linha": 5, "base": "Ruim", "tipo": "motoboy", "flex": 1, "shopee": 1, "avulso": 1},
+    ]
+    preview = classificar_linhas(brutas, {}, exige_tipo=True)
+    by_line = {l.linha: l for l in preview.linhas}
+    assert by_line[2].acao == ACAO_CRIAR and by_line[2].papel == "seller"
+    assert by_line[3].acao == ACAO_CRIAR and by_line[3].papel == "base_parceira"
+    assert by_line[3].as_preview_dict()["tipo"] == "base"
+    assert by_line[4].acao == ACAO_ERRO
+    assert "obrigatório" in (by_line[4].motivo or "").lower()
+    assert by_line[5].acao == ACAO_ERRO
+
+
+def test_confirmar_owner_base_grava_papel(monkeypatch):
+    monkeypatch.setattr(
+        "base_import_service.owner_exige_tipo_import", lambda db, sb: True
+    )
+    db = MagicMock()
+    result_proxy = MagicMock()
+    result_proxy.all.return_value = []
+    db.scalars.return_value = result_proxy
+    created = []
+
+    def fake_add(obj):
+        if getattr(obj, "id_base", None) is None:
+            obj.id_base = 50
+            created.append(obj)
+
+    db.add.side_effect = fake_add
+    user = SimpleNamespace(username="admin")
+    out = confirmar_importacao(
+        db,
+        "TENANT_BASE",
+        user,
+        [
+            {
+                "linha": 2,
+                "base": "Novo Seller",
+                "tipo": "seller",
+                "flex": 8,
+                "shopee": 5,
+                "avulso": 8,
+            },
+            {
+                "linha": 3,
+                "base": "Nova Base",
+                "papel": "base_parceira",
+                "flex": 9,
+                "shopee": 6,
+                "avulso": 9,
+            },
+        ],
+    )
+    assert out["criadas"] == 2
+    assert out["erros"] == 0
+    assert {c.papel for c in created} == {"seller", "base_parceira"}
 
 
 def test_confirmar_cria_e_atualiza():

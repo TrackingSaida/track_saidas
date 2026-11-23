@@ -25,10 +25,11 @@ from models import (  # classe do models.py com __tablename__ = "base"
     User,
 )
 from base_import_service import (
-    MODELO_FILENAME,
     XLSX_MEDIA_TYPE,
     confirmar_importacao,
     gerar_modelo_xlsx,
+    modelo_filename,
+    owner_exige_tipo_import,
     preview_importacao,
 )
 from base_papel_pure import (
@@ -547,13 +548,15 @@ def baixar_modelo_import_bases(
     current_user: User = Depends(get_current_user),
 ):
     # Garante sessão válida / sub_base (mesmo escopo do create)
-    _resolve_user_sub_base(db, current_user)
-    content = gerar_modelo_xlsx()
+    sub_base_user = _resolve_user_sub_base(db, current_user)
+    exige_tipo = owner_exige_tipo_import(db, sub_base_user)
+    content = gerar_modelo_xlsx(exige_tipo=exige_tipo)
+    fname = modelo_filename(exige_tipo=exige_tipo)
     return Response(
         content=content,
         media_type=XLSX_MEDIA_TYPE,
         headers={
-            "Content-Disposition": f'attachment; filename="{MODELO_FILENAME}"',
+            "Content-Disposition": f'attachment; filename="{fname}"',
         },
     )
 

@@ -14,8 +14,10 @@ from base_papel_pure import (
     exige_cnpj_endereco_seller,
     exige_papel_obrigatorio,
     normalizar_papel,
+    normalizar_papel_planilha,
     papel_ao_promover_owner_para_base,
     permite_autenticacao_portal,
+    rotulo_tipo_planilha,
 )
 from base_repasse_pure import (
     calcular_repasse,
@@ -45,6 +47,20 @@ def test_normalizar_papel_aceita_valores_validos_e_vazio():
 def test_normalizar_papel_recusa_valor_desconhecido():
     with pytest.raises(ValueError):
         normalizar_papel("subbase")
+
+
+def test_normalizar_papel_planilha_aliases_e_obrigatorio():
+    assert normalizar_papel_planilha("seller") == "seller"
+    assert normalizar_papel_planilha(" Base ") == "base_parceira"
+    assert normalizar_papel_planilha("base_parceira") == "base_parceira"
+    assert rotulo_tipo_planilha("base_parceira") == "base"
+    assert rotulo_tipo_planilha("seller") == "seller"
+    with pytest.raises(ValueError):
+        normalizar_papel_planilha(None)
+    with pytest.raises(ValueError):
+        normalizar_papel_planilha("")
+    with pytest.raises(ValueError):
+        normalizar_papel_planilha("motoboy")
 
 
 def test_papel_obrigatorio_so_para_owner_base():

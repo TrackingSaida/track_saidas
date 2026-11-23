@@ -29,6 +29,21 @@ def normalizar_papel(value: Optional[str]) -> Optional[str]:
     return v
 
 
+def normalizar_papel_planilha(value: Optional[str]) -> str:
+    """Planilha: seller | base (| base_parceira). Obrigatório; devolve enum interno."""
+    if value is None or not str(value).strip():
+        raise ValueError("Tipo obrigatório: seller ou base.")
+    v = str(value).strip().lower()
+    aliases = {
+        "seller": "seller",
+        "base": "base_parceira",
+        "base_parceira": "base_parceira",
+    }
+    if v not in aliases:
+        raise ValueError("Tipo inválido. Use seller ou base.")
+    return aliases[v]
+
+
 def exige_papel_obrigatorio(tipo_owner: Optional[str]) -> bool:
     return (tipo_owner or "").strip().lower() == "base"
 
@@ -39,6 +54,15 @@ def eh_seller(papel: Optional[str]) -> bool:
 
 def eh_base_parceira(papel: Optional[str]) -> bool:
     return (papel or "").strip().lower() == "base_parceira"
+
+
+def rotulo_tipo_planilha(papel: Optional[str]) -> Optional[str]:
+    """Rótulo da planilha/UI a partir do papel interno."""
+    if eh_base_parceira(papel):
+        return "base"
+    if eh_seller(papel):
+        return "seller"
+    return None
 
 
 def permite_autenticacao_portal(papel: Optional[str], tipo_owner: Optional[str]) -> bool:
