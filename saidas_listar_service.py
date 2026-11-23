@@ -48,6 +48,7 @@ class SaidaListRow:
     base: Optional[str]
     is_grande: bool
     categoria_g_id: Optional[int] = None
+    repasse_base_id: Optional[int] = None
 
 
 def clamp_listar_limit(limit: Optional[int], cap: int = MAX_LISTAR_LIMIT) -> Optional[int]:
@@ -528,6 +529,31 @@ def _load_motoboy_nome_map(db, motoboy_ids: Sequence[int]) -> Dict[int, str]:
         out[mid] = format_motoboy_nome_parts(
             nome, sobrenome, username_val, motoboy_id=mid
         )
+    return out
+
+
+def _load_base_repasse_nome_map(db, base_ids: Sequence[int]) -> Dict[int, str]:
+    """Resolve id_base → nome exibível (Base parceira de destino)."""
+    from sqlalchemy import select
+
+    from db_utils import run_db_query_with_retry
+    from models import BasePreco
+
+    if not base_ids:
+        return {}
+    out: Dict[int, str] = {}
+    for lote in _chunked(sorted(set(int(b) for b in base_ids)), MAX_IDS_POR_LOTE):
+        rows_lote = run_db_query_with_retry(
+            db,
+            lambda lote=lote: db.execute(
+                select(BasePreco.id_base, BasePreco.base).where(BasePreco.id_base.in_(lote))
+            ).all(),
+        )
+        for id_base, nome in rows_lote:
+            if id_base is None:
+                continue
+            label = (nome or "").strip()
+            out[int(id_base)] = label or f"Base {int(id_base)}"
     return out
 
 
@@ -1265,7 +1291,7 @@ def listar_saidas_paginado(
     WITH candidatos AS (
       SELECT
         s.id_saida, s.timestamp, s.sub_base, s.username, s.entregador,
-        s.entregador_id, s.motoboy_id, s.codigo, s.servico, s.status, s.base, s.is_grande,
+        s.entregador_id, s.motoboy_id, s.repasse_base_id, s.codigo, s.servico, s.status, s.base, s.is_grande,
         s.categoria_g_id
       FROM saidas s
       WHERE s.sub_base = :sub_base
@@ -1370,6 +1396,7 @@ def listar_saidas_paginado(
       p.entregador,
       p.entregador_id,
       p.motoboy_id,
+      p.repasse_base_id,
       p.codigo,
       p.servico,
       p.status,
@@ -1458,6 +1485,12 @@ def listar_saidas_paginado(
         int(r["motoboy_id"]) for r in page_rows_raw if r.get("motoboy_id") is not None
     ]
     page_motoboy_map = _load_motoboy_nome_map(db, page_motoboy_ids)
+    page_repasse_ids = [
+        int(r["repasse_base_id"])
+        for r in page_rows_raw
+        if r.get("repasse_base_id") is not None
+    ]
+    page_repasse_map = _load_base_repasse_nome_map(db, page_repasse_ids)
 
     items = []
     for r in page_rows_raw:
@@ -1475,10 +1508,15 @@ def listar_saidas_paginado(
             base=r["base"],
             is_grande=bool(r["is_grande"] or False),
             categoria_g_id=r.get("categoria_g_id"),
+            repasse_base_id=(
+                int(r["repasse_base_id"]) if r.get("repasse_base_id") is not None else None
+            ),
         )
         ctx = ctx_map.get(row.id_saida)
         if row.motoboy_id is not None:
             nome_exec = page_motoboy_map.get(int(row.motoboy_id)) or row.entregador
+        elif row.repasse_base_id is not None:
+            nome_exec = page_repasse_map.get(int(row.repasse_base_id)) or row.entregador
         else:
             nome_exec = row.entregador
         from name_normalizer import normalize_display_name

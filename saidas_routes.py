@@ -2334,6 +2334,12 @@ def _montar_item_listar_saida(
         "entregador_id": getattr(row, "entregador_id", None),
         "motoboy_id": getattr(row, "motoboy_id", None),
         "repasse_base_id": getattr(row, "repasse_base_id", None),
+        "repasse_base_nome": (
+            (nome_executor or None)
+            if getattr(row, "repasse_base_id", None) is not None
+            and getattr(row, "motoboy_id", None) is None
+            else None
+        ),
         "codigo": row.codigo,
         "codigo_exibicao": row.codigo,
         "servico": row.servico,
