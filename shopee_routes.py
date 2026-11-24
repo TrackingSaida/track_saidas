@@ -23,6 +23,12 @@ from sqlalchemy import select
 
 from auth import get_current_user
 from db import get_db
+from marketplace_oauth_state import (
+    decode_oauth_state,
+    encode_oauth_state,
+    tentar_vincular_shopee_no_callback,
+    validar_seller_para_vinculo,
+)
 from models import BasePreco, Owner, ShopeeToken, User
 
 router = APIRouter(prefix="/shopee", tags=["Shopee"])
@@ -218,6 +224,26 @@ def _fetch_shop_name(
 # 1) Gerar URL de autorização da Shopee (sem enviar dados internos à plataforma)
 # -------------------------------------------------
 @router.get(
+    "/oauth-state",
+    summary="Emite state OAuth assinado com id_base do Seller (uso pelo operador autenticado)",
+)
+def shopee_oauth_state(
+    state: Optional[str] = Query(None, alias="state", description="sub_base"),
+    id_base: int = Query(..., description="Seller cadastrado"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    sub_base = _exigir_admin_sub_base(user)
+    sb = (state or "").strip() or sub_base
+    if sb != sub_base:
+        raise HTTPException(403, "Sub-base do state não confere com a do usuário.")
+    base_row, err = validar_seller_para_vinculo(db, sub_base, int(id_base))
+    if err or base_row is None:
+        raise HTTPException(422 if err and "parceira" in (err or "") else 404, err or "Seller inválido.")
+    return {"state": encode_oauth_state(sub_base, int(id_base)), "sub_base": sub_base, "id_base": int(id_base)}
+
+
+@router.get(
     "/auth-url",
     summary="Gera a URL para o seller autorizar a Shopee",
 )
@@ -231,7 +257,7 @@ def gerar_auth_url(
 ):
     host, partner_id, partner_key, redirect_url, env = _get_shopee_config()
 
-    # Se state (sub_base) vier preenchido, colocamos na URL de redirect para o callback receber
+    # state: sub_base puro (legado) ou JWT com id_base — repassado ao callback
     state_val = (state or "").strip()
     if state_val:
         callback = redirect_url + ("&" if "?" in redirect_url else "?") + "state=" + quote(state_val, safe="")
@@ -331,7 +357,8 @@ def shopee_callback(
     if expires_in:
         expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in))
 
-    sub_base_val = (state or "").strip() or None
+    sub_base_val, id_base_state = decode_oauth_state(state)
+    sub_base_val = sub_base_val or None
 
     # Uma conexão por (loja, sub_base): outra base autorizando a mesma loja não toma a conexão existente.
     existente = (
@@ -371,6 +398,12 @@ def shopee_callback(
         record.shop_name = shop_name
         db.commit()
 
+    vinculo_info: dict = {}
+    if id_base_state is not None and sub_base_val:
+        vinculo_info = tentar_vincular_shopee_no_callback(
+            db, shop_id=int(shop_id), sub_base=sub_base_val, id_base=int(id_base_state)
+        )
+
     frontend_base = (os.getenv("ML_AFTER_CALLBACK", "https://tracking-saidas.com.br/") or "").rstrip("/")
     success_page = f"{frontend_base}/autenticacao-sucesso.html"
     params = ["shopee=ok"]
@@ -381,6 +414,14 @@ def shopee_callback(
             nome_fantasia = (getattr(owner, "nome_fantasia", None) or "").strip()
             if nome_fantasia:
                 params.append("nome_fantasia=" + quote(nome_fantasia, safe=""))
+    if vinculo_info.get("vinculado"):
+        params.append("vinculado=1")
+        if vinculo_info.get("base_nome"):
+            params.append("base_nome=" + quote(str(vinculo_info["base_nome"]), safe=""))
+    elif id_base_state is not None:
+        params.append("vinculado=0")
+        if vinculo_info.get("motivo"):
+            params.append("vinculo_motivo=" + quote(str(vinculo_info["motivo"]), safe=""))
     params.append("_t=" + str(int(time.time())))
     success_url = success_page + "?" + "&".join(params)
     return RedirectResponse(url=success_url, status_code=302)

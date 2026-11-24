@@ -17,6 +17,12 @@ from sqlalchemy import select
 from auth import get_current_user
 from cobertura_cep_service import cep_coberto, list_prefixos_ativos
 from db import get_db
+from marketplace_oauth_state import (
+    decode_oauth_state,
+    encode_oauth_state,
+    tentar_vincular_ml_no_callback,
+    validar_seller_para_vinculo,
+)
 from models import BasePreco, MLConexao, Owner, User
 from ml_int_envios_pure import ml_shipment_destinatario
 from ml_int_service import (
@@ -31,6 +37,7 @@ from ml_int_service import (
     ml_conexao_status,
     sync_envios_sub_base,
 )
+from typing import Optional
 
 
 def _normalize_sub_base(value: str | None) -> str:
@@ -95,17 +102,38 @@ ML_REDIRECT_URI_INT = os.getenv("ML_REDIRECT_URI_ML_INT") or os.getenv("ML_REDIR
 FRONTEND_AFTER_CALLBACK = os.getenv("ML_AFTER_CALLBACK", "https://tracking-saidas.com.br/")
 
 
-# ---------- OAuth: connect (sem auth) ----------
+# ---------- OAuth: connect ----------
 @router.get("/connect")
-def ml_int_connect(state: str = Query("", alias="state")):
-    """Gera URL de autorização ML. Frontend deve passar state=sub_base (ou valor codificado)."""
+def ml_int_connect(
+    state: str = Query("", alias="state"),
+    id_base: Optional[int] = Query(None, description="Seller (id_base) para vínculo automático no callback"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Gera URL de autorização ML. Com id_base, o state é JWT assinado (vínculo no callback)."""
+    if user.role not in (0, 1):
+        raise HTTPException(403, "Acesso restrito a root e admin.")
     client_id = os.getenv("ML_CLIENT_ID")
     redirect_uri = ML_REDIRECT_URI_INT
     if not client_id or not redirect_uri:
         raise HTTPException(500, "ML_CLIENT_ID ou ML_REDIRECT_URI não configurados.")
-    q = {"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri}
-    if state:
-        q["state"] = state
+    sub_base = _normalize_sub_base(state) or _normalize_sub_base(getattr(user, "sub_base", None))
+    if not sub_base:
+        raise HTTPException(400, "Sub-base não definida.")
+    if getattr(user, "sub_base", None) and _normalize_sub_base(user.sub_base) != sub_base:
+        raise HTTPException(403, "Sub-base do state não confere com a do usuário.")
+    state_out = sub_base
+    if id_base is not None:
+        base_row, err = validar_seller_para_vinculo(db, sub_base, int(id_base))
+        if err or base_row is None:
+            raise HTTPException(422 if err and "parceira" in (err or "") else 404, err or "Seller inválido.")
+        state_out = encode_oauth_state(sub_base, int(id_base))
+    q = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state_out,
+    }
     params = urlencode(q)
     return {"auth_url": f"{ML_AUTH_BASE}?{params}"}
 
@@ -117,7 +145,7 @@ def ml_int_callback(
     state: str = Query(""),
     db: Session = Depends(get_db),
 ):
-    """Troca code por token, grava ml_conexoes com sub_base = state, redireciona para sucesso."""
+    """Troca code por token, grava ml_conexoes; com id_base no state, vincula o Seller."""
     if not ML_REDIRECT_URI_INT:
         raise HTTPException(500, "ML_REDIRECT_URI não configurado.")
     try:
@@ -134,27 +162,14 @@ def ml_int_callback(
     success_page = f"{base_url}/autenticacao-sucesso.html"
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
-    sub_base_value = _normalize_sub_base(state)
+    sub_base_value, id_base_state = decode_oauth_state(state)
     nickname = (user_me.get("nickname") or "").strip()
 
-    # Nome fantasia do owner para exibir na página de sucesso (prioridade sobre sub_base)
     nome_fantasia = None
     if sub_base_value:
         owner = db.scalar(select(Owner).where(Owner.sub_base == sub_base_value))
         if owner:
             nome_fantasia = (getattr(owner, "nome_fantasia", None) or "").strip() or None
-
-    def success_url() -> str:
-        params = ["ml=ok"]
-        if sub_base_value:
-            params.append("sub_base=" + quote(sub_base_value, safe=""))
-        if nome_fantasia:
-            params.append("nome_fantasia=" + quote(nome_fantasia, safe=""))
-        if nickname:
-            params.append("seller_name=" + quote(nickname, safe=""))
-        params.append("v=2")
-        params.append("_t=" + str(int(time.time())))
-        return success_page + "?" + "&".join(params)
 
     _upsert_ml_conexao(
         db,
@@ -165,6 +180,33 @@ def ml_int_callback(
         expires_at=expires_at,
         nickname=nickname,
     )
+
+    vinculo_info: dict = {}
+    if id_base_state is not None and sub_base_value:
+        vinculo_info = tentar_vincular_ml_no_callback(
+            db, user_id_ml=user_id_ml, sub_base=sub_base_value, id_base=int(id_base_state)
+        )
+
+    def success_url() -> str:
+        params = ["ml=ok"]
+        if sub_base_value:
+            params.append("sub_base=" + quote(sub_base_value, safe=""))
+        if nome_fantasia:
+            params.append("nome_fantasia=" + quote(nome_fantasia, safe=""))
+        if nickname:
+            params.append("seller_name=" + quote(nickname, safe=""))
+        if vinculo_info.get("vinculado"):
+            params.append("vinculado=1")
+            if vinculo_info.get("base_nome"):
+                params.append("base_nome=" + quote(str(vinculo_info["base_nome"]), safe=""))
+        elif id_base_state is not None:
+            params.append("vinculado=0")
+            if vinculo_info.get("motivo"):
+                params.append("vinculo_motivo=" + quote(str(vinculo_info["motivo"]), safe=""))
+        params.append("v=2")
+        params.append("_t=" + str(int(time.time())))
+        return success_page + "?" + "&".join(params)
+
     return RedirectResponse(url=success_url())
 
 

@@ -668,13 +668,13 @@ _DETAIL_COLUNAS_DIGITOS = ("dest_cep", "dest_contato")
 
 
 def _localizar_detail_termos(term: str, variants: Sequence[str]) -> Tuple[str, List[str]]:
-    """(termo para colunas de texto, variantes numéricas ≥5 dígitos para CEP/telefone)."""
+    """(termo para colunas de texto, variantes numéricas ≥3 dígitos para CEP/telefone/região)."""
     raw = (term or "").strip()
     numericas = [
         v for v in variants
-        if v and v != raw and sum(ch.isdigit() for ch in v) >= 5
+        if v and v != raw and sum(ch.isdigit() for ch in v) >= 3
     ]
-    if raw and sum(ch.isdigit() for ch in raw) >= 5 and raw not in numericas:
+    if raw and sum(ch.isdigit() for ch in raw) >= 3 and raw not in numericas:
         numericas.insert(0, raw)
     return raw, numericas
 
@@ -939,6 +939,7 @@ def _listar_cache_key(
     limit: Optional[int],
     offset: int,
     categoria_g_id: Optional[int] = None,
+    regiao: Optional[str] = None,
 ) -> str:
     import json
 
@@ -955,6 +956,7 @@ def _listar_cache_key(
         "localizar": (localizar or "").strip() or None,
         "somente_g": bool(somente_g),
         "categoria_g_id": categoria_g_id,
+        "regiao": (regiao or None),
         "codigo_exato": bool(codigo_exato),
         "limit": limit,
         "offset": int(offset or 0),
@@ -1026,6 +1028,7 @@ def listar_saidas_paginado(
     offset: int = 0,
     montar_item,
     categoria_g_id: Optional[int] = None,
+    regiao: Optional[str] = None,
     limit_cap: int = MAX_LISTAR_LIMIT,
     use_cache: bool = True,
 ) -> Dict[str, Any]:
@@ -1056,6 +1059,7 @@ def listar_saidas_paginado(
         limit=limit,
         offset=offset,
         categoria_g_id=categoria_g_id,
+        regiao=regiao,
     )
     cached = _listar_cache_get(cache_key) if use_cache else None
     if cached is not None:
@@ -1199,6 +1203,15 @@ def listar_saidas_paginado(
     if categoria_g_id is not None:
         params["categoria_g_id"] = int(categoria_g_id)
         where_extra.append("s.is_grande IS TRUE AND s.categoria_g_id = :categoria_g_id")
+    if regiao:
+        params["regiao"] = regiao
+        where_extra.append(
+            """EXISTS (
+              SELECT 1 FROM saidas_detail sd_reg
+              WHERE sd_reg.id_saida = s.id_saida
+                AND left(regexp_replace(coalesce(sd_reg.dest_cep, ''), '\\D', '', 'g'), 3) = :regiao
+            )"""
+        )
 
     if codigo and codigo.strip():
         params["codigo_trim"] = codigo.strip().upper()

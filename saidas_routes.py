@@ -50,6 +50,7 @@ from saidas_exportar_service import (
     validar_total_exportacao,
 )
 from codigo_normalizer import canonicalize_servico, normalize_codigo
+from saida_regiao_pure import regiao_de_cep
 from saida_historico_service import SaidaHistoricoItemOut, listar_historico_saida
 from pacote_g_categorias import (
     aplicar_categoria_saida,
@@ -314,6 +315,8 @@ class SaidaDetailOut(BaseModel):
     dest_contato: Optional[str] = None
     endereco_formatado: Optional[str] = None
     endereco_origem: Optional[str] = None
+    # Prefixo de 3 dígitos do CEP de destino (quando houver CEP válido).
+    regiao: Optional[str] = None
     foto_urls: Optional[List[str]] = None
     # Fotos tipadas para timeline (evento/tentativa); foto_urls permanece para compatibilidade.
     fotos: Optional[List[Dict[str, Any]]] = None
@@ -2347,6 +2350,7 @@ def _montar_item_listar_saida(
         "base": row.base,
         "is_grande": getattr(row, "is_grande", False) or False,
         "categoria_g_id": getattr(row, "categoria_g_id", None),
+        "regiao": None,
     }
 
 
@@ -2371,6 +2375,24 @@ def _enriquecer_categoria_g_items(
             cid = it.get("categoria_g_id") or padrao_id
         it["categoria_g_id"] = cid
         it["categoria_g_nome"] = nomes.get(cid) if cid is not None else None
+
+
+def _enriquecer_regiao_items(db: Session, items: List[Dict[str, Any]]) -> None:
+    """Preenche regiao (3 dígitos do dest_cep) nos itens da página."""
+    from models import SaidaDetail
+    from saida_regiao_pure import regiao_de_cep
+
+    if not items:
+        return
+    ids = [int(it["id_saida"]) for it in items if it.get("id_saida") is not None]
+    if not ids:
+        return
+    rows = db.execute(
+        select(SaidaDetail.id_saida, SaidaDetail.dest_cep).where(SaidaDetail.id_saida.in_(ids))
+    ).all()
+    por_id = {int(r[0]): regiao_de_cep(r[1]) for r in rows}
+    for it in items:
+        it["regiao"] = por_id.get(int(it["id_saida"])) if it.get("id_saida") is not None else None
 
 
 def _enriquecer_codigo_exibicao_items(
@@ -2774,18 +2796,24 @@ def listar_saidas(
     localizar: Optional[str] = Query(None),
     somente_g: Optional[bool] = Query(None),
     categoria_g_id: Optional[int] = Query(None),
+    regiao: Optional[str] = Query(None, description="Prefixo de 3 dígitos do CEP de destino"),
     codigo_exato: bool = Query(False),
     limit: Optional[int] = Query(None),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from saida_regiao_pure import normalizar_filtro_regiao
+
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
+    regiao_n = normalizar_filtro_regiao(regiao)
+    if regiao and str(regiao).strip() and regiao_n is None:
+        raise HTTPException(422, "Região deve ter exatamente 3 dígitos.")
 
     if codigo and codigo.strip() and codigo_exato:
-        return _listar_saidas_codigo_exato(
+        result = _listar_saidas_codigo_exato(
             db=db,
             sub_base=sub_base,
             codigo=codigo,
@@ -2801,12 +2829,18 @@ def listar_saidas(
             limit=limit,
             offset=offset,
         )
+        _enriquecer_regiao_items(db, result.get("items") or [])
+        if regiao_n:
+            items = [it for it in (result.get("items") or []) if it.get("regiao") == regiao_n]
+            result["items"] = items
+            result["total"] = len(items)
+        return result
 
     # Prefixo (codigo sem codigo_exato) e contém (localizar) — usados pelo cascade
     # do app mobile. Caminho leve: NÃO usar o CTE D-15 completo (sem período
     # isso varria a sub_base inteira e gerava timeout / "Falha ao buscar registros").
     if (codigo and codigo.strip() and not codigo_exato) or (localizar and localizar.strip() and not (codigo and codigo.strip())):
-        return _listar_saidas_codigo_parcial(
+        result = _listar_saidas_codigo_parcial(
             db,
             sub_base=sub_base,
             codigo=codigo,
@@ -2823,6 +2857,12 @@ def listar_saidas(
             limit=limit,
             offset=offset,
         )
+        _enriquecer_regiao_items(db, result.get("items") or [])
+        if regiao_n:
+            items = [it for it in (result.get("items") or []) if it.get("regiao") == regiao_n]
+            result["items"] = items
+            result["total"] = len(items)
+        return result
 
     # Caminho otimizado: colunas leves + histórico em tuplas + paginação/totais
     # no mesmo conjunto lógico, enriquecendo apenas a página.
@@ -2840,6 +2880,7 @@ def listar_saidas(
         localizar=localizar,
         somente_g=somente_g,
         categoria_g_id=categoria_g_id,
+        regiao=regiao_n,
         codigo_exato=codigo_exato,
         limit=limit,
         offset=offset,
@@ -2851,6 +2892,7 @@ def listar_saidas(
         db, sub_base=sub_base, items=result.get("items") or []
     )
     _enriquecer_categoria_g_items(db, sub_base=sub_base, items=result.get("items") or [])
+    _enriquecer_regiao_items(db, result.get("items") or [])
     return result
 
 
@@ -3025,6 +3067,7 @@ def get_saida_detalhe(
             dest_contato=detail_row.dest_contato,
             endereco_formatado=detail_row.endereco_formatado,
             endereco_origem=detail_row.endereco_origem,
+            regiao=regiao_de_cep(detail_row.dest_cep),
             foto_urls=foto_urls_list or None,
             fotos=fotos_out or None,
         )

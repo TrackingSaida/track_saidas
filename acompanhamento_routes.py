@@ -78,13 +78,19 @@ def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> dict[int
 
 class AcompanhamentoItem(BaseModel):
     data: str
-    motoboy_id: int
-    motoboy_nome: str
+    motoboy_id: Optional[int] = None
+    motoboy_nome: Optional[str] = None
+    # Prefixo de 3 dígitos do CEP de destino; "SEM_CEP" quando não há CEP.
+    regiao: Optional[str] = None
+    # Prefixo predominante nos pedidos do motoboy (visão por motoboy).
+    cep_predominante: Optional[str] = None
+    # Quantidade de motoboys com pacote na região (visão por região).
+    responsaveis: Optional[int] = None
     pedidos: int
     entregues: int
     em_rota: int
     ausente_ou_ocorrencias: int
-    rota: str
+    rota: str = "—"
     distancia_tempo: Optional[str] = None
     ultima_entrega: Optional[str] = None
     sla: Optional[float] = None
@@ -104,11 +110,14 @@ class AcompanhamentoTotais(BaseModel):
     entradas: Optional[int] = None
     saidas: Optional[int] = None
     pct_saida_sobre_entrada: Optional[float] = None
+    aguardando_saida: Optional[int] = None
+    outras_situacoes: Optional[int] = None
 
 
 class AcompanhamentoDiaResponse(BaseModel):
     items: List[AcompanhamentoItem]
     totais: AcompanhamentoTotais
+    agrupar: str = "motoboy"
     data_inicio: Optional[str] = None
     data_fim: Optional[str] = None
 
@@ -217,16 +226,28 @@ def acompanhamento_dia(
     data_inicio: Optional[date] = Query(None, description="Início do período (YYYY-MM-DD)"),
     data_fim: Optional[date] = Query(None, description="Fim do período (YYYY-MM-DD)"),
     motoboy_id: Optional[int] = Query(None, description="Filtrar por motoboy"),
+    agrupar: str = Query("motoboy", description="motoboy | regiao"),
+    regiao: Optional[str] = Query(None, description="Filtro de região (3 dígitos) quando agrupar=regiao"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Retorna desempenho por motoboy na data ou período informado.
-    Agrupa Saida por motoboy_id; inclui totais e SLA.
+    Desempenho do dia: por motoboy (padrão) ou por região (prefixo CEP de destino).
     """
+    from saida_regiao_pure import normalizar_filtro_regiao, regiao_de_cep
+
     sub_base = getattr(current_user, "sub_base", None)
     if not sub_base or not str(sub_base).strip():
         raise HTTPException(status_code=403, detail="Sub_base não definida.")
+
+    modo = (agrupar or "motoboy").strip().lower()
+    if modo not in ("motoboy", "regiao"):
+        raise HTTPException(400, "agrupar deve ser motoboy ou regiao.")
+    regiao_n = normalizar_filtro_regiao(regiao)
+    if regiao and str(regiao).strip() and regiao_n is None and str(regiao).strip().upper() != "SEM_CEP":
+        raise HTTPException(422, "Região deve ter exatamente 3 dígitos (ou SEM_CEP).")
+    if str(regiao or "").strip().upper() == "SEM_CEP":
+        regiao_n = "SEM_CEP"
 
     inicio, fim = _resolver_periodo(data, data_inicio, data_fim)
     label_data = fim.isoformat() if inicio == fim else f"{inicio.isoformat()}_{fim.isoformat()}"
@@ -236,8 +257,9 @@ def acompanhamento_dia(
         .where(Saida.sub_base == sub_base)
         .where(Saida.data >= inicio)
         .where(Saida.data <= fim)
-        .where(Saida.motoboy_id.isnot(None))
     )
+    if modo == "motoboy":
+        stmt = stmt.where(Saida.motoboy_id.isnot(None))
     if motoboy_id is not None:
         stmt = stmt.where(Saida.motoboy_id == motoboy_id)
 
@@ -256,48 +278,18 @@ def acompanhamento_dia(
         for row in db.execute(stmt_entregue).all():
             cache_entregue[row.id_saida] = row.ts
 
-    # Agrupar por motoboy_id
-    by_motoboy: dict[int, list] = {}
-    for s in saidas:
-        mid = s.motoboy_id
-        if mid not in by_motoboy:
-            by_motoboy[mid] = []
-        by_motoboy[mid].append(s)
-
-    # Rotas no período por motoboy (ativa ou finalizada)
-    rotas_map = {}  # motoboy_id -> "Rota" | "SEM ROTA"
-    if by_motoboy:
-        rota_stmt = (
-            select(RotasMotoboy.motoboy_id, RotasMotoboy.status)
-            .where(RotasMotoboy.data >= inicio)
-            .where(RotasMotoboy.data <= fim)
-            .where(RotasMotoboy.motoboy_id.in_(list(by_motoboy.keys())))
-        )
-        for row in db.execute(rota_stmt).all():
-            mid, status = row[0], (row[1] or "").strip().lower()
-            current = rotas_map.get(mid)
-            if status == "ativa":
-                rotas_map[mid] = "Ativa"
-            elif current != "Ativa":
-                rotas_map[mid] = "Rota"
-    for mid in by_motoboy:
-        if mid not in rotas_map:
-            rotas_map[mid] = "SEM ROTA"
-
-    items = []
+    items: List[AcompanhamentoItem] = []
     totais_pedidos = 0
     totais_entregues = 0
     totais_em_rota = 0
     totais_ausente = 0
 
-    nomes_motoboy = _carregar_nomes_motoboy_ids(db, [int(mid) for mid in by_motoboy.keys()])
-    for mid, list_saidas in by_motoboy.items():
+    def _contar_status(list_saidas: list) -> Tuple[int, int, int, int, Optional[object]]:
         pedidos = len(list_saidas)
         entregues = 0
         em_rota = 0
         ausente_ou_ocorrencias = 0
         ultima_entrega_dt = None
-
         for s in list_saidas:
             st = normalizar_status_saida(s.status)
             if st == STATUS_ENTREGUE:
@@ -310,36 +302,140 @@ def acompanhamento_dia(
             if ts_entrega:
                 if ultima_entrega_dt is None or ts_entrega > ultima_entrega_dt:
                     ultima_entrega_dt = ts_entrega
+        return pedidos, entregues, em_rota, ausente_ou_ocorrencias, ultima_entrega_dt
 
-        sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
-        sum_shopee, sum_mercado, sum_avulso = _somar_servicos(list_saidas)
+    cep_map: dict[int, Optional[str]] = {}
+    if ids_saida:
+        for row in db.execute(
+            select(SaidaDetail.id_saida, SaidaDetail.dest_cep).where(
+                SaidaDetail.id_saida.in_(ids_saida)
+            )
+        ).all():
+            cep_map[int(row[0])] = row[1]
 
-        motoboy_nome = nomes_motoboy.get(int(mid), f"Motoboy {mid}")
+    def _prefix_saida(s: Saida) -> str:
+        return regiao_de_cep(cep_map.get(s.id_saida)) or "SEM_CEP"
 
-        items.append(
-            AcompanhamentoItem(
-                data=label_data,
-                motoboy_id=mid,
-                motoboy_nome=motoboy_nome,
-                pedidos=pedidos,
-                entregues=entregues,
-                em_rota=em_rota,
-                ausente_ou_ocorrencias=ausente_ou_ocorrencias,
-                rota=rotas_map.get(mid, "SEM ROTA"),
-                distancia_tempo=None,
-                ultima_entrega=ultima_entrega_dt.isoformat() if ultima_entrega_dt else None,
-                sla=sla,
-                sum_shopee=sum_shopee,
-                sum_mercado=sum_mercado,
-                sum_avulso=sum_avulso,
+    def _cep_predominante(list_saidas: list) -> Optional[str]:
+        counts: dict[str, int] = {}
+        for s in list_saidas:
+            prefix = regiao_de_cep(cep_map.get(s.id_saida))
+            if not prefix:
+                continue
+            counts[prefix] = counts.get(prefix, 0) + 1
+        if not counts:
+            return "SEM_CEP"
+        # Empate: menor prefixo
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+    if modo == "regiao":
+        by_regiao: dict[str, list] = {}
+        for s in saidas:
+            prefix = _prefix_saida(s)
+            if regiao_n and prefix != regiao_n:
+                continue
+            by_regiao.setdefault(prefix, []).append(s)
+
+        for prefix, list_saidas in by_regiao.items():
+            pedidos, entregues, em_rota, ausente_ou_ocorrencias, ultima_entrega_dt = _contar_status(
+                list_saidas
+            )
+            sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
+            sum_shopee, sum_mercado, sum_avulso = _somar_servicos(list_saidas)
+            responsaveis = len({s.motoboy_id for s in list_saidas if s.motoboy_id is not None})
+            items.append(
+                AcompanhamentoItem(
+                    data=label_data,
+                    motoboy_id=None,
+                    motoboy_nome=None,
+                    regiao=prefix,
+                    responsaveis=responsaveis,
+                    pedidos=pedidos,
+                    entregues=entregues,
+                    em_rota=em_rota,
+                    ausente_ou_ocorrencias=ausente_ou_ocorrencias,
+                    rota="—",
+                    distancia_tempo=None,
+                    ultima_entrega=ultima_entrega_dt.isoformat() if ultima_entrega_dt else None,
+                    sla=sla,
+                    sum_shopee=sum_shopee,
+                    sum_mercado=sum_mercado,
+                    sum_avulso=sum_avulso,
+                )
+            )
+            totais_pedidos += pedidos
+            totais_entregues += entregues
+            totais_em_rota += em_rota
+            totais_ausente += ausente_ou_ocorrencias
+
+        items.sort(
+            key=lambda it: (
+                1 if it.regiao == "SEM_CEP" else 0,
+                it.regiao or "",
             )
         )
-        totais_pedidos += pedidos
-        totais_entregues += entregues
-        totais_em_rota += em_rota
-        totais_ausente += ausente_ou_ocorrencias
+    else:
+        by_motoboy: dict[int, list] = {}
+        for s in saidas:
+            mid = s.motoboy_id
+            if mid is None:
+                continue
+            by_motoboy.setdefault(mid, []).append(s)
 
-    items.sort(key=lambda it: (it.motoboy_nome or "").casefold())
+        rotas_map: dict[int, str] = {}
+        if by_motoboy:
+            rota_stmt = (
+                select(RotasMotoboy.motoboy_id, RotasMotoboy.status)
+                .where(RotasMotoboy.data >= inicio)
+                .where(RotasMotoboy.data <= fim)
+                .where(RotasMotoboy.motoboy_id.in_(list(by_motoboy.keys())))
+            )
+            for row in db.execute(rota_stmt).all():
+                mid, status = row[0], (row[1] or "").strip().lower()
+                current = rotas_map.get(mid)
+                if status == "ativa":
+                    rotas_map[mid] = "Ativa"
+                elif current != "Ativa":
+                    rotas_map[mid] = "Rota"
+        for mid in by_motoboy:
+            if mid not in rotas_map:
+                rotas_map[mid] = "SEM ROTA"
+
+        nomes_motoboy = _carregar_nomes_motoboy_ids(db, [int(mid) for mid in by_motoboy.keys()])
+        for mid, list_saidas in by_motoboy.items():
+            pedidos, entregues, em_rota, ausente_ou_ocorrencias, ultima_entrega_dt = _contar_status(
+                list_saidas
+            )
+            sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
+            sum_shopee, sum_mercado, sum_avulso = _somar_servicos(list_saidas)
+            motoboy_nome = nomes_motoboy.get(int(mid), f"Motoboy {mid}")
+
+            items.append(
+                AcompanhamentoItem(
+                    data=label_data,
+                    motoboy_id=mid,
+                    motoboy_nome=motoboy_nome,
+                    regiao=None,
+                    cep_predominante=_cep_predominante(list_saidas),
+                    pedidos=pedidos,
+                    entregues=entregues,
+                    em_rota=em_rota,
+                    ausente_ou_ocorrencias=ausente_ou_ocorrencias,
+                    rota=rotas_map.get(mid, "SEM ROTA"),
+                    distancia_tempo=None,
+                    ultima_entrega=ultima_entrega_dt.isoformat() if ultima_entrega_dt else None,
+                    sla=sla,
+                    sum_shopee=sum_shopee,
+                    sum_mercado=sum_mercado,
+                    sum_avulso=sum_avulso,
+                )
+            )
+            totais_pedidos += pedidos
+            totais_entregues += entregues
+            totais_em_rota += em_rota
+            totais_ausente += ausente_ou_ocorrencias
+
+        items.sort(key=lambda it: (it.motoboy_nome or "").casefold())
 
     sla_total = round(100.0 * totais_entregues / totais_pedidos, 1) if totais_pedidos > 0 else None
 
@@ -353,14 +449,18 @@ def acompanhamento_dia(
     entradas_count: Optional[int] = None
     saidas_count: Optional[int] = None
     pct_saida: Optional[float] = None
-    if entrada_habilitada:
-        # Volume do dia = Coletas ∪ Entradas; Saídas = mesma regra dos Indicadores.
-        entradas_count, _total_coletas, _total_entradas = calcular_volume_que_entrou(
-            db, sub_base, inicio, fim
-        )
-        saidas_count = contar_saidas_como_indicadores(db, sub_base, inicio, fim)
-        if entradas_count > 0:
-            pct_saida = round(100.0 * saidas_count / entradas_count, 1)
+    # Volume do dia sempre disponível para o resumo da transportadora (protótipo).
+    entradas_count, _total_coletas, _total_entradas = calcular_volume_que_entrou(
+        db, sub_base, inicio, fim
+    )
+    saidas_count = contar_saidas_como_indicadores(db, sub_base, inicio, fim)
+    if entradas_count > 0:
+        pct_saida = round(100.0 * saidas_count / entradas_count, 1)
+    aguardando = max(0, int(entradas_count or 0) - int(saidas_count or 0))
+    outras = max(
+        0,
+        int(saidas_count or 0) - int(totais_entregues) - int(totais_em_rota),
+    )
 
     return AcompanhamentoDiaResponse(
         items=items,
@@ -374,7 +474,10 @@ def acompanhamento_dia(
             entradas=entradas_count,
             saidas=saidas_count,
             pct_saida_sobre_entrada=pct_saida,
+            aguardando_saida=aguardando,
+            outras_situacoes=outras,
         ),
+        agrupar=modo,
         data_inicio=inicio.isoformat(),
         data_fim=fim.isoformat(),
     )
