@@ -76,6 +76,12 @@ def _carregar_nomes_motoboy_ids(db: Session, motoboy_ids: List[int]) -> dict[int
     return carregar_nomes_motoboy_ids(db, motoboy_ids)
 
 
+class ResponsavelResumo(BaseModel):
+    motoboy_id: int
+    motoboy_nome: str
+    pedidos: int
+
+
 class AcompanhamentoItem(BaseModel):
     data: str
     motoboy_id: Optional[int] = None
@@ -86,6 +92,8 @@ class AcompanhamentoItem(BaseModel):
     cep_predominante: Optional[str] = None
     # Quantidade de motoboys com pacote na região (visão por região).
     responsaveis: Optional[int] = None
+    # Lista leve para expand/drawer na visão por região.
+    responsaveis_resumo: Optional[List[ResponsavelResumo]] = None
     pedidos: int
     entregues: int
     em_rota: int
@@ -336,20 +344,42 @@ def acompanhamento_dia(
                 continue
             by_regiao.setdefault(prefix, []).append(s)
 
+        mids_regiao = {
+            int(s.motoboy_id)
+            for list_saidas in by_regiao.values()
+            for s in list_saidas
+            if s.motoboy_id is not None
+        }
+        nomes_regiao = _carregar_nomes_motoboy_ids(db, list(mids_regiao)) if mids_regiao else {}
+
         for prefix, list_saidas in by_regiao.items():
             pedidos, entregues, em_rota, ausente_ou_ocorrencias, ultima_entrega_dt = _contar_status(
                 list_saidas
             )
             sla = round(100.0 * entregues / pedidos, 1) if pedidos > 0 else None
             sum_shopee, sum_mercado, sum_avulso = _somar_servicos(list_saidas)
-            responsaveis = len({s.motoboy_id for s in list_saidas if s.motoboy_id is not None})
+            por_motoboy: dict[int, int] = {}
+            for s in list_saidas:
+                if s.motoboy_id is None:
+                    continue
+                mid = int(s.motoboy_id)
+                por_motoboy[mid] = por_motoboy.get(mid, 0) + 1
+            resumo = [
+                ResponsavelResumo(
+                    motoboy_id=mid,
+                    motoboy_nome=nomes_regiao.get(mid, f"Motoboy {mid}"),
+                    pedidos=qtd,
+                )
+                for mid, qtd in sorted(por_motoboy.items(), key=lambda kv: (-kv[1], kv[0]))
+            ]
             items.append(
                 AcompanhamentoItem(
                     data=label_data,
                     motoboy_id=None,
                     motoboy_nome=None,
                     regiao=prefix,
-                    responsaveis=responsaveis,
+                    responsaveis=len(resumo),
+                    responsaveis_resumo=resumo,
                     pedidos=pedidos,
                     entregues=entregues,
                     em_rota=em_rota,
