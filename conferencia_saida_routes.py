@@ -7,22 +7,26 @@ from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
+from conferencia_saida_pure import status_agrupado_conferencia
 from conferencia_saida_service import (
     STATUS_CONFERIDA,
     STATUS_PENDENTE,
     STATUS_RECONFERIR,
+    carregar_conferencias_motoboy_dia,
     carregar_nomes_motoboy,
     conferir_saida,
     contar_saidas_por_motoboy_dia,
     contar_totais_e_novos_por_motoboy_dia,
     listar_saidas_motoboy_dia,
     listar_saidas_novas_apos_conferencia,
+    listar_saidas_operacionais_sessoes_motoboy_dia,
     owner_conferencia_habilitada,
     resumo_novos_pacotes,
+    somar_operacional_sessoes_por_motoboy_dia,
     somar_servicos_saidas,
     upsert_conferencia_dia,
 )
@@ -195,6 +199,81 @@ def _detalhe_out(
         novos_mercado=int(novos_payload["novos_mercado"]),
         novos_avulso=int(novos_payload["novos_avulso"]),
         novos_pacotes=[PacoteNovoOut(**p) for p in novos_payload["novos_pacotes"]],
+    )
+
+
+def _detalhe_motoboy_dia_out(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_id: int,
+    data_ref: date,
+    rows: List[ConferenciaSaida],
+) -> ConferenciaDetalheOut:
+    """Detalhe agregado do motoboy/dia: soma das sessões, sem sessao_id."""
+    if not rows:
+        raise HTTPException(404, "Conferência não encontrada para este motoboy/dia.")
+
+    status = status_agrupado_conferencia([r.status for r in rows])
+    sessao_ids = [int(r.sessao_id) for r in rows if r.sessao_id is not None]
+    tem_sessao = bool(sessao_ids)
+
+    if tem_sessao:
+        saidas = listar_saidas_operacionais_sessoes_motoboy_dia(
+            db, sub_base=sub_base, sessao_ids=sessao_ids
+        )
+    else:
+        saidas = listar_saidas_motoboy_dia(
+            db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
+        )
+    shopee, ml, avulso = somar_servicos_saidas(saidas)
+    total_vivo = shopee + ml + avulso
+    nome = carregar_nomes_motoboy(db, [motoboy_id]).get(motoboy_id, f"Motoboy {motoboy_id}")
+
+    novos_payload = {
+        "novos_qtd": 0,
+        "novos_shopee": 0,
+        "novos_mercado": 0,
+        "novos_avulso": 0,
+        "novos_pacotes": [],
+    }
+    if status == STATUS_RECONFERIR:
+        novos = listar_saidas_novas_apos_conferencia(
+            db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
+        )
+        novos_payload = resumo_novos_pacotes(novos)
+
+    conferido_em = None
+    if status == STATUS_CONFERIDA:
+        datas = [r.conferido_em for r in rows if r.conferido_em is not None]
+        if datas:
+            conferido_em = max(datas).isoformat()
+
+    return ConferenciaDetalheOut(
+        sessao_id=None,
+        motoboy_id=motoboy_id,
+        motoboy_nome=nome,
+        data_ref=data_ref,
+        status=status,
+        sum_shopee=shopee,
+        sum_mercado=ml,
+        sum_avulso=avulso,
+        total=total_vivo,
+        qtd_no_momento=total_vivo,
+        conferido_em=conferido_em,
+        novos_qtd=int(novos_payload["novos_qtd"]),
+        novos_shopee=int(novos_payload["novos_shopee"]),
+        novos_mercado=int(novos_payload["novos_mercado"]),
+        novos_avulso=int(novos_payload["novos_avulso"]),
+        novos_pacotes=[PacoteNovoOut(**p) for p in novos_payload["novos_pacotes"]],
+        snapshot_total=None,
+        snapshot_shopee=None,
+        snapshot_ml=None,
+        snapshot_avulso=None,
+        operacional_total=total_vivo,
+        operacional_shopee=shopee,
+        operacional_ml=ml,
+        operacional_avulso=avulso,
     )
 
 
@@ -512,67 +591,89 @@ def listar_conferencias(
         ConferenciaSaida.sub_base == sub_base,
         ConferenciaSaida.data_ref >= data_inicio,
         ConferenciaSaida.data_ref <= data_fim,
-        ConferenciaSaida.status == status,
     )
     if motoboy_id is not None:
         q = q.where(ConferenciaSaida.motoboy_id == motoboy_id)
 
     rows = list(db.scalars(q).all())
-    nomes = carregar_nomes_motoboy(db, [int(r.motoboy_id) for r in rows])
-    chaves = [(int(r.motoboy_id), r.data_ref) for r in rows]
+    grupos: dict[tuple[int, date], list[ConferenciaSaida]] = {}
+    for r in rows:
+        grupos.setdefault((int(r.motoboy_id), r.data_ref), []).append(r)
+
+    grupos_filtrados: dict[tuple[int, date], list[ConferenciaSaida]] = {}
+    status_por_chave: dict[tuple[int, date], str] = {}
+    for chave, grupo in grupos.items():
+        status_grupo = status_agrupado_conferencia([r.status for r in grupo])
+        if status_grupo != status:
+            continue
+        grupos_filtrados[chave] = grupo
+        status_por_chave[chave] = status_grupo
+
+    chaves = list(grupos_filtrados.keys())
+    nomes = carregar_nomes_motoboy(db, [mid for mid, _ in chaves])
     qtd_map: dict = {}
     novos_map: dict = {}
-    qtd_sessao_map: dict[int, int] = {}
-    if rows:
-        sessao_ids = [int(r.sessao_id) for r in rows if r.sessao_id is not None]
-        if sessao_ids:
-            qtd_sessao_map = {
-                int(sessao_id): int(total)
-                for sessao_id, total in db.execute(
-                    select(SaidaSessaoItem.sessao_id, func.count(Saida.id_saida))
-                    .join(SaidaSessao, SaidaSessao.id == SaidaSessaoItem.sessao_id)
-                    .join(Saida, Saida.id_saida == SaidaSessaoItem.id_saida)
-                    .where(
-                        SaidaSessaoItem.sessao_id.in_(sessao_ids),
-                        SaidaSessaoItem.ativo_operacional.is_(True),
-                        Saida.sub_base == SaidaSessao.sub_base,
-                        Saida.motoboy_id == SaidaSessao.motoboy_id,
-                    )
-                    .group_by(SaidaSessaoItem.sessao_id)
-                ).all()
-            }
+    qtd_sessao_grupos: dict[tuple[int, date], int] = {}
+
+    if chaves:
+        grupos_sessoes: dict[tuple[int, date], list[int]] = {}
+        chaves_legado: list[tuple[int, date]] = []
+        for chave, grupo in grupos_filtrados.items():
+            sessao_ids = [int(r.sessao_id) for r in grupo if r.sessao_id is not None]
+            if sessao_ids:
+                grupos_sessoes[chave] = sessao_ids
+            else:
+                chaves_legado.append(chave)
+
+        if grupos_sessoes:
+            totais_sessao = somar_operacional_sessoes_por_motoboy_dia(
+                db, sub_base=sub_base, grupos=grupos_sessoes
+            )
+            for chave, (shopee, ml, avulso) in totais_sessao.items():
+                qtd_sessao_grupos[chave] = shopee + ml + avulso
+
         if status == STATUS_RECONFERIR:
             qtd_map, novos_map = contar_totais_e_novos_por_motoboy_dia(
                 db, sub_base=sub_base, chaves=chaves
             )
-        else:
+        elif chaves_legado:
             qtd_map = contar_saidas_por_motoboy_dia(
-                db, sub_base=sub_base, chaves=chaves
+                db, sub_base=sub_base, chaves=chaves_legado
             )
 
-    items = [
-        ConferenciaItemOut(
-            id=int(r.id),
-            sessao_id=int(r.sessao_id) if r.sessao_id is not None else None,
-            motoboy_id=int(r.motoboy_id),
-            motoboy_nome=nomes.get(int(r.motoboy_id), f"Motoboy {r.motoboy_id}"),
-            data_ref=r.data_ref,
-            status=r.status,
-            qtd_no_momento=(
-                qtd_sessao_map.get(int(r.sessao_id), 0)
-                if r.sessao_id is not None
-                else qtd_map.get((int(r.motoboy_id), r.data_ref), 0)
-            ),
-            conferido_em=r.conferido_em.isoformat() if r.conferido_em else None,
-            ultima_abertura_em=r.ultima_abertura_em.isoformat() if r.ultima_abertura_em else None,
-            novos_qtd=(
-                novos_map.get((int(r.motoboy_id), r.data_ref), 0)
-                if status == STATUS_RECONFERIR
-                else None
-            ),
+    items: List[ConferenciaItemOut] = []
+    for chave, grupo in grupos_filtrados.items():
+        mid, data_ref = chave
+        status_grupo = status_por_chave[chave]
+        tem_sessao = any(r.sessao_id is not None for r in grupo)
+        qtd = (
+            qtd_sessao_grupos.get(chave, 0)
+            if tem_sessao
+            else qtd_map.get(chave, 0)
         )
-        for r in rows
-    ]
+        aberturas = [r.ultima_abertura_em for r in grupo if r.ultima_abertura_em]
+        conferidos = [r.conferido_em for r in grupo if r.conferido_em]
+        conferido_em = None
+        if status_grupo == STATUS_CONFERIDA and conferidos:
+            conferido_em = max(conferidos).isoformat()
+        items.append(
+            ConferenciaItemOut(
+                id=min(int(r.id) for r in grupo),
+                sessao_id=None,
+                motoboy_id=mid,
+                motoboy_nome=nomes.get(mid, f"Motoboy {mid}"),
+                data_ref=data_ref,
+                status=status_grupo,
+                qtd_no_momento=qtd,
+                conferido_em=conferido_em,
+                ultima_abertura_em=(
+                    max(aberturas).isoformat() if aberturas else None
+                ),
+                novos_qtd=(
+                    novos_map.get(chave, 0) if status_grupo == STATUS_RECONFERIR else None
+                ),
+            )
+        )
     items.sort(key=lambda x: (x.motoboy_nome or "").casefold())
     return ConferenciaListOut(items=items, total=len(items))
 
@@ -590,19 +691,20 @@ def detalhe_conferencia(
         raise HTTPException(403, "Sub-base não definida.")
     _require_flag(db, current_user, sub_base)
 
-    row = db.scalar(
-        select(ConferenciaSaida).where(
-            ConferenciaSaida.sub_base == sub_base,
-            ConferenciaSaida.motoboy_id == motoboy_id,
-            ConferenciaSaida.data_ref == data_ref,
-            ConferenciaSaida.sessao_id.is_(None),
-        )
+    rows = carregar_conferencias_motoboy_dia(
+        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
     )
-    if row is None:
+    if not rows:
         raise HTTPException(404, "Conferência não encontrada para este motoboy/dia.")
 
-    return _detalhe_out(
-        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref, row=row
+    # Única linha legada sem sessão: mantém o detalhe do dia operacional.
+    if len(rows) == 1 and rows[0].sessao_id is None:
+        return _detalhe_out(
+            db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref, row=rows[0]
+        )
+
+    return _detalhe_motoboy_dia_out(
+        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref, rows=rows
     )
 
 
@@ -620,7 +722,7 @@ def post_conferir(
     _require_flag(db, current_user, sub_base)
 
     try:
-        row = conferir_saida(
+        conferir_saida(
             db,
             sub_base=sub_base,
             motoboy_id=motoboy_id,
@@ -628,7 +730,6 @@ def post_conferir(
             user_id=getattr(current_user, "id", None),
         )
         db.commit()
-        db.refresh(row)
     except ValueError:
         db.rollback()
         raise HTTPException(404, "Conferência não encontrada para este motoboy/dia.")
@@ -636,6 +737,15 @@ def post_conferir(
         db.rollback()
         raise HTTPException(500, f"Erro ao conferir saída: {e}")
 
-    return _detalhe_out(
-        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=body.data_ref, row=row
+    rows = carregar_conferencias_motoboy_dia(
+        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=body.data_ref
+    )
+    if not rows:
+        raise HTTPException(404, "Conferência não encontrada para este motoboy/dia.")
+    if len(rows) == 1 and rows[0].sessao_id is None:
+        return _detalhe_out(
+            db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=body.data_ref, row=rows[0]
+        )
+    return _detalhe_motoboy_dia_out(
+        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=body.data_ref, rows=rows
     )
