@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Iterable, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -109,6 +109,35 @@ def obter_sessao_aberta(
     return db.scalar(stmt)
 
 
+def _travar_criacao_sessao_aberta(db: Session, *, sub_base: str, motoboy_id: int) -> None:
+    """Serializa criação da primeira sessão ABERTA sem Motoboy FOR UPDATE.
+
+    Motoboy FOR UPDATE conflitava com FOR KEY SHARE da FK em INSERT de
+    conferencia_saida (deadlock com finalizar_sessao). Advisory xact não
+    conflita com KEY SHARE e cobre o caso em que ainda não existe linha
+    ABERTA (unique parcial uq_saida_sessao_aberta_motoboy).
+
+    Chave 64-bit: dois int4 via hashtext — namespace + (sub_base:motoboy_id).
+    Vive até commit/rollback da Session do caller; esta função não faz commit.
+    """
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    db.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtext(:ns), "
+            "hashtext(:sub_base || ':' || :motoboy_id)"
+            ")"
+        ),
+        {
+            "ns": "saida_sessao_aberta",
+            "sub_base": (sub_base or "").strip(),
+            "motoboy_id": str(int(motoboy_id)),
+        },
+    )
+
+
 def obter_ou_criar_sessao_aberta(
     db: Session,
     *,
@@ -117,12 +146,10 @@ def obter_ou_criar_sessao_aberta(
     data_ref: date,
     user_id: Optional[int],
 ) -> SaidaSessao:
-    # Serializa a criação por motoboy antes de consultar a sessão aberta.
-    # O lock apenas na tabela de sessões não protege o caso em que ainda não
-    # existe linha e duas leituras concorrentes tentam criar a primeira sessão.
-    motoboy = db.scalar(
-        _travar(select(Motoboy).where(Motoboy.id_motoboy == motoboy_id), db)
-    )
+    # Serializa a criação por (sub_base, motoboy) antes de consultar a sessão
+    # aberta. O unique parcial não protege sozinho o insert do “vazio”.
+    _travar_criacao_sessao_aberta(db, sub_base=sub_base, motoboy_id=motoboy_id)
+    motoboy = db.scalar(select(Motoboy).where(Motoboy.id_motoboy == motoboy_id))
     if motoboy is None:
         raise HTTPException(404, detail={"code": "MOTOBOY_NAO_ENCONTRADO"})
     sessao = obter_sessao_aberta(
