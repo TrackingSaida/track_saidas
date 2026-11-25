@@ -46,6 +46,21 @@ def status_conferencia_dia(status_registro: Optional[str]) -> str:
     return STATUS_PENDENTE
 
 
+def status_agrupado_conferencia(statuses: Iterable[Optional[str]]) -> str:
+    """Colapsa várias conferências do mesmo motoboy/dia em um status.
+
+    Reconferir > Pendente > Conferida. Sem status, conta como pendente.
+    """
+    norms = [(s or "").strip().lower() for s in statuses]
+    if not norms:
+        return STATUS_PENDENTE
+    if any(s == STATUS_RECONFERIR for s in norms):
+        return STATUS_RECONFERIR
+    if any(s != STATUS_CONFERIDA for s in norms):
+        return STATUS_PENDENTE
+    return STATUS_CONFERIDA
+
+
 def montar_dias_conferencia_periodo(
     registros: Iterable[dict],
     datas_operacionais: Iterable[str],
