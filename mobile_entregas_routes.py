@@ -3357,7 +3357,7 @@ def _validar_saida_para_finalizacao_lote(
         return "Pedido já finalizado"
     if status_norm == STATUS_AUSENTE and acao == "entregue":
         return "Pedido já marcado como ausente"
-    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         return "Status não permite finalização"
     return None
 
@@ -3715,7 +3715,8 @@ def marcar_entregue(
                 "message": "Registre uma nova tentativa antes de marcar como entregue.",
             },
         )
-    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    # "saiu" legado (Registros/web) é elegível; AGUARDANDO_CONFIRMACAO_SAIDA permanece bloqueado.
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         audit_entrega(
             "marcar_entregue_result",
             result="reject",
@@ -3822,6 +3823,18 @@ def marcar_ausente(
         status_atual=status_norm,
         motivo_id=body.motivo_id,
     )
+    # Já ausente: idempotente para a outbox (mesmo código que ENTREGUE/CANCELADO).
+    if status_norm == STATUS_AUSENTE:
+        audit_entrega(
+            "marcar_ausente_result",
+            result="reject",
+            code="STATUS_FINALIZADO",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if _status_esta_finalizado(status_norm):
         audit_entrega(
             "marcar_ausente_result",
@@ -3833,7 +3846,8 @@ def marcar_ausente(
             status_atual=status_norm,
         )
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
-    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    # "saiu" legado (Registros/web) é elegível; AGUARDANDO_CONFIRMACAO_SAIDA permanece bloqueado.
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         audit_entrega(
             "marcar_ausente_result",
             result="reject",
