@@ -7,6 +7,7 @@ POST /coletas/fechamentos/lote — gerar em lote as bases elegíveis
 POST /coletas/fechamentos/marcar-recebido — baixar recebimentos
 POST /coletas/fechamentos — criar
 GET /coletas/fechamentos/{id_fechamento} — obter (para modal)
+GET /coletas/fechamentos/{id_fechamento}/extrato — extrato detalhado (códigos)
 PATCH /coletas/fechamentos/{id_fechamento} — reajustar
 DELETE /coletas/fechamentos/{id_fechamento} — excluir gerado ou reajustado
 """
@@ -54,6 +55,13 @@ from fechamento_base_ciclo_pure import (
     resolver_pix_receber,
 )
 from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
+from fechamento_extrato_pure import (
+    calcular_divergencia,
+    montar_linhas_extrato,
+    montar_mensagem_divergencia,
+    totais_cancelados_itens,
+    totais_de_itens_fechamento,
+)
 from fechamento_valor_pure import adicional_g
 from pacote_g_categorias import (
     SERVICOS_G,
@@ -62,6 +70,7 @@ from pacote_g_categorias import (
     padrao_id_ou_none,
     regras_por_categoria,
 )
+from pedido_sincronizado import sincronizado_nao_coletado
 
 router = APIRouter(prefix="/fechamentos", tags=["Fechamentos Bases"])
 
@@ -917,6 +926,67 @@ class FechamentoOut(BaseModel):
     valor_final_recalculado: Optional[Decimal] = None
     seller_info: Optional[Dict[str, Any]] = None
     emitido_por: Optional[str] = None
+
+
+class ExtratoLinhaOut(BaseModel):
+    data: str
+    codigo: str
+    servico: str
+    servico_tipo: str
+    quantidade: int = 1
+    origem: str
+    status: Optional[str] = None
+    is_grande: bool = False
+
+
+class ExtratoTotaisOut(BaseModel):
+    shopee: int = 0
+    ml: int = 0
+    avulso: int = 0
+    total: int = 0
+
+
+class ExtratoDivergenciaOut(BaseModel):
+    divergente: bool = False
+    deltas: Dict[str, int] = Field(default_factory=dict)
+    total_fechamento: int = 0
+    total_extrato: int = 0
+    diferenca_total: int = 0
+    mensagem: Optional[str] = None
+
+
+class FechamentoExtratoOut(BaseModel):
+    id_fechamento: int
+    base: str
+    periodo_inicio: date
+    periodo_fim: date
+    status: str
+    linhas: List[ExtratoLinhaOut]
+    cancelados: List[ExtratoLinhaOut] = []
+    pacotes_g: List[ExtratoLinhaOut] = []
+    totais_extrato: ExtratoTotaisOut
+    totais_fechamento: ExtratoTotaisOut
+    totais_sem_codigo: ExtratoTotaisOut
+    totais_cancelados_extrato: ExtratoTotaisOut
+    totais_cancelados_fechamento: ExtratoTotaisOut
+    divergencia: ExtratoDivergenciaOut
+    seller_info: Optional[Dict[str, Any]] = None
+    emitido_por: Optional[str] = None
+    valor_bruto: Decimal = Decimal("0.00")
+    valor_cancelados: Decimal = Decimal("0.00")
+    valor_adicao: Decimal = Decimal("0.00")
+    valor_subtracao: Decimal = Decimal("0.00")
+    valor_final: Decimal = Decimal("0.00")
+    motivo_adicao: Optional[str] = None
+    motivo_subtracao: Optional[str] = None
+    total_g_shopee: int = 0
+    total_g_ml: int = 0
+    total_g_avulso: int = 0
+    total_pacotes_g: int = 0
+    valor_g: Decimal = Decimal("0.00")
+    ajuste_g_valor: Optional[Decimal] = None
+    itens: List[FechamentoItemOut] = []
+    precos: dict = Field(default_factory=dict)
 
 
 class FechamentoReceberItem(BaseModel):
@@ -2114,6 +2184,254 @@ def obter_fechamento(
         valor_final_recalculado=valor_final_rec if divergencia else None,
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
+    )
+
+
+def _totais_out(mapa: Dict[str, int]) -> ExtratoTotaisOut:
+    s = int(mapa.get("shopee") or 0)
+    m = int(mapa.get("ml") or 0)
+    a = int(mapa.get("avulso") or 0)
+    return ExtratoTotaisOut(shopee=s, ml=m, avulso=a, total=s + m + a)
+
+
+def _volumes_coleta_periodo(
+    db: Session,
+    sub_base: str,
+    base: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> Dict[str, Dict[str, int]]:
+    from datetime import time as dt_time
+
+    base_key = base.strip().upper()
+    dt_start = datetime.combine(periodo_inicio, dt_time.min)
+    dt_end = datetime.combine(periodo_fim, dt_time(23, 59, 59))
+    rows = list(
+        db.scalars(
+            select(Coleta).where(
+                Coleta.sub_base == sub_base,
+                func.upper(Coleta.base) == base_key,
+                Coleta.timestamp >= dt_start,
+                Coleta.timestamp <= dt_end,
+            ).where(
+                (Coleta.shopee != 0)
+                | (Coleta.mercado_livre != 0)
+                | (Coleta.avulso != 0)
+                | (Coleta.valor_total != 0)
+            )
+        ).all()
+    )
+    volumes: Dict[str, Dict[str, int]] = {}
+    for r in rows:
+        dia = r.timestamp.date().isoformat()
+        if dia not in volumes:
+            volumes[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
+        volumes[dia]["shopee"] += int(r.shopee or 0)
+        volumes[dia]["ml"] += int(r.mercado_livre or 0)
+        volumes[dia]["avulso"] += int(r.avulso or 0)
+    return volumes
+
+
+def _saidas_extrato_periodo(
+    db: Session,
+    sub_base: str,
+    base: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    cancelados: bool,
+) -> List[Saida]:
+    base_key = base.strip().upper()
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base,
+        ~sincronizado_nao_coletado(),
+        Saida.data >= periodo_inicio,
+        Saida.data <= periodo_fim,
+    )
+    if base.strip():
+        stmt = stmt.where(func.upper(Saida.base) == base_key)
+    if cancelados:
+        stmt = stmt.where(func.lower(Saida.status) == "cancelado")
+    else:
+        stmt = stmt.where(func.lower(func.coalesce(Saida.status, "")) != "cancelado")
+    stmt = stmt.order_by(Saida.data, Saida.codigo, Saida.id_saida)
+    return list(db.scalars(stmt).all())
+
+
+def _codigo_linha_extrato(s: Saida, labels_avulso: Optional[Dict[int, str]] = None) -> str:
+    """Avulso usa campos de exibição; demais serviços mantêm o código interno."""
+    tipo = _normalizar_servico_saida(s.servico or "")
+    if tipo == "avulso" and labels_avulso:
+        sid = getattr(s, "id_saida", None)
+        if sid is not None:
+            label = (labels_avulso.get(int(sid)) or "").strip()
+            if label:
+                return label
+    return (s.codigo or "").strip() or "—"
+
+
+def _linha_de_saida(s: Saida, labels_avulso: Optional[Dict[int, str]] = None) -> dict:
+    tipo = _normalizar_servico_saida(s.servico or "")
+    from fechamento_extrato_pure import label_servico
+
+    return {
+        "data": (s.data or s.timestamp.date()).isoformat(),
+        "codigo": _codigo_linha_extrato(s, labels_avulso),
+        "servico": label_servico(tipo),
+        "servico_tipo": tipo,
+        "quantidade": 1,
+        "origem": "saida",
+        "status": s.status,
+        "is_grande": bool(getattr(s, "is_grande", False)),
+    }
+
+
+@router.get("/{id_fechamento}/extrato", response_model=FechamentoExtratoOut)
+def obter_extrato_fechamento(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Extrato detalhado: data operacional, código e serviço (PRD-019)."""
+    _exigir_admin_financeiro(current_user)
+    sub_base = _sub_base_from_token_or_422(current_user)
+    fech = db.get(BaseFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+
+    itens = list(
+        db.scalars(
+            select(BaseFechamentoItem)
+            .where(BaseFechamentoItem.id_fechamento == id_fechamento)
+            .order_by(BaseFechamentoItem.data)
+        ).all()
+    )
+    itens_out = [
+        FechamentoItemOut(
+            data=i.data.isoformat(),
+            shopee=i.shopee,
+            mercado_livre=i.mercado_livre,
+            avulso=i.avulso,
+            cancelados_shopee=i.cancelados_shopee,
+            cancelados_ml=i.cancelados_ml,
+            cancelados_avulso=i.cancelados_avulso,
+            pacotes_g=getattr(i, "pacotes_g", 0) or 0,
+            g_shopee=getattr(i, "g_shopee", 0) or 0,
+            g_ml=getattr(i, "g_ml", 0) or 0,
+            g_avulso=getattr(i, "g_avulso", 0) or 0,
+            g_categorias=getattr(i, "g_categorias", None),
+        )
+        for i in itens
+    ]
+
+    volumes = _volumes_coleta_periodo(
+        db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim
+    )
+    rows_ok = _saidas_extrato_periodo(
+        db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim, cancelados=False
+    )
+    rows_canc = _saidas_extrato_periodo(
+        db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim, cancelados=True
+    )
+
+    from avulso_campos_service import labels_exibicao_por_saidas
+
+    avulso_rows = [
+        s
+        for s in list(rows_ok) + list(rows_canc)
+        if _normalizar_servico_saida(s.servico or "") == "avulso"
+    ]
+    labels_avulso = (
+        labels_exibicao_por_saidas(db, sub_base=sub_base, rows=avulso_rows)
+        if avulso_rows
+        else {}
+    )
+
+    saidas_payload = [
+        {
+            "data": (s.data or s.timestamp.date()).isoformat(),
+            "codigo": _codigo_linha_extrato(s, labels_avulso),
+            "servico_tipo": _normalizar_servico_saida(s.servico or ""),
+            "status": s.status,
+            "is_grande": bool(getattr(s, "is_grande", False)),
+        }
+        for s in rows_ok
+    ]
+    linhas_raw, totais_ext, totais_sem, _saldo = montar_linhas_extrato(
+        saidas=saidas_payload, volumes_coleta=volumes
+    )
+    cancelados_raw = [_linha_de_saida(s, labels_avulso) for s in rows_canc]
+    pacotes_g_raw = [
+        _linha_de_saida(s, labels_avulso) for s in rows_ok if getattr(s, "is_grande", False)
+    ]
+
+    totais_fech = totais_de_itens_fechamento(itens)
+    totais_canc_fech = totais_cancelados_itens(itens)
+    totais_canc_ext = {"shopee": 0, "ml": 0, "avulso": 0}
+    for c in cancelados_raw:
+        tipo = c.get("servico_tipo") or "avulso"
+        totais_canc_ext[tipo] = totais_canc_ext.get(tipo, 0) + int(c.get("quantidade") or 0)
+
+    precos_dec = _precos_base(db, sub_base, fech.base)
+    total_g_shopee = sum(getattr(i, "g_shopee", 0) or 0 for i in itens)
+    total_g_ml = sum(getattr(i, "g_ml", 0) or 0 for i in itens)
+    total_g_avulso = sum(getattr(i, "g_avulso", 0) or 0 for i in itens)
+    total_pacotes_g = sum(getattr(i, "pacotes_g", 0) or 0 for i in itens)
+
+    div = calcular_divergencia(
+        totais_fech,
+        totais_ext,
+        cancelados_fechamento=totais_canc_fech,
+        cancelados_extrato=totais_canc_ext,
+        pacotes_g_fechamento=total_pacotes_g,
+        pacotes_g_extrato=len(pacotes_g_raw),
+    )
+    mensagem = montar_mensagem_divergencia(
+        totais_sem_codigo=totais_sem,
+        divergencia=div,
+    )
+    if mensagem:
+        div["divergente"] = True
+
+    return FechamentoExtratoOut(
+        id_fechamento=fech.id_fechamento,
+        base=fech.base,
+        periodo_inicio=fech.periodo_inicio,
+        periodo_fim=fech.periodo_fim,
+        status=fech.status,
+        linhas=[ExtratoLinhaOut(**x) for x in linhas_raw],
+        cancelados=[ExtratoLinhaOut(**x) for x in cancelados_raw],
+        pacotes_g=[ExtratoLinhaOut(**x) for x in pacotes_g_raw],
+        totais_extrato=_totais_out(totais_ext),
+        totais_fechamento=_totais_out(totais_fech),
+        totais_sem_codigo=_totais_out(totais_sem),
+        totais_cancelados_extrato=_totais_out(totais_canc_ext),
+        totais_cancelados_fechamento=_totais_out(totais_canc_fech),
+        divergencia=ExtratoDivergenciaOut(
+            divergente=bool(div["divergente"]),
+            deltas=div["deltas"],
+            total_fechamento=div["total_fechamento"],
+            total_extrato=div["total_extrato"],
+            diferenca_total=div["diferenca_total"],
+            mensagem=mensagem,
+        ),
+        seller_info=_montar_seller_info(db, sub_base, fech.base),
+        emitido_por=_emitido_por(db, sub_base),
+        valor_bruto=fech.valor_bruto,
+        valor_cancelados=fech.valor_cancelados,
+        valor_adicao=getattr(fech, "valor_adicao", None) or Decimal("0.00"),
+        valor_subtracao=getattr(fech, "valor_subtracao", None) or Decimal("0.00"),
+        valor_final=fech.valor_final,
+        motivo_adicao=getattr(fech, "motivo_adicao", None),
+        motivo_subtracao=getattr(fech, "motivo_subtracao", None),
+        total_g_shopee=total_g_shopee,
+        total_g_ml=total_g_ml,
+        total_g_avulso=total_g_avulso,
+        total_pacotes_g=total_pacotes_g,
+        valor_g=getattr(fech, "valor_g", None) or Decimal("0.00"),
+        ajuste_g_valor=None,
+        itens=itens_out,
+        precos={k: float(v) for k, v in precos_dec.items()},
     )
 
 
