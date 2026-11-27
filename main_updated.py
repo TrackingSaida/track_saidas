@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import logging
 from fastapi import FastAPI, Request
@@ -9,6 +10,15 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
 from http_error_public import CLIENT_SAFE_500, public_error_body
+
+# Uvicorn não configura o root logger: INFO de loggers como entrega_audit
+# seria descartado. Garante stdout cedo para o Render capturar audit_entrega.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        stream=sys.stdout,
+    )
 
 logger = logging.getLogger("main")
 
@@ -206,6 +216,7 @@ from mobile_push_routes import router as mobile_push_router
 from avisos_routes import router as avisos_router, mobile_router as avisos_mobile_router
 from mobile_fechamentos_routes import router as mobile_fechamentos_router
 from mobile_app_version_routes import router as mobile_app_version_router
+from mobile_telemetry_routes import router as mobile_telemetry_router
 from owner_cobranca_routes import router as owner_cobranca_router
 from motoboy_convite_routes import (
     admin_router as motoboy_convite_admin_router,
@@ -241,6 +252,7 @@ app.include_router(avisos_router, prefix=API_PREFIX)
 app.include_router(avisos_mobile_router, prefix=API_PREFIX)
 app.include_router(mobile_fechamentos_router, prefix=API_PREFIX)
 app.include_router(mobile_app_version_router, prefix=API_PREFIX)
+app.include_router(mobile_telemetry_router, prefix=API_PREFIX)
 app.include_router(upload_router, prefix=API_PREFIX)
 app.include_router(owners_router, prefix=API_PREFIX)
 app.include_router(base_router, prefix=API_PREFIX)
@@ -455,6 +467,7 @@ def internal_cleanup_history(request: Request):
                 "coletas": result.rows_coletas,
                 "rotas_motoboy": result.rows_rotas,
                 "address_telemetry": result.rows_address_telemetry,
+                "mobile_telemetry_events": result.rows_mobile_telemetry,
                 "geocode_cache": result.rows_geocode_cache,
                 "suggestion_cache": result.rows_suggestion_cache,
                 "enderecos_conhecidos": result.rows_enderecos_conhecidos,

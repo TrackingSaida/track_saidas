@@ -3432,8 +3432,14 @@ def finalizar_lote(
     user: User = Depends(get_current_motoboy),
 ):
     """Finaliza pedidos em lote (parcial). Backend valida campos obrigatórios por pedido."""
-    ids_unicos = list(dict.fromkeys(int(i) for i in body.ids))
+    import time
+
+    from coleta_recalc_control import defer_recalcular_coleta
+    from coletas import recalcular_coleta
     from saida_operacional_pure import classificar_acao_obsoleta
+
+    t0 = time.perf_counter()
+    ids_unicos = list(dict.fromkeys(int(i) for i in body.ids))
 
     fluxo = fluxo_confirmacao_ativo(db, user.sub_base or "")
     candidatas = db.scalars(
@@ -3475,6 +3481,7 @@ def finalizar_lote(
             raise HTTPException(status_code=422, detail="Observação obrigatória quando motivo é 'Outro'.")
 
     details_map = _carregar_details_por_saida_ids(db, ids_restantes)
+    campos_cache = build_campos_cache_for_sub_base(db, sub_base=user.sub_base or "")
 
     active_route_ids = get_active_route_delivery_ids(db, user.motoboy_id)
     active_route_set = set(active_route_ids or [])
@@ -3482,128 +3489,190 @@ def finalizar_lote(
     finalizados: List[FinalizarLoteItemOut] = []
     bloqueados: List[FinalizarLoteBloqueadoOut] = []
     erros: List[FinalizarLoteErroOut] = []
+    n_bloqueados_rota_ativa = 0
+    coletas_para_recalcular: set[int] = set()
+    ausencias_para_push: List[Tuple[int, str]] = []
 
-    for id_saida in ids_restantes:
-        try:
-            if id_saida in active_route_set:
-                s_preview = db.get(Saida, id_saida)
-                bloqueados.append(
-                    FinalizarLoteBloqueadoOut(
-                        id_saida=id_saida,
-                        codigo=getattr(s_preview, "codigo", None) if s_preview else None,
-                        motivo="Pedido faz parte da rota ativa. Finalize pela rota ou individualmente.",
-                    )
-                )
-                continue
-
-            s = db.get(Saida, id_saida)
-            bloqueio = _validar_saida_para_finalizacao_lote(
-                s, body.acao, user.motoboy_id, user.sub_base
-            )
-            if bloqueio:
-                bloqueados.append(
-                    FinalizarLoteBloqueadoOut(
-                        id_saida=id_saida,
-                        codigo=getattr(s, "codigo", None) if s else None,
-                        motivo=bloqueio,
-                    )
-                )
-                continue
-
-            assert s is not None
-            detail = details_map.get(id_saida) or _get_detail_for_saida(db, id_saida)
-            status_anterior = normalizar_status_saida(s.status) or (s.status or STATUS_EM_ROTA)
-
-            if body.acao == "entregue":
-                faltantes = validate_campos_obrigatorios_conclusao(
-                    db,
-                    saida=s,
-                    contexto="ENTREGUE",
-                    detail=detail,
-                    overrides=None,
-                )
-                if faltantes:
+    with defer_recalcular_coleta():
+        for id_saida in ids_restantes:
+            try:
+                if id_saida in active_route_set:
+                    s_preview = por_id.get(id_saida)
+                    n_bloqueados_rota_ativa += 1
                     bloqueados.append(
                         FinalizarLoteBloqueadoOut(
                             id_saida=id_saida,
-                            codigo=s.codigo,
-                            motivo=format_bloqueio_motivo(faltantes),
+                            codigo=getattr(s_preview, "codigo", None) if s_preview else None,
+                            motivo="Pedido faz parte da rota ativa. Finalize pela rota ou individualmente.",
                         )
                     )
                     continue
-                _aplicar_entregue_lote(db, s, user, status_anterior)
-                status_novo = STATUS_ENTREGUE
-            else:
-                assert motivo is not None
-                overrides = (
-                    {"observacao_ocorrencia": body.observacao}
-                    if body.observacao is not None
-                    else None
+
+                s = por_id.get(id_saida)
+                bloqueio = _validar_saida_para_finalizacao_lote(
+                    s, body.acao, user.motoboy_id, user.sub_base
                 )
-                faltantes = validate_campos_obrigatorios_conclusao(
-                    db,
-                    saida=s,
-                    contexto="AUSENTE",
-                    detail=detail,
-                    overrides=overrides,
-                )
-                if faltantes:
+                if bloqueio:
                     bloqueados.append(
                         FinalizarLoteBloqueadoOut(
                             id_saida=id_saida,
-                            codigo=s.codigo,
-                            motivo=format_bloqueio_motivo(faltantes),
+                            codigo=getattr(s, "codigo", None) if s else None,
+                            motivo=bloqueio,
                         )
                     )
                     continue
-                _aplicar_ausente_lote(db, s, user, motivo, body.observacao, detail, status_anterior)
-                status_novo = STATUS_AUSENTE
 
-            db.commit()
-            db.refresh(s)
-            if status_novo == STATUS_AUSENTE:
+                assert s is not None
+                detail = details_map.get(id_saida) or _get_detail_for_saida(db, id_saida)
+                status_anterior = normalizar_status_saida(s.status) or (s.status or STATUS_EM_ROTA)
+
+                nested = db.begin_nested()
                 try:
-                    from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
-                    from push_notification_service import send_to_motoboy, send_to_staff_sub_base
+                    if body.acao == "entregue":
+                        faltantes = validate_campos_obrigatorios_conclusao(
+                            db,
+                            saida=s,
+                            contexto="ENTREGUE",
+                            detail=detail,
+                            overrides=None,
+                            campos_cache=campos_cache,
+                        )
+                        if faltantes:
+                            nested.rollback()
+                            bloqueados.append(
+                                FinalizarLoteBloqueadoOut(
+                                    id_saida=id_saida,
+                                    codigo=s.codigo,
+                                    motivo=format_bloqueio_motivo(faltantes),
+                                )
+                            )
+                            continue
+                        _aplicar_entregue_lote(db, s, user, status_anterior)
+                        status_novo = STATUS_ENTREGUE
+                    else:
+                        assert motivo is not None
+                        overrides = (
+                            {"observacao_ocorrencia": body.observacao}
+                            if body.observacao is not None
+                            else None
+                        )
+                        faltantes = validate_campos_obrigatorios_conclusao(
+                            db,
+                            saida=s,
+                            contexto="AUSENTE",
+                            detail=detail,
+                            overrides=overrides,
+                            campos_cache=campos_cache,
+                        )
+                        if faltantes:
+                            nested.rollback()
+                            bloqueados.append(
+                                FinalizarLoteBloqueadoOut(
+                                    id_saida=id_saida,
+                                    codigo=s.codigo,
+                                    motivo=format_bloqueio_motivo(faltantes),
+                                )
+                            )
+                            continue
+                        _aplicar_ausente_lote(
+                            db, s, user, motivo, body.observacao, detail, status_anterior
+                        )
+                        status_novo = STATUS_AUSENTE
+                    nested.commit()
+                except Exception:
+                    nested.rollback()
+                    raise
 
+                id_coleta = getattr(s, "id_coleta", None)
+                if id_coleta is not None:
+                    try:
+                        coletas_para_recalcular.add(int(id_coleta))
+                    except (TypeError, ValueError):
+                        pass
+                if status_novo == STATUS_AUSENTE:
+                    codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
+                    ausencias_para_push.append((id_saida, codigo))
+                finalizados.append(FinalizarLoteItemOut(id_saida=id_saida, status=status_novo))
+            except Exception as exc:
+                # Savepoint já isolou o item; não dar rollback da sessão inteira
+                # (senão perde os finalizados anteriores do mesmo lote).
+                logging.exception("finalizar_lote id_saida=%s", id_saida)
+                erros.append(FinalizarLoteErroOut(id_saida=id_saida, mensagem=str(exc)))
+
+        for id_coleta in sorted(coletas_para_recalcular):
+            try:
+                recalcular_coleta(db, id_coleta, commit=False)
+            except Exception:
+                logger.exception("finalizar_lote_recalcular_coleta id_coleta=%s", id_coleta)
+
+        if finalizados or coletas_para_recalcular:
+            db.commit()
+            for item in finalizados:
+                s_ref = por_id.get(item.id_saida)
+                if s_ref is not None:
+                    try:
+                        db.refresh(s_ref)
+                    except Exception:
+                        pass
+
+    if ausencias_para_push:
+        try:
+            from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
+            from push_notification_service import send_to_motoboy, send_to_staff_sub_base
+
+            for id_saida, codigo in ausencias_para_push:
+                try:
                     bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
-                    if bloqueado and total >= 3:
-                        codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
-                        send_to_motoboy(
-                            db,
-                            motoboy_id=int(user.motoboy_id),
-                            sub_base=user.sub_base,
-                            tipo="bloqueio_ausencia",
-                            title="Pacote bloqueado",
-                            body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
-                            data={"id_saida": id_saida, "codigo": codigo},
-                            chave_dedupe=str(id_saida),
-                        )
-                        send_to_staff_sub_base(
-                            db,
-                            sub_base=user.sub_base,
-                            tipo="bloqueio_ausencia",
-                            title="Pacote bloqueado por ausência",
-                            body=f"Pacote {codigo} bloqueado por limite de ausências.",
-                            data={"id_saida": id_saida, "codigo": codigo},
-                            chave_dedupe=f"staff:{id_saida}",
-                        )
-                        db.commit()
+                    if not (bloqueado and total >= 3):
+                        continue
+                    send_to_motoboy(
+                        db,
+                        motoboy_id=int(user.motoboy_id),
+                        sub_base=user.sub_base,
+                        tipo="bloqueio_ausencia",
+                        title="Pacote bloqueado",
+                        body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
+                        data={"id_saida": id_saida, "codigo": codigo},
+                        chave_dedupe=str(id_saida),
+                    )
+                    send_to_staff_sub_base(
+                        db,
+                        sub_base=user.sub_base,
+                        tipo="bloqueio_ausencia",
+                        title="Pacote bloqueado por ausência",
+                        body=f"Pacote {codigo} bloqueado por limite de ausências.",
+                        data={"id_saida": id_saida, "codigo": codigo},
+                        chave_dedupe=f"staff:{id_saida}",
+                    )
                 except Exception:
                     logger.exception("push_bloqueio_ausencia_lote_failed id_saida=%s", id_saida)
-            finalizados.append(FinalizarLoteItemOut(id_saida=id_saida, status=status_novo))
-        except Exception as exc:
-            db.rollback()
-            logging.exception("finalizar_lote id_saida=%s", id_saida)
-            erros.append(FinalizarLoteErroOut(id_saida=id_saida, mensagem=str(exc)))
+            db.commit()
+        except Exception:
+            logger.exception("push_bloqueio_ausencia_lote_batch_failed")
 
     rota_sync: Optional[RotaSyncOut] = None
-    if finalizados:
+    finalized_ids = {item.id_saida for item in finalizados}
+    if finalized_ids & active_route_set:
         sync_raw = sync_active_route_after_delivery_update(
-            db, user.motoboy_id, finalizados[-1].id_saida
+            db, user.motoboy_id, next(iter(finalized_ids & active_route_set))
         )
         if sync_raw.get("in_active_route") or sync_raw.get("rota_finalizada"):
             rota_sync = RotaSyncOut(**sync_raw)
+
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    audit_entrega(
+        "finalizar_lote_done",
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        duration_ms=duration_ms,
+        n_ids=len(ids_unicos),
+        n_finalizados=len(finalizados),
+        n_bloqueados=len(bloqueados),
+        n_bloqueados_rota_ativa=n_bloqueados_rota_ativa,
+        n_erros=len(erros),
+        n_obsoletos=len(obsoletos),
+        acao=body.acao,
+    )
 
     return FinalizarLoteResponse(
         finalizados=finalizados,
