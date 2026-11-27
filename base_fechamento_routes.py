@@ -2258,13 +2258,25 @@ def _saidas_extrato_periodo(
     return list(db.scalars(stmt).all())
 
 
-def _linha_de_saida(s: Saida) -> dict:
+def _codigo_linha_extrato(s: Saida, labels_avulso: Optional[Dict[int, str]] = None) -> str:
+    """Avulso usa campos de exibição; demais serviços mantêm o código interno."""
+    tipo = _normalizar_servico_saida(s.servico or "")
+    if tipo == "avulso" and labels_avulso:
+        sid = getattr(s, "id_saida", None)
+        if sid is not None:
+            label = (labels_avulso.get(int(sid)) or "").strip()
+            if label:
+                return label
+    return (s.codigo or "").strip() or "—"
+
+
+def _linha_de_saida(s: Saida, labels_avulso: Optional[Dict[int, str]] = None) -> dict:
     tipo = _normalizar_servico_saida(s.servico or "")
     from fechamento_extrato_pure import label_servico
 
     return {
         "data": (s.data or s.timestamp.date()).isoformat(),
-        "codigo": (s.codigo or "").strip() or "—",
+        "codigo": _codigo_linha_extrato(s, labels_avulso),
         "servico": label_servico(tipo),
         "servico_tipo": tipo,
         "quantidade": 1,
@@ -2322,10 +2334,23 @@ def obter_extrato_fechamento(
         db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim, cancelados=True
     )
 
+    from avulso_campos_service import labels_exibicao_por_saidas
+
+    avulso_rows = [
+        s
+        for s in list(rows_ok) + list(rows_canc)
+        if _normalizar_servico_saida(s.servico or "") == "avulso"
+    ]
+    labels_avulso = (
+        labels_exibicao_por_saidas(db, sub_base=sub_base, rows=avulso_rows)
+        if avulso_rows
+        else {}
+    )
+
     saidas_payload = [
         {
             "data": (s.data or s.timestamp.date()).isoformat(),
-            "codigo": (s.codigo or "").strip() or "—",
+            "codigo": _codigo_linha_extrato(s, labels_avulso),
             "servico_tipo": _normalizar_servico_saida(s.servico or ""),
             "status": s.status,
             "is_grande": bool(getattr(s, "is_grande", False)),
@@ -2335,8 +2360,10 @@ def obter_extrato_fechamento(
     linhas_raw, totais_ext, totais_sem, _saldo = montar_linhas_extrato(
         saidas=saidas_payload, volumes_coleta=volumes
     )
-    cancelados_raw = [_linha_de_saida(s) for s in rows_canc]
-    pacotes_g_raw = [_linha_de_saida(s) for s in rows_ok if getattr(s, "is_grande", False)]
+    cancelados_raw = [_linha_de_saida(s, labels_avulso) for s in rows_canc]
+    pacotes_g_raw = [
+        _linha_de_saida(s, labels_avulso) for s in rows_ok if getattr(s, "is_grande", False)
+    ]
 
     totais_fech = totais_de_itens_fechamento(itens)
     totais_canc_fech = totais_cancelados_itens(itens)
