@@ -134,16 +134,24 @@ def validate_campos_obrigatorios_conclusao(
     contexto: str,
     detail: Optional[SaidaDetail],
     overrides: Optional[Dict[str, Optional[str]]] = None,
+    campos_cache: Optional[Dict[tuple, List[str]]] = None,
 ) -> List[str]:
     sub_base = (getattr(saida, "sub_base", None) or "").strip()
     if not sub_base:
         return []
-    obrigatorios = resolve_campos_obrigatorios_ativos(
-        db,
-        sub_base=sub_base,
-        servico=getattr(saida, "servico", None),
-        contexto=contexto,
-    )
+    if campos_cache is not None:
+        obrigatorios = resolve_campos_obrigatorios_from_cache(
+            cache=campos_cache,
+            servico=getattr(saida, "servico", None),
+            contexto=contexto,
+        )
+    else:
+        obrigatorios = resolve_campos_obrigatorios_ativos(
+            db,
+            sub_base=sub_base,
+            servico=getattr(saida, "servico", None),
+            contexto=contexto,
+        )
     faltantes: List[str] = []
     for campo in obrigatorios:
         if campo == "foto":
