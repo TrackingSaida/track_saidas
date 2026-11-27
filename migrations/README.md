@@ -396,3 +396,14 @@ psql "$DATABASE_URL" -f migrations/ml_conexoes_unique_user_sub_base.sql
 ```
 
 Após o deploy, sellers com `invalid_grant` passam a aparecer como **Requer nova autorização** na tela de Autenticação.
+
+## mobile_telemetry_events.sql
+
+**Obrigatória antes** do piloto PRD-018 (telemetria de funil mobile / closed testing GG FLEX).
+Sem ela o `POST /api/mobile/telemetry/events` responde 500 ao gravar.
+
+Tabela `mobile_telemetry_events` + índices por sub_base/event/device. Retenção via cleanup (30 dias).
+
+```bash
+psql "$DATABASE_URL" -f migrations/mobile_telemetry_events.sql
+```

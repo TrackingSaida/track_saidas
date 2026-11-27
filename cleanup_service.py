@@ -19,6 +19,7 @@ from models import (
     HistoryRetentionPolicy,
     LogLeitura,
     MaintenanceJobState,
+    MobileTelemetryEvent,
     OwnerCobrancaItem,
     RotasMotoboy,
     Saida,
@@ -32,6 +33,7 @@ logger = logging.getLogger("cleanup_service")
 
 JOB_NAME = "history_cleanup_v1"
 DEFAULT_RETENTION_DAYS = 60
+MOBILE_TELEMETRY_RETENTION_DAYS = int(os.getenv("MOBILE_TELEMETRY_RETENTION_DAYS", "30") or "30")
 
 OPTIONAL_TABLES = frozenset({
     "saida_historico",
@@ -40,6 +42,7 @@ OPTIONAL_TABLES = frozenset({
     "logs_leitura",
     "rotas_motoboy",
     "address_telemetry",
+    "mobile_telemetry_events",
     "geocode_cache",
     "suggestion_cache",
     "enderecos_conhecidos",
@@ -111,6 +114,7 @@ class CleanupResult:
     rows_coletas: int = 0
     rows_rotas: int = 0
     rows_address_telemetry: int = 0
+    rows_mobile_telemetry: int = 0
     rows_geocode_cache: int = 0
     rows_suggestion_cache: int = 0
     rows_enderecos_conhecidos: int = 0
@@ -130,6 +134,7 @@ class _PhaseBCounters:
     rows_coletas: int = 0
     rows_rotas: int = 0
     rows_address_telemetry: int = 0
+    rows_mobile_telemetry: int = 0
     rows_geocode_cache: int = 0
     rows_suggestion_cache: int = 0
     rows_enderecos_conhecidos: int = 0
@@ -258,6 +263,7 @@ def _run_phase_b(
         _phase_b_logs_leitura,
         _phase_b_rotas_motoboy,
         _phase_b_address_telemetry,
+        _phase_b_mobile_telemetry,
         _phase_b_geocode_cache,
         _phase_b_suggestion_cache,
         _phase_b_enderecos_conhecidos,
@@ -333,6 +339,25 @@ def _phase_b_address_telemetry(db, ctx, *, cutoff, cutoff_date, batch_size, coun
     )
     count = _safe_delete_by_ids(ctx, db, "address_telemetry", AddressTelemetry, AddressTelemetry.id, ids)
     counters.rows_address_telemetry += count
+    return count
+
+
+def _phase_b_mobile_telemetry(db, ctx, *, cutoff, cutoff_date, batch_size, counters) -> int:
+    days = max(1, int(MOBILE_TELEMETRY_RETENTION_DAYS or 30))
+    telemetry_cutoff = _utc_now() - timedelta(days=days)
+    ids = _safe_select_ids(
+        ctx,
+        db,
+        "mobile_telemetry_events",
+        select(MobileTelemetryEvent.id)
+        .where(MobileTelemetryEvent.created_at < telemetry_cutoff)
+        .order_by(MobileTelemetryEvent.id.asc())
+        .limit(batch_size),
+    )
+    count = _safe_delete_by_ids(
+        ctx, db, "mobile_telemetry_events", MobileTelemetryEvent, MobileTelemetryEvent.id, ids
+    )
+    counters.rows_mobile_telemetry += count
     return count
 
 
@@ -623,6 +648,7 @@ def run_history_cleanup(
         rows_coletas=phase_b.rows_coletas,
         rows_rotas=phase_b.rows_rotas,
         rows_address_telemetry=phase_b.rows_address_telemetry,
+        rows_mobile_telemetry=phase_b.rows_mobile_telemetry,
         rows_geocode_cache=phase_b.rows_geocode_cache,
         rows_suggestion_cache=phase_b.rows_suggestion_cache,
         rows_enderecos_conhecidos=phase_b.rows_enderecos_conhecidos,
@@ -710,6 +736,17 @@ def estimate_old_volume(
             db,
             "address_telemetry",
             select(func.count()).select_from(AddressTelemetry).where(AddressTelemetry.created_at < cutoff),
+        ),
+        "old_mobile_telemetry": _safe_scalar_count(
+            ctx,
+            db,
+            "mobile_telemetry_events",
+            select(func.count())
+            .select_from(MobileTelemetryEvent)
+            .where(
+                MobileTelemetryEvent.created_at
+                < (_utc_now() - timedelta(days=max(1, int(MOBILE_TELEMETRY_RETENTION_DAYS or 30))))
+            ),
         ),
         "old_geocode_cache": _safe_scalar_count(
             ctx,

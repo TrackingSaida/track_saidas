@@ -1497,6 +1497,15 @@ def saida_after_update(mapper, connection, target: Saida):
     if not target.id_coleta:
         return
 
+    # Lotes / updates em massa podem adiar o recálculo (1x por coleta no fim).
+    try:
+        from coleta_recalc_control import should_skip_recalcular_coleta
+
+        if should_skip_recalcular_coleta():
+            return
+    except Exception:
+        pass
+
     # Cria sessão vinculada a essa conexão
     db = Session(bind=connection)
 
@@ -1634,6 +1643,36 @@ class AddressTelemetry(Base):
     query_hash = Column(Text, nullable=True)
     event_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ==========================
+# Tabela: mobile_telemetry_events (PRD-018)
+# ==========================
+class MobileTelemetryEvent(Base):
+    __tablename__ = "mobile_telemetry_events"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    event_at = Column(DateTime(timezone=True), nullable=True)
+    event_name = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, nullable=False)
+    sub_base = Column(Text, nullable=False)
+    owner_id = Column(BigInteger, nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
+    client_action_id = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    stage = Column(Text, nullable=True)
+    app_version = Column(Text, nullable=True)
+    platform = Column(Text, nullable=True)
+    device_brand = Column(Text, nullable=True)
+    device_manufacturer = Column(Text, nullable=True)
+    device_model = Column(Text, nullable=True)
+    os_name = Column(Text, nullable=True)
+    os_version = Column(Text, nullable=True)
+    android_api_level = Column(Integer, nullable=True)
+    device_total_memory_mb = Column(Integer, nullable=True)
+    cpu_arch = Column(Text, nullable=True)
+    props_json = Column(JSON, nullable=True)
 
 
 # ==========================

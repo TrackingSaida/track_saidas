@@ -348,7 +348,7 @@ def _get_precos_cached(db: Session, sub_base: str, base: str) -> Tuple[Decimal, 
 # REPROCESSAMENTO DE COLETA
 # ============================================================
 
-def recalcular_coleta(db: Session, id_coleta: int):
+def recalcular_coleta(db: Session, id_coleta: int, *, commit: bool = True):
     coleta = db.get(Coleta, id_coleta)
     if not coleta:
         raise HTTPException(404, f"Coleta {id_coleta} não encontrada.")
@@ -381,8 +381,9 @@ def recalcular_coleta(db: Session, id_coleta: int):
     coleta.avulso = count["avulso"]
     coleta.valor_total = total
 
-    db.commit()
-    db.refresh(coleta)
+    if commit:
+        db.commit()
+        db.refresh(coleta)
     return coleta
 
 
