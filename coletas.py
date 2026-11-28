@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Literal, Dict, Tuple, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
@@ -30,6 +30,11 @@ from coleta_operacional_service import (
 from models import ColetaExecucaoParticipante
 from coleta_leituras_service import obter_totais_por_nome_base
 from pacote_g_categorias import garantir_categoria_padrao, normalizar_g_categorias
+from coleta_client_action_service import (
+    claim_client_action,
+    completar_client_action,
+)
+from entrega_audit_log import norm_client_action_id
 
 
 router = APIRouter(prefix="/coletas", tags=["Coletas"])
@@ -151,6 +156,7 @@ class LoteResponse(BaseModel):
     qr_alerta: bool = False
     qr_alerta_mensagem: Optional[str] = None
     codigos_qr_atualizados: List[str] = Field(default_factory=list)
+    idempotente: bool = False
 
 
 class ColetaAvulsoSaidaOut(BaseModel):
@@ -381,6 +387,13 @@ def recalcular_coleta(db: Session, id_coleta: int, *, commit: bool = True):
     coleta.avulso = count["avulso"]
     coleta.valor_total = total
 
+    try:
+        from perf_instrumentation import note_recalc
+
+        note_recalc(rows=len(saidas))
+    except Exception:
+        pass
+
     if commit:
         db.commit()
         db.refresh(coleta)
@@ -394,11 +407,34 @@ def recalcular_coleta(db: Session, id_coleta: int, *, commit: bool = True):
 @router.post("/lote", response_model=LoteResponse, status_code=201)
 def registrar_coleta_em_lote(
     payload: ColetaLoteIn,
+    response: Response,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    x_client_action_id: Optional[str] = Header(None, alias="X-Client-Action-Id"),
 ):
     # 1) Resolve sub_base + entregador: prioriza payload.entregador_id, senão JWT
     sub_base = _sub_base_from_token_or_422(current_user)
+    client_action_id = norm_client_action_id(x_client_action_id)
+    first_codigo = (payload.itens[0].codigo if payload.itens else None) or None
+    claim, replay = claim_client_action(
+        db,
+        sub_base=sub_base,
+        client_action_id=client_action_id,
+        base=payload.base,
+        codigo=first_codigo,
+    )
+    if claim == "replay" and replay is not None:
+        response.status_code = 200
+        return LoteResponse.model_validate(replay)
+    if claim == "in_progress":
+        raise HTTPException(
+            409,
+            detail={
+                "code": "COLETA_LOTE_EM_ANDAMENTO",
+                "message": "Esta leitura ainda está sendo processada. Aguarde e tente de novo.",
+            },
+        )
+
     exigir_modo(db, sub_base, "codigo")
     data_operacao = _resolver_data_operacao_leitura(current_user, payload.data_operacao)
     if payload.entregador_id is not None:
@@ -542,18 +578,13 @@ def registrar_coleta_em_lote(
         raise HTTPException(409, f"Código '{truly_dup[0]}' já coletado.")
 
     if not novos_itens and codigos_qr_atualizados:
-        try:
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            raise HTTPException(500, f"Falha ao atualizar QR da coleta: {e}")
         totais = obter_totais_por_nome_base(
             db,
             sub_base=sub_base,
             base_nome=payload.base,
             data_operacao=data_operacao,
         )
-        return LoteResponse(
+        out_qr = LoteResponse(
             coleta=None,
             resumo=ResumoLote(
                 inseridos=0,
@@ -574,6 +605,21 @@ def registrar_coleta_em_lote(
             qr_alerta_mensagem=MSG_QR_ALERTA_ML if qr_alerta_lote else None,
             codigos_qr_atualizados=codigos_qr_atualizados,
         )
+        if client_action_id:
+            completar_client_action(
+                db,
+                sub_base=sub_base,
+                client_action_id=client_action_id,
+                resultado=out_qr.model_dump(mode="json"),
+                base=payload.base,
+                codigo=norm_codes[0] if norm_codes else None,
+            )
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(500, f"Falha ao atualizar QR da coleta: {e}")
+        return out_qr
 
     created = 0
     count = {"shopee": 0, "mercado_livre": 0, "avulso": 0}
@@ -750,8 +796,49 @@ def registrar_coleta_em_lote(
             data_operacao=data_operacao,
         )
 
+        totais = obter_totais_por_nome_base(
+            db,
+            sub_base=sub_base,
+            base_nome=payload.base,
+            data_operacao=data_operacao,
+        )
+        out = LoteResponse(
+            coleta=ColetaOut.model_validate(coleta),
+            resumo=ResumoLote(
+                inseridos=created,
+                duplicados=0,
+                codigos_duplicados=[],
+                contagem=count,
+                precos={
+                    "shopee": _fmt_money(p_shopee),
+                    "ml": _fmt_money(p_ml),
+                    "avulso": _fmt_money(p_avulso),
+                },
+                total=_fmt_money(coleta.valor_total),
+            ),
+            saidas_criadas=saidas_criadas,
+            totais=TotaisColetaBase(**totais),
+            qr_atualizado=bool(codigos_qr_atualizados),
+            qr_alerta=qr_alerta_lote,
+            qr_alerta_mensagem=MSG_QR_ALERTA_ML if qr_alerta_lote else None,
+            codigos_qr_atualizados=codigos_qr_atualizados,
+        )
+        if client_action_id:
+            completar_client_action(
+                db,
+                sub_base=sub_base,
+                client_action_id=client_action_id,
+                resultado=out.model_dump(mode="json"),
+                base=payload.base,
+                codigo=saidas_criadas[0].codigo if saidas_criadas else (norm_codes[0] if norm_codes else None),
+                id_saida=saidas_criadas[0].id_saida if saidas_criadas else None,
+                id_coleta=coleta.id_coleta,
+                id_execucao=getattr(coleta, "execucao_id", None),
+            )
+
         db.commit()
         db.refresh(coleta)
+        return out
 
     except HTTPException:
         db.rollback()
@@ -759,34 +846,6 @@ def registrar_coleta_em_lote(
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"Falha ao registrar lote: {e}")
-
-    totais = obter_totais_por_nome_base(
-        db,
-        sub_base=sub_base,
-        base_nome=payload.base,
-        data_operacao=data_operacao,
-    )
-    return LoteResponse(
-        coleta=ColetaOut.model_validate(coleta),
-        resumo=ResumoLote(
-            inseridos=created,
-            duplicados=0,
-            codigos_duplicados=[],
-            contagem=count,
-            precos={
-                "shopee": _fmt_money(p_shopee),
-                "ml": _fmt_money(p_ml),
-                "avulso": _fmt_money(p_avulso),
-            },
-            total=_fmt_money(coleta.valor_total),
-        ),
-        saidas_criadas=saidas_criadas,
-        totais=TotaisColetaBase(**totais),
-        qr_atualizado=bool(codigos_qr_atualizados),
-        qr_alerta=qr_alerta_lote,
-        qr_alerta_mensagem=MSG_QR_ALERTA_ML if qr_alerta_lote else None,
-        codigos_qr_atualizados=codigos_qr_atualizados,
-    )
 
 
 @router.post("/lancar-avulso", response_model=ColetaLancarAvulsoOut, status_code=201)

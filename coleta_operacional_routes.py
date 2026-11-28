@@ -856,6 +856,18 @@ def finalizar_coleta(
     participante = _participante_atual(execucao, current_user.id)
     if not participante and not _admin(current_user):
         raise HTTPException(403, "Você não participa desta coleta.")
+
+    # PRD-020: replay idempotente se já finalizado (offline/sync).
+    if participante and getattr(participante, "status", None) == "finalizado":
+        return _serializar_execucao(execucao, current_user, execucao.participantes)
+    if (
+        not participante
+        and _admin(current_user)
+        and getattr(execucao, "status", None) in ("coletado", "sem_volume")
+        and all(getattr(p, "status", None) == "finalizado" for p in execucao.participantes)
+    ):
+        return _serializar_execucao(execucao, current_user, execucao.participantes)
+
     if participante:
         if _quantidade_total(participante) == 0 and not participante.sem_volume:
             raise HTTPException(422, "Registre ao menos um pacote/quantidade ou informe coleta sem volume.")

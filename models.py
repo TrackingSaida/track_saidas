@@ -1648,6 +1648,31 @@ class AddressTelemetry(Base):
 # ==========================
 # Tabela: mobile_telemetry_events (PRD-018)
 # ==========================
+# Tabela: coleta_client_actions (PRD-020 — idempotência do lote)
+# ==========================
+class ColetaClientAction(Base):
+    __tablename__ = "coleta_client_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base",
+            "client_action_id",
+            name="uq_coleta_client_actions_sub_action",
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    client_action_id = Column(Text, nullable=False)
+    base = Column(Text, nullable=True)
+    codigo = Column(Text, nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
+    id_coleta = Column(BigInteger, nullable=True)
+    id_execucao = Column(BigInteger, nullable=True)
+    resultado_json = Column(Text, nullable=False)
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+# ==========================
 class MobileTelemetryEvent(Base):
     __tablename__ = "mobile_telemetry_events"
 
