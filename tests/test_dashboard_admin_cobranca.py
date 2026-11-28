@@ -1,5 +1,9 @@
 """Testes da base de cobrança do Indicador Admin."""
+import os
+from datetime import datetime
 from decimal import Decimal
+
+os.environ.setdefault("DATABASE_URL", "postgresql+psycopg2://u:p@localhost:5432/t")
 
 from dashboard_admin_cobranca import (
     agregar_cobranca_por_owner,
@@ -139,3 +143,28 @@ def test_receita_usa_valor_do_owner():
 
 def test_detalhe_vazio():
     assert detalhe_base_cobranca(0, 0, 0) == "0 pacotes"
+
+
+def test_busca_entrada_restringe_historico_ao_periodo():
+    from sqlalchemy.dialects import postgresql
+
+    from dashboard_admin_cobranca import _stmt_ids_entrada_periodo
+
+    stmt = _stmt_ids_entrada_periodo(
+        ["Giro"],
+        datetime(2026, 11, 16),
+        datetime(2026, 11, 17),
+        somente_sem_coleta=True,
+    )
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    upper = sql.upper()
+    assert "HAVING" not in upper
+    assert "GROUP BY" in upper
+    assert "SAIDA_HISTORICO.TIMESTAMP >=" in upper
+    assert "SAIDA_HISTORICO.TIMESTAMP <" in upper
+    assert "ID_COLETA IS NULL" in upper

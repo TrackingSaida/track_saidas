@@ -68,8 +68,8 @@ ROTULOS_ACAO = {
     "rota_iniciada": "Rota iniciada",
     "rota_preparada": "Rota preparada",
     "entregue": "Finalizou entrega",
-    "ausente": "Registrou ausência",
-    "ausente_lote": "Registrou ausência em lote",
+    "ausente": "Registrou ocorrência",
+    "ausente_lote": "Registrou ocorrência em lote",
     "entregue_lote": "Finalizou entrega em lote",
     "nova_tentativa": "Liberou nova tentativa",
     "liberacao_ausencias": "Nova tentativa liberada pela operação",
@@ -98,6 +98,9 @@ ROTULOS_ACAO = {
     "saida_confirmada": "Confirmou início da entrega",
     "saida_removida_antes_confirmacao": "Removeu antes de começar entrega",
     "nova_saida_mesmo_entregador": "Pacote incluído em novo lote de saída",
+    "transferencia_solicitada": "Solicitou transferência do pedido",
+    "transferencia_recusada": "Recusou transferência do pedido",
+    "transferencia_cancelada": "Cancelou solicitação de transferência",
 }
 
 FALLBACK_ACAO_HISTORICO_ANTERIOR = "Histórico anterior à atualização"
@@ -130,9 +133,10 @@ ROTULOS_SITUACAO = {
     "AGUARDANDO_CONFIRMACAO_SAIDA": "Aguardando confirmação de saída",
     "SAIU_PARA_ENTREGA": "Saiu para entrega",
     "SAIU": "Saiu para entrega",
-    "EM_ROTA": "Em rota",
+    # Consulta: Situação unificada. Código técnico EM_ROTA permanece no banco (rota/tracking).
+    "EM_ROTA": "Saiu para entrega",
     "ENTREGUE": "Entregue",
-    "AUSENTE": "Ausente",
+    "AUSENTE": "Ocorrência",
     "CANCELADO": "Cancelado",
     "ENCERRADO_SISTEMA": "Encerrado",
     "ENCERRADO": "Encerrado",
@@ -402,6 +406,34 @@ def rotulo_acao_evento(
     if not key:
         return None
     return ROTULOS_ACAO.get(key)
+
+
+def rotulo_acao_ocorrencia_com_motivo(
+    evento: Optional[str],
+    *,
+    motivo_ocorrencia: Optional[str] = None,
+    houve_reatribuicao: bool = False,
+    motoboy_id_anterior: Optional[int] = None,
+) -> Optional[str]:
+    """Rótulo de ação de ausência/ocorrência; inclui o motivo quando disponível."""
+    base = rotulo_acao_evento(
+        evento,
+        houve_reatribuicao=houve_reatribuicao,
+        motoboy_id_anterior=motoboy_id_anterior,
+    )
+    key = resolver_chave_acao(
+        evento,
+        houve_reatribuicao=houve_reatribuicao,
+        motoboy_id_anterior=motoboy_id_anterior,
+    )
+    if key not in {"ausente", "ausente_lote"}:
+        return base
+    motivo = (motivo_ocorrencia or "").strip()
+    if not motivo:
+        return base
+    if key == "ausente_lote":
+        return f"Registrou em lote: {motivo}"
+    return f"Registrou: {motivo}"
 
 
 def deve_excluir_saida_operacional(ctx: Optional[SaidaOperacionalContext]) -> bool:

@@ -6,9 +6,12 @@ import pytest
 from fechamento_base_ciclo_pure import (
     aviso_ciclo_fechamento,
     ciclo_corresponde,
+    fim_semana_por_agenda,
     normalizar_periodo_fechamento,
+    periodo_aberto_para_base,
     renome_fechamento_bloqueado,
     resolver_chave_pix,
+    rotulo_ciclo_semanal,
 )
 
 
@@ -32,10 +35,72 @@ def test_quinzena_civil():
     assert not ciclo_corresponde("quinzenal", date(2026, 10, 16), date(2026, 11, 15))
 
 
-def test_semana_segunda_a_domingo_pode_cruzar_o_mes():
+def test_semana_civil_segunda_a_domingo_pode_cruzar_o_mes():
     assert ciclo_corresponde("semanal", date(2026, 10, 26), date(2026, 11, 1))
     assert not ciclo_corresponde("semanal", date(2026, 10, 20), date(2026, 10, 26))
     assert not ciclo_corresponde("semanal", date(2026, 10, 5), date(2026, 10, 18))
+
+
+def test_semana_sem_dias_coleta_so_segunda_a_domingo():
+    assert ciclo_corresponde("semanal", date(2026, 11, 16), date(2026, 11, 22), dias_coleta=None)
+    assert ciclo_corresponde("semanal", date(2026, 11, 16), date(2026, 11, 22), dias_coleta=[])
+    assert not ciclo_corresponde("semanal", date(2026, 11, 16), date(2026, 11, 20), dias_coleta=None)
+    assert not ciclo_corresponde("semanal", date(2026, 11, 16), date(2026, 11, 20), dias_coleta=[])
+
+
+def test_semana_agenda_seg_sex_aceita_agenda_e_civil():
+    dias = [1, 2, 3, 4, 5]
+    seg = date(2026, 11, 16)
+    sex = date(2026, 11, 20)
+    dom = date(2026, 11, 22)
+    qui = date(2026, 11, 19)
+    assert fim_semana_por_agenda(seg, dias) == sex
+    assert ciclo_corresponde("semanal", seg, sex, dias_coleta=dias)
+    assert ciclo_corresponde("semanal", seg, dom, dias_coleta=dias)  # legado/preset
+    assert not ciclo_corresponde("semanal", seg, qui, dias_coleta=dias)
+    assert not ciclo_corresponde("semanal", date(2026, 11, 17), sex, dias_coleta=dias)
+
+
+def test_semana_agenda_seg_sab():
+    dias = [1, 2, 3, 4, 5, 6]
+    seg = date(2026, 11, 16)
+    sab = date(2026, 11, 21)
+    sex = date(2026, 11, 20)
+    dom = date(2026, 11, 22)
+    assert ciclo_corresponde("semanal", seg, sab, dias_coleta=dias)
+    assert ciclo_corresponde("semanal", seg, dom, dias_coleta=dias)
+    assert not ciclo_corresponde("semanal", seg, sex, dias_coleta=dias)
+
+
+def test_semana_agenda_com_domingo_coincide_com_civil():
+    dias = [1, 2, 3, 4, 5, 6, 7]
+    seg = date(2026, 11, 16)
+    dom = date(2026, 11, 22)
+    assert ciclo_corresponde("semanal", seg, dom, dias_coleta=dias)
+    assert not ciclo_corresponde("semanal", seg, date(2026, 11, 21), dias_coleta=dias)
+
+
+def test_semana_agenda_cruza_mes():
+    dias = [1, 2, 3, 4, 5]
+    seg = date(2026, 10, 26)
+    sex = date(2026, 10, 30)
+    assert ciclo_corresponde("semanal", seg, sex, dias_coleta=dias)
+    assert ciclo_corresponde("semanal", seg, date(2026, 11, 1), dias_coleta=dias)
+
+
+def test_aviso_semanal_reflete_agenda_seg_sex():
+    aviso = aviso_ciclo_fechamento(
+        "BIBI",
+        "semanal",
+        date(2026, 11, 16),
+        date(2026, 11, 19),
+        dias_coleta=[1, 2, 3, 4, 5],
+    )
+    assert aviso is not None
+    assert "segunda a sexta" in aviso
+    assert "domingo" not in aviso
+    assert rotulo_ciclo_semanal([1, 2, 3, 4, 5, 6]) == "semana (segunda a sábado)"
+    assert rotulo_ciclo_semanal(None) == "semana (segunda a domingo)"
 
 
 def test_mes_civil():
@@ -63,3 +128,119 @@ def test_pix_da_base_prevalece_sobre_o_global():
     assert resolver_chave_pix("  ", "global@pix") == "global@pix"
     assert resolver_chave_pix(None, "  ") is None
     assert resolver_chave_pix(None, None) is None
+
+
+def test_periodo_aberto_respeita_agenda_da_base():
+    inicio = date(2026, 11, 9)  # segunda
+    fim = date(2026, 11, 15)  # domingo
+    sexta = date(2026, 11, 13)
+    sabado = date(2026, 11, 14)
+    domingo = date(2026, 11, 15)
+    # Seg–Sex: na sexta (último dia) não há dia programado depois de hoje.
+    assert not periodo_aberto_para_base(inicio, fim, sexta, [1, 2, 3, 4, 5])
+    # Seg–Sex: no sábado a agenda do período já encerrou.
+    assert not periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5])
+    # Seg–Sáb: na sexta ainda há sábado à frente.
+    assert periodo_aberto_para_base(inicio, fim, sexta, [1, 2, 3, 4, 5, 6])
+    # Seg–Sáb: no sábado é o último dia; pendência do dia fica no calendário.
+    assert not periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5, 6])
+    # Seg–Sáb: no domingo não resta dia programado.
+    assert not periodo_aberto_para_base(inicio, fim, domingo, [1, 2, 3, 4, 5, 6])
+    # COLETA_EXTRA no domingo mantém aberto no sábado.
+    assert periodo_aberto_para_base(inicio, fim, sabado, [1, 2, 3, 4, 5], [domingo])
+    # Sem dias_coleta, cai no critério civil.
+    assert periodo_aberto_para_base(inicio, fim, sabado, [])
+    assert not periodo_aberto_para_base(inicio, fim, date(2026, 11, 16), [])
+
+
+def test_periodo_aberto_respeita_feriado_e_justificativa_futuros():
+    inicio = date(2026, 11, 16)  # segunda
+    fim = date(2026, 11, 20)  # sexta (agenda)
+    quinta = date(2026, 11, 19)
+    sexta = date(2026, 11, 20)
+    dias = [1, 2, 3, 4, 5]
+    assert periodo_aberto_para_base(inicio, fim, quinta, dias)
+    assert not periodo_aberto_para_base(
+        inicio,
+        fim,
+        quinta,
+        dias,
+        excecoes_tipo_por_data={sexta: "FERIADO"},
+    )
+    assert not periodo_aberto_para_base(
+        inicio,
+        fim,
+        quinta,
+        dias,
+        excecoes_tipo_por_data={sexta: "JUSTIFICADO"},
+    )
+    # Último dia da agenda: não é "aberto" (pendência do dia ≠ aberto).
+    assert not periodo_aberto_para_base(inicio, fim, sexta, dias)
+
+
+def test_periodo_aberto_coleta_extra_justificada_nao_mantem_aberto():
+    inicio = date(2026, 11, 16)
+    fim = date(2026, 11, 22)
+    sabado = date(2026, 11, 21)
+    domingo = date(2026, 11, 22)
+    dias = [1, 2, 3, 4, 5]
+    assert periodo_aberto_para_base(inicio, fim, sabado, dias, [domingo])
+    assert not periodo_aberto_para_base(
+        inicio,
+        fim,
+        sabado,
+        dias,
+        [domingo],
+        excecoes_tipo_por_data={domingo: "SEM_COLETA"},
+    )
+
+
+def test_dias_pendentes_exigem_coleta_encerrada():
+    from fechamento_base_ciclo_pure import (
+        listar_dias_pendentes_agenda,
+        status_coleta_satisfaz_fechamento,
+    )
+
+    assert status_coleta_satisfaz_fechamento("coletado")
+    assert status_coleta_satisfaz_fechamento("sem_volume")
+    assert not status_coleta_satisfaz_fechamento("em_coleta")
+    assert not status_coleta_satisfaz_fechamento(None)
+
+    inicio = date(2026, 11, 9)
+    fim = date(2026, 11, 13)  # sexta
+    dias = [1, 2, 3, 4, 5]
+    # Sem execução → pendente.
+    assert listar_dias_pendentes_agenda(
+        inicio,
+        fim,
+        dias,
+        execucoes_ok=set(),
+        lancamentos_legados=set(),
+    ) == [
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+        "2026-11-12",
+        "2026-11-13",
+    ]
+    # Só dias com coletado/sem_volume (já filtrados no caller) satisfazem.
+    ok = {date(2026, 11, d) for d in (9, 10, 11, 12, 13)}
+    assert (
+        listar_dias_pendentes_agenda(
+            inicio,
+            fim,
+            dias,
+            execucoes_ok=ok,
+            lancamentos_legados=set(),
+        )
+        == []
+    )
+    # Sexta sem status terminal permanece pendente (em_coleta não entra em execucoes_ok).
+    ok_sem_sexta = {date(2026, 11, d) for d in (9, 10, 11, 12)}
+    assert listar_dias_pendentes_agenda(
+        inicio,
+        fim,
+        dias,
+        execucoes_ok=ok_sem_sexta,
+        lancamentos_legados=set(),
+    ) == ["2026-11-13"]

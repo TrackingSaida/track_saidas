@@ -7,9 +7,11 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from coleta_agenda_pure import dia_permite_lancamento_coleta
 from models import (
     BasePreco,
     Coleta,
+    ColetaCalendarioExcecao,
     ColetaExecucao,
     ColetaExecucaoParticipante,
     Motoboy,
@@ -18,6 +20,29 @@ from models import (
 )
 
 MODOS_COM_COLETA = {"codigo", "coleta_manual", "ambos"}
+MODOS_PARTICIPANTES = {"n", "um"}
+
+
+def participantes_modo_owner(owner: Owner) -> str:
+    """n = vários sem restrição; um = um por vez (exige Ajudar). Default n."""
+    modo = (getattr(owner, "coleta_participantes_modo", None) or "n").strip().lower()
+    return modo if modo in MODOS_PARTICIPANTES else "n"
+
+
+def exige_confirmacao_ajudar(
+    *,
+    modo: str,
+    ja_participa: bool,
+    outros_ativos: list,
+    ajudar: bool,
+    retroativo: bool,
+) -> bool:
+    """True quando o iniciar deve responder 409 com pode_ajudar."""
+    if modo != "um":
+        return False
+    if ja_participa or not outros_ativos or ajudar or retroativo:
+        return False
+    return True
 
 
 def combinar_modo_execucao(atual: str, solicitado: str) -> str:
@@ -259,10 +284,69 @@ def resolver_executor(db: Session, current_user: User, executor_user_id: Optiona
     exec_sub = (getattr(executor, "sub_base", None) or "").strip()
     if role not in (0, 1) and exec_sub != claim_sub:
         raise HTTPException(404, "Executor não encontrado nesta sub_base.")
+    try:
+        executor_role = int(getattr(executor, "role", -1))
+    except (TypeError, ValueError):
+        executor_role = -1
+    # A flag de coleta é do perfil motoboy. Staff logado não herda ficha antiga.
+    if executor_role != 4:
+        return executor, None
     motoboy = db.scalar(select(Motoboy).where(Motoboy.user_id == executor.id))
     if motoboy and not bool(getattr(motoboy, "pode_realizar_coleta", False)):
         raise HTTPException(403, "Este motoboy não possui permissão para realizar coletas.")
     return executor, int(motoboy.id_motoboy) if motoboy else None
+
+
+def _tipo_excecao_calendario_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    base_id: Optional[int],
+    data_operacao: date,
+) -> Optional[str]:
+    """Exceção da base no dia prevalece sobre a global."""
+    excecoes = list(
+        db.scalars(
+            select(ColetaCalendarioExcecao).where(
+                ColetaCalendarioExcecao.sub_base == sub_base,
+                ColetaCalendarioExcecao.data == data_operacao,
+            )
+        ).all()
+    )
+    if not excecoes:
+        return None
+    if base_id is not None:
+        for item in excecoes:
+            if item.base_id is not None and int(item.base_id) == int(base_id):
+                return (item.tipo or "").strip() or None
+    for item in excecoes:
+        if item.base_id is None:
+            return (item.tipo or "").strip() or None
+    return None
+
+
+def exigir_dia_programado(
+    db: Session,
+    *,
+    sub_base: str,
+    base: BasePreco,
+    data_operacao: date,
+) -> None:
+    """Bloqueia lançamento fora da agenda confirmada (salvo Coleta extra)."""
+    tipo = _tipo_excecao_calendario_dia(
+        db,
+        sub_base=sub_base,
+        base_id=getattr(base, "id_base", None),
+        data_operacao=data_operacao,
+    )
+    ok, msg = dia_permite_lancamento_coleta(
+        agenda_confirmada=bool(getattr(base, "agenda_coleta_confirmada", False)),
+        dias_coleta=getattr(base, "dias_coleta", None),
+        weekday=data_operacao.isoweekday(),
+        tipo_excecao=tipo,
+    )
+    if not ok:
+        raise HTTPException(422, msg or "Dia fora da agenda de coleta da base.")
 
 
 def obter_ou_criar_execucao(
@@ -273,6 +357,12 @@ def obter_ou_criar_execucao(
     data_operacao: date,
     modo: str,
 ) -> ColetaExecucao:
+    exigir_dia_programado(
+        db,
+        sub_base=sub_base,
+        base=base,
+        data_operacao=data_operacao,
+    )
     execucao = db.scalar(
         select(ColetaExecucao).where(
             ColetaExecucao.sub_base == sub_base,

@@ -18,6 +18,7 @@ MOTOBOY_ROLE = 4
 PERMISSOES_MOTOBOY = (
     "pode_ler_coleta",
     "pode_realizar_coleta",
+    "pode_realizar_entrada",
     "pode_ler_saida",
     "pode_digitar_codigo_manual",
     "pode_lancar_avulso",
@@ -48,6 +49,9 @@ def resolver_permissoes_motoboy(owner: Owner, overrides: Optional[Mapping[str, A
         return o.get(key)
 
     def_coleta = bool(getattr(owner, "default_pode_realizar_coleta", False))
+    def_entrada = bool(getattr(owner, "default_pode_realizar_entrada", False)) and bool(
+        getattr(owner, "entrada_obrigatoria_habilitada", False)
+    )
     def_saida = bool(getattr(owner, "default_pode_ler_saida", True))
     def_digitar = bool(getattr(owner, "default_pode_digitar_codigo_manual", False))
     def_avulso = bool(getattr(owner, "default_pode_lancar_avulso", True))
@@ -61,6 +65,11 @@ def resolver_permissoes_motoboy(owner: Owner, overrides: Optional[Mapping[str, A
         if ov("pode_realizar_coleta") is not None
         else (pode_ler_coleta if ov("pode_ler_coleta") is not None else def_coleta)
     )
+    pode_realizar_entrada = (
+        ov("pode_realizar_entrada") if ov("pode_realizar_entrada") is not None else def_entrada
+    )
+    if not bool(getattr(owner, "entrada_obrigatoria_habilitada", False)):
+        pode_realizar_entrada = False
     pode_ler_saida = ov("pode_ler_saida") if ov("pode_ler_saida") is not None else def_saida
     pode_digitar_codigo_manual = (
         ov("pode_digitar_codigo_manual") if ov("pode_digitar_codigo_manual") is not None else def_digitar
@@ -86,6 +95,7 @@ def resolver_permissoes_motoboy(owner: Owner, overrides: Optional[Mapping[str, A
     return {
         "pode_ler_coleta": pode_ler_coleta,
         "pode_realizar_coleta": pode_realizar_coleta,
+        "pode_realizar_entrada": bool(pode_realizar_entrada),
         "pode_ler_saida": pode_ler_saida,
         "pode_digitar_codigo_manual": pode_digitar_codigo_manual,
         "pode_lancar_avulso": pode_lancar_avulso,

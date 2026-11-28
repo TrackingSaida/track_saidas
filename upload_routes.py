@@ -215,21 +215,18 @@ def _build_watermark_image_bytes(*, image_bytes: bytes, codigo: str) -> bytes:
 
 
 def _status_amigavel(status: Optional[str]) -> str:
-    norm = (status or "").strip().upper().replace(" ", "_")
-    mapping = {
-        "ENTREGUE": "Entregue",
-        "AUSENTE": "Ausente",
-        "EM_ROTA": "Em rota",
-        "SAIU_PARA_ENTREGA": "Saiu para entrega",
-        "CANCELADO": "Cancelado",
-    }
-    return mapping.get(norm, (status or "—").strip() or "—")
+    from saida_operacional_pure import rotulo_situacao
+
+    raw = (status or "").strip()
+    if not raw:
+        return "—"
+    return rotulo_situacao(raw)
 
 
 def _is_status_ocorrencia_label(status_label: Optional[str]) -> bool:
-    """Ausente na homol; também aceita o rótulo Ocorrência."""
+    """Aceita rótulo novo (Ocorrência) e legado (Ausente) no comprovante."""
     s = (status_label or "").strip().lower()
-    return s in {"ausente", "ocorrência", "ocorrencia"}
+    return s in {"ocorrência", "ocorrencia", "ausente"}
 
 
 def _format_dt_br(value: Optional[datetime], *, assume_utc: bool = False) -> str:
@@ -325,7 +322,7 @@ def _build_comprovante_resumo(
     motivo = (getattr(detail, "motivo_ocorrencia", None) or "").strip() if detail else ""
     observacao = ""
     if detail:
-        if status_label == "Ausente":
+        if _is_status_ocorrencia_label(status_label):
             observacao = (detail.observacao_ocorrencia or "").strip()
         else:
             observacao = (detail.observacao_entrega or "").strip()
@@ -341,7 +338,7 @@ def _build_comprovante_resumo(
         linhas.append(("Recebido por", nome_recebedor))
     if entregador_primeiro:
         linhas.append((label_entregador, entregador_primeiro))
-    if motivo and status_label == "Ausente":
+    if motivo and _is_status_ocorrencia_label(status_label):
         linhas.append(("Motivo", motivo))
     if observacao:
         linhas.append(("Observação", observacao))
@@ -356,7 +353,7 @@ def _build_comprovante_resumo(
         caption_parts.append(f"Recebido por: {nome_recebedor}")
     if entregador_primeiro:
         caption_parts.append(f"{label_entregador}: {entregador_primeiro}")
-    if motivo and status_label == "Ausente":
+    if motivo and _is_status_ocorrencia_label(status_label):
         caption_parts.append(f"Motivo: {motivo}")
 
     return {

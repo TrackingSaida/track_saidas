@@ -167,8 +167,9 @@ def get_current_mobile_scan_user(
 class EntregaListItem(BaseModel):
     id_saida: int
     codigo: Optional[str]
+    codigo_exibicao: Optional[str] = None  # rótulo amigável do avulso (campos de identificação)
     status: str
-    exibicao: str  # "Pendente" | "Entregue" | "Ausente"
+    exibicao: str  # "Pendente" | "Entregue" | "Ocorrência"
     servico: Optional[str] = None  # Shopee | Mercado Livre | Flex | Avulso
     cliente: Optional[str] = None
     bairro: Optional[str] = None
@@ -422,6 +423,18 @@ class RotasAvancarOut(BaseModel):
     parada_atual: int
 
 
+class TransferenciaPendenteResumo(BaseModel):
+    transferencia_id: int
+    id_saida: int
+    codigo: Optional[str] = None
+    rota_id: Optional[str] = None
+    motoboy_destino_id: Optional[int] = None
+    motoboy_destino_nome: Optional[str] = None
+    motoboy_origem_id: Optional[int] = None
+    motoboy_origem_nome: Optional[str] = None
+    criada_em: Optional[str] = None
+
+
 class RotasAtivaOut(BaseModel):
     status: str = "sem_rota"
     rota_id: Optional[str] = None
@@ -441,6 +454,7 @@ class RotasAtivaOut(BaseModel):
     polyline_coords: Optional[List[dict]] = None
     distancia_total_m: Optional[int] = None
     duracao_total_s: Optional[int] = None
+    transferencias_pendentes: List[TransferenciaPendenteResumo] = Field(default_factory=list)
 
 
 class RotasOrdemBody(BaseModel):
@@ -491,6 +505,7 @@ class ExtratoDiaItem(BaseModel):
 class ExtratoPedidoItem(BaseModel):
     id_saida: int
     codigo: Optional[str]
+    codigo_exibicao: Optional[str] = None
     status: str
     exibicao: str
     servico: str
@@ -525,7 +540,7 @@ def _status_exibicao(status: Optional[str]) -> str:
     if s == STATUS_ENTREGUE:
         return "Entregue"
     if s == STATUS_AUSENTE:
-        return "Ausente"
+        return "Ocorrência"
     if s == STATUS_CANCELADO:
         return "Cancelado"
     if s == STATUS_ENCERRADO_SISTEMA:
@@ -764,6 +779,47 @@ def _saida_to_item(
     }
     _apply_campos_obrigatorios_to_item(item, s, db=db, campos_cache=campos_cache)
     return item
+
+
+def _enriquecer_codigo_exibicao_entregas(
+    db: Session,
+    *,
+    sub_base: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    """Preenche codigo_exibicao com identificação amigável nos avulsos (igual Registros)."""
+    if not items or not sub_base:
+        return
+    from types import SimpleNamespace
+
+    from avulso_campos_service import labels_exibicao_por_saidas
+
+    row_ns = []
+    for it in items:
+        cod = str(it.get("codigo") or "")
+        srv = str(it.get("servico") or "").lower()
+        sid = it.get("id_saida")
+        if sid is None:
+            continue
+        if not (cod.upper().startswith("AVULSO-") or "avulso" in srv):
+            continue
+        row_ns.append(
+            SimpleNamespace(
+                id_saida=int(sid),
+                codigo=cod,
+                base=it.get("base"),
+            )
+        )
+    if not row_ns:
+        return
+    labels = labels_exibicao_por_saidas(db, sub_base=sub_base, rows=row_ns)
+    for it in items:
+        sid = it.get("id_saida")
+        if sid is None:
+            continue
+        label = labels.get(int(sid))
+        if label:
+            it["codigo_exibicao"] = label
 
 
 def _parse_data_yyyy_mm_dd(raw: Optional[str]) -> Optional[date]:
@@ -1144,6 +1200,7 @@ def listar_entregas(
             campos_cache=campos_cache,
         )
         out.append(item)
+    _enriquecer_codigo_exibicao_entregas(db, sub_base=sub_base, items=out)
     return out
 
 
@@ -1310,6 +1367,32 @@ def extrato_financeiro_motoboy(
             )
         )
     dias.sort(key=lambda item: item.data, reverse=True)
+
+    # Rótulo amigável do avulso (busca em Minhas entregas).
+    extrato_itens: List[ExtratoPedidoItem] = []
+    for dia in dias:
+        extrato_itens.extend(dia.itens)
+        extrato_itens.extend(dia.itens_cancelados or [])
+    extrato_itens.extend(itens_cancelados_periodo)
+    if extrato_itens and sub_base:
+        as_dicts: List[Dict[str, Any]] = [
+            {
+                "id_saida": int(p.id_saida),
+                "codigo": p.codigo,
+                "servico": p.servico,
+            }
+            for p in extrato_itens
+        ]
+        _enriquecer_codigo_exibicao_entregas(db, sub_base=sub_base, items=as_dicts)
+        labels = {
+            int(d["id_saida"]): d.get("codigo_exibicao")
+            for d in as_dicts
+            if d.get("codigo_exibicao")
+        }
+        for p in extrato_itens:
+            label = labels.get(int(p.id_saida))
+            if label:
+                p.codigo_exibicao = label
 
     fechamentos_periodo = run_db_query_with_retry(
         db,
@@ -1807,14 +1890,52 @@ def _upsert_rota_preparando(
 
     existing = _find_open_rota(db, motoboy_id=motoboy_id, sub_base=sub_base, ref_date=ref_date)
     now = datetime.utcnow()
-    if existing and existing.status == "ativa":
-        return existing
 
     geom_status = "missing"
     geom_hash = None
     if polyline_encoded and geometry_provider:
         geom_status = "valid"
         geom_hash = order_hash(ordem)
+
+    if existing and existing.status == "ativa":
+        # PRD-013: persiste só o sufixo; prefixo até parada_atual permanece congelado.
+        ordem_atual = json.loads(existing.ordem_json) if isinstance(existing.ordem_json, str) else existing.ordem_json
+        if not isinstance(ordem_atual, list):
+            ordem_atual = []
+        parada = int(existing.parada_atual or 0)
+        prefix = [int(x) for x in ordem_atual[:parada]]
+        # `ordem` pode ser a ordem completa ou só o sufixo; normaliza pelo prefixo.
+        ordem_ints = [int(x) for x in ordem]
+        if prefix and ordem_ints[: len(prefix)] == prefix:
+            nova_ordem = ordem_ints
+        else:
+            nova_ordem = prefix + [sid for sid in ordem_ints if sid not in prefix]
+        if set(nova_ordem) != set(int(x) for x in ordem_atual):
+            # Otimização parcial não pode adicionar/remover ids; só reordenar futuros.
+            return existing
+        if nova_ordem[:parada] != prefix:
+            return existing
+        rev = int(getattr(existing, "route_revision", 0) or 0) + 1
+        existing.ordem_json = json.dumps(nova_ordem)
+        existing.updated_at = now
+        existing.route_revision = rev
+        existing.optimization_mode = optimization_mode
+        existing.optimization_input_hash = optimization_input_hash
+        existing.optimized_at = datetime.now(_tz.utc)
+        existing.distancia_total_m = distancia_total_m
+        existing.duracao_total_s = duracao_total_s
+        if polyline_encoded and geometry_provider:
+            existing.polyline_encoded = polyline_encoded
+            existing.geometry_provider = geometry_provider
+            existing.geometry_status = geom_status
+            existing.geometry_order_hash = geom_hash
+        else:
+            existing.geometry_status = "stale" if existing.polyline_encoded else "missing"
+            if not polyline_encoded:
+                existing.geometry_order_hash = None
+        db.commit()
+        db.refresh(existing)
+        return existing
 
     if existing and existing.status == "preparando":
         rev = int(getattr(existing, "route_revision", 0) or 0) + 1
@@ -2276,24 +2397,63 @@ def rotas_ativa(
     else:
         hoje = _hoje_operacional()
 
+    from saida_transferencia_service import pendentes_resumo_origem
+
+    pendencias = pendentes_resumo_origem(
+        db, motoboy_id=int(motoboy_id), sub_base=sub_base
+    )
+
+    def _with_pendencias(payload: dict) -> RotasAtivaOut:
+        payload = dict(payload)
+        payload["transferencias_pendentes"] = pendencias
+        return RotasAtivaOut(**payload)
+
     rota = _find_open_rota(db, motoboy_id=int(motoboy_id), sub_base=sub_base, ref_date=hoje)
     if not rota:
-        return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
+        return _with_pendencias(
+            build_rotas_ativa_out(
+                None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()
+            )
+        )
 
     if map_rota_to_api_status(rota) == API_STATUS_EM_ENTREGA:
         if not refresh_active_route_if_stale(db, rota):
-            return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
+            return _with_pendencias(
+                build_rotas_ativa_out(
+                    None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()
+                )
+            )
         ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
         if not isinstance(ordem, list):
             ordem = []
         if len(ordem) > 0 and rota.parada_atual >= len(ordem):
-            return RotasAtivaOut(**build_rotas_ativa_out(None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()))
-        return RotasAtivaOut(**build_rotas_ativa_out(rota, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat(), ordem=ordem))
+            return _with_pendencias(
+                build_rotas_ativa_out(
+                    None, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat()
+                )
+            )
+        return _with_pendencias(
+            build_rotas_ativa_out(
+                rota,
+                sub_base=sub_base,
+                motoboy_id=int(motoboy_id),
+                data_iso=hoje.isoformat(),
+                ordem=ordem,
+            )
+        )
 
     ordem = json.loads(rota.ordem_json) if isinstance(rota.ordem_json, str) else rota.ordem_json
     if not isinstance(ordem, list):
         ordem = []
-    return RotasAtivaOut(**build_rotas_ativa_out(rota, sub_base=sub_base, motoboy_id=int(motoboy_id), data_iso=hoje.isoformat(), ordem=ordem))
+    return _with_pendencias(
+        build_rotas_ativa_out(
+            rota,
+            sub_base=sub_base,
+            motoboy_id=int(motoboy_id),
+            data_iso=hoje.isoformat(),
+            ordem=ordem,
+        )
+    )
 
 
 # ============================================================
@@ -2640,6 +2800,8 @@ def detalhe_entrega(
     ocorrencia_map = _carregar_data_hora_ocorrencia_map(db, [id_saida])
     item = _saida_to_item(s, detail, data_hora_ocorrencia=ocorrencia_map.get(id_saida), db=db)
     _enrich_datas_detalhe(db, s, item)
+    if user.sub_base:
+        _enriquecer_codigo_exibicao_entregas(db, sub_base=user.sub_base, items=[item])
     return item
 
 
@@ -3195,7 +3357,7 @@ def _validar_saida_para_finalizacao_lote(
         return "Pedido já finalizado"
     if status_norm == STATUS_AUSENTE and acao == "entregue":
         return "Pedido já marcado como ausente"
-    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         return "Status não permite finalização"
     return None
 
@@ -3270,8 +3432,14 @@ def finalizar_lote(
     user: User = Depends(get_current_motoboy),
 ):
     """Finaliza pedidos em lote (parcial). Backend valida campos obrigatórios por pedido."""
-    ids_unicos = list(dict.fromkeys(int(i) for i in body.ids))
+    import time
+
+    from coleta_recalc_control import defer_recalcular_coleta
+    from coletas import recalcular_coleta
     from saida_operacional_pure import classificar_acao_obsoleta
+
+    t0 = time.perf_counter()
+    ids_unicos = list(dict.fromkeys(int(i) for i in body.ids))
 
     fluxo = fluxo_confirmacao_ativo(db, user.sub_base or "")
     candidatas = db.scalars(
@@ -3313,6 +3481,7 @@ def finalizar_lote(
             raise HTTPException(status_code=422, detail="Observação obrigatória quando motivo é 'Outro'.")
 
     details_map = _carregar_details_por_saida_ids(db, ids_restantes)
+    campos_cache = build_campos_cache_for_sub_base(db, sub_base=user.sub_base or "")
 
     active_route_ids = get_active_route_delivery_ids(db, user.motoboy_id)
     active_route_set = set(active_route_ids or [])
@@ -3320,128 +3489,203 @@ def finalizar_lote(
     finalizados: List[FinalizarLoteItemOut] = []
     bloqueados: List[FinalizarLoteBloqueadoOut] = []
     erros: List[FinalizarLoteErroOut] = []
+    n_bloqueados_rota_ativa = 0
+    coletas_para_recalcular: set[int] = set()
+    ausencias_para_push: List[Tuple[int, str]] = []
 
-    for id_saida in ids_restantes:
-        try:
-            if id_saida in active_route_set:
-                s_preview = db.get(Saida, id_saida)
-                bloqueados.append(
-                    FinalizarLoteBloqueadoOut(
-                        id_saida=id_saida,
-                        codigo=getattr(s_preview, "codigo", None) if s_preview else None,
-                        motivo="Pedido faz parte da rota ativa. Finalize pela rota ou individualmente.",
-                    )
-                )
-                continue
-
-            s = db.get(Saida, id_saida)
-            bloqueio = _validar_saida_para_finalizacao_lote(
-                s, body.acao, user.motoboy_id, user.sub_base
-            )
-            if bloqueio:
-                bloqueados.append(
-                    FinalizarLoteBloqueadoOut(
-                        id_saida=id_saida,
-                        codigo=getattr(s, "codigo", None) if s else None,
-                        motivo=bloqueio,
-                    )
-                )
-                continue
-
-            assert s is not None
-            detail = details_map.get(id_saida) or _get_detail_for_saida(db, id_saida)
-            status_anterior = normalizar_status_saida(s.status) or (s.status or STATUS_EM_ROTA)
-
-            if body.acao == "entregue":
-                faltantes = validate_campos_obrigatorios_conclusao(
-                    db,
-                    saida=s,
-                    contexto="ENTREGUE",
-                    detail=detail,
-                    overrides=None,
-                )
-                if faltantes:
+    with defer_recalcular_coleta():
+        for id_saida in ids_restantes:
+            try:
+                if id_saida in active_route_set:
+                    s_preview = por_id.get(id_saida)
+                    n_bloqueados_rota_ativa += 1
                     bloqueados.append(
                         FinalizarLoteBloqueadoOut(
                             id_saida=id_saida,
-                            codigo=s.codigo,
-                            motivo=format_bloqueio_motivo(faltantes),
+                            codigo=getattr(s_preview, "codigo", None) if s_preview else None,
+                            motivo="Pedido faz parte da rota ativa. Finalize pela rota ou individualmente.",
                         )
                     )
                     continue
-                _aplicar_entregue_lote(db, s, user, status_anterior)
-                status_novo = STATUS_ENTREGUE
-            else:
-                assert motivo is not None
-                overrides = (
-                    {"observacao_ocorrencia": body.observacao}
-                    if body.observacao is not None
-                    else None
+
+                s = por_id.get(id_saida)
+                bloqueio = _validar_saida_para_finalizacao_lote(
+                    s, body.acao, user.motoboy_id, user.sub_base
                 )
-                faltantes = validate_campos_obrigatorios_conclusao(
-                    db,
-                    saida=s,
-                    contexto="AUSENTE",
-                    detail=detail,
-                    overrides=overrides,
-                )
-                if faltantes:
+                if bloqueio:
                     bloqueados.append(
                         FinalizarLoteBloqueadoOut(
                             id_saida=id_saida,
-                            codigo=s.codigo,
-                            motivo=format_bloqueio_motivo(faltantes),
+                            codigo=getattr(s, "codigo", None) if s else None,
+                            motivo=bloqueio,
                         )
                     )
                     continue
-                _aplicar_ausente_lote(db, s, user, motivo, body.observacao, detail, status_anterior)
-                status_novo = STATUS_AUSENTE
 
-            db.commit()
-            db.refresh(s)
-            if status_novo == STATUS_AUSENTE:
+                assert s is not None
+                detail = details_map.get(id_saida) or _get_detail_for_saida(db, id_saida)
+                status_anterior = normalizar_status_saida(s.status) or (s.status or STATUS_EM_ROTA)
+
+                nested = db.begin_nested()
                 try:
-                    from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
-                    from push_notification_service import send_to_motoboy, send_to_staff_sub_base
+                    if body.acao == "entregue":
+                        faltantes = validate_campos_obrigatorios_conclusao(
+                            db,
+                            saida=s,
+                            contexto="ENTREGUE",
+                            detail=detail,
+                            overrides=None,
+                            campos_cache=campos_cache,
+                        )
+                        if faltantes:
+                            nested.rollback()
+                            bloqueados.append(
+                                FinalizarLoteBloqueadoOut(
+                                    id_saida=id_saida,
+                                    codigo=s.codigo,
+                                    motivo=format_bloqueio_motivo(faltantes),
+                                )
+                            )
+                            continue
+                        _aplicar_entregue_lote(db, s, user, status_anterior)
+                        status_novo = STATUS_ENTREGUE
+                    else:
+                        assert motivo is not None
+                        overrides = (
+                            {"observacao_ocorrencia": body.observacao}
+                            if body.observacao is not None
+                            else None
+                        )
+                        faltantes = validate_campos_obrigatorios_conclusao(
+                            db,
+                            saida=s,
+                            contexto="AUSENTE",
+                            detail=detail,
+                            overrides=overrides,
+                            campos_cache=campos_cache,
+                        )
+                        if faltantes:
+                            nested.rollback()
+                            bloqueados.append(
+                                FinalizarLoteBloqueadoOut(
+                                    id_saida=id_saida,
+                                    codigo=s.codigo,
+                                    motivo=format_bloqueio_motivo(faltantes),
+                                )
+                            )
+                            continue
+                        _aplicar_ausente_lote(
+                            db, s, user, motivo, body.observacao, detail, status_anterior
+                        )
+                        status_novo = STATUS_AUSENTE
+                    nested.commit()
+                except Exception:
+                    nested.rollback()
+                    raise
 
+                id_coleta = getattr(s, "id_coleta", None)
+                if id_coleta is not None:
+                    try:
+                        coletas_para_recalcular.add(int(id_coleta))
+                    except (TypeError, ValueError):
+                        pass
+                if status_novo == STATUS_AUSENTE:
+                    codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
+                    ausencias_para_push.append((id_saida, codigo))
+                finalizados.append(FinalizarLoteItemOut(id_saida=id_saida, status=status_novo))
+            except Exception as exc:
+                # Savepoint já isolou o item; não dar rollback da sessão inteira
+                # (senão perde os finalizados anteriores do mesmo lote).
+                logging.exception("finalizar_lote id_saida=%s", id_saida)
+                erros.append(FinalizarLoteErroOut(id_saida=id_saida, mensagem=str(exc)))
+
+        for id_coleta in sorted(coletas_para_recalcular):
+            try:
+                recalcular_coleta(db, id_coleta, commit=False)
+            except Exception:
+                logger.exception("finalizar_lote_recalcular_coleta id_coleta=%s", id_coleta)
+
+        if finalizados or coletas_para_recalcular:
+            db.commit()
+            for item in finalizados:
+                s_ref = por_id.get(item.id_saida)
+                if s_ref is not None:
+                    try:
+                        db.refresh(s_ref)
+                    except Exception:
+                        pass
+
+    if ausencias_para_push:
+        try:
+            from ausencia_bloqueio_service import esta_bloqueado_por_ausencias
+            from push_notification_service import send_to_motoboy, send_to_staff_sub_base
+
+            for id_saida, codigo in ausencias_para_push:
+                try:
                     bloqueado, total = esta_bloqueado_por_ausencias(db, id_saida)
-                    if bloqueado and total >= 3:
-                        codigo = (getattr(s, "codigo", None) or "").strip() or str(id_saida)
-                        send_to_motoboy(
-                            db,
-                            motoboy_id=int(user.motoboy_id),
-                            sub_base=user.sub_base,
-                            tipo="bloqueio_ausencia",
-                            title="Pacote bloqueado",
-                            body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
-                            data={"id_saida": id_saida, "codigo": codigo},
-                            chave_dedupe=str(id_saida),
-                        )
-                        send_to_staff_sub_base(
-                            db,
-                            sub_base=user.sub_base,
-                            tipo="bloqueio_ausencia",
-                            title="Pacote bloqueado por ausência",
-                            body=f"Pacote {codigo} bloqueado por limite de ausências.",
-                            data={"id_saida": id_saida, "codigo": codigo},
-                            chave_dedupe=f"staff:{id_saida}",
-                        )
-                        db.commit()
+                    if not (bloqueado and total >= 3):
+                        continue
+                    send_to_motoboy(
+                        db,
+                        motoboy_id=int(user.motoboy_id),
+                        sub_base=user.sub_base,
+                        tipo="bloqueio_ausencia",
+                        title="Pacote bloqueado",
+                        body="Este pacote atingiu o limite de ausências. Só a base pode liberar nova tentativa.",
+                        data={"id_saida": id_saida, "codigo": codigo},
+                        chave_dedupe=str(id_saida),
+                    )
+                    send_to_staff_sub_base(
+                        db,
+                        sub_base=user.sub_base,
+                        tipo="bloqueio_ausencia",
+                        title="Pacote bloqueado por ausência",
+                        body=f"Pacote {codigo} bloqueado por limite de ausências.",
+                        data={"id_saida": id_saida, "codigo": codigo},
+                        chave_dedupe=f"staff:{id_saida}",
+                    )
                 except Exception:
                     logger.exception("push_bloqueio_ausencia_lote_failed id_saida=%s", id_saida)
-            finalizados.append(FinalizarLoteItemOut(id_saida=id_saida, status=status_novo))
-        except Exception as exc:
-            db.rollback()
-            logging.exception("finalizar_lote id_saida=%s", id_saida)
-            erros.append(FinalizarLoteErroOut(id_saida=id_saida, mensagem=str(exc)))
+            db.commit()
+        except Exception:
+            logger.exception("push_bloqueio_ausencia_lote_outer_failed")
+
+        try:
+            from pedido_recusado_service import talvez_notificar_recusado_apos_ausencia
+
+            motivo_desc = motivo.descricao if motivo is not None else None
+            talvez_notificar_recusado_apos_ausencia(
+                db,
+                sub_base=user.sub_base,
+                user=user,
+                ids_e_motivos=[(sid, motivo_desc) for sid, _codigo in ausencias_para_push],
+            )
+        except Exception:
+            logger.exception("push_pedido_recusado_lote_failed")
 
     rota_sync: Optional[RotaSyncOut] = None
-    if finalizados:
+    finalized_ids = {item.id_saida for item in finalizados}
+    if finalized_ids & active_route_set:
         sync_raw = sync_active_route_after_delivery_update(
-            db, user.motoboy_id, finalizados[-1].id_saida
+            db, user.motoboy_id, next(iter(finalized_ids & active_route_set))
         )
         if sync_raw.get("in_active_route") or sync_raw.get("rota_finalizada"):
             rota_sync = RotaSyncOut(**sync_raw)
+
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    audit_entrega(
+        "finalizar_lote_done",
+        user_id=user.id,
+        motoboy_id=user.motoboy_id,
+        duration_ms=duration_ms,
+        n_ids=len(ids_unicos),
+        n_finalizados=len(finalizados),
+        n_bloqueados=len(bloqueados),
+        n_bloqueados_rota_ativa=n_bloqueados_rota_ativa,
+        n_erros=len(erros),
+        n_obsoletos=len(obsoletos),
+        acao=body.acao,
+    )
 
     return FinalizarLoteResponse(
         finalizados=finalizados,
@@ -3553,7 +3797,8 @@ def marcar_entregue(
                 "message": "Registre uma nova tentativa antes de marcar como entregue.",
             },
         )
-    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    # "saiu" legado (Registros/web) é elegível; AGUARDANDO_CONFIRMACAO_SAIDA permanece bloqueado.
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         audit_entrega(
             "marcar_entregue_result",
             result="reject",
@@ -3617,6 +3862,9 @@ def marcar_entregue(
             user_id=user.id,
         )
     )
+    from saida_transferencia_service import obsolecer_pendencias_da_saida
+
+    obsolecer_pendencias_da_saida(db, id_saida=id_saida, user_id=user.id)
     db.commit()
     db.refresh(s)
     audit_entrega(
@@ -3657,6 +3905,18 @@ def marcar_ausente(
         status_atual=status_norm,
         motivo_id=body.motivo_id,
     )
+    # Já ausente: idempotente para a outbox (mesmo código que ENTREGUE/CANCELADO).
+    if status_norm == STATUS_AUSENTE:
+        audit_entrega(
+            "marcar_ausente_result",
+            result="reject",
+            code="STATUS_FINALIZADO",
+            id_saida=id_saida,
+            user_id=user.id,
+            client_action_id=client_action_id,
+            status_atual=status_norm,
+        )
+        raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
     if _status_esta_finalizado(status_norm):
         audit_entrega(
             "marcar_ausente_result",
@@ -3668,7 +3928,8 @@ def marcar_ausente(
             status_atual=status_norm,
         )
         raise HTTPException(status_code=422, detail=_status_finalizado_detail(s, status_norm))
-    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA):
+    # "saiu" legado (Registros/web) é elegível; AGUARDANDO_CONFIRMACAO_SAIDA permanece bloqueado.
+    if status_norm not in (STATUS_SAIU_PARA_ENTREGA, STATUS_EM_ROTA, "saiu"):
         audit_entrega(
             "marcar_ausente_result",
             result="reject",
@@ -3741,6 +4002,9 @@ def marcar_ausente(
             ),
         )
     )
+    from saida_transferencia_service import obsolecer_pendencias_da_saida
+
+    obsolecer_pendencias_da_saida(db, id_saida=id_saida, user_id=user.id)
     db.commit()
     db.refresh(s)
     try:
@@ -3772,6 +4036,17 @@ def marcar_ausente(
             db.commit()
     except Exception:
         logger.exception("push_bloqueio_ausencia_failed id_saida=%s", id_saida)
+    try:
+        from pedido_recusado_service import talvez_notificar_recusado_apos_ausencia
+
+        talvez_notificar_recusado_apos_ausencia(
+            db,
+            sub_base=user.sub_base,
+            user=user,
+            ids_e_motivos=[(id_saida, motivo.descricao)],
+        )
+    except Exception:
+        logger.exception("push_pedido_recusado_failed id_saida=%s", id_saida)
     audit_entrega(
         "marcar_ausente_result",
         result="ok",
@@ -3956,6 +4231,43 @@ def listar_motivos_ausencia(
         select(MotivoAusencia).where(MotivoAusencia.ativo.is_(True)).order_by(MotivoAusencia.id)
     ).all()
     return [MotivoAusenciaOut(id=r.id, descricao=r.descricao) for r in rows]
+
+
+class PedidoRecusadoItemOut(BaseModel):
+    id_saida: int
+    codigo: Optional[str] = None
+    codigo_exibicao: Optional[str] = None
+    servico: Optional[str] = None
+
+
+class PedidosRecusadosOut(BaseModel):
+    total: int
+    items: List[PedidoRecusadoItemOut]
+
+
+# ============================================================
+# GET /mobile/pedidos-recusados — fila admin (ausente + motivo Recusado)
+# ============================================================
+@router.get("/pedidos-recusados", response_model=PedidosRecusadosOut)
+def listar_pedidos_recusados_admin(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Lista ausentes atuais com motivo Recusado da sub_base (root/admin)."""
+    from pedido_recusado_service import listar_pedidos_recusados, require_admin_root_sub_base
+
+    sub_base = require_admin_root_sub_base(user)
+    rows = listar_pedidos_recusados(db, sub_base=sub_base)
+    items = [
+        PedidoRecusadoItemOut(
+            id_saida=int(r["id_saida"]),
+            codigo=r.get("codigo"),
+            codigo_exibicao=r.get("codigo_exibicao"),
+            servico=r.get("servico"),
+        )
+        for r in rows
+    ]
+    return PedidosRecusadosOut(total=len(items), items=items)
 
 
 # ============================================================
@@ -4952,6 +5264,17 @@ def assumir_entrega(
     if status_norm == STATUS_AUSENTE:
         raise_if_bloqueado_ausencias(db, id_saida)
     antigo = s.motoboy_id
+    if antigo is not None and antigo != user.motoboy_id:
+        from saida_transferencia_service import tentar_gate_reatribuicao
+
+        tentar_gate_reatribuicao(
+            db,
+            saida=s,
+            sub_base=user.sub_base or "",
+            motoboy_destino_id=int(user.motoboy_id),
+            solicitante_user_id=getattr(user, "id", None),
+            solicitante_motoboy_id=getattr(user, "motoboy_id", None),
+        )
     encerrar_item_da_operacao_anterior(
         db,
         sub_base=user.sub_base,
@@ -5029,3 +5352,55 @@ def assumir_entrega(
             endpoint="/mobile/entrega/{id_saida}/assumir",
         )
     return {"ok": True, "id_saida": id_saida}
+
+
+# ============================================================
+# PRD-013 — transferências pendentes (origem)
+# ============================================================
+@router.get("/transferencias/pendentes")
+def listar_transferencias_pendentes(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from saida_transferencia_service import pendentes_resumo_origem
+
+    sub_base = user.sub_base or ""
+    return {
+        "items": pendentes_resumo_origem(
+            db, motoboy_id=int(user.motoboy_id), sub_base=sub_base
+        )
+    }
+
+
+@router.post("/transferencias/{transferencia_id}/aceitar")
+def aceitar_transferencia_mobile(
+    transferencia_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from saida_transferencia_service import aceitar_transferencia
+
+    return aceitar_transferencia(
+        db,
+        transferencia_id=transferencia_id,
+        motoboy_id=int(user.motoboy_id),
+        sub_base=user.sub_base or "",
+        user_id=getattr(user, "id", None),
+    )
+
+
+@router.post("/transferencias/{transferencia_id}/recusar")
+def recusar_transferencia_mobile(
+    transferencia_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_motoboy),
+):
+    from saida_transferencia_service import recusar_transferencia
+
+    return recusar_transferencia(
+        db,
+        transferencia_id=transferencia_id,
+        motoboy_id=int(user.motoboy_id),
+        sub_base=user.sub_base or "",
+        user_id=getattr(user, "id", None),
+    )

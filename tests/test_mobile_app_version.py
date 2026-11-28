@@ -1,4 +1,4 @@
-"""Piso de versão do app: 1.11.0 para todos; 1.12.0 para root, admin e operador."""
+"""Piso de versão do app: 1.16.11 para todos; role staff legado 1.12.0 (efetivo = max)."""
 from mobile_app_version import (
     is_update_required,
     load_policy,
@@ -16,6 +16,8 @@ def test_comparacao_semver():
     assert not version_lt("1.12.0", "1.11.0")
     assert not version_lt("1.12", "1.12.0")
     assert not version_lt("lixo", "1.11.0")
+    assert version_lt("1.16.10", "1.16.11")
+    assert not version_lt("1.16.11", "1.16.11")
 
 
 def test_piso_padrao_por_perfil(monkeypatch):
@@ -23,27 +25,28 @@ def test_piso_padrao_por_perfil(monkeypatch):
     monkeypatch.delenv("MOBILE_MIN_VERSION_ROLES", raising=False)
     policy = load_policy()
 
-    assert required_version(policy, None) == "1.11.0"
-    assert required_version(policy, 4) == "1.11.0"
-    assert required_version(policy, 3) == "1.11.0"
-    assert required_version(policy, 0) == "1.12.0"
-    assert required_version(policy, 1) == "1.12.0"
-    assert required_version(policy, 2) == "1.12.0"
+    assert required_version(policy, None) == "1.16.11"
+    assert required_version(policy, 4) == "1.16.11"
+    assert required_version(policy, 3) == "1.16.11"
+    assert required_version(policy, 0) == "1.16.11"
+    assert required_version(policy, 1) == "1.16.11"
+    assert required_version(policy, 2) == "1.16.11"
 
-    assert is_update_required("1.10.0", policy, 4)
-    assert not is_update_required("1.11.0", policy, 4)
-    assert not is_update_required("1.12.0", policy, 4)
-    assert is_update_required("1.11.0", policy, 2)
-    assert not is_update_required("1.12.0", policy, 1)
+    assert is_update_required("1.16.10", policy, 4)
+    assert not is_update_required("1.16.11", policy, 4)
+    assert not is_update_required("1.17.0", policy, 4)
+    assert is_update_required("1.12.0", policy, 2)
+    assert not is_update_required("1.16.11", policy, 1)
     assert not is_update_required("", policy, 1)
 
 
-def test_antes_do_login_nao_aplica_piso_de_admin(monkeypatch):
+def test_antes_do_login_usa_piso_geral(monkeypatch):
     monkeypatch.delenv("MOBILE_MIN_VERSION", raising=False)
     monkeypatch.delenv("MOBILE_MIN_VERSION_ROLES", raising=False)
     policy = load_policy()
-    assert not is_update_required("1.11.0", policy, None)
-    assert is_update_required("1.11.0", policy, 1)
+    assert is_update_required("1.11.0", policy, None)
+    assert not is_update_required("1.16.11", policy, None)
+    assert is_update_required("1.16.10", policy, 1)
 
 
 def test_env_substitui_pisos(monkeypatch):
@@ -71,7 +74,7 @@ def test_payload_publico_nao_expoe_tenant(monkeypatch):
     monkeypatch.delenv("MOBILE_MIN_VERSION", raising=False)
     monkeypatch.delenv("MOBILE_MIN_VERSION_ROLES", raising=False)
     payload = public_policy_payload()
-    assert payload["min_version"] == "1.11.0"
+    assert payload["min_version"] == "1.16.11"
     assert "3" not in payload["min_version_by_role"]
     assert "4" not in payload["min_version_by_role"]
     assert payload["min_version_by_role"]["1"] == "1.12.0"

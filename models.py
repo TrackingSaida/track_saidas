@@ -105,6 +105,7 @@ class Owner(Base):
     bloquear_saida_sem_coleta = Column(Boolean, nullable=False, server_default=text("false"))
     # Defaults Motoboy (Políticas gerais) — novos cadastros
     default_pode_realizar_coleta = Column(Boolean, nullable=False, server_default=text("false"))
+    default_pode_realizar_entrada = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_ler_saida = Column(Boolean, nullable=False, server_default=text("true"))
     default_pode_digitar_codigo_manual = Column(Boolean, nullable=False, server_default=text("false"))
     default_pode_lancar_avulso = Column(Boolean, nullable=False, server_default=text("true"))
@@ -124,6 +125,8 @@ class Owner(Base):
     pix_receber = Column(Text, nullable=True)
     # cpf | cnpj | telefone | email | aleatoria. Nulo em chave antiga, sem tipo.
     pix_receber_tipo = Column(Text, nullable=True)
+    # n = vários coletores sem restrição; um = um por vez (409 + Ajudar)
+    coleta_participantes_modo = Column(Text, nullable=False, server_default=text("'n'"))
 
     def __repr__(self) -> str:
         return f"<Owner id_owner={self.id_owner} username={self.username!r} ativo={self.ativo}>"
@@ -190,6 +193,8 @@ class Motoboy(Base):
     # Permissão canônica para participar de coleta por leitura e/ou manual.
     # pode_ler_coleta é mantido por compatibilidade com clientes antigos.
     pode_realizar_coleta = Column(Boolean, default=False, nullable=False, server_default=text("false"))
+    # Registrar entrada no app; só vale com owner.entrada_obrigatoria_habilitada
+    pode_realizar_entrada = Column(Boolean, default=False, nullable=False, server_default=text("false"))
     pode_ler_saida = Column(Boolean, default=True, nullable=False)
     pode_digitar_codigo_manual = Column(Boolean, default=True, nullable=False)
     pode_lancar_avulso = Column(Boolean, default=True, nullable=False)
@@ -1403,6 +1408,40 @@ class RotasMotoboy(Base):
 
 
 # ==========================
+# Tabela: saida_transferencias_pendentes (PRD-013)
+# ==========================
+class SaidaTransferenciaPendente(Base):
+    __tablename__ = "saida_transferencias_pendentes"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id_saida = Column(BigInteger, nullable=False, index=True)
+    sub_base = Column(Text, nullable=False)
+    motoboy_origem_id = Column(
+        BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="CASCADE"), nullable=False
+    )
+    motoboy_destino_id = Column(
+        BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="SET NULL"), nullable=True
+    )
+    repasse_base_id = Column(BigInteger, nullable=True)
+    solicitante_user_id = Column(BigInteger, nullable=True)
+    solicitante_motoboy_id = Column(
+        BigInteger, ForeignKey("motoboys.id_motoboy", ondelete="SET NULL"), nullable=True
+    )
+    rota_id = Column(BigInteger, nullable=True)
+    route_revision_ref = Column(Integer, nullable=True)
+    status = Column(Text, nullable=False, server_default=text("'pendente'"))
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    resolvida_em = Column(DateTime(timezone=False), nullable=True)
+    resolvida_por_user_id = Column(BigInteger, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<SaidaTransferenciaPendente id={self.id} id_saida={self.id_saida} "
+            f"status={self.status!r}>"
+        )
+
+
+# ==========================
 # Tabela: route_optimization_requests (idempotência de otimização)
 # ==========================
 class RouteOptimizationRequest(Base):
@@ -1457,6 +1496,15 @@ def saida_after_update(mapper, connection, target: Saida):
     """
     if not target.id_coleta:
         return
+
+    # Lotes / updates em massa podem adiar o recálculo (1x por coleta no fim).
+    try:
+        from coleta_recalc_control import should_skip_recalcular_coleta
+
+        if should_skip_recalcular_coleta():
+            return
+    except Exception:
+        pass
 
     # Cria sessão vinculada a essa conexão
     db = Session(bind=connection)
@@ -1595,6 +1643,61 @@ class AddressTelemetry(Base):
     query_hash = Column(Text, nullable=True)
     event_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ==========================
+# Tabela: mobile_telemetry_events (PRD-018)
+# ==========================
+# Tabela: coleta_client_actions (PRD-020 — idempotência do lote)
+# ==========================
+class ColetaClientAction(Base):
+    __tablename__ = "coleta_client_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "sub_base",
+            "client_action_id",
+            name="uq_coleta_client_actions_sub_action",
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sub_base = Column(Text, nullable=False)
+    client_action_id = Column(Text, nullable=False)
+    base = Column(Text, nullable=True)
+    codigo = Column(Text, nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
+    id_coleta = Column(BigInteger, nullable=True)
+    id_execucao = Column(BigInteger, nullable=True)
+    resultado_json = Column(Text, nullable=False)
+    criada_em = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+# ==========================
+class MobileTelemetryEvent(Base):
+    __tablename__ = "mobile_telemetry_events"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    event_at = Column(DateTime(timezone=True), nullable=True)
+    event_name = Column(Text, nullable=False)
+    motoboy_id = Column(BigInteger, nullable=False)
+    sub_base = Column(Text, nullable=False)
+    owner_id = Column(BigInteger, nullable=True)
+    id_saida = Column(BigInteger, nullable=True)
+    client_action_id = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    stage = Column(Text, nullable=True)
+    app_version = Column(Text, nullable=True)
+    platform = Column(Text, nullable=True)
+    device_brand = Column(Text, nullable=True)
+    device_manufacturer = Column(Text, nullable=True)
+    device_model = Column(Text, nullable=True)
+    os_name = Column(Text, nullable=True)
+    os_version = Column(Text, nullable=True)
+    android_api_level = Column(Integer, nullable=True)
+    device_total_memory_mb = Column(Integer, nullable=True)
+    cpu_arch = Column(Text, nullable=True)
+    props_json = Column(JSON, nullable=True)
 
 
 # ==========================

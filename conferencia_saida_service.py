@@ -1,14 +1,28 @@
 """Serviço de Conferência de Saída (motoboy + dia operacional)."""
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from conferencia_saida_pure import filtrar_status_conferencia, status_conta_na_conferencia
-from models import ConferenciaSaida, Motoboy, Owner, Saida, SaidaHistorico, User
+from conferencia_saida_pure import (
+    filtrar_status_conferencia,
+    status_agrupado_conferencia,
+    status_conta_na_conferencia,
+)
+from models import (
+    ConferenciaSaida,
+    Motoboy,
+    Owner,
+    Saida,
+    SaidaHistorico,
+    SaidaSessao,
+    SaidaSessaoItem,
+    User,
+)
 from saida_operacional_utils import (
     carregar_contexto_operacional,
     carregar_saidas_candidatas_periodo,
@@ -16,6 +30,7 @@ from saida_operacional_utils import (
     filtrar_saidas_por_periodo_operacional,
     timestamp_operacional_saida,
 )
+from saida_sessao_service import STATUS_FORA_DA_VISAO_OPERACIONAL, _travar
 
 STATUS_PENDENTE = "pendente"
 STATUS_RECONFERIR = "reconferir"
@@ -325,6 +340,118 @@ def label_fechamento(status: str) -> str:
     return LABEL_FECHAMENTO.get(status, "Não conferido")
 
 
+def _saidas_operacionais_por_sessao_ids(
+    db: Session,
+    *,
+    sub_base: str,
+    sessao_ids: List[int],
+) -> Dict[int, List[Saida]]:
+    """Pacotes da visão operacional por sessão (ativo, mesmo motoboy/sub_base, fora cancelado/encerrado)."""
+    ids = sorted({int(x) for x in sessao_ids if x is not None})
+    if not ids:
+        return {}
+    rows = db.execute(
+        select(SaidaSessaoItem.sessao_id, Saida)
+        .join(SaidaSessao, SaidaSessao.id == SaidaSessaoItem.sessao_id)
+        .join(Saida, Saida.id_saida == SaidaSessaoItem.id_saida)
+        .where(
+            SaidaSessaoItem.sessao_id.in_(ids),
+            SaidaSessaoItem.ativo_operacional.is_(True),
+            SaidaSessao.sub_base == sub_base,
+            Saida.sub_base == SaidaSessao.sub_base,
+            Saida.motoboy_id == SaidaSessao.motoboy_id,
+        )
+        .order_by(Saida.codigo, Saida.id_saida)
+    ).all()
+    fora = {s.upper() for s in STATUS_FORA_DA_VISAO_OPERACIONAL}
+    out: Dict[int, List[Saida]] = {sid: [] for sid in ids}
+    vistos: Dict[int, set[int]] = {sid: set() for sid in ids}
+    for sessao_id, saida in rows:
+        sid = int(sessao_id)
+        status = (saida.status or "").strip().upper()
+        if status in fora:
+            continue
+        saida_id = int(saida.id_saida)
+        if saida_id in vistos[sid]:
+            continue
+        vistos[sid].add(saida_id)
+        out[sid].append(saida)
+    return out
+
+
+def somar_operacional_sessoes_por_motoboy_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    grupos: Dict[Tuple[int, date], List[int]],
+) -> Dict[Tuple[int, date], Tuple[int, int, int]]:
+    """Soma Shopee/ML/Avulso das sessões de cada (motoboy_id, data_ref), sem repetir id_saida."""
+    sessao_ids = sorted(
+        {int(sid) for ids in grupos.values() for sid in ids if sid is not None}
+    )
+    por_sessao = _saidas_operacionais_por_sessao_ids(
+        db, sub_base=sub_base, sessao_ids=sessao_ids
+    )
+    resultado: Dict[Tuple[int, date], Tuple[int, int, int]] = {}
+    for chave, ids in grupos.items():
+        vistos: set[int] = set()
+        saidas: List[Saida] = []
+        for sid in ids:
+            for saida in por_sessao.get(int(sid), []):
+                saida_id = int(saida.id_saida)
+                if saida_id in vistos:
+                    continue
+                vistos.add(saida_id)
+                saidas.append(saida)
+        resultado[chave] = somar_servicos_saidas(saidas)
+    return resultado
+
+
+def listar_saidas_operacionais_sessoes_motoboy_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    sessao_ids: List[int],
+) -> List[Saida]:
+    """Lista única de pacotes operacionais das sessões (sem repetir id_saida)."""
+    por_sessao = _saidas_operacionais_por_sessao_ids(
+        db, sub_base=sub_base, sessao_ids=sessao_ids
+    )
+    vistos: set[int] = set()
+    saidas: List[Saida] = []
+    for sid in sorted({int(x) for x in sessao_ids if x is not None}):
+        for saida in por_sessao.get(sid, []):
+            saida_id = int(saida.id_saida)
+            if saida_id in vistos:
+                continue
+            vistos.add(saida_id)
+            saidas.append(saida)
+    saidas.sort(key=lambda s: ((s.codigo or "").upper(), int(s.id_saida)))
+    return saidas
+
+
+def carregar_conferencias_motoboy_dia(
+    db: Session,
+    *,
+    sub_base: str,
+    motoboy_id: int,
+    data_ref: date,
+    travar: bool = False,
+) -> List[ConferenciaSaida]:
+    stmt = (
+        select(ConferenciaSaida)
+        .where(
+            ConferenciaSaida.sub_base == sub_base,
+            ConferenciaSaida.motoboy_id == motoboy_id,
+            ConferenciaSaida.data_ref == data_ref,
+        )
+        .order_by(ConferenciaSaida.id.asc())
+    )
+    if travar:
+        stmt = _travar(stmt, db)
+    return list(db.scalars(stmt).all())
+
+
 def conferencia_por_dia_periodo(
     db: Session,
     *,
@@ -340,16 +467,19 @@ def conferencia_por_dia_periodo(
                 ConferenciaSaida.motoboy_id == motoboy_id,
                 ConferenciaSaida.data_ref >= periodo_inicio,
                 ConferenciaSaida.data_ref <= periodo_fim,
-            ).order_by(ConferenciaSaida.data_ref.asc())
+            ).order_by(ConferenciaSaida.data_ref.asc(), ConferenciaSaida.id.asc())
         ).all()
     )
+    por_dia: Dict[date, List[str]] = {}
+    for r in rows:
+        por_dia.setdefault(r.data_ref, []).append(r.status)
     return [
         {
-            "data": r.data_ref.isoformat(),
-            "status": r.status,
-            "label": label_fechamento(r.status),
+            "data": dia.isoformat(),
+            "status": status_agrupado_conferencia(statuses),
+            "label": label_fechamento(status_agrupado_conferencia(statuses)),
         }
-        for r in rows
+        for dia, statuses in sorted(por_dia.items(), key=lambda item: item[0])
     ]
 
 
@@ -361,7 +491,7 @@ def status_conferencia_registrada_motoboys(
     periodo_inicio: date,
     periodo_fim: date,
 ) -> Dict[Tuple[int, date], str]:
-    """Status gravado por (motoboy_id, data_ref) — uma consulta para todos os motoboys."""
+    """Status agrupado por (motoboy_id, data_ref) — uma consulta para todos os motoboys."""
     ids = sorted({int(m) for m in motoboy_ids if m is not None})
     if not ids:
         return {}
@@ -373,7 +503,10 @@ def status_conferencia_registrada_motoboys(
             ConferenciaSaida.data_ref <= periodo_fim,
         )
     ).all()
-    return {(int(mid), d): st for mid, d, st in rows}
+    por_chave: Dict[Tuple[int, date], List[str]] = {}
+    for mid, d, st in rows:
+        por_chave.setdefault((int(mid), d), []).append(st)
+    return {chave: status_agrupado_conferencia(statuses) for chave, statuses in por_chave.items()}
 
 
 def conferir_saida(
@@ -384,37 +517,67 @@ def conferir_saida(
     data_ref: date,
     user_id: Optional[int],
 ) -> ConferenciaSaida:
-    row = db.scalar(
-        select(ConferenciaSaida).where(
-            ConferenciaSaida.sub_base == sub_base,
-            ConferenciaSaida.motoboy_id == motoboy_id,
-            ConferenciaSaida.data_ref == data_ref,
-        )
+    """Confere todas as linhas abertas do motoboy/dia (sessões e legado)."""
+    rows = carregar_conferencias_motoboy_dia(
+        db,
+        sub_base=sub_base,
+        motoboy_id=motoboy_id,
+        data_ref=data_ref,
+        travar=True,
     )
-    if row is None:
+    if not rows:
         raise ValueError("CONFERENCIA_NAO_ENCONTRADA")
 
-    saidas = listar_saidas_motoboy_dia(
-        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
-    )
-    # Reconferência usa evento distinto para histórico / última ação.
-    evento_hist = (
-        "saida_reconferida" if row.status == STATUS_RECONFERIR else "saida_conferida"
-    )
     now = datetime.utcnow()
-    row.status = STATUS_CONFERIDA
-    row.conferido_por = user_id
-    row.conferido_em = now
-    row.qtd_no_momento = len(saidas)
+    sessao_ids = [int(r.sessao_id) for r in rows if r.sessao_id is not None]
+    por_sessao = _saidas_operacionais_por_sessao_ids(
+        db, sub_base=sub_base, sessao_ids=sessao_ids
+    )
+    tem_sessao = bool(sessao_ids)
+    saidas_legado: Optional[List[Saida]] = None
 
-    for s in saidas:
-        db.add(
-            SaidaHistorico(
-                id_saida=s.id_saida,
-                evento=evento_hist,
-                status_anterior=s.status,
-                status_novo=s.status,
-                user_id=user_id,
-            )
+    for row in rows:
+        if row.status == STATUS_CONFERIDA:
+            continue
+        evento_hist = (
+            "saida_reconferida" if row.status == STATUS_RECONFERIR else "saida_conferida"
         )
-    return row
+        if row.sessao_id is not None:
+            saidas = por_sessao.get(int(row.sessao_id), [])
+            for s in saidas:
+                db.add(
+                    SaidaHistorico(
+                        id_saida=s.id_saida,
+                        evento=evento_hist,
+                        status_anterior=s.status,
+                        status_novo=s.status,
+                        motoboy_id_anterior=s.motoboy_id,
+                        motoboy_id_novo=s.motoboy_id,
+                        user_id=user_id,
+                        payload=json.dumps({"sessao_id": int(row.sessao_id)}),
+                    )
+                )
+            row.qtd_no_momento = len(saidas)
+        else:
+            # Com sessões no dia, o legado só fecha o status; sem sessão, confere o dia.
+            if not tem_sessao:
+                if saidas_legado is None:
+                    saidas_legado = listar_saidas_motoboy_dia(
+                        db, sub_base=sub_base, motoboy_id=motoboy_id, data_ref=data_ref
+                    )
+                for s in saidas_legado:
+                    db.add(
+                        SaidaHistorico(
+                            id_saida=s.id_saida,
+                            evento=evento_hist,
+                            status_anterior=s.status,
+                            status_novo=s.status,
+                            user_id=user_id,
+                        )
+                    )
+                row.qtd_no_momento = len(saidas_legado)
+        row.status = STATUS_CONFERIDA
+        row.conferido_por = user_id
+        row.conferido_em = now
+
+    return rows[0]

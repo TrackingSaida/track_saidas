@@ -27,6 +27,7 @@ from models import Owner, User
 router = APIRouter(prefix="/politicas", tags=["Políticas gerais"])
 
 MODOS_OPERACAO = {"codigo", "coleta_manual", "ambos"}
+MODOS_PARTICIPANTES = {"n", "um"}
 
 
 class OperacaoPoliticas(BaseModel):
@@ -39,12 +40,14 @@ class OperacaoPoliticas(BaseModel):
     devolucao_sub_base_habilitada: bool = False
     pix_receber: Optional[str] = None
     pix_receber_tipo: Optional[str] = None
+    coleta_participantes_modo: str = "n"
 
 
 class PadroesMotoboyPoliticas(BaseModel):
     """Preset oficial: ler saídas + avulso coleta + foto; demais off."""
 
     pode_realizar_coleta: bool = False
+    pode_realizar_entrada: bool = False
     pode_ler_saida: bool = True
     pode_digitar_codigo_manual: bool = False
     pode_lancar_avulso: bool = True
@@ -85,10 +88,12 @@ class OperacaoPoliticasPatch(BaseModel):
     devolucao_sub_base_habilitada: Optional[bool] = None
     pix_receber: Optional[str] = Field(default=None, max_length=140)
     pix_receber_tipo: Optional[str] = Field(default=None, max_length=20)
+    coleta_participantes_modo: Optional[str] = None
 
 
 class PadroesMotoboyPatch(BaseModel):
     pode_realizar_coleta: Optional[bool] = None
+    pode_realizar_entrada: Optional[bool] = None
     pode_ler_saida: Optional[bool] = None
     pode_digitar_codigo_manual: Optional[bool] = None
     pode_lancar_avulso: Optional[bool] = None
@@ -148,6 +153,7 @@ def _owner_to_out(
         avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
         padroes = PadroesMotoboyPoliticas(
             pode_realizar_coleta=bool(getattr(owner, "default_pode_realizar_coleta", False)),
+            pode_realizar_entrada=bool(getattr(owner, "default_pode_realizar_entrada", False)),
             pode_ler_saida=bool(getattr(owner, "default_pode_ler_saida", True)),
             pode_digitar_codigo_manual=bool(getattr(owner, "default_pode_digitar_codigo_manual", False)),
             pode_lancar_avulso=bool(avulso_coleta or avulso_saida),
@@ -155,6 +161,9 @@ def _owner_to_out(
             pode_criar_avulso_saida=avulso_saida,
             avulso_exige_foto=bool(getattr(owner, "default_avulso_exige_foto", True)),
         )
+    modo_part = (getattr(owner, "coleta_participantes_modo", None) or "n").strip().lower() or "n"
+    if modo_part not in MODOS_PARTICIPANTES:
+        modo_part = "n"
     return PoliticasOut(
         operacao=OperacaoPoliticas(
             coleta_habilitada=not bool(owner.ignorar_coleta),
@@ -168,6 +177,7 @@ def _owner_to_out(
             devolucao_sub_base_habilitada=bool(getattr(owner, "devolucao_sub_base_habilitada", False)),
             pix_receber=(getattr(owner, "pix_receber", None) or "").strip() or None,
             pix_receber_tipo=(getattr(owner, "pix_receber_tipo", None) or "").strip() or None,
+            coleta_participantes_modo=modo_part,
         ),
         padroes_motoboy=padroes,
         cobertura=CoberturaPoliticas(
@@ -188,6 +198,7 @@ def _padroes_from_owner(owner: Owner) -> PadroesMotoboyPoliticas:
     avulso_coleta, avulso_saida = resolve_owner_avulso_defaults(owner)
     return PadroesMotoboyPoliticas(
         pode_realizar_coleta=bool(getattr(owner, "default_pode_realizar_coleta", False)),
+        pode_realizar_entrada=bool(getattr(owner, "default_pode_realizar_entrada", False)),
         pode_ler_saida=bool(getattr(owner, "default_pode_ler_saida", True)),
         pode_digitar_codigo_manual=bool(getattr(owner, "default_pode_digitar_codigo_manual", False)),
         pode_lancar_avulso=bool(avulso_coleta or avulso_saida),
@@ -200,6 +211,7 @@ def _padroes_from_owner(owner: Owner) -> PadroesMotoboyPoliticas:
 def _restore_owner_padroes(owner: Owner, pad: PadroesMotoboyPoliticas) -> None:
     """Reaplica snapshot no objeto após commit (expire_on_commit) sem SELECT stale."""
     owner.default_pode_realizar_coleta = bool(pad.pode_realizar_coleta)
+    owner.default_pode_realizar_entrada = bool(pad.pode_realizar_entrada)
     owner.default_pode_ler_saida = bool(pad.pode_ler_saida)
     owner.default_pode_digitar_codigo_manual = bool(pad.pode_digitar_codigo_manual)
     owner.default_pode_criar_avulso_coleta = bool(pad.pode_criar_avulso_coleta)
@@ -256,6 +268,8 @@ def patch_politicas(
             operacao_changed = True
         if op.entrada_habilitada is not None:
             owner.entrada_obrigatoria_habilitada = bool(op.entrada_habilitada)
+            if not owner.entrada_obrigatoria_habilitada:
+                owner.default_pode_realizar_entrada = False
             operacao_changed = True
         if op.conferencia_saida_habilitada is not None:
             owner.conferencia_saida_habilitada = bool(op.conferencia_saida_habilitada)
@@ -277,11 +291,21 @@ def patch_politicas(
                 raise HTTPException(422, str(exc)) from exc
             owner.pix_receber_tipo = tipo
             owner.pix_receber = chave
+        if op.coleta_participantes_modo is not None:
+            modo_part = op.coleta_participantes_modo.strip().lower()
+            if modo_part not in MODOS_PARTICIPANTES:
+                raise HTTPException(422, "coleta_participantes_modo deve ser 'n' ou 'um'.")
+            owner.coleta_participantes_modo = modo_part
+            operacao_changed = True
 
     if body.padroes_motoboy:
         p = body.padroes_motoboy
         if p.pode_realizar_coleta is not None:
             owner.default_pode_realizar_coleta = bool(p.pode_realizar_coleta)
+        if p.pode_realizar_entrada is not None:
+            owner.default_pode_realizar_entrada = bool(p.pode_realizar_entrada)
+            if not bool(owner.entrada_obrigatoria_habilitada):
+                owner.default_pode_realizar_entrada = False
         if p.pode_ler_saida is not None:
             owner.default_pode_ler_saida = bool(p.pode_ler_saida)
         if p.pode_digitar_codigo_manual is not None:
@@ -321,9 +345,13 @@ def patch_politicas(
         users_role4 = list_users_role4_da_sub_base(db, sub_base)
         sem_perfil = sum(1 for u in users_role4 if getattr(u, "motoboy", None) is None)
         motoboys = list_motoboys_da_sub_base(db, sub_base)
+        entrada_default = bool(owner.default_pode_realizar_entrada) and bool(
+            owner.entrada_obrigatoria_habilitada
+        )
         for m in motoboys:
             m.pode_realizar_coleta = bool(owner.default_pode_realizar_coleta)
             m.pode_ler_coleta = bool(owner.default_pode_realizar_coleta)
+            m.pode_realizar_entrada = entrada_default
             m.pode_ler_saida = bool(owner.default_pode_ler_saida)
             m.pode_digitar_codigo_manual = bool(owner.default_pode_digitar_codigo_manual)
             apply_motoboy_avulso_padroes(

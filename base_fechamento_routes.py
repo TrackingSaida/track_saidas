@@ -7,17 +7,19 @@ POST /coletas/fechamentos/lote — gerar em lote as bases elegíveis
 POST /coletas/fechamentos/marcar-recebido — baixar recebimentos
 POST /coletas/fechamentos — criar
 GET /coletas/fechamentos/{id_fechamento} — obter (para modal)
+GET /coletas/fechamentos/{id_fechamento}/extrato — extrato detalhado (códigos)
 PATCH /coletas/fechamentos/{id_fechamento} — reajustar
+DELETE /coletas/fechamentos/{id_fechamento} — excluir gerado ou reajustado
 """
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -39,15 +41,27 @@ from base_fechamento_status_pure import (
     MOTIVO_JA_GERADO,
     fechamento_base_divergente,
     motivo_bloqueio_lote_base,
+    normalizar_status_fechamento_base,
     status_base_permite_reajuste,
 )
 from fechamento_base_ciclo_pure import (
+    MOTIVO_PERIODO_ABERTO,
     MOTIVO_PERIODO_FECHAMENTO,
     aviso_ciclo_fechamento,
+    listar_dias_pendentes_agenda,
     normalizar_periodo_fechamento,
+    status_coleta_satisfaz_fechamento,
+    periodo_aberto_para_base,
     resolver_pix_receber,
 )
 from coletas import _decimal, _get_precos_cached, _sub_base_from_token_or_422
+from fechamento_extrato_pure import (
+    calcular_divergencia,
+    montar_linhas_extrato,
+    montar_mensagem_divergencia,
+    totais_cancelados_itens,
+    totais_de_itens_fechamento,
+)
 from fechamento_valor_pure import adicional_g
 from pacote_g_categorias import (
     SERVICOS_G,
@@ -56,6 +70,7 @@ from pacote_g_categorias import (
     padrao_id_ou_none,
     regras_por_categoria,
 )
+from pedido_sincronizado import sincronizado_nao_coletado
 
 router = APIRouter(prefix="/fechamentos", tags=["Fechamentos Bases"])
 
@@ -123,8 +138,9 @@ def _resumo_calendario_fechamento(
     ).all()
     globais = {item.data: item for item in excecoes if item.base_id is None}
     por_base = {item.data: item for item in excecoes if item.base_id == base.id_base}
-    execucoes = {
-        item.data_operacao: item
+    # Só execução encerrada satisfaz o dia; em_coleta continua pendente.
+    execucoes_ok = {
+        item.data_operacao
         for item in db.scalars(
             select(ColetaExecucao).where(
                 ColetaExecucao.sub_base == sub_base,
@@ -133,6 +149,7 @@ def _resumo_calendario_fechamento(
                 ColetaExecucao.data_operacao <= periodo_fim,
             )
         ).all()
+        if status_coleta_satisfaz_fechamento(item.status)
     }
     # Compatibilidade: coletas anteriores à migração ainda vivem apenas na
     # tabela legada e devem satisfazer a agenda da base.
@@ -148,26 +165,39 @@ def _resumo_calendario_fechamento(
         ).all()
     }
     dias_configurados = set(base.dias_coleta or [])
+    tipos: Dict[date, str] = {}
+    for data, item in globais.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
+    for data, item in por_base.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
     esperado = com_lancamento = feriados = justificados = 0
-    pendentes: list[dict] = []
     cursor = periodo_inicio
     while cursor <= periodo_fim:
-        excecao = por_base.get(cursor) or globais.get(cursor)
+        tipo = (tipos.get(cursor) or "").strip().upper()
         programado = cursor.isoweekday() in dias_configurados
-        coleta_extra = bool(excecao and excecao.tipo == "COLETA_EXTRA")
+        coleta_extra = tipo == "COLETA_EXTRA"
         if not programado and not coleta_extra:
             cursor += timedelta(days=1)
             continue
         esperado += 1
-        if cursor in execucoes or cursor in lancamentos_legados:
+        if cursor in execucoes_ok or cursor in lancamentos_legados:
             com_lancamento += 1
-        elif excecao and excecao.tipo == "FERIADO":
+        elif tipo == "FERIADO":
             feriados += 1
-        elif excecao and excecao.tipo in ("SEM_COLETA", "JUSTIFICADO"):
+        elif tipo in ("SEM_COLETA", "JUSTIFICADO"):
             justificados += 1
-        else:
-            pendentes.append({"data": cursor.isoformat(), "status": "PENDENTE"})
         cursor += timedelta(days=1)
+    pendentes_iso = listar_dias_pendentes_agenda(
+        periodo_inicio,
+        periodo_fim,
+        list(base.dias_coleta or []),
+        execucoes_ok=execucoes_ok,
+        lancamentos_legados=lancamentos_legados,
+        excecoes_tipo_por_data=tipos,
+    )
+    pendentes = [{"data": d, "status": "PENDENTE"} for d in pendentes_iso]
     return {
         "coleta_habilitada": True,
         "agenda_confirmada": True,
@@ -321,14 +351,155 @@ def _ciclo_da_base(
         )
     )
     codigo = None
+    dias_coleta = None
     if preco is not None:
         try:
             codigo = normalizar_periodo_fechamento(getattr(preco, "periodo_fechamento", None))
         except ValueError:
             codigo = None
         nome = (preco.base or nome).strip() or nome
-    aviso = aviso_ciclo_fechamento(nome, codigo, periodo_inicio, periodo_fim)
+        dias_coleta = list(getattr(preco, "dias_coleta", None) or [])
+    aviso = aviso_ciclo_fechamento(
+        nome, codigo, periodo_inicio, periodo_fim, dias_coleta=dias_coleta
+    )
     return codigo, aviso
+
+
+def _tipos_excecao_por_data(
+    excecoes: Iterable,
+    base_id: Optional[int],
+) -> Dict[date, str]:
+    """Merge global + override por base (mesma regra do calendário de pendências)."""
+    globais: Dict[date, str] = {}
+    por_base: Dict[date, str] = {}
+    for item in excecoes or ():
+        tipo = (getattr(item, "tipo", None) or "").strip().upper()
+        if not tipo:
+            continue
+        data = getattr(item, "data", None)
+        if data is None:
+            continue
+        item_base_id = getattr(item, "base_id", None)
+        if item_base_id is None:
+            globais[data] = tipo
+        elif base_id is not None and int(item_base_id) == int(base_id):
+            por_base[data] = tipo
+    tipos = dict(globais)
+    tipos.update(por_base)
+    return tipos
+
+
+def _preco_da_base(db: Session, sub_base: str, base_nome: str) -> Optional[BasePreco]:
+    nome = (base_nome or "").strip()
+    if not nome:
+        return None
+    return db.scalar(
+        select(BasePreco).where(
+            BasePreco.sub_base == sub_base,
+            func.upper(BasePreco.base) == nome.upper(),
+        )
+    )
+
+
+def _datas_coleta_extra(
+    db: Session,
+    sub_base: str,
+    preco: Optional[BasePreco],
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> set[date]:
+    if periodo_inicio > periodo_fim:
+        return set()
+    base_id = getattr(preco, "id_base", None) if preco is not None else None
+    stmt = select(ColetaCalendarioExcecao).where(
+        ColetaCalendarioExcecao.sub_base == sub_base,
+        ColetaCalendarioExcecao.data >= periodo_inicio,
+        ColetaCalendarioExcecao.data <= periodo_fim,
+        ColetaCalendarioExcecao.tipo == "COLETA_EXTRA",
+    )
+    if base_id is not None:
+        stmt = stmt.where(
+            or_(
+                ColetaCalendarioExcecao.base_id == base_id,
+                ColetaCalendarioExcecao.base_id.is_(None),
+            )
+        )
+    else:
+        stmt = stmt.where(ColetaCalendarioExcecao.base_id.is_(None))
+    return {item.data for item in db.scalars(stmt).all()}
+
+
+def _excecoes_calendario_periodo(
+    db: Session,
+    sub_base: str,
+    preco: Optional[BasePreco],
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> list:
+    if periodo_inicio > periodo_fim:
+        return []
+    base_id = getattr(preco, "id_base", None) if preco is not None else None
+    stmt = select(ColetaCalendarioExcecao).where(
+        ColetaCalendarioExcecao.sub_base == sub_base,
+        ColetaCalendarioExcecao.data >= periodo_inicio,
+        ColetaCalendarioExcecao.data <= periodo_fim,
+    )
+    if base_id is not None:
+        stmt = stmt.where(
+            or_(
+                ColetaCalendarioExcecao.base_id == base_id,
+                ColetaCalendarioExcecao.base_id.is_(None),
+            )
+        )
+    else:
+        stmt = stmt.where(ColetaCalendarioExcecao.base_id.is_(None))
+    return list(db.scalars(stmt).all())
+
+
+def _periodo_ainda_aberto_base(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    hoje: Optional[date] = None,
+    preco: Optional[BasePreco] = None,
+) -> bool:
+    """True se a base ainda tem dia de coleta no intervalo em aberto."""
+    ref = hoje or date.today()
+    preco_base = preco if preco is not None else _preco_da_base(db, sub_base, base_nome)
+    dias = list(getattr(preco_base, "dias_coleta", None) or []) if preco_base is not None else []
+    extras = _datas_coleta_extra(db, sub_base, preco_base, periodo_inicio, periodo_fim)
+    base_id = getattr(preco_base, "id_base", None) if preco_base is not None else None
+    tipos = _tipos_excecao_por_data(
+        _excecoes_calendario_periodo(db, sub_base, preco_base, periodo_inicio, periodo_fim),
+        int(base_id) if base_id is not None else None,
+    )
+    return periodo_aberto_para_base(
+        periodo_inicio,
+        periodo_fim,
+        ref,
+        dias,
+        extras,
+        excecoes_tipo_por_data=tipos,
+    )
+
+
+def _exigir_periodo_encerrado_base(
+    db: Session,
+    sub_base: str,
+    base_nome: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> None:
+    if _periodo_ainda_aberto_base(db, sub_base, base_nome, periodo_inicio, periodo_fim):
+        raise HTTPException(
+            400,
+            "Não é permitido gerar fechamento enquanto ainda houver dia de coleta "
+            "futuro neste período. Justifique os dias restantes (feriado, sem coleta) "
+            "ou aguarde o último dia da agenda da base.",
+        )
 
 
 def _emitido_por(db: Session, sub_base: str) -> str:
@@ -721,6 +892,7 @@ class CalcularOut(BaseModel):
     calendario: dict
     periodo_fechamento: Optional[str] = None
     aviso_ciclo: Optional[str] = None
+    periodo_aberto: bool = False
 
 
 class FechamentoOut(BaseModel):
@@ -754,6 +926,67 @@ class FechamentoOut(BaseModel):
     valor_final_recalculado: Optional[Decimal] = None
     seller_info: Optional[Dict[str, Any]] = None
     emitido_por: Optional[str] = None
+
+
+class ExtratoLinhaOut(BaseModel):
+    data: str
+    codigo: str
+    servico: str
+    servico_tipo: str
+    quantidade: int = 1
+    origem: str
+    status: Optional[str] = None
+    is_grande: bool = False
+
+
+class ExtratoTotaisOut(BaseModel):
+    shopee: int = 0
+    ml: int = 0
+    avulso: int = 0
+    total: int = 0
+
+
+class ExtratoDivergenciaOut(BaseModel):
+    divergente: bool = False
+    deltas: Dict[str, int] = Field(default_factory=dict)
+    total_fechamento: int = 0
+    total_extrato: int = 0
+    diferenca_total: int = 0
+    mensagem: Optional[str] = None
+
+
+class FechamentoExtratoOut(BaseModel):
+    id_fechamento: int
+    base: str
+    periodo_inicio: date
+    periodo_fim: date
+    status: str
+    linhas: List[ExtratoLinhaOut]
+    cancelados: List[ExtratoLinhaOut] = []
+    pacotes_g: List[ExtratoLinhaOut] = []
+    totais_extrato: ExtratoTotaisOut
+    totais_fechamento: ExtratoTotaisOut
+    totais_sem_codigo: ExtratoTotaisOut
+    totais_cancelados_extrato: ExtratoTotaisOut
+    totais_cancelados_fechamento: ExtratoTotaisOut
+    divergencia: ExtratoDivergenciaOut
+    seller_info: Optional[Dict[str, Any]] = None
+    emitido_por: Optional[str] = None
+    valor_bruto: Decimal = Decimal("0.00")
+    valor_cancelados: Decimal = Decimal("0.00")
+    valor_adicao: Decimal = Decimal("0.00")
+    valor_subtracao: Decimal = Decimal("0.00")
+    valor_final: Decimal = Decimal("0.00")
+    motivo_adicao: Optional[str] = None
+    motivo_subtracao: Optional[str] = None
+    total_g_shopee: int = 0
+    total_g_ml: int = 0
+    total_g_avulso: int = 0
+    total_pacotes_g: int = 0
+    valor_g: Decimal = Decimal("0.00")
+    ajuste_g_valor: Optional[Decimal] = None
+    itens: List[FechamentoItemOut] = []
+    precos: dict = Field(default_factory=dict)
 
 
 class FechamentoReceberItem(BaseModel):
@@ -930,12 +1163,6 @@ def calcular_fechamento(
     sub_base = _sub_base_from_token_or_422(current_user)
     if periodo_inicio > periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if periodo_fim >= date.today():
-        raise HTTPException(
-            400,
-            "Não é permitido calcular fechamento para período ainda em aberto. "
-            "Escolha um período cuja data final seja anterior à data de hoje.",
-        )
 
     itens, valor_bruto, valor_cancelados, valor_final = _build_itens_e_valores(
         db, sub_base, base, periodo_inicio, periodo_fim
@@ -963,6 +1190,9 @@ def calcular_fechamento(
         db, sub_base, base, periodo_inicio, periodo_fim
     )
     periodo_codigo, aviso_ciclo = _ciclo_da_base(db, sub_base, base, periodo_inicio, periodo_fim)
+    periodo_aberto = _periodo_ainda_aberto_base(
+        db, sub_base, base, periodo_inicio, periodo_fim
+    )
 
     return CalcularOut(
         base=base.strip(),
@@ -987,6 +1217,7 @@ def calcular_fechamento(
         calendario=calendario,
         periodo_fechamento=periodo_codigo,
         aviso_ciclo=aviso_ciclo,
+        periodo_aberto=periodo_aberto,
     )
 
 
@@ -1002,14 +1233,11 @@ def _criar_fechamento_base_core(
     """Valida e insere o fechamento (sem commit). Retorna (fechamento, itens, ajuste_g)."""
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if payload.periodo_fim >= date.today():
-        raise HTTPException(
-            400,
-            "Não é permitido criar fechamento para período ainda em aberto. "
-            "Escolha um período cuja data final seja anterior à data de hoje.",
-        )
 
     base_norm = payload.base.strip()
+    _exigir_periodo_encerrado_base(
+        db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
+    )
     _, aviso_ciclo = _ciclo_da_base(
         db, sub_base, base_norm, payload.periodo_inicio, payload.periodo_fim
     )
@@ -1393,7 +1621,10 @@ def _dias_pendentes_calendario_em_memoria(
     execucoes_datas: set,
     lancamentos_legados: set,
 ) -> List[str]:
-    """Mesma regra de `_resumo_calendario_fechamento`, sem novas consultas."""
+    """Mesma regra de `_resumo_calendario_fechamento`, sem novas consultas.
+
+    `execucoes_datas` deve conter só dias com status coletado/sem_volume.
+    """
     if ignorar_coleta:
         return []
     if not preco or not bool(preco.agenda_coleta_confirmada):
@@ -1403,24 +1634,21 @@ def _dias_pendentes_calendario_em_memoria(
     por_base = {
         item.data: item for item in excecoes if base_id is not None and item.base_id == base_id
     }
-    dias_configurados = set(preco.dias_coleta or [])
-    pendentes: List[str] = []
-    cursor = periodo_inicio
-    while cursor <= periodo_fim:
-        excecao = por_base.get(cursor) or globais.get(cursor)
-        programado = cursor.isoweekday() in dias_configurados
-        coleta_extra = bool(excecao and excecao.tipo == "COLETA_EXTRA")
-        if not programado and not coleta_extra:
-            cursor += timedelta(days=1)
-            continue
-        if cursor in execucoes_datas or cursor in lancamentos_legados:
-            pass
-        elif excecao and excecao.tipo in ("FERIADO", "SEM_COLETA", "JUSTIFICADO"):
-            pass
-        else:
-            pendentes.append(cursor.isoformat())
-        cursor += timedelta(days=1)
-    return pendentes
+    tipos: Dict[date, str] = {}
+    for data, item in globais.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
+    for data, item in por_base.items():
+        if item.tipo:
+            tipos[data] = str(item.tipo)
+    return listar_dias_pendentes_agenda(
+        periodo_inicio,
+        periodo_fim,
+        list(preco.dias_coleta or []),
+        execucoes_ok=execucoes_datas,
+        lancamentos_legados=lancamentos_legados,
+        excecoes_tipo_por_data=tipos,
+    )
 
 
 def _cnpj_por_base_precos(
@@ -1623,6 +1851,8 @@ def _linhas_resumo_por_base(
     ).all():
         if item.base_id is None:
             continue
+        if not status_coleta_satisfaz_fechamento(item.status):
+            continue
         execucoes_por_base_id.setdefault(int(item.base_id), set()).add(item.data_operacao)
 
     cnpj_por_chave = _cnpj_por_base_precos(db, sub_base, precos_por_chave)
@@ -1701,9 +1931,37 @@ def _linhas_resumo_por_base(
                 periodo_codigo = normalizar_periodo_fechamento(getattr(preco, "periodo_fechamento", None))
             except ValueError:
                 periodo_codigo = None
-            aviso_ciclo = aviso_ciclo_fechamento(nome, periodo_codigo, periodo_inicio, periodo_fim)
+            dias_coleta = list(getattr(preco, "dias_coleta", None) or [])
+            aviso_ciclo = aviso_ciclo_fechamento(
+                nome, periodo_codigo, periodo_inicio, periodo_fim, dias_coleta=dias_coleta
+            )
         if motivo is None and aviso_ciclo:
             motivo = MOTIVO_PERIODO_FECHAMENTO
+        if motivo is None:
+            base_id = getattr(preco, "id_base", None) if preco is not None else None
+            extras = {
+                item.data
+                for item in excecoes
+                if (item.tipo or "").strip().upper() == "COLETA_EXTRA"
+                and (
+                    item.base_id is None
+                    or (base_id is not None and item.base_id == base_id)
+                )
+            }
+            dias_coleta = list(getattr(preco, "dias_coleta", None) or []) if preco is not None else []
+            tipos = _tipos_excecao_por_data(
+                excecoes, int(base_id) if base_id is not None else None
+            )
+            # Sem agenda de coleta do owner, não bloqueia por dias futuros.
+            if (not ignorar_coleta) and periodo_aberto_para_base(
+                periodo_inicio,
+                periodo_fim,
+                date.today(),
+                dias_coleta,
+                extras,
+                excecoes_tipo_por_data=tipos,
+            ):
+                motivo = MOTIVO_PERIODO_ABERTO
         linhas.append(
             ResumoBaseLinha(
                 base=nome,
@@ -1782,8 +2040,6 @@ def criar_fechamentos_lote(
     sub_base = _sub_base_from_token_or_422(current_user)
     if payload.periodo_inicio > payload.periodo_fim:
         raise HTTPException(400, "periodo_inicio deve ser anterior a periodo_fim.")
-    if payload.periodo_fim >= date.today():
-        raise HTTPException(400, "O período ainda está em aberto. Escolha um período encerrado.")
 
     linhas = {
         linha.base.upper(): linha
@@ -1929,6 +2185,279 @@ def obter_fechamento(
         seller_info=seller_info,
         emitido_por=_emitido_por(db, sub_base),
     )
+
+
+def _totais_out(mapa: Dict[str, int]) -> ExtratoTotaisOut:
+    s = int(mapa.get("shopee") or 0)
+    m = int(mapa.get("ml") or 0)
+    a = int(mapa.get("avulso") or 0)
+    return ExtratoTotaisOut(shopee=s, ml=m, avulso=a, total=s + m + a)
+
+
+def _volumes_coleta_periodo(
+    db: Session,
+    sub_base: str,
+    base: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+) -> Dict[str, Dict[str, int]]:
+    from datetime import time as dt_time
+
+    base_key = base.strip().upper()
+    dt_start = datetime.combine(periodo_inicio, dt_time.min)
+    dt_end = datetime.combine(periodo_fim, dt_time(23, 59, 59))
+    rows = list(
+        db.scalars(
+            select(Coleta).where(
+                Coleta.sub_base == sub_base,
+                func.upper(Coleta.base) == base_key,
+                Coleta.timestamp >= dt_start,
+                Coleta.timestamp <= dt_end,
+            ).where(
+                (Coleta.shopee != 0)
+                | (Coleta.mercado_livre != 0)
+                | (Coleta.avulso != 0)
+                | (Coleta.valor_total != 0)
+            )
+        ).all()
+    )
+    volumes: Dict[str, Dict[str, int]] = {}
+    for r in rows:
+        dia = r.timestamp.date().isoformat()
+        if dia not in volumes:
+            volumes[dia] = {"shopee": 0, "ml": 0, "avulso": 0}
+        volumes[dia]["shopee"] += int(r.shopee or 0)
+        volumes[dia]["ml"] += int(r.mercado_livre or 0)
+        volumes[dia]["avulso"] += int(r.avulso or 0)
+    return volumes
+
+
+def _saidas_extrato_periodo(
+    db: Session,
+    sub_base: str,
+    base: str,
+    periodo_inicio: date,
+    periodo_fim: date,
+    *,
+    cancelados: bool,
+) -> List[Saida]:
+    base_key = base.strip().upper()
+    stmt = select(Saida).where(
+        Saida.sub_base == sub_base,
+        ~sincronizado_nao_coletado(),
+        Saida.data >= periodo_inicio,
+        Saida.data <= periodo_fim,
+    )
+    if base.strip():
+        stmt = stmt.where(func.upper(Saida.base) == base_key)
+    if cancelados:
+        stmt = stmt.where(func.lower(Saida.status) == "cancelado")
+    else:
+        stmt = stmt.where(func.lower(func.coalesce(Saida.status, "")) != "cancelado")
+    stmt = stmt.order_by(Saida.data, Saida.codigo, Saida.id_saida)
+    return list(db.scalars(stmt).all())
+
+
+def _codigo_linha_extrato(s: Saida, labels_avulso: Optional[Dict[int, str]] = None) -> str:
+    """Avulso usa campos de exibição; demais serviços mantêm o código interno."""
+    tipo = _normalizar_servico_saida(s.servico or "")
+    if tipo == "avulso" and labels_avulso:
+        sid = getattr(s, "id_saida", None)
+        if sid is not None:
+            label = (labels_avulso.get(int(sid)) or "").strip()
+            if label:
+                return label
+    return (s.codigo or "").strip() or "—"
+
+
+def _linha_de_saida(s: Saida, labels_avulso: Optional[Dict[int, str]] = None) -> dict:
+    tipo = _normalizar_servico_saida(s.servico or "")
+    from fechamento_extrato_pure import label_servico
+
+    return {
+        "data": (s.data or s.timestamp.date()).isoformat(),
+        "codigo": _codigo_linha_extrato(s, labels_avulso),
+        "servico": label_servico(tipo),
+        "servico_tipo": tipo,
+        "quantidade": 1,
+        "origem": "saida",
+        "status": s.status,
+        "is_grande": bool(getattr(s, "is_grande", False)),
+    }
+
+
+@router.get("/{id_fechamento}/extrato", response_model=FechamentoExtratoOut)
+def obter_extrato_fechamento(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Extrato detalhado: data operacional, código e serviço (PRD-019)."""
+    _exigir_admin_financeiro(current_user)
+    sub_base = _sub_base_from_token_or_422(current_user)
+    fech = db.get(BaseFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+
+    itens = list(
+        db.scalars(
+            select(BaseFechamentoItem)
+            .where(BaseFechamentoItem.id_fechamento == id_fechamento)
+            .order_by(BaseFechamentoItem.data)
+        ).all()
+    )
+    itens_out = [
+        FechamentoItemOut(
+            data=i.data.isoformat(),
+            shopee=i.shopee,
+            mercado_livre=i.mercado_livre,
+            avulso=i.avulso,
+            cancelados_shopee=i.cancelados_shopee,
+            cancelados_ml=i.cancelados_ml,
+            cancelados_avulso=i.cancelados_avulso,
+            pacotes_g=getattr(i, "pacotes_g", 0) or 0,
+            g_shopee=getattr(i, "g_shopee", 0) or 0,
+            g_ml=getattr(i, "g_ml", 0) or 0,
+            g_avulso=getattr(i, "g_avulso", 0) or 0,
+            g_categorias=getattr(i, "g_categorias", None),
+        )
+        for i in itens
+    ]
+
+    volumes = _volumes_coleta_periodo(
+        db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim
+    )
+    rows_ok = _saidas_extrato_periodo(
+        db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim, cancelados=False
+    )
+    rows_canc = _saidas_extrato_periodo(
+        db, sub_base, fech.base, fech.periodo_inicio, fech.periodo_fim, cancelados=True
+    )
+
+    from avulso_campos_service import labels_exibicao_por_saidas
+
+    avulso_rows = [
+        s
+        for s in list(rows_ok) + list(rows_canc)
+        if _normalizar_servico_saida(s.servico or "") == "avulso"
+    ]
+    labels_avulso = (
+        labels_exibicao_por_saidas(db, sub_base=sub_base, rows=avulso_rows)
+        if avulso_rows
+        else {}
+    )
+
+    saidas_payload = [
+        {
+            "data": (s.data or s.timestamp.date()).isoformat(),
+            "codigo": _codigo_linha_extrato(s, labels_avulso),
+            "servico_tipo": _normalizar_servico_saida(s.servico or ""),
+            "status": s.status,
+            "is_grande": bool(getattr(s, "is_grande", False)),
+        }
+        for s in rows_ok
+    ]
+    linhas_raw, totais_ext, totais_sem, _saldo = montar_linhas_extrato(
+        saidas=saidas_payload, volumes_coleta=volumes
+    )
+    cancelados_raw = [_linha_de_saida(s, labels_avulso) for s in rows_canc]
+    pacotes_g_raw = [
+        _linha_de_saida(s, labels_avulso) for s in rows_ok if getattr(s, "is_grande", False)
+    ]
+
+    totais_fech = totais_de_itens_fechamento(itens)
+    totais_canc_fech = totais_cancelados_itens(itens)
+    totais_canc_ext = {"shopee": 0, "ml": 0, "avulso": 0}
+    for c in cancelados_raw:
+        tipo = c.get("servico_tipo") or "avulso"
+        totais_canc_ext[tipo] = totais_canc_ext.get(tipo, 0) + int(c.get("quantidade") or 0)
+
+    precos_dec = _precos_base(db, sub_base, fech.base)
+    total_g_shopee = sum(getattr(i, "g_shopee", 0) or 0 for i in itens)
+    total_g_ml = sum(getattr(i, "g_ml", 0) or 0 for i in itens)
+    total_g_avulso = sum(getattr(i, "g_avulso", 0) or 0 for i in itens)
+    total_pacotes_g = sum(getattr(i, "pacotes_g", 0) or 0 for i in itens)
+
+    div = calcular_divergencia(
+        totais_fech,
+        totais_ext,
+        cancelados_fechamento=totais_canc_fech,
+        cancelados_extrato=totais_canc_ext,
+        pacotes_g_fechamento=total_pacotes_g,
+        pacotes_g_extrato=len(pacotes_g_raw),
+    )
+    mensagem = montar_mensagem_divergencia(
+        totais_sem_codigo=totais_sem,
+        divergencia=div,
+    )
+    if mensagem:
+        div["divergente"] = True
+
+    return FechamentoExtratoOut(
+        id_fechamento=fech.id_fechamento,
+        base=fech.base,
+        periodo_inicio=fech.periodo_inicio,
+        periodo_fim=fech.periodo_fim,
+        status=fech.status,
+        linhas=[ExtratoLinhaOut(**x) for x in linhas_raw],
+        cancelados=[ExtratoLinhaOut(**x) for x in cancelados_raw],
+        pacotes_g=[ExtratoLinhaOut(**x) for x in pacotes_g_raw],
+        totais_extrato=_totais_out(totais_ext),
+        totais_fechamento=_totais_out(totais_fech),
+        totais_sem_codigo=_totais_out(totais_sem),
+        totais_cancelados_extrato=_totais_out(totais_canc_ext),
+        totais_cancelados_fechamento=_totais_out(totais_canc_fech),
+        divergencia=ExtratoDivergenciaOut(
+            divergente=bool(div["divergente"]),
+            deltas=div["deltas"],
+            total_fechamento=div["total_fechamento"],
+            total_extrato=div["total_extrato"],
+            diferenca_total=div["diferenca_total"],
+            mensagem=mensagem,
+        ),
+        seller_info=_montar_seller_info(db, sub_base, fech.base),
+        emitido_por=_emitido_por(db, sub_base),
+        valor_bruto=fech.valor_bruto,
+        valor_cancelados=fech.valor_cancelados,
+        valor_adicao=getattr(fech, "valor_adicao", None) or Decimal("0.00"),
+        valor_subtracao=getattr(fech, "valor_subtracao", None) or Decimal("0.00"),
+        valor_final=fech.valor_final,
+        motivo_adicao=getattr(fech, "motivo_adicao", None),
+        motivo_subtracao=getattr(fech, "motivo_subtracao", None),
+        total_g_shopee=total_g_shopee,
+        total_g_ml=total_g_ml,
+        total_g_avulso=total_g_avulso,
+        total_pacotes_g=total_pacotes_g,
+        valor_g=getattr(fech, "valor_g", None) or Decimal("0.00"),
+        ajuste_g_valor=None,
+        itens=itens_out,
+        precos={k: float(v) for k, v in precos_dec.items()},
+    )
+
+
+# =========================================================
+# DELETE — Excluir fechamento ainda não recebido
+# =========================================================
+
+@router.delete("/{id_fechamento}", status_code=204)
+def excluir_fechamento(
+    id_fechamento: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Apaga um fechamento GERADO ou REAJUSTADO. Recebido não entra. As coletas permanecem."""
+    _exigir_admin_financeiro(current_user)
+    sub_base = _sub_base_from_token_or_422(current_user)
+    fech = db.get(BaseFechamento, id_fechamento)
+    if not fech or fech.sub_base != sub_base:
+        raise HTTPException(404, "Fechamento não encontrado.")
+    status = normalizar_status_fechamento_base(fech.status)
+    if status == STATUS_RECEBIDO:
+        raise HTTPException(400, "Fechamento recebido não pode ser excluído.")
+    if not status_base_permite_reajuste(fech.status):
+        raise HTTPException(400, "Só é possível excluir um fechamento gerado ou reajustado.")
+    db.delete(fech)
+    db.commit()
 
 
 # =========================================================

@@ -52,6 +52,7 @@ def build_rotas_ativa_out(
             "polyline_coords": None,
             "distancia_total_m": None,
             "duracao_total_s": None,
+            "transferencias_pendentes": [],
         }
 
     ordem_list = ordem if ordem is not None else []
@@ -76,5 +77,6 @@ def build_rotas_ativa_out(
         "started_at": started_iso,
         "updated_at": updated_iso,
         "optimization_mode": getattr(rota, "optimization_mode", None),
+        "transferencias_pendentes": [],
         **geom,
     }

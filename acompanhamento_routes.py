@@ -23,6 +23,7 @@ from saidas_routes import (
     STATUS_ENTREGUE,
     STATUS_AUSENTE,
 )
+from saida_operacional_pure import conta_como_saiu_para_entrega
 from saida_operacional_utils import (
     carregar_contexto_operacional,
     carregar_saidas_candidatas_periodo,
@@ -301,7 +302,7 @@ def acompanhamento_dia(
             st = normalizar_status_saida(s.status)
             if st == STATUS_ENTREGUE:
                 entregues += 1
-            elif st == STATUS_EM_ROTA:
+            elif st == STATUS_EM_ROTA or conta_como_saiu_para_entrega(s.status):
                 em_rota += 1
             elif st == STATUS_AUSENTE:
                 ausente_ou_ocorrencias += 1
