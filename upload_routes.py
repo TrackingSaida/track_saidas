@@ -226,6 +226,12 @@ def _status_amigavel(status: Optional[str]) -> str:
     return mapping.get(norm, (status or "—").strip() or "—")
 
 
+def _is_status_ocorrencia_label(status_label: Optional[str]) -> bool:
+    """Ausente na homol; também aceita o rótulo Ocorrência."""
+    s = (status_label or "").strip().lower()
+    return s in {"ausente", "ocorrência", "ocorrencia"}
+
+
 def _format_dt_br(value: Optional[datetime], *, assume_utc: bool = False) -> str:
     """Formata data/hora no fuso operacional (America/Sao_Paulo).
 
@@ -366,11 +372,25 @@ def _build_comprovante_resumo(
     }
 
 
-def _load_font(size: int, bold: bool = False):
+def _load_font(size: int, bold: bool = False, mono: bool = False):
     from PIL import ImageFont
 
     candidates = []
-    if bold:
+    if mono and bold:
+        candidates.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+            ]
+        )
+    elif mono:
+        candidates.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            ]
+        )
+    elif bold:
         candidates.extend(
             [
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -424,6 +444,9 @@ def _load_comprovante_logo(max_width: int = 220, max_height: int = 56):
                 continue
             with Image.open(path) as raw:
                 logo = raw.convert("RGBA")
+            bbox = logo.getbbox()
+            if bbox:
+                logo = logo.crop(bbox)
             if logo.width <= 0 or logo.height <= 0:
                 continue
             ratio = min(max_width / float(logo.width), max_height / float(logo.height), 1.0)
@@ -457,93 +480,225 @@ def _header_latin1_safe(value: Any, *, max_len: int = 200) -> str:
     return text
 
 
+def _px(scale: float, value: float) -> int:
+    return max(1, int(round(value * scale)))
+
+
+def _status_seal_colors(status: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int, int]]:
+    """Texto, ponto e fundo do selo. A cor fica só no sinal de status."""
+    if status == "Entregue":
+        return (21, 128, 61), (22, 163, 74), (243, 245, 244)
+    if _is_status_ocorrencia_label(status):
+        return (185, 28, 28), (220, 38, 38), (250, 246, 246)
+    return (29, 78, 216), (37, 99, 235), (243, 246, 252)
+
+
+def _cover_crop_4_3(photo: Any, target_width: int) -> Any:
+    from PIL import Image
+
+    target_h = max(1, int(round(target_width * 3 / 4)))
+    scale = max(target_width / float(photo.width), target_h / float(photo.height))
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+    resized = photo.resize(
+        (
+            max(1, int(round(photo.width * scale))),
+            max(1, int(round(photo.height * scale))),
+        ),
+        resample,
+    )
+    left = max(0, (resized.width - target_width) // 2)
+    top = max(0, (resized.height - target_h) // 2)
+    return resized.crop((left, top, left + target_width, top + target_h))
+
+
+def _text_chip(text: str, font: Any, pad_x: int, pad_y: int) -> Any:
+    from PIL import Image, ImageDraw
+
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bbox = probe.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    chip = Image.new("RGBA", (tw + pad_x * 2, th + pad_y * 2), (0, 0, 0, 158))
+    ImageDraw.Draw(chip).text(
+        (pad_x - bbox[0], pad_y - bbox[1]),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+    )
+    return chip
+
+
 def _build_comprovante_share_image_bytes(
     *, photo_bytes_list: List[bytes], resumo: Dict[str, Any]
 ) -> bytes:
-    """Monta cartão com logo + dados + até 3 fotos empilhadas (WhatsApp-friendly)."""
+    """Monta o cartão do comprovante: selo, código em mono e fotos 4:3.
+
+    O primeiro quadrado (largura × largura) precisa mostrar selo, código, data
+    e o início da primeira foto, que é o recorte do preview no WhatsApp.
+    """
     from PIL import Image, ImageDraw
 
     if not photo_bytes_list:
         raise ValueError("Nenhuma foto para montar o comprovante.")
 
-    photos: List[Any] = []
+    opened: List[Any] = []
     target_width = 720
     for raw in photo_bytes_list[:3]:
         with Image.open(BytesIO(raw)) as photo_raw:
             photo = photo_raw.convert("RGB")
         target_width = max(target_width, min(1080, photo.width))
-        photos.append(photo)
+        opened.append(photo)
+    photos = [_cover_crop_4_3(photo, target_width) for photo in opened]
 
-    resized: List[Any] = []
-    for photo in photos:
-        if photo.width != target_width:
-            ratio = target_width / float(photo.width)
-            photo = photo.resize((target_width, max(1, int(photo.height * ratio))))
-        resized.append(photo)
-    photos = resized
-
-    pad_x = 28
-    pad_y = 24
-    gap = 10
-    title_font = _load_font(34, bold=True)
-    label_font = _load_font(22, bold=True)
-    value_font = _load_font(24, bold=False)
-    footer_font = _load_font(18, bold=False)
-
+    scale = target_width / 360.0
+    pad = _px(scale, 16)
+    ink = (20, 18, 16)
+    meta_color = (92, 101, 109)
+    rule = (230, 228, 225)
     status = str(resumo.get("status") or "Comprovante")
-    title = f"Comprovante — {status}"
-    linhas: List[Tuple[str, str]] = list(resumo.get("linhas") or [])
-    logo = _load_comprovante_logo()
+    codigo = str(resumo.get("codigo") or "").strip() or "—"
+    data_hora = str(resumo.get("data_hora") or "").strip()
+    entregador = str(resumo.get("entregador") or "").strip()
+    meta_parts = [part for part in (data_hora, entregador) if part]
+    meta = " · ".join(meta_parts)
 
-    # Mede altura do cabeçalho
+    extras: List[Tuple[str, str]] = []
+    recebedor = str(resumo.get("nome_recebedor") or "").strip()
+    if recebedor:
+        extras.append(("Recebido por", recebedor))
+    motivo = str(resumo.get("motivo") or "").strip()
+    if motivo and _is_status_ocorrencia_label(status):
+        extras.append(("Motivo", motivo))
+    observacao = str(resumo.get("observacao") or "").strip()
+    if observacao:
+        extras.append(("Observação", observacao))
+
+    seal_font = _load_font(_px(scale, 12), bold=True)
+    code_font = _load_font(_px(scale, 26), mono=True)
+    meta_font = _load_font(_px(scale, 13))
+    extra_label_font = _load_font(_px(scale, 11), bold=True)
+    extra_value_font = _load_font(_px(scale, 13))
+    stamp_font = _load_font(_px(scale, 11), mono=True)
+    footer_font = _load_font(_px(scale, 12), bold=True)
+
     probe = Image.new("RGB", (target_width, 10), (255, 255, 255))
     probe_draw = ImageDraw.Draw(probe)
-    content_width = target_width - (pad_x * 2)
-    y = pad_y
-    if logo is not None:
-        y += logo.height + 14
-    y += probe_draw.textbbox((0, 0), title, font=title_font)[3] + 16
-    for label, value in linhas:
-        y += probe_draw.textbbox((0, 0), label, font=label_font)[3] + 4
-        for wrapped in _wrap_text(probe_draw, str(value), value_font, content_width):
-            y += probe_draw.textbbox((0, 0), wrapped, font=value_font)[3] + 2
-        y += 10
-    y += 8
-    header_h = y + pad_y
+    seal_text_box = probe_draw.textbbox((0, 0), status, font=seal_font)
+    seal_tw = seal_text_box[2] - seal_text_box[0]
+    seal_th = seal_text_box[3] - seal_text_box[1]
+    dot_d = _px(scale, 7)
+    seal_pad_x = _px(scale, 8)
+    seal_pad_y = _px(scale, 4)
+    seal_gap = _px(scale, 6)
+    seal_h = max(seal_th, dot_d) + seal_pad_y * 2
+    seal_w = seal_pad_x + dot_d + seal_gap + seal_tw + seal_pad_x
 
-    photos_h = sum(p.height for p in photos) + gap * max(0, len(photos) - 1)
-    canvas = Image.new("RGB", (target_width, header_h + photos_h), (248, 250, 252))
+    logo = _load_comprovante_logo(
+        max_width=max(1, target_width - pad * 2 - seal_w - _px(scale, 12)),
+        max_height=_px(scale, 32),
+    )
+    row_h = max(logo.height if logo is not None else 0, seal_h)
+    content_width = target_width - pad * 2
+
+    y = pad + row_h + _px(scale, 14)
+    code_box = probe_draw.textbbox((0, 0), codigo, font=code_font)
+    y += code_box[3] - code_box[1]
+    if meta:
+        y += _px(scale, 6)
+        meta_box = probe_draw.textbbox((0, 0), meta, font=meta_font)
+        y += meta_box[3] - meta_box[1]
+    extra_lines: List[Tuple[str, List[str]]] = []
+    for label, value in extras:
+        y += _px(scale, 10)
+        label_box = probe_draw.textbbox((0, 0), label, font=extra_label_font)
+        y += label_box[3] - label_box[1] + _px(scale, 2)
+        wrapped = _wrap_text(probe_draw, value, extra_value_font, content_width)
+        extra_lines.append((label, wrapped))
+        for line in wrapped:
+            line_box = probe_draw.textbbox((0, 0), line, font=extra_value_font)
+            y += line_box[3] - line_box[1] + _px(scale, 2)
+    y += _px(scale, 14)
+    header_h = y + 1
+
+    footer = "ROTEVO"
+    footer_box = probe_draw.textbbox((0, 0), footer, font=footer_font)
+    footer_h = _px(scale, 10) + (footer_box[3] - footer_box[1]) + _px(scale, 12)
+    photos_h = sum(photo.height for photo in photos)
+    canvas = Image.new("RGB", (target_width, header_h + photos_h + footer_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    # Faixa de status
-    accent = (22, 163, 74) if status == "Entregue" else ((220, 38, 38) if status == "Ausente" else (37, 99, 235))
-    draw.rectangle([(0, 0), (target_width, 8)], fill=accent)
-
-    y = pad_y + 4
+    y = pad
     if logo is not None:
-        canvas.paste(logo, (pad_x, y), logo)
-        y += logo.height + 14
+        canvas.paste(logo, (pad, y + (row_h - logo.height) // 2), logo)
+    seal_x = target_width - pad - seal_w
+    seal_y = y + (row_h - seal_h) // 2
+    text_color, dot_color, seal_bg = _status_seal_colors(status)
+    seal_box = (seal_x, seal_y, seal_x + seal_w, seal_y + seal_h)
+    if hasattr(draw, "rounded_rectangle"):
+        draw.rounded_rectangle(seal_box, radius=seal_h // 2, fill=seal_bg)
+    else:
+        draw.rectangle(seal_box, fill=seal_bg)
+    dot_y = seal_y + (seal_h - dot_d) // 2
+    draw.ellipse(
+        (seal_x + seal_pad_x, dot_y, seal_x + seal_pad_x + dot_d, dot_y + dot_d),
+        fill=dot_color,
+    )
+    draw.text(
+        (
+            seal_x + seal_pad_x + dot_d + seal_gap - seal_text_box[0],
+            seal_y + (seal_h - seal_th) // 2 - seal_text_box[1],
+        ),
+        status,
+        font=seal_font,
+        fill=text_color,
+    )
 
-    draw.text((pad_x, y), title, font=title_font, fill=(15, 23, 42))
-    y += draw.textbbox((0, 0), title, font=title_font)[3] + 16
+    y = pad + row_h + _px(scale, 14)
+    draw.text((pad - code_box[0], y - code_box[1]), codigo, font=code_font, fill=ink)
+    y += code_box[3] - code_box[1]
+    if meta:
+        y += _px(scale, 6)
+        meta_box = draw.textbbox((0, 0), meta, font=meta_font)
+        draw.text((pad - meta_box[0], y - meta_box[1]), meta, font=meta_font, fill=meta_color)
+        y += meta_box[3] - meta_box[1]
+    for label, wrapped in extra_lines:
+        y += _px(scale, 10)
+        label_box = draw.textbbox((0, 0), label, font=extra_label_font)
+        draw.text((pad - label_box[0], y - label_box[1]), label, font=extra_label_font, fill=meta_color)
+        y += label_box[3] - label_box[1] + _px(scale, 2)
+        for line in wrapped:
+            line_box = draw.textbbox((0, 0), line, font=extra_value_font)
+            draw.text((pad - line_box[0], y - line_box[1]), line, font=extra_value_font, fill=ink)
+            y += line_box[3] - line_box[1] + _px(scale, 2)
+    y += _px(scale, 14)
+    draw.line([(0, y), (target_width, y)], fill=rule)
 
-    for label, value in linhas:
-        draw.text((pad_x, y), label, font=label_font, fill=(100, 116, 139))
-        y += draw.textbbox((0, 0), label, font=label_font)[3] + 4
-        for wrapped in _wrap_text(draw, str(value), value_font, content_width):
-            draw.text((pad_x, y), wrapped, font=value_font, fill=(15, 23, 42))
-            y += draw.textbbox((0, 0), wrapped, font=value_font)[3] + 2
-        y += 10
+    photo_y = header_h
+    stamp_margin = _px(scale, 8)
+    chip_pad_x = _px(scale, 6)
+    chip_pad_y = _px(scale, 3)
+    total = len(photos)
+    for index, photo in enumerate(photos):
+        canvas.paste(photo, (0, photo_y))
+        if index:
+            draw.line([(0, photo_y), (target_width, photo_y)], fill=rule)
+        code_chip = _text_chip(f"cód. {codigo}", stamp_font, chip_pad_x, chip_pad_y)
+        index_chip = _text_chip(f"{index + 1}/{total}", stamp_font, chip_pad_x, chip_pad_y)
+        chip_y = photo_y + photo.height - stamp_margin - code_chip.height
+        canvas.paste(code_chip, (stamp_margin, chip_y), code_chip)
+        canvas.paste(
+            index_chip,
+            (target_width - stamp_margin - index_chip.width, chip_y),
+            index_chip,
+        )
+        photo_y += photo.height
 
-    footer = "ROTEVO — comprovante operacional"
-    draw.text((pad_x, header_h - pad_y - 4), footer, font=footer_font, fill=(148, 163, 184))
-
-    y = header_h
-    for i, photo in enumerate(photos):
-        canvas.paste(photo, (0, y))
-        y += photo.height
-        if i < len(photos) - 1:
-            y += gap
+    footer_box = draw.textbbox((0, 0), footer, font=footer_font)
+    draw.text(
+        (pad - footer_box[0], photo_y + _px(scale, 10) - footer_box[1]),
+        footer,
+        font=footer_font,
+        fill=(138, 145, 143),
+    )
 
     buf = BytesIO()
     canvas.save(buf, format="JPEG", quality=85, optimize=True)
@@ -897,7 +1052,7 @@ def export_comprovante(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Exporta JPEG com cartão + até 3 fotos do mesmo evento (empilhadas, WhatsApp-friendly)."""
+    """Exporta JPEG do comprovante: selo, código e até 3 fotos 4:3 do mesmo evento."""
     sub_base = current_user.sub_base
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário inválido.")
@@ -910,13 +1065,9 @@ def export_comprovante(
         raise HTTPException(status_code=404, detail="Comprovante não encontrado.")
     image_list = _download_comprovante_keys(keys)
     try:
-        watermarked_list = [
-            _build_watermark_image_bytes(image_bytes=img, codigo=saida.codigo or "")
-            for img in image_list
-        ]
         resumo = _build_comprovante_resumo(db, saida=saida, detail=detail)
         share_image = _build_comprovante_share_image_bytes(
-            photo_bytes_list=watermarked_list, resumo=resumo
+            photo_bytes_list=image_list, resumo=resumo
         )
     except HTTPException:
         raise
@@ -927,7 +1078,7 @@ def export_comprovante(
         "export_share: id_saida=%s index=%s fotos=%s status=%s has_recebedor=%s user_id=%s",
         id_saida,
         body.index,
-        len(watermarked_list),
+        len(image_list),
         resumo.get("status"),
         bool(resumo.get("nome_recebedor")),
         getattr(current_user, "id", None),
@@ -948,6 +1099,6 @@ def export_comprovante(
             "X-Comprovante-Recebedor": _header_latin1_safe(resumo.get("nome_recebedor")),
             "X-Comprovante-Entregador": _header_latin1_safe(resumo.get("entregador")),
             "X-Comprovante-Index": str(body.index),
-            "X-Comprovante-Fotos": str(len(watermarked_list)),
+            "X-Comprovante-Fotos": str(len(image_list)),
         },
     )
