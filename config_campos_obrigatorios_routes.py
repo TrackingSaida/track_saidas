@@ -16,6 +16,9 @@ from models import PedidoCamposObrigatoriosConfig, User
 from pedido_campos_obrigatorios_service import (
     CONTEXTOS_VALIDOS,
     CAMPOS_VALIDOS,
+    CAMPOS_SO_ENTREGUE,
+    CAMPOS_VALIDOS_AUSENTE_AMBOS,
+    CONTEXTO_LABEL,
     normalize_contexto,
     normalize_campos_obrigatorios,
 )
@@ -76,7 +79,10 @@ def get_campos_obrigatorios_meta(
     return {
         "servicos": SERVICOS_DISPONIVEIS,
         "contextos": sorted(CONTEXTOS_VALIDOS),
+        "contexto_labels": {k: CONTEXTO_LABEL.get(k, k) for k in sorted(CONTEXTOS_VALIDOS)},
         "campos": sorted(CAMPOS_VALIDOS),
+        "campos_so_entregue": sorted(CAMPOS_SO_ENTREGUE),
+        "campos_validos_ausente_ambos": sorted(CAMPOS_VALIDOS_AUSENTE_AMBOS),
     }
 
 
@@ -108,11 +114,14 @@ def create_campos_obrigatorios_rule(
     if not sub_base:
         raise HTTPException(status_code=401, detail="Usuário sem sub_base.")
 
+    contexto = normalize_contexto(body.contexto)
     row = PedidoCamposObrigatoriosConfig(
         sub_base=sub_base,
         servico=canonicalize_servico(body.servico),
-        contexto=normalize_contexto(body.contexto),
-        campos_obrigatorios=json.dumps(normalize_campos_obrigatorios(body.campos_obrigatorios)),
+        contexto=contexto,
+        campos_obrigatorios=json.dumps(
+            normalize_campos_obrigatorios(body.campos_obrigatorios, contexto=contexto)
+        ),
         ativo=bool(body.ativo),
     )
     db.add(row)
@@ -137,9 +146,12 @@ def update_campos_obrigatorios_rule(
     if not row or row.sub_base != sub_base:
         raise HTTPException(status_code=404, detail="Regra não encontrada.")
 
+    contexto = normalize_contexto(body.contexto)
     row.servico = canonicalize_servico(body.servico)
-    row.contexto = normalize_contexto(body.contexto)
-    row.campos_obrigatorios = json.dumps(normalize_campos_obrigatorios(body.campos_obrigatorios))
+    row.contexto = contexto
+    row.campos_obrigatorios = json.dumps(
+        normalize_campos_obrigatorios(body.campos_obrigatorios, contexto=contexto)
+    )
     row.ativo = bool(body.ativo)
     db.commit()
     db.refresh(row)

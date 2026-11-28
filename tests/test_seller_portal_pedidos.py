@@ -38,7 +38,7 @@ def test_status_amigavel_seller():
     assert status_pedido_amigavel("COLETADO") == "Coletado"
     assert status_pedido_amigavel("EM_ROTA") == "Saiu para entrega"
     assert status_pedido_amigavel("SAIU_PARA_ENTREGA") == "Saiu para entrega"
-    assert status_pedido_amigavel("AUSENTE") == "Destinatário ausente"
+    assert status_pedido_amigavel("AUSENTE") == "Ocorrência"
     assert status_pedido_amigavel("ENTREGUE") == "Entregue"
     assert status_pedido_amigavel("CANCELADO") == "Cancelado"
 
@@ -124,7 +124,7 @@ def test_timeline_projeta_somente_eventos_do_seller(monkeypatch):
     )
     out = projetar_timeline_seller(MagicMock(), 9)
     # Mais recente no topo (padrão de tracking).
-    assert [x["titulo"] for x in out] == ["Destinatário ausente", "Pacote coletado"]
+    assert [x["titulo"] for x in out] == ["Ocorrência", "Pacote coletado"]
     assert out[0]["detalhe"] == "Tentativa 1: Não atendeu"
     assert "scan" not in str(out)
 

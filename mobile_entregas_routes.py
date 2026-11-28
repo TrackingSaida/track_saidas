@@ -169,7 +169,7 @@ class EntregaListItem(BaseModel):
     codigo: Optional[str]
     codigo_exibicao: Optional[str] = None  # rótulo amigável do avulso (campos de identificação)
     status: str
-    exibicao: str  # "Pendente" | "Entregue" | "Ausente"
+    exibicao: str  # "Pendente" | "Entregue" | "Ocorrência"
     servico: Optional[str] = None  # Shopee | Mercado Livre | Flex | Avulso
     cliente: Optional[str] = None
     bairro: Optional[str] = None
@@ -540,7 +540,7 @@ def _status_exibicao(status: Optional[str]) -> str:
     if s == STATUS_ENTREGUE:
         return "Entregue"
     if s == STATUS_AUSENTE:
-        return "Ausente"
+        return "Ocorrência"
     if s == STATUS_CANCELADO:
         return "Cancelado"
     if s == STATUS_ENCERRADO_SISTEMA:
@@ -3648,7 +3648,20 @@ def finalizar_lote(
                     logger.exception("push_bloqueio_ausencia_lote_failed id_saida=%s", id_saida)
             db.commit()
         except Exception:
-            logger.exception("push_bloqueio_ausencia_lote_batch_failed")
+            logger.exception("push_bloqueio_ausencia_lote_outer_failed")
+
+        try:
+            from pedido_recusado_service import talvez_notificar_recusado_apos_ausencia
+
+            motivo_desc = motivo.descricao if motivo is not None else None
+            talvez_notificar_recusado_apos_ausencia(
+                db,
+                sub_base=user.sub_base,
+                user=user,
+                ids_e_motivos=[(sid, motivo_desc) for sid, _codigo in ausencias_para_push],
+            )
+        except Exception:
+            logger.exception("push_pedido_recusado_lote_failed")
 
     rota_sync: Optional[RotaSyncOut] = None
     finalized_ids = {item.id_saida for item in finalizados}
@@ -4009,6 +4022,17 @@ def marcar_ausente(
             db.commit()
     except Exception:
         logger.exception("push_bloqueio_ausencia_failed id_saida=%s", id_saida)
+    try:
+        from pedido_recusado_service import talvez_notificar_recusado_apos_ausencia
+
+        talvez_notificar_recusado_apos_ausencia(
+            db,
+            sub_base=user.sub_base,
+            user=user,
+            ids_e_motivos=[(id_saida, motivo.descricao)],
+        )
+    except Exception:
+        logger.exception("push_pedido_recusado_failed id_saida=%s", id_saida)
     audit_entrega(
         "marcar_ausente_result",
         result="ok",
@@ -4193,6 +4217,43 @@ def listar_motivos_ausencia(
         select(MotivoAusencia).where(MotivoAusencia.ativo.is_(True)).order_by(MotivoAusencia.id)
     ).all()
     return [MotivoAusenciaOut(id=r.id, descricao=r.descricao) for r in rows]
+
+
+class PedidoRecusadoItemOut(BaseModel):
+    id_saida: int
+    codigo: Optional[str] = None
+    codigo_exibicao: Optional[str] = None
+    servico: Optional[str] = None
+
+
+class PedidosRecusadosOut(BaseModel):
+    total: int
+    items: List[PedidoRecusadoItemOut]
+
+
+# ============================================================
+# GET /mobile/pedidos-recusados — fila admin (ausente + motivo Recusado)
+# ============================================================
+@router.get("/pedidos-recusados", response_model=PedidosRecusadosOut)
+def listar_pedidos_recusados_admin(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Lista ausentes atuais com motivo Recusado da sub_base (root/admin)."""
+    from pedido_recusado_service import listar_pedidos_recusados, require_admin_root_sub_base
+
+    sub_base = require_admin_root_sub_base(user)
+    rows = listar_pedidos_recusados(db, sub_base=sub_base)
+    items = [
+        PedidoRecusadoItemOut(
+            id_saida=int(r["id_saida"]),
+            codigo=r.get("codigo"),
+            codigo_exibicao=r.get("codigo_exibicao"),
+            servico=r.get("servico"),
+        )
+        for r in rows
+    ]
+    return PedidosRecusadosOut(total=len(items), items=items)
 
 
 # ============================================================

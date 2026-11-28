@@ -40,6 +40,7 @@ ALWAYS_SEND_TYPES = frozenset(
         "transferencia_pendente",
         "transferencia_resolvida",
         "transferencia_recusada",
+        "pedido_recusado",
     }
 )
 

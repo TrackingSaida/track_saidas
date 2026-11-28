@@ -12,12 +12,19 @@ from models import PedidoCamposObrigatoriosConfig, Saida, SaidaDetail
 
 CONTEXTOS_VALIDOS = {"ENTREGUE", "AUSENTE", "AMBOS"}
 CAMPOS_VALIDOS = {"foto", "recebedor", "tipo_recebedor", "documento", "observacao"}
+CAMPOS_SO_ENTREGUE = frozenset({"recebedor", "tipo_recebedor", "documento"})
+CAMPOS_VALIDOS_AUSENTE_AMBOS = frozenset({"foto", "observacao"})
 CAMPO_LABEL: Dict[str, str] = {
     "foto": "Foto",
     "recebedor": "Recebedor",
     "tipo_recebedor": "Tipo Recebedor",
     "documento": "Documento",
     "observacao": "Observação",
+}
+CONTEXTO_LABEL: Dict[str, str] = {
+    "ENTREGUE": "Entregue",
+    "AUSENTE": "Ocorrência",
+    "AMBOS": "Ambos",
 }
 
 
@@ -28,7 +35,29 @@ def normalize_contexto(raw: str) -> str:
     return contexto
 
 
-def normalize_campos_obrigatorios(campos: Iterable[str]) -> List[str]:
+def filter_campos_for_contexto(campos: Iterable[str], contexto_efetivo: str) -> List[str]:
+    """Filtra campos pelo contexto efetivo da operação (ENTREGUE ou AUSENTE)."""
+    ctx = (contexto_efetivo or "").strip().upper()
+    out: List[str] = []
+    seen: Set[str] = set()
+    for campo in campos or []:
+        c = (campo or "").strip().lower()
+        if not c or c in seen:
+            continue
+        if ctx == "AUSENTE" and c in CAMPOS_SO_ENTREGUE:
+            continue
+        if c not in CAMPOS_VALIDOS:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
+def normalize_campos_obrigatorios(
+    campos: Iterable[str],
+    *,
+    contexto: Optional[str] = None,
+) -> List[str]:
     out: List[str] = []
     seen: Set[str] = set()
     for campo in campos or []:
@@ -41,6 +70,20 @@ def normalize_campos_obrigatorios(campos: Iterable[str]) -> List[str]:
             continue
         seen.add(c)
         out.append(c)
+    if contexto is not None:
+        ctx = normalize_contexto(contexto)
+        if ctx in {"AUSENTE", "AMBOS"}:
+            invalidos = [c for c in out if c in CAMPOS_SO_ENTREGUE]
+            if invalidos:
+                labels = [CAMPO_LABEL.get(c, c) for c in invalidos]
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Campos só de entrega não podem ser usados em contexto "
+                        f"{CONTEXTO_LABEL.get(ctx, ctx)}: {', '.join(labels)}. "
+                        "Use apenas Foto e/ou Observação, ou escolha o contexto Entregue."
+                    ),
+                )
     return out
 
 
@@ -75,7 +118,7 @@ def resolve_campos_obrigatorios_ativos(
     for row in rows:
         for c in parse_campos_obrigatorios_text(getattr(row, "campos_obrigatorios", "[]")):
             campos_union.add(c)
-    return sorted(campos_union)
+    return filter_campos_for_contexto(sorted(campos_union), contexto_norm)
 
 
 def build_campos_cache_for_sub_base(db: Session, *, sub_base: str) -> Dict[tuple, List[str]]:
@@ -106,7 +149,7 @@ def resolve_campos_obrigatorios_from_cache(
     servico_norm = canonicalize_servico(servico)
     contexto_norm = normalize_contexto(contexto)
     merged = set(cache.get((servico_norm, "AMBOS"), [])) | set(cache.get((servico_norm, contexto_norm), []))
-    return sorted(merged)
+    return filter_campos_for_contexto(sorted(merged), contexto_norm)
 
 
 def _has_foto(detail: Optional[SaidaDetail], overrides: Optional[Dict[str, Optional[str]]] = None) -> bool:

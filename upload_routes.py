@@ -223,6 +223,12 @@ def _status_amigavel(status: Optional[str]) -> str:
     return rotulo_situacao(raw)
 
 
+def _is_status_ocorrencia_label(status_label: Optional[str]) -> bool:
+    """Aceita rótulo novo (Ocorrência) e legado (Ausente) no comprovante."""
+    s = (status_label or "").strip().lower()
+    return s in {"ocorrência", "ocorrencia", "ausente"}
+
+
 def _format_dt_br(value: Optional[datetime], *, assume_utc: bool = False) -> str:
     """Formata data/hora no fuso operacional (America/Sao_Paulo).
 
@@ -316,7 +322,7 @@ def _build_comprovante_resumo(
     motivo = (getattr(detail, "motivo_ocorrencia", None) or "").strip() if detail else ""
     observacao = ""
     if detail:
-        if status_label == "Ausente":
+        if _is_status_ocorrencia_label(status_label):
             observacao = (detail.observacao_ocorrencia or "").strip()
         else:
             observacao = (detail.observacao_entrega or "").strip()
@@ -332,7 +338,7 @@ def _build_comprovante_resumo(
         linhas.append(("Recebido por", nome_recebedor))
     if entregador_primeiro:
         linhas.append((label_entregador, entregador_primeiro))
-    if motivo and status_label == "Ausente":
+    if motivo and _is_status_ocorrencia_label(status_label):
         linhas.append(("Motivo", motivo))
     if observacao:
         linhas.append(("Observação", observacao))
@@ -347,7 +353,7 @@ def _build_comprovante_resumo(
         caption_parts.append(f"Recebido por: {nome_recebedor}")
     if entregador_primeiro:
         caption_parts.append(f"{label_entregador}: {entregador_primeiro}")
-    if motivo and status_label == "Ausente":
+    if motivo and _is_status_ocorrencia_label(status_label):
         caption_parts.append(f"Motivo: {motivo}")
 
     return {
@@ -513,7 +519,11 @@ def _build_comprovante_share_image_bytes(
     draw = ImageDraw.Draw(canvas)
 
     # Faixa de status
-    accent = (22, 163, 74) if status == "Entregue" else ((220, 38, 38) if status == "Ausente" else (37, 99, 235))
+    accent = (
+        (22, 163, 74)
+        if status == "Entregue"
+        else ((220, 38, 38) if _is_status_ocorrencia_label(status) else (37, 99, 235))
+    )
     draw.rectangle([(0, 0), (target_width, 8)], fill=accent)
 
     y = pad_y + 4
