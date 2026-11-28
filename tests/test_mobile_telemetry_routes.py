@@ -9,20 +9,41 @@ from mobile_telemetry_policy import (
 
 def test_eventos_permitidos_incluem_funil_e_device():
     assert "baixa_confirm_tap" in ALLOWED_EVENT_NAMES
+    assert "baixa_foto_stage" in ALLOWED_EVENT_NAMES
     assert "outbox_sync_stage" in ALLOWED_EVENT_NAMES
     assert "device_snapshot" in ALLOWED_EVENT_NAMES
 
 
 def test_is_allowed_event_name():
     assert is_allowed_event_name("baixa_confirm_tap")
+    assert is_allowed_event_name("baixa_foto_stage")
     assert not is_allowed_event_name("hack_event")
 
 
 def test_sanitize_props_so_whitelist():
     props = sanitize_props(
-        {"kind": "entregue", "secret": "x", "photo_count": 2}
+        {
+            "kind": "entregue",
+            "secret": "x",
+            "photo_count": 2,
+            "attempt_id": "foto_abc",
+            "source": "camera",
+            "bytes_in": 1200000,
+            "bytes_out": 180000,
+            "skipped_resize": False,
+            "timeout_ms": 25000,
+        }
     )
-    assert props == {"kind": "entregue", "photo_count": 2}
+    assert props == {
+        "kind": "entregue",
+        "photo_count": 2,
+        "attempt_id": "foto_abc",
+        "source": "camera",
+        "bytes_in": 1200000,
+        "bytes_out": 180000,
+        "skipped_resize": False,
+        "timeout_ms": 25000,
+    }
     assert sanitize_props({"secret": 1}) is None
 
 
