@@ -381,6 +381,13 @@ def recalcular_coleta(db: Session, id_coleta: int, *, commit: bool = True):
     coleta.avulso = count["avulso"]
     coleta.valor_total = total
 
+    try:
+        from perf_instrumentation import note_recalc
+
+        note_recalc(rows=len(saidas))
+    except Exception:
+        pass
+
     if commit:
         db.commit()
         db.refresh(coleta)
