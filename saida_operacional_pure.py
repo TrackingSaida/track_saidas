@@ -136,7 +136,7 @@ ROTULOS_SITUACAO = {
     # Consulta: Situação unificada. Código técnico EM_ROTA permanece no banco (rota/tracking).
     "EM_ROTA": "Saiu para entrega",
     "ENTREGUE": "Entregue",
-    "AUSENTE": "Ausente",
+    "AUSENTE": "Ocorrência",
     "CANCELADO": "Cancelado",
     "ENCERRADO_SISTEMA": "Encerrado",
     "ENCERRADO": "Encerrado",

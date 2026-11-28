@@ -45,7 +45,7 @@ SITUACAO_LABEL = {
     "saiu_para_entrega": "Saiu para entrega",
     "em_rota": "Em rota",
     "entregue": "Entregue",
-    "ausente": "Ausente",
+    "ausente": "Ocorrência",
     "cancelado": "Cancelado",
     "encerrado": "Encerrado",
     "encerrado_sistema": "Encerrado",

@@ -52,8 +52,8 @@ _ROTULOS_SELLER = {
     "lancar_avulso": "Pacote coletado",
     "em_rota": "Saiu para entrega",
     "status_saiu_manual": "Saiu para entrega",
-    "ausente": "Destinatário ausente",
-    "ausente_lote": "Destinatário ausente",
+    "ausente": "Ocorrência",
+    "ausente_lote": "Ocorrência",
     "nova_tentativa": "Nova tentativa de entrega",
     "liberacao_ausencias": "Nova tentativa de entrega",
     "entregue": "Entregue",
@@ -134,7 +134,7 @@ def status_pedido_amigavel(status: Optional[str]) -> str:
     if st_compact == "CANCELADO":
         return "Cancelado"
     if st_compact in ("AUSENTE",):
-        return "Destinatário ausente"
+        return "Ocorrência"
     if st_compact in ("ENTREGUE",):
         return "Entregue"
     if st_compact in ("DEVOLVIDO", "DEVOLUCAO"):
