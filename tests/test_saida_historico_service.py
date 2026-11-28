@@ -63,7 +63,7 @@ def test_projetar_historico_mobile_inclui_motivo_ausencia():
             id_saida=10,
             evento="ausente",
             timestamp=ts,
-            acao_label="Registrou ausência",
+            acao_label="Registrou: Cliente ausente",
             motivo_ocorrencia="Cliente ausente",
             tentativa=2,
         )
