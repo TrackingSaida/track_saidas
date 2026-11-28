@@ -58,6 +58,13 @@ engine = create_engine(
     echo=ECHO_SQL,
 )
 
+try:
+    from perf_instrumentation import attach_engine_listeners
+
+    attach_engine_listeners(engine)
+except Exception:
+    pass
+
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,

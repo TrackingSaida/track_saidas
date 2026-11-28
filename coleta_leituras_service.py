@@ -436,6 +436,14 @@ def _recalcular_coleta_sem_commit(db: Session, coleta: Coleta) -> Optional[Colet
     coleta.g_ml = g_ml
     coleta.g_avulso = g_avulso
     coleta.valor_total = total
+
+    try:
+        from perf_instrumentation import note_recalc
+
+        note_recalc(rows=len(saidas))
+    except Exception:
+        pass
+
     return coleta
 
 

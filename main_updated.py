@@ -154,7 +154,17 @@ app.add_middleware(
         "Content-Language",
     ],
     max_age=600,  # evita preflight antigo sem PATCH cacheado por 24h
-    expose_headers=["X-Backend-Process-Time", "Content-Disposition", "X-Claims-Stale", "X-Envio-Id", "X-Codigo", "X-Id-Saida", "X-Cobertura-Aviso", "X-Etiqueta-Aviso"],
+    expose_headers=[
+        "X-Backend-Process-Time",
+        "X-Request-Id",
+        "Content-Disposition",
+        "X-Claims-Stale",
+        "X-Envio-Id",
+        "X-Codigo",
+        "X-Id-Saida",
+        "X-Cobertura-Aviso",
+        "X-Etiqueta-Aviso",
+    ],
 )
 
 
@@ -177,6 +187,18 @@ class EnsurePatchCorsMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(EnsurePatchCorsMiddleware)
+
+# Instrumentação de performance (PRD-017). Default off: PERF_INSTRUMENTATION=1.
+try:
+    from perf_instrumentation import (
+        PERF_INSTRUMENTATION_ENABLED,
+        PerfInstrumentationMiddleware,
+    )
+
+    if PERF_INSTRUMENTATION_ENABLED:
+        app.add_middleware(PerfInstrumentationMiddleware)
+except Exception as exc:
+    logger.warning("perf_instrumentation_unavailable: %s", exc)
 
 # ──────────────────────────────────────────────────────────────────
 # Routers em uso
@@ -341,7 +363,26 @@ def startup_event():
 # Healthcheck
 @app.get(f"{API_PREFIX}/health", tags=["Health"])
 def health():
-    return {"status": "ok", "version": app.version}
+    payload = {"status": "ok", "version": app.version}
+    try:
+        from perf_instrumentation import (
+            PERF_INSTRUMENTATION_ENABLED,
+            PERF_INSTRUMENTATION_SAMPLE_RATE,
+            pool_snapshot,
+        )
+        from db import engine
+
+        payload["perf_instrumentation"] = {
+            "enabled": PERF_INSTRUMENTATION_ENABLED,
+            "sample_rate": PERF_INSTRUMENTATION_SAMPLE_RATE,
+        }
+        if PERF_INSTRUMENTATION_ENABLED:
+            snap = pool_snapshot(engine)
+            if snap:
+                payload["pool"] = snap
+    except Exception:
+        pass
+    return payload
 
 # ──────────────────────────────────────────────────────────────────
 # Endpoint interno: refresh de tokens (Cron Render — recomendado a cada 1h)
