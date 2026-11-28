@@ -169,7 +169,7 @@ class EntregaListItem(BaseModel):
     codigo: Optional[str]
     codigo_exibicao: Optional[str] = None  # rótulo amigável do avulso (campos de identificação)
     status: str
-    exibicao: str  # "Pendente" | "Entregue" | "Ausente"
+    exibicao: str  # "Pendente" | "Entregue" | "Ocorrência"
     servico: Optional[str] = None  # Shopee | Mercado Livre | Flex | Avulso
     cliente: Optional[str] = None
     bairro: Optional[str] = None
@@ -540,7 +540,7 @@ def _status_exibicao(status: Optional[str]) -> str:
     if s == STATUS_ENTREGUE:
         return "Entregue"
     if s == STATUS_AUSENTE:
-        return "Ausente"
+        return "Ocorrência"
     if s == STATUS_CANCELADO:
         return "Cancelado"
     if s == STATUS_ENCERRADO_SISTEMA:

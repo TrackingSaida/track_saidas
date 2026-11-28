@@ -140,7 +140,7 @@ def status_avulso_label(status: Optional[str]) -> str:
         "entregue": "Entregue",
         "nao_coletado": "Não coletado",
         "não_coletado": "Não coletado",
-        "ausente": "Ausente",
+        "ausente": "Ocorrência",
         "devolvido": "Devolvido",
         "cancelado": "Cancelado",
         "encerrado_sistema": "Encerrado pelo sistema",
