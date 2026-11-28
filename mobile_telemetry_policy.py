@@ -10,6 +10,7 @@ ALLOWED_EVENT_NAMES = frozenset(
         "pendentes_abertos",
         "baixa_form_aberto",
         "baixa_foto_capturada",
+        "baixa_foto_stage",
         "baixa_confirm_tap",
         "outbox_enqueued",
         "outbox_sync_stage",
@@ -27,6 +28,12 @@ PROPS_WHITELIST = frozenset(
         "error_code",
         "is_device",
         "net_type",
+        "attempt_id",
+        "source",
+        "bytes_in",
+        "bytes_out",
+        "skipped_resize",
+        "timeout_ms",
     }
 )
 
