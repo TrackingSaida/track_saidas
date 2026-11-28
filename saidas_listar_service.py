@@ -23,6 +23,7 @@ from saida_operacional_pure import (
     evento_tecnico_nao_substitui_acao,
     normalizar_evento_atribuicao,
     rotulo_acao_evento,
+    rotulo_acao_ocorrencia_com_motivo,
 )
 
 # SQLAlchemy / models são importados sob demanda nas rotinas de banco
@@ -262,12 +263,13 @@ def build_operacional_ctx_from_historico_rows(
             ultimo_evento, motoboy_id_anterior=ultimo_motoboy_ant
         )
 
-        acao_label = rotulo_acao_evento(
+        payload = _payload_dict(getattr(ultimo, "payload", None)) if ultimo is not None else {}
+        acao_label = rotulo_acao_ocorrencia_com_motivo(
             ultimo_evento,
+            motivo_ocorrencia=str(payload.get("motivo_ocorrencia") or "").strip() or None,
             houve_reatribuicao=houve_reatribuicao,
             motoboy_id_anterior=ultimo_motoboy_ant,
         )
-        payload = _payload_dict(getattr(ultimo, "payload", None)) if ultimo is not None else {}
         rotulo_plataforma = rotulo_evento_payload((ultimo_evento or "").strip().lower(), payload)
         if rotulo_plataforma:
             acao_label = rotulo_plataforma
